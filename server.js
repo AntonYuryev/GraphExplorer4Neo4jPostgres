@@ -14,7 +14,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // bolt+ssc = encrypted, trust all certificates (including self-signed)
 const neo4jDriver = neo4j.driver(
   'bolt+ssc://neo4j.lifesciencepsg.com:7687',
-  neo4j.auth.basic('yuryeva', 'El$evier2024')
+  neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
 );
 const NEO4J_DB = 'mammaloct2025new';
 
