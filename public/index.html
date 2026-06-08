@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Graph Explorer</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════
+     LOGIN SCREEN
+════════════════════════════════════════════════════════════ -->
+<div id="login-screen">
+  <div id="login-box">
+    <div id="login-logo">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+        <circle cx="20" cy="20" r="20" fill="#4f8ef7"/>
+        <circle cx="12" cy="14" r="5" fill="white"/>
+        <circle cx="28" cy="14" r="5" fill="white"/>
+        <circle cx="20" cy="28" r="5" fill="white"/>
+        <line x1="12" y1="14" x2="28" y2="14" stroke="white" stroke-width="2"/>
+        <line x1="12" y1="14" x2="20" y2="28" stroke="white" stroke-width="2"/>
+        <line x1="28" y1="14" x2="20" y2="28" stroke="white" stroke-width="2"/>
+      </svg>
+    </div>
+    <h1>Graph Explorer</h1>
+    <p class="login-subtitle">Neo4j + PostgreSQL</p>
+    <div id="login-error" class="error-msg" style="display:none"></div>
+    <form id="login-form" onsubmit="handleLogin(event)">
+      <input type="text" id="login-username" placeholder="Username" required autocomplete="username">
+      <input type="password" id="login-password" placeholder="Password" required autocomplete="current-password">
+      <button type="submit" id="login-btn">Sign In</button>
+    </form>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     MAIN APP
+════════════════════════════════════════════════════════════ -->
+<div id="app" style="display:none">
+
+  <!-- Header -->
+  <header id="app-header">
+    <div id="header-left">
+      <svg width="24" height="24" viewBox="0 0 40 40" fill="none" style="margin-right:8px;vertical-align:middle">
+        <circle cx="20" cy="20" r="20" fill="#4f8ef7"/>
+        <circle cx="12" cy="14" r="5" fill="white"/>
+        <circle cx="28" cy="14" r="5" fill="white"/>
+        <circle cx="20" cy="28" r="5" fill="white"/>
+        <line x1="12" y1="14" x2="28" y2="14" stroke="white" stroke-width="2"/>
+        <line x1="12" y1="14" x2="20" y2="28" stroke="white" stroke-width="2"/>
+        <line x1="28" y1="14" x2="20" y2="28" stroke="white" stroke-width="2"/>
+      </svg>
+      <span id="app-title">Graph Explorer</span>
+    </div>
+    <div id="header-center">
+      <div id="graph-stats"></div>
+    </div>
+    <div id="header-right">
+      <span id="current-user-label"></span>
+      <button class="btn-ghost" onclick="openChangePassword()">Change Password</button>
+      <button class="btn-ghost" id="admin-btn" onclick="openUserManagement()" style="display:none">Users</button>
+      <button class="btn-danger-ghost" onclick="logout()">Sign Out</button>
+    </div>
+  </header>
+
+  <!-- Query bar -->
+  <div id="query-bar">
+    <textarea id="cypher-input" placeholder="Enter Cypher query — e.g.: MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 50" rows="2" onkeydown="handleQueryKeydown(event)"></textarea>
+    <div id="query-actions">
+      <button class="btn-primary" onclick="runQuery()" id="run-btn">▶ Run</button>
+      <button class="btn-ghost" onclick="clearGraph()">Clear</button>
+    </div>
+  </div>
+
+  <!-- Toolbar -->
+  <div id="toolbar">
+    <!-- Layout -->
+    <div class="toolbar-group">
+      <span class="toolbar-label">Layout</span>
+      <button class="btn-tool active" data-layout="cose" onclick="applyLayout('cose',this)">Force</button>
+      <button class="btn-tool" data-layout="dagre" onclick="applyLayout('dagre',this)">Hierarchical</button>
+      <button class="btn-tool" data-layout="circle" onclick="applyLayout('circle',this)">Circular</button>
+      <button class="btn-tool" data-layout="concentric" onclick="applyLayout('concentric',this)">Concentric</button>
+      <button class="btn-tool" data-layout="grid" onclick="applyLayout('grid',this)">Grid</button>
+    </div>
+
+    <!-- Save/Load -->
+    <div class="toolbar-group">
+      <span class="toolbar-label">Subgraph</span>
+      <button class="btn-tool" onclick="promptSaveSubgraph()">💾 Save</button>
+      <button class="btn-tool" onclick="document.getElementById('load-file-input').click()">📂 Load</button>
+      <input type="file" id="load-file-input" accept=".json" style="display:none" onchange="loadSubgraph(event)">
+    </div>
+
+    <!-- View toggle -->
+    <div class="toolbar-group" style="margin-left:auto">
+      <button class="btn-tool active" id="view-graph-btn" onclick="switchView('graph')">Graph</button>
+      <button class="btn-tool" id="view-table-btn" onclick="switchView('table')">Table</button>
+    </div>
+  </div>
+
+  <!-- Main content area -->
+  <div id="content-area">
+
+    <!-- Graph view -->
+    <div id="graph-view">
+      <div id="graph-canvas-wrapper">
+        <div id="cy"></div>
+        <div id="graph-empty-state">
+          <p>Run a Cypher query to visualize the graph</p>
+          <code>MATCH (n)-[r]-&gt;(m) RETURN n, r, m LIMIT 50</code>
+        </div>
+        <div id="graph-loading" style="display:none">
+          <div class="spinner"></div>
+          <span>Querying Neo4j...</span>
+        </div>
+      </div>
+      <div id="legend-panel">
+        <div id="legend-title">Relation Types</div>
+        <div id="legend-items"></div>
+        <div id="legend-thickness">
+          <div class="legend-section-title">Edge thickness</div>
+          <div class="legend-thickness-row"><span class="thickness-line t1"></span>0 references</div>
+          <div class="legend-thickness-row"><span class="thickness-line t2"></span>1 reference</div>
+          <div class="legend-thickness-row"><span class="thickness-line t3"></span>2 references</div>
+          <div class="legend-thickness-row"><span class="thickness-line t4"></span>≥3 references</div>
+          <div class="legend-section-title" style="margin-top:10px">Line style</div>
+          <div class="legend-thickness-row"><span class="line-solid"></span>Direct relation</div>
+          <div class="legend-thickness-row"><span class="line-dashed"></span>Indirect relation</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table view (hidden by default) -->
+    <div id="table-view" style="display:none">
+      <div id="table-toolbar">
+        <input type="text" id="table-search" placeholder="Filter rows..." oninput="filterTable(this.value)">
+        <button class="btn-tool" onclick="exportTableCSV()">⬇ Export CSV</button>
+        <span id="table-loading-msg" style="display:none;color:#888;font-size:12px">Loading references...</span>
+      </div>
+      <div id="table-wrapper">
+        <table id="data-table">
+          <thead>
+            <tr>
+              <th onclick="sortTable('regulator')">Regulator ⇅</th>
+              <th onclick="sortTable('regulatorType')">Regulator Type ⇅</th>
+              <th onclick="sortTable('target')">Target ⇅</th>
+              <th onclick="sortTable('targetType')">Target Type ⇅</th>
+              <th onclick="sortTable('relationType')">Relation Type ⇅</th>
+              <th onclick="sortTable('effect')">Effect ⇅</th>
+              <th onclick="sortTable('numRefs')"># Refs ⇅</th>
+              <th>PMID</th>
+              <th>DOI</th>
+              <th onclick="sortTable('year')">Year ⇅</th>
+              <th>Title</th>
+              <th>Sentence</th>
+            </tr>
+          </thead>
+          <tbody id="table-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /content-area -->
+
+</div><!-- /app -->
+
+<!-- ═══════════════════════════════════════════════════════════
+     TOOLTIP
+════════════════════════════════════════════════════════════ -->
+<div id="tooltip" style="display:none"></div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     MODALS
+════════════════════════════════════════════════════════════ -->
+
+<!-- Save subgraph modal -->
+<div id="save-modal" class="modal-backdrop" style="display:none" onclick="closeSaveModal(event)">
+  <div class="modal-box">
+    <h3>Save Subgraph</h3>
+    <input type="text" id="save-name-input" placeholder="Subgraph name..." onkeydown="if(event.key==='Enter')confirmSave()">
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="document.getElementById('save-modal').style.display='none'">Cancel</button>
+      <button class="btn-primary" onclick="confirmSave()">Save & Download</button>
+    </div>
+  </div>
+</div>
+
+<!-- Change password modal -->
+<div id="change-pw-modal" class="modal-backdrop" style="display:none" onclick="closeChangePwModal(event)">
+  <div class="modal-box">
+    <h3>Change Password</h3>
+    <div id="change-pw-error" class="error-msg" style="display:none"></div>
+    <div id="change-pw-success" class="success-msg" style="display:none"></div>
+    <input type="password" id="cp-current" placeholder="Current password">
+    <input type="password" id="cp-new" placeholder="New password (min 6 chars)">
+    <input type="password" id="cp-confirm" placeholder="Confirm new password">
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="document.getElementById('change-pw-modal').style.display='none'">Cancel</button>
+      <button class="btn-primary" onclick="submitChangePassword()">Update Password</button>
+    </div>
+  </div>
+</div>
+
+<!-- User management modal (admin only) -->
+<div id="users-modal" class="modal-backdrop" style="display:none" onclick="closeUsersModal(event)">
+  <div class="modal-box" style="min-width:480px">
+    <h3>User Management</h3>
+    <div id="users-list-container"></div>
+    <hr style="margin:16px 0; border-color:#eee">
+    <h4 style="margin:0 0 10px">Add User</h4>
+    <div id="add-user-error" class="error-msg" style="display:none"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="new-user-name" placeholder="Username" style="flex:1;min-width:120px">
+      <input type="password" id="new-user-pass" placeholder="Password" style="flex:1;min-width:120px">
+      <select id="new-user-role">
+        <option value="user">User</option>
+        <option value="admin">Admin</option>
+      </select>
+      <button class="btn-primary" onclick="addUser()">Add</button>
+    </div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn-ghost" onclick="document.getElementById('users-modal').style.display='none'">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Right-click context menu -->
+<div id="context-menu" style="display:none">
+  <div class="ctx-item" onclick="openCurationFromContext()">✏️ Edit Properties</div>
+</div>
+
+<!-- Curation modal -->
+<div id="curation-modal" class="modal-backdrop" style="display:none" onclick="closeCurationModal(event)">
+  <div class="modal-box" style="min-width:580px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+    <h3 id="curation-title">Edit Properties</h3>
+    <div id="curation-props-container" style="overflow-y:auto;flex:1;margin-bottom:12px"></div>
+    <button class="btn-ghost" style="width:fit-content;margin-bottom:16px" onclick="addPropertyRow()">+ Add Property</button>
+    <div class="modal-actions" style="align-items:center">
+      <span id="curation-status" style="font-size:12px;flex:1"></span>
+      <button class="btn-ghost" onclick="document.getElementById('curation-modal').style.display='none'">Cancel</button>
+      <button class="btn-primary" onclick="saveCuration()">Save to Neo4j</button>
+    </div>
+  </div>
+</div>
+
+<!-- Scripts: load order matters for Cytoscape extensions -->
+<script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<script src="app.js"></script>
+
+</body>
+</html>
