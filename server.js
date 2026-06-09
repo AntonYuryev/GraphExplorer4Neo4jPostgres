@@ -5,10 +5,32 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Strict limiter for login — prevents brute-force password attacks.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,   // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again in 15 minutes.' }
+});
+
+// General limiter for all database-touching API routes.
+// 200 requests per minute is generous for interactive use by a small team,
+// while still blocking runaway scripts or accidental loops.
+const dbLimiter = rateLimit({
+  windowMs: 60 * 1000,         // 1 minute
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down and try again shortly.' }
+});
 
 // ─── Neo4j ───────────────────────────────────────────────────────────────────
 // bolt+ssc = encrypted, trust all certificates (including self-signed)
@@ -129,7 +151,7 @@ function processValue(val, nodesMap, edgesMap) {
 }
 
 // ─── Auth routes ──────────────────────────────────────────────────────────────
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
@@ -196,7 +218,7 @@ app.delete('/api/auth/users/:username', authMiddleware, (req, res) => {
 });
 
 // ─── Neo4j query ─────────────────────────────────────────────────────────────
-app.post('/api/graph/query', authMiddleware, async (req, res) => {
+app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
   const { query } = req.body || {};
   if (!query || !query.trim()) return res.status(400).json({ error: 'Cypher query is required' });
 
@@ -227,7 +249,7 @@ app.post('/api/graph/query', authMiddleware, async (req, res) => {
 // ─── PostgreSQL references (tooltip — single edge hover) ──────────────────────
 // RelationID in Neo4j is a string; id in Postgres is bigint.
 // Pass as strings and cast to bigint in SQL to preserve full 64-bit precision.
-app.post('/api/references', authMiddleware, async (req, res) => {
+app.post('/api/references', dbLimiter, authMiddleware, async (req, res) => {
   const { relationIds } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json([]);
 
@@ -259,7 +281,7 @@ app.post('/api/references', authMiddleware, async (req, res) => {
 // ─── PostgreSQL references batch (table view) ────────────────────────────────
 // Accepts optional scopusColumns array to LEFT JOIN scopus_data table.
 // scopus_data is joined on: reference.unique_id = scopus_data.reference_id
-app.post('/api/references/batch', authMiddleware, async (req, res) => {
+app.post('/api/references/batch', dbLimiter, authMiddleware, async (req, res) => {
   const { relationIds, scopusColumns } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json({});
 
@@ -307,7 +329,7 @@ app.post('/api/references/batch', authMiddleware, async (req, res) => {
 
 // ─── PostgreSQL: MedScan ID lookup ───────────────────────────────────────────
 // Accepts an array of Neo4j NodeID values and returns { nodeId: medScanValue }.
-app.post('/api/nodes/medscan', authMiddleware, async (req, res) => {
+app.post('/api/nodes/medscan', dbLimiter, authMiddleware, async (req, res) => {
   const { nodeIds } = req.body || {};
   if (!Array.isArray(nodeIds) || !nodeIds.length) return res.json({});
 
@@ -334,7 +356,7 @@ app.post('/api/nodes/medscan', authMiddleware, async (req, res) => {
 
 // ─── PostgreSQL: update reference row ────────────────────────────────────────
 // Column names are validated against actual table columns to prevent SQL injection.
-app.post('/api/references/update', authMiddleware, async (req, res) => {
+app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) => {
   const { id, fields } = req.body || {};
   if (!id || !fields) return res.status(400).json({ error: 'id and fields required' });
 
@@ -361,7 +383,7 @@ app.post('/api/references/update', authMiddleware, async (req, res) => {
 });
 
 // ─── PostgreSQL: list columns for reference and scopus_data tables ────────────
-app.get('/api/schema/columns', authMiddleware, async (req, res) => {
+app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
   try {
     const refResult = await pgPool.query(
       `SELECT column_name FROM information_schema.columns
@@ -395,7 +417,7 @@ app.get('/api/schema/columns', authMiddleware, async (req, res) => {
 });
 
 // ─── Curation: update node properties ────────────────────────────────────────
-app.post('/api/graph/update-node', authMiddleware, async (req, res) => {
+app.post('/api/graph/update-node', dbLimiter, authMiddleware, async (req, res) => {
   const { elementId, properties } = req.body || {};
   if (!elementId || !properties) return res.status(400).json({ error: 'elementId and properties required' });
 
@@ -426,7 +448,7 @@ app.post('/api/graph/update-node', authMiddleware, async (req, res) => {
 });
 
 // ─── Curation: update relation properties ────────────────────────────────────
-app.post('/api/graph/update-relation', authMiddleware, async (req, res) => {
+app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, res) => {
   const { elementId, properties } = req.body || {};
   if (!elementId || !properties) return res.status(400).json({ error: 'elementId and properties required' });
 
