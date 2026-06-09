@@ -139,6 +139,7 @@
         <input type="text" id="table-search" placeholder="Filter rows..." oninput="filterTable(this.value)">
         <button class="btn-tool" onclick="openColumnsDialog()">⚙ Columns</button>
         <button class="btn-tool" onclick="exportTableCSV()">⬇ Export CSV</button>
+        <button class="btn-tool" onclick="exportTableExcel()">⬇ Export Excel</button>
         <span id="table-loading-msg" style="display:none;color:#888;font-size:12px">Loading references...</span>
       </div>
       <div id="table-wrapper">
@@ -256,6 +257,7 @@
 <script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
 <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
 <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
 <script src="app.js"></script>
 
 </body>
