@@ -65,6 +65,19 @@ const pgPool = new Pool({
 
 Replace `YOUR_NEO4J_USERNAME`, `YOUR_NEO4J_PASSWORD`, `YOUR_PG_USERNAME`, and `YOUR_PG_PASSWORD` with your own credentials. The host, port, and database name are shared and should stay the same unless your DBA tells you otherwise.
 
+**PostgreSQL schema** (line ~35):
+```javascript
+const PG_SCHEMA = process.env.PG_SCHEMA || 'resnetcustomnov';
+```
+
+Change `'resnetcustomnov'` to your own schema name. Alternatively, set it without editing the file by passing an environment variable when starting the server:
+
+```
+PG_SCHEMA=myschema node server.js          # Mac / Linux
+set PG_SCHEMA=myschema && node server.js   # Windows Command Prompt
+$env:PG_SCHEMA="myschema"; node server.js  # Windows PowerShell
+```
+
 ---
 
 ## Installation (one-time)
