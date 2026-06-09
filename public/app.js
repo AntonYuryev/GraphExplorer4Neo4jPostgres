@@ -23,6 +23,11 @@ let currentLayout = 'cose';
 let contextTarget = null;   // element targeted by right-click
 let curationTarget = null;  // element open in curation modal
 
+// ─── Table column state ───────────────────────────────────────────────────────
+let columnDefs = [];         // [{key,label,visible,source,dbField}] — current order
+let availableDbColumns = { reference: [], scopus_data: [] };
+let dragSrcColIdx = null;    // for header drag-and-drop
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DIRECT_TYPES = new Set([
   'Binding', 'DirectRegulation', 'ProtModification', 'PromoterBinding', 'ChemicalReaction'
@@ -44,6 +49,67 @@ const NODE_COLORS = {
   Complex: '#a6d854', Reaction: '#999999'
 };
 const DEFAULT_NODE_COLOR = '#5a6a9a';
+
+// Human-readable overrides for reference table column names in the Columns dialog
+const COL_DISPLAY_NAMES = {
+  'id':        'RelationID',
+  'unique_id': 'AssertionID'
+};
+
+// Hardcoded scopus_data columns and their display labels.
+// Joined to reference via: reference.unique_id = scopus_data.reference_id
+const SCOPUS_COLUMNS = {
+  'citation_type':                      'Article type',
+  'citation_count':                     'Citations',
+  'fwci':                               'FWCI',
+  'fwci_perc':                          'FWCI %ile',
+  'citation_count_ns':                  'Non-self citations',
+  'fwci_ns':                            'Non-self FWCI',
+  'fwci_perc_ns':                       'Non-self FWCI %ile',
+  'citescore2024':                      'CiteScore2024',
+  'min_asjc_citescore_percentile_raw':  'CiteScore %ile',
+  'patent_citation_count':              'Patent citations',
+  'corporate':                          'Corporate',
+  'num_refs':                           'References',
+  'independent_ref_count':              'Independent References',
+  'document_score':                     'Document score',
+  'relation_score':                     'Relation score'
+};
+
+const COL_CONFIG_KEY = 'graphExplorerColumnDefs';  // localStorage key
+
+function saveColumnConfig() {
+  try { localStorage.setItem(COL_CONFIG_KEY, JSON.stringify(columnDefs)); } catch(e) {}
+}
+
+function loadColumnConfig() {
+  try {
+    var saved = localStorage.getItem(COL_CONFIG_KEY);
+    if (saved) {
+      var parsed = JSON.parse(saved);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch(e) {}
+  return null;
+}
+
+// Default table columns — source:'graph' columns come from Neo4j edge/node data,
+// source:'reference' and source:'scopus_data' come from PostgreSQL.
+// dbField is the raw DB column name; key is the property name in tableRows.
+const DEFAULT_COLUMNS = [
+  { key: 'regulator',     label: 'Regulator',      visible: true,  source: 'graph' },
+  { key: 'regulatorType', label: 'Regulator Type', visible: true,  source: 'graph' },
+  { key: 'target',        label: 'Target',         visible: true,  source: 'graph' },
+  { key: 'targetType',    label: 'Target Type',    visible: true,  source: 'graph' },
+  { key: 'relationType',  label: 'Relation Type',  visible: true,  source: 'graph' },
+  { key: 'effect',        label: 'Effect',         visible: true,  source: 'graph' },
+  { key: 'numRefs',       label: '# Refs',         visible: true,  source: 'graph',     sortKey: 'numRefs' },
+  { key: 'pmid',          label: 'PMID',           visible: true,  source: 'reference', dbField: 'pmid' },
+  { key: 'doi',           label: 'DOI',            visible: true,  source: 'reference', dbField: 'doi' },
+  { key: 'year',          label: 'Year',           visible: true,  source: 'reference', dbField: 'pubyear' },
+  { key: 'title',         label: 'Title',          visible: true,  source: 'reference', dbField: 'title' },
+  { key: 'sentence',      label: 'Sentence',       visible: true,  source: 'reference', dbField: 'msrc' }
+];
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', function() {
@@ -96,6 +162,12 @@ function showApp() {
   if (currentRole === 'admin') {
     document.getElementById('admin-btn').style.display = '';
   }
+  // Load saved column config or fall back to defaults
+  columnDefs = loadColumnConfig() || DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
+  // Fetch available DB column lists (used by Columns dialog)
+  api('/api/schema/columns', null).then(function(data) {
+    availableDbColumns = { reference: data.reference || [], scopus_data: data.scopus_data || [] };
+  }).catch(function() {});
   initCytoscape();
 }
 
@@ -329,8 +401,9 @@ function getNodeColor(labels) {
 }
 
 function getEdgeThickness(numRefs) {
+  // Min 2px (easy to hover), max 5px for 3+ references
   var n = Math.min(Number(numRefs) || 0, 3);
-  return 1 + (n / 3) * 3;
+  return 2 + (n / 3) * 3;
 }
 
 function renderGraph(data, savedPositions) {
@@ -604,12 +677,27 @@ async function loadTableData() {
   var msg = document.getElementById('table-loading-msg');
   msg.style.display = 'inline';
 
+  // Collect any scopus_data columns that are currently active
+  var scopusCols = columnDefs
+    .filter(function(c) { return c.source === 'scopus_data'; })
+    .map(function(c) { return c.dbField; });
+
   var refsGrouped = {};
   if (relIds.length > 0) {
     try {
-      refsGrouped = await api('/api/references/batch', { relationIds: relIds });
+      refsGrouped = await api('/api/references/batch', { relationIds: relIds, scopusColumns: scopusCols });
     } catch(err) {
-      console.error('Batch references failed:', err.message);
+      console.error('Batch references failed (with scopus):', err.message);
+      // Scopus JOIN may have failed (e.g. table missing or type mismatch).
+      // Retry without scopus columns so reference data still loads.
+      if (scopusCols.length > 0) {
+        try {
+          refsGrouped = await api('/api/references/batch', { relationIds: relIds, scopusColumns: [] });
+          console.warn('Scopus JOIN failed — showing reference columns only. Check server log for details.');
+        } catch(err2) {
+          console.error('Batch references also failed without scopus:', err2.message);
+        }
+      }
     }
   }
   msg.style.display = 'none';
@@ -637,25 +725,66 @@ async function loadTableData() {
       numRefs: edge.properties.RelationNumberOfReferences || 0
     };
 
+    var buildRow = function(ref) {
+      var row = Object.assign({}, base);
+      if (ref) {
+        // Store ALL raw reference fields so columns added later can find values
+        // without needing a DB reload (SELECT * already fetches everything).
+        Object.keys(ref).forEach(function(k) {
+          if (k.startsWith('sd_')) {
+            row[k] = ref[k] != null ? String(ref[k]) : '';  // scopus already prefixed
+          } else {
+            row['_ref_' + k] = ref[k];  // raw storage, keyed by _ref_{dbFieldName}
+          }
+        });
+        // Also map current columnDef keys for fast access in renderTableRows
+        columnDefs.forEach(function(col) {
+          if (col.source === 'reference') {
+            if (col.key === 'year') row.year = getRefYear(ref);
+            else if (col.key === 'sentence') row.sentence = ref.msrc || '';
+            else row[col.key] = ref[col.dbField] != null ? String(ref[col.dbField]) : '';
+          } else if (col.source === 'scopus_data') {
+            row[col.key] = ref['sd_' + col.dbField] != null ? String(ref['sd_' + col.dbField]) : '';
+          }
+        });
+      } else {
+        columnDefs.forEach(function(col) {
+          if (col.source === 'reference' || col.source === 'scopus_data') row[col.key] = '';
+        });
+      }
+      return row;
+    };
+
     if (refs.length === 0) {
-      tableRows.push(Object.assign({}, base, { pmid: '', doi: '', year: '', title: '', sentence: '' }));
+      tableRows.push(buildRow(null));
     } else {
-      refs.forEach(function(ref) {
-        tableRows.push(Object.assign({}, base, {
-          pmid: ref.pmid || '',
-          doi: ref.doi || '',
-          year: getRefYear(ref),
-          title: ref.title || '',
-          sentence: ref.msrc || ''
-        }));
-      });
+      refs.forEach(function(ref) { tableRows.push(buildRow(ref)); });
     }
   });
 
+  renderTableHeader();
   renderTableRows(tableRows);
 }
 
+function renderTableHeader() {
+  var thead = document.querySelector('#data-table thead tr');
+  if (!thead) return;
+  var visCols = columnDefs.filter(function(c) { return c.visible; });
+  thead.innerHTML = visCols.map(function(col, i) {
+    var sortAttr = col.source === 'graph' ? ' onclick="sortTable(\'' + col.key + '\')"' : '';
+    var sortLabel = col.source === 'graph' ? ' <span class="col-sort-arrow">⇅</span>' : '';
+    return '<th data-col-idx="' + i + '" draggable="true"' + sortAttr
+      + ' ondragstart="colDragStart(event,' + i + ')"'
+      + ' ondragover="colDragOver(event)"'
+      + ' ondrop="colDrop(event,' + i + ')"'
+      + ' ondragend="colDragEnd(event)"'
+      + ' title="Drag to reorder">'
+      + escHtml(col.label) + sortLabel + '</th>';
+  }).join('');
+}
+
 function renderTableRows(rows) {
+  var visCols = columnDefs.filter(function(c) { return c.visible; });
   var tbody = document.getElementById('table-body');
   tbody.innerHTML = '';
   rows.forEach(function(row) {
@@ -672,24 +801,27 @@ function renderTableRows(rows) {
         showContextMenu(evt.clientX, evt.clientY, 'edge', row.edgeId, row.elementId, name, props, row.relId);
       });
     }
-    var pmidCell = row.pmid
-      ? '<a href="https://pubmed.ncbi.nlm.nih.gov/' + row.pmid + '" target="_blank" style="color:#4f8ef7">' + row.pmid + '</a>'
-      : '';
-    var doiCell = row.doi
-      ? '<a href="https://doi.org/' + row.doi + '" target="_blank" style="color:#4f8ef7">' + escHtml(row.doi) + '</a>'
-      : '';
-    var cells = [
-      escHtml(row.regulator), escHtml(row.regulatorType),
-      escHtml(row.target),    escHtml(row.targetType),
-      escHtml(row.relationType), escHtml(row.effect),
-      escHtml(String(row.numRefs)),
-      pmidCell, doiCell,
-      escHtml(String(row.year || '')),
-      escHtml(row.title),
-      escHtml(row.sentence)
-    ];
+    var cells = visCols.map(function(col) {
+      var val = row[col.key];
+      // If this is a reference column added after the last loadTableData call,
+      // row[col.key] won't exist yet — fall back to raw _ref_* storage.
+      if (val === undefined && col.source === 'reference') {
+        if (col.key === 'year') val = row['_ref_pubyear'] != null ? String(row['_ref_pubyear']) : '';
+        else if (col.key === 'sentence') val = row['_ref_msrc'] || '';
+        else val = row['_ref_' + col.dbField] != null ? String(row['_ref_' + col.dbField]) : '';
+      }
+      if (col.key === 'pmid' && val) {
+        return '<a href="https://pubmed.ncbi.nlm.nih.gov/' + escHtml(String(val)) + '" target="_blank" style="color:#4f8ef7">' + escHtml(String(val)) + '</a>';
+      }
+      if (col.key === 'doi' && val) {
+        return '<a href="https://doi.org/' + escHtml(String(val)) + '" target="_blank" style="color:#4f8ef7">' + escHtml(String(val)) + '</a>';
+      }
+      return escHtml(val != null ? String(val) : '');
+    });
     tr.innerHTML = cells.map(function(v, i) {
-      var cls = i === 11 ? ' class="sentence-cell"' : '';
+      var col = visCols[i];
+      var isSentence = col.key === 'sentence' || (col.source === 'scopus_data');
+      var cls = isSentence ? ' class="sentence-cell"' : '';
       var raw = typeof v === 'string' ? v : '';
       return '<td' + cls + ' title="' + raw.replace(/"/g, '&quot;') + '">' + v + '</td>';
     }).join('');
@@ -722,15 +854,12 @@ function sortTable(col) {
 }
 
 function exportTableCSV() {
-  var cols = ['regulator','regulatorType','target','targetType',
-    'relationType','effect','numRefs','pmid','doi','year','title','sentence'];
-  var header = ['Regulator','Regulator Type','Target','Target Type',
-    'Relation Type','Effect','RelationNumberOfReferences','PMID','DOI','Year','Title','Sentence'];
-
+  var visCols = columnDefs.filter(function(c) { return c.visible; });
   var esc = function(v) { return '"' + String(v || '').replace(/"/g, '""') + '"'; };
-  var lines = [header.map(esc).join(',')];
-  tableRows.forEach(function(row) { lines.push(cols.map(function(c) { return esc(row[c]); }).join(',')); });
-
+  var lines = [visCols.map(function(c) { return esc(c.label); }).join(',')];
+  tableRows.forEach(function(row) {
+    lines.push(visCols.map(function(c) { return esc(row[c.key]); }).join(','));
+  });
   var blob = new Blob([lines.join('\n')], { type: 'text/csv' });
   var url = URL.createObjectURL(blob);
   var a = document.createElement('a');
@@ -1020,7 +1149,7 @@ function addPropertyRow() {
   row.className = 'prop-row';
   row.innerHTML = '<input class="prop-key neo-prop-key" value="" placeholder="Property name">'
     + '<input class="prop-val neo-prop-val" value="" placeholder="Value">'
-    + '<button class="prop-del" onclick="this.closest(\'.prop-row\').remove()" title="Remove">×</button>';
+    + '<button class="prop-del" onclick="this.closest(\'.prop-row\').remove()" title="Remove">x</button>';
   if (pgSection) container.insertBefore(row, pgSection);
   else container.appendChild(row);
   row.querySelector('.neo-prop-key').focus();
@@ -1042,7 +1171,6 @@ async function saveCuration() {
   statusEl.style.color = '#7a8099';
   statusEl.textContent = 'Saving...';
 
-  // Collect Neo4j properties from editable rows
   var container = document.getElementById('curation-props-container');
   var keyEls = container.querySelectorAll('.neo-prop-key');
   var valEls = container.querySelectorAll('.neo-prop-val');
@@ -1053,7 +1181,6 @@ async function saveCuration() {
     if (k) neoProps[k] = v;
   });
 
-  // Save to Neo4j
   var endpoint = type === 'node' ? '/api/graph/update-node' : '/api/graph/update-relation';
   try {
     await api(endpoint, { elementId: elementId, properties: neoProps });
@@ -1063,7 +1190,6 @@ async function saveCuration() {
     return;
   }
 
-  // Update in-memory graphData
   if (type === 'node') {
     var nd = graphData.nodes.find(function(n) { return n.id === curationTarget.id; });
     if (nd) nd.properties = Object.assign({}, nd.properties, neoProps);
@@ -1074,7 +1200,6 @@ async function saveCuration() {
     if (ed) ed.properties = Object.assign({}, ed.properties, neoProps);
   }
 
-  // Save PostgreSQL reference changes (edges only)
   if (type === 'edge' && pgRefs && pgRefs.length > 0) {
     var pgSection = document.getElementById('pg-refs-section');
     if (pgSection) {
@@ -1110,4 +1235,147 @@ async function saveCuration() {
   setTimeout(function() {
     document.getElementById('curation-modal').style.display = 'none';
   }, 900);
+}
+
+// ─── Column drag-and-drop ─────────────────────────────────────────────────────
+function colDragStart(evt, idx) {
+  dragSrcColIdx = idx;
+  evt.dataTransfer.effectAllowed = 'move';
+  evt.currentTarget.classList.add('col-dragging');
+}
+
+function colDragOver(evt) {
+  evt.preventDefault();
+  evt.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('#data-table th').forEach(function(el) { el.classList.remove('col-drag-over'); });
+  evt.currentTarget.classList.add('col-drag-over');
+}
+
+function colDrop(evt, dropIdx) {
+  evt.preventDefault();
+  if (dragSrcColIdx === null || dragSrcColIdx === dropIdx) return;
+
+  var visCols = columnDefs.filter(function(c) { return c.visible; });
+  var srcKey = visCols[dragSrcColIdx] && visCols[dragSrcColIdx].key;
+  var dstKey = visCols[dropIdx] && visCols[dropIdx].key;
+  if (!srcKey || !dstKey) return;
+
+  var srcDefIdx = columnDefs.findIndex(function(c) { return c.key === srcKey; });
+  var dstDefIdx = columnDefs.findIndex(function(c) { return c.key === dstKey; });
+  if (srcDefIdx < 0 || dstDefIdx < 0) return;
+
+  var moved = columnDefs.splice(srcDefIdx, 1)[0];
+  var newDst = columnDefs.findIndex(function(c) { return c.key === dstKey; });
+  columnDefs.splice(newDst, 0, moved);
+
+  document.querySelectorAll('#data-table th').forEach(function(el) { el.classList.remove('col-drag-over'); });
+  saveColumnConfig();
+  renderTableHeader();
+  renderTableRows(tableRows);
+}
+
+function colDragEnd(evt) {
+  dragSrcColIdx = null;
+  document.querySelectorAll('#data-table th').forEach(function(el) {
+    el.classList.remove('col-dragging', 'col-drag-over');
+  });
+}
+
+// ─── Columns dialog ───────────────────────────────────────────────────────────
+function renderColumnsDialogContent() {
+  var refList   = document.getElementById('col-ref-list');
+  var sdList    = document.getElementById('col-sd-list');
+  var sdSection = document.getElementById('col-sd-section');
+
+  // ── reference table columns (fetched from server) ──────────────────────────
+  var refCols = availableDbColumns.reference || [];
+  refList.innerHTML = refCols.length === 0
+    ? '<div style="color:#7a8099;font-size:12px">Loading columns...</div>'
+    : refCols.map(function(dbField) {
+        var existing = columnDefs.find(function(c) { return c.source === 'reference' && c.dbField === dbField; });
+        var checked  = existing ? existing.visible : false;
+        var label    = COL_DISPLAY_NAMES[dbField] || dbField;
+        return '<label class="col-check-row"><input type="checkbox" data-source="reference" data-field="'
+          + escHtml(dbField) + '"' + (checked ? ' checked' : '') + '> '
+          + escHtml(label) + '</label>';
+      }).join('');
+
+  // ── scopus_data columns (hardcoded list, joined on unique_id=reference_id) ─
+  sdSection.style.display = '';
+  sdList.innerHTML = Object.keys(SCOPUS_COLUMNS).map(function(dbField) {
+    var existing = columnDefs.find(function(c) { return c.source === 'scopus_data' && c.dbField === dbField; });
+    var checked  = existing ? existing.visible : false;
+    var label    = SCOPUS_COLUMNS[dbField];
+    return '<label class="col-check-row"><input type="checkbox" data-source="scopus_data" data-field="'
+      + escHtml(dbField) + '"' + (checked ? ' checked' : '') + '> '
+      + escHtml(label)
+      + ' <span style="color:#7a8099;font-size:10px">(scopus)</span></label>';
+  }).join('');
+}
+
+async function openColumnsDialog() {
+  var modal = document.getElementById('columns-modal');
+  modal.style.display = 'flex';
+
+  if (availableDbColumns.reference.length === 0) {
+    document.getElementById('col-ref-list').innerHTML =
+      '<div style="color:#7a8099;font-size:12px">Loading...</div>';
+    try {
+      var data = await api('/api/schema/columns', null);
+      availableDbColumns = { reference: data.reference || [], scopus_data: data.scopus_data || [] };
+    } catch(e) {
+      document.getElementById('col-ref-list').innerHTML =
+        '<div style="color:#e05560;font-size:12px">Failed to load columns: ' + escHtml(e.message) + '</div>';
+      return;
+    }
+  }
+
+  renderColumnsDialogContent();
+}
+
+function closeColumnsModal(evt) {
+  if (evt.target === document.getElementById('columns-modal'))
+    document.getElementById('columns-modal').style.display = 'none';
+}
+
+async function applyColumnsDialog() {
+  var modal = document.getElementById('columns-modal');
+  var checkboxes = modal.querySelectorAll('input[type="checkbox"]');
+  var needsScopusReload = false;
+
+  checkboxes.forEach(function(cb) {
+    var source = cb.dataset.source;
+    var dbField = cb.dataset.field;
+    var key = source === 'scopus_data' ? ('sd_' + dbField) : dbField;
+    if (source === 'reference') {
+      if (dbField === 'pubyear') key = 'year';
+      else if (dbField === 'msrc') key = 'sentence';
+    }
+    var label = source === 'scopus_data'
+      ? (SCOPUS_COLUMNS[dbField] || dbField)
+      : (COL_DISPLAY_NAMES[dbField] || dbField);
+
+    var existing = columnDefs.find(function(c) { return c.dbField === dbField && c.source === source; });
+
+    if (cb.checked) {
+      if (existing) {
+        existing.visible = true;
+      } else {
+        columnDefs.push({ key: key, label: label, visible: true, source: source, dbField: dbField });
+        if (source === 'scopus_data') needsScopusReload = true;
+      }
+    } else {
+      if (existing) existing.visible = false;
+    }
+  });
+
+  modal.style.display = 'none';
+  saveColumnConfig();
+
+  if (needsScopusReload && tableRows.length > 0) {
+    await loadTableData();
+  } else {
+    renderTableHeader();
+    renderTableRows(tableRows);
+  }
 }
