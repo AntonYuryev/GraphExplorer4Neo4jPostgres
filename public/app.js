@@ -16,6 +16,8 @@ let refsCache = {};                          // relId → [postgres rows]
 let typeColorMap = {};                       // relType → hex color
 let colorIdx = 0;
 let tooltipVisible = false;
+let tooltipHideTimer = null;
+let lastMouseX = 0, lastMouseY = 0;
 let tableRows = [];                          // all table rows
 let tableSortCol = null;
 let tableSortAsc = true;
@@ -120,8 +122,22 @@ window.addEventListener('DOMContentLoaded', function() {
     currentRole = sessionStorage.getItem('currentRole');
     showApp();
   }
+  // Track cursor so renderTooltip can re-position after content is set.
   document.addEventListener('mousemove', function(e) {
-    if (tooltipVisible) positionTooltip(e.clientX, e.clientY);
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+  });
+  // Hovering the tooltip itself cancels the hide timer; leaving it hides it.
+  var tipEl = document.getElementById('tooltip');
+  // Prevent tooltip events from reaching Cytoscape (pan/zoom).
+  // Use capture phase so we intercept before Cytoscape's own listeners.
+  ['mousedown', 'mouseup', 'mousemove', 'click', 'wheel',
+   'pointerdown', 'pointerup', 'pointermove',
+   'touchstart', 'touchmove', 'touchend'].forEach(function(evtName) {
+    tipEl.addEventListener(evtName, function(e) {
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+    }, { capture: true, passive: false });
   });
 });
 
@@ -224,6 +240,7 @@ function initCytoscape() {
   // Tooltip on edge hover
   cy.on('mouseover', 'edge', async function(evt) {
     if (document.getElementById('curation-modal').style.display !== 'none') return;
+    if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
     var edge = evt.target;
     var pos = evt.originalEvent || { clientX: 0, clientY: 0 };
     showTooltipLoading();
@@ -241,13 +258,13 @@ function initCytoscape() {
   });
 
   cy.on('mouseout', 'edge', function() {
-    tooltipVisible = false;
-    document.getElementById('tooltip').style.display = 'none';
+    // Tooltip stays visible until user clicks empty canvas area.
   });
 
   // Tooltip on node hover
   cy.on('mouseover', 'node', function(evt) {
     if (document.getElementById('curation-modal').style.display !== 'none') return;
+    if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
     var node = evt.target;
     var pos = evt.originalEvent || { clientX: 0, clientY: 0 };
     renderNodeTooltip(node);
@@ -256,8 +273,7 @@ function initCytoscape() {
   });
 
   cy.on('mouseout', 'node', function() {
-    tooltipVisible = false;
-    document.getElementById('tooltip').style.display = 'none';
+    // Tooltip stays visible until user clicks empty canvas area.
   });
 
   // Node click: highlight neighbourhood
@@ -269,7 +285,13 @@ function initCytoscape() {
   });
 
   cy.on('tap', function(evt) {
-    if (evt.target === cy) cy.elements().removeClass('faded');
+    if (evt.target === cy) {
+      cy.elements().removeClass('faded');
+      // Hide tooltip when clicking empty canvas area.
+      tooltipVisible = false;
+      if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+      document.getElementById('tooltip').style.display = 'none';
+    }
   });
 
   // Save positions on node drag
@@ -557,10 +579,19 @@ function updateLegend() {
 }
 
 // ─── Tooltip ──────────────────────────────────────────────────────────────────
+function hideTooltipDelayed() {
+  if (tooltipHideTimer) clearTimeout(tooltipHideTimer);
+  tooltipHideTimer = setTimeout(function() {
+    tooltipVisible = false;
+    tooltipHideTimer = null;
+    document.getElementById('tooltip').style.display = 'none';
+  }, 800);
+}
+
 function showTooltipLoading() {
   var el = document.getElementById('tooltip');
-  el.innerHTML = '<div class="tooltip-loading">Loading references…</div>';
   el.style.display = 'block';
+  document.getElementById('tooltip-inner').innerHTML = '<div class="tooltip-loading">Loading references…</div>';
 }
 
 function renderTooltip(edge, refs) {
@@ -608,8 +639,10 @@ function renderTooltip(edge, refs) {
     }
   }
 
-  el.innerHTML = html;
   el.style.display = 'block';
+  document.getElementById('tooltip-inner').innerHTML = html;
+  // Re-position now that full content is rendered and real dimensions are known.
+  positionTooltip(lastMouseX, lastMouseY);
 }
 
 function renderNodeTooltip(node) {
@@ -625,8 +658,9 @@ function renderNodeTooltip(node) {
   if (description) html += '<div style="font-size:12px;color:#c8cde8;margin-top:6px;line-height:1.5">' + escHtml(description) + '</div>';
   if (urn) html += '<div style="font-size:11px;color:#7a8099;margin-top:6px">URN: ' + escHtml(urn) + '</div>';
 
-  el.innerHTML = html;
   el.style.display = 'block';
+  document.getElementById('tooltip-inner').innerHTML = html;
+  positionTooltip(lastMouseX, lastMouseY);
 }
 
 function positionTooltip(x, y) {
