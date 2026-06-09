@@ -14,7 +14,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // bolt+ssc = encrypted, trust all certificates (including self-signed)
 const neo4jDriver = neo4j.driver(
   'bolt+ssc://neo4j.lifesciencepsg.com:7687',
-  neo4j.auth.basic('yuryeva', 'El$evier2024')
+  neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
 );
 const NEO4J_DB = 'mammaloct2025new';
 
@@ -27,8 +27,8 @@ const pgPool = new Pool({
   host: 'postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com',
   port: 5432,
   database: 'psgdev',
-  user: 'psguser',
-  password: 'k4ZHuXWjt8eodjgeZimkCdzJgmAKoI8KPGXZphG4tbt2ujUw1rxSJpLhSHAtVOvx',
+  user: 'YOUR_PG_USERNAME',
+  password: 'YOUR_PG_PASSWORD',
   ssl: { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
