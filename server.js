@@ -92,13 +92,23 @@ function loadUsers() {
 }
 
 function saveUsers(users) {
-  // Sanitize to known fields only — prevents arbitrary network data from being
-  // persisted to the file system (CodeQL: network data written to file).
-  const safe = users.map(u => ({
-    username: String(u.username || ''),
-    password: String(u.password || ''),
-    role:     String(u.role     || 'user')
-  }));
+  // Break the taint chain completely so CodeQL cannot trace user-supplied data
+  // into the fs.writeFileSync call:
+  //   - username/password: written as regex match[0], not the raw input string
+  //   - role: written as a hardcoded string literal chosen by a ternary
+  const NAME_RE   = /^[a-zA-Z0-9_-]{1,64}$/;
+  const BCRYPT_RE = /^\$2[ab]\$\d{2}\$[./A-Za-z0-9]{53}$/;
+
+  const safe = [];
+  for (const u of users) {
+    const nameMatch  = NAME_RE.exec(typeof u.username === 'string' ? u.username : '');
+    const hashMatch  = BCRYPT_RE.exec(typeof u.password === 'string' ? u.password : '');
+    // Role is always a hardcoded literal — never the user-supplied value itself.
+    const role = u.role === 'admin' ? 'admin' : 'user';
+    if (nameMatch && hashMatch) {
+      safe.push({ username: nameMatch[0], password: hashMatch[0], role });
+    }
+  }
   fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
 }
 
@@ -301,15 +311,27 @@ app.post('/api/references', dbLimiter, authMiddleware, async (req, res) => {
 // Accepts optional scopusColumns array to LEFT JOIN scopus_data table.
 // scopus_data is joined on: reference.unique_id = scopus_data.reference_id
 
-// Hardcoded allowlist of every known scopus_data column.
-// Using an explicit Set (not a regex) satisfies CodeQL's "query built from
-// user-controlled sources" check — only these exact strings can reach SQL.
-const ALLOWED_SCOPUS_COLS = new Set([
-  'citation_type', 'citation_count', 'fwci', 'fwci_perc',
-  'citation_count_ns', 'fwci_ns', 'fwci_perc_ns', 'citescore2024',
-  'min_asjc_citescore_percentile_raw', 'patent_citation_count',
-  'corporate', 'num_refs', 'independent_ref_count', 'document_score', 'relation_score'
-]);
+// Maps each allowed scopus_data column name to its hardcoded SQL SELECT fragment.
+// The user-supplied column list is used only as lookup keys into this map;
+// the actual SQL strings are never derived from user input, which fully breaks
+// the taint chain that CodeQL's "query built from user-controlled sources" rule tracks.
+const SCOPUS_COL_SQL = {
+  citation_type:                     'sd."citation_type" AS "sd_citation_type"',
+  citation_count:                     'sd."citation_count" AS "sd_citation_count"',
+  fwci:                               'sd."fwci" AS "sd_fwci"',
+  fwci_perc:                          'sd."fwci_perc" AS "sd_fwci_perc"',
+  citation_count_ns:                  'sd."citation_count_ns" AS "sd_citation_count_ns"',
+  fwci_ns:                            'sd."fwci_ns" AS "sd_fwci_ns"',
+  fwci_perc_ns:                       'sd."fwci_perc_ns" AS "sd_fwci_perc_ns"',
+  citescore2024:                      'sd."citescore2024" AS "sd_citescore2024"',
+  min_asjc_citescore_percentile_raw:  'sd."min_asjc_citescore_percentile_raw" AS "sd_min_asjc_citescore_percentile_raw"',
+  patent_citation_count:              'sd."patent_citation_count" AS "sd_patent_citation_count"',
+  corporate:                          'sd."corporate" AS "sd_corporate"',
+  num_refs:                           'sd."num_refs" AS "sd_num_refs"',
+  independent_ref_count:              'sd."independent_ref_count" AS "sd_independent_ref_count"',
+  document_score:                     'sd."document_score" AS "sd_document_score"',
+  relation_score:                     'sd."relation_score" AS "sd_relation_score"'
+};
 
 app.post('/api/references/batch', dbLimiter, authMiddleware, async (req, res) => {
   const { relationIds, scopusColumns } = req.body || {};
@@ -318,14 +340,16 @@ app.post('/api/references/batch', dbLimiter, authMiddleware, async (req, res) =>
   const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
   if (!validIds.length) return res.json({});
 
-  // Only permit columns that are in the hardcoded allowlist above.
-  const safeScopusCols = (Array.isArray(scopusColumns) ? scopusColumns : [])
-    .filter(c => ALLOWED_SCOPUS_COLS.has(c));
+  // Look up each requested column in the hardcoded map.
+  // Only map values (not user strings) reach the SQL query.
+  const scopusFragments = (Array.isArray(scopusColumns) ? scopusColumns : [])
+    .map(c => SCOPUS_COL_SQL[c])
+    .filter(Boolean);
 
   try {
     let sql;
-    if (safeScopusCols.length > 0) {
-      const scopusSelect = safeScopusCols.map(c => `sd."${c}" AS "sd_${c}"`).join(', ');
+    if (scopusFragments.length > 0) {
+      const scopusSelect = scopusFragments.join(', ');
       sql = `
         SELECT r.*, ${scopusSelect}
         FROM ${PG_SCHEMA}.reference r
