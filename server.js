@@ -62,25 +62,44 @@ const JWT_SECRET = process.env.JWT_SECRET || 'graph-explorer-jwt-secret-change-i
 const USERS_FILE = path.join(__dirname, 'users.json');
 
 function loadUsers() {
-  if (!fs.existsSync(USERS_FILE)) {
-    const users = [{
+  try {
+    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    // File does not exist — create default admin atomically (flag 'wx' fails if
+    // the file was created by another process between our read and write, eliminating
+    // the TOCTOU race condition).
+    const defaultUsers = [{
       username: 'admin',
       password: bcrypt.hashSync('admin123', 10),
       role: 'admin'
     }];
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-    console.log('\n========================================');
-    console.log('Default admin account created:');
-    console.log('  Username: admin');
-    console.log('  Password: admin123');
-    console.log('Change this password after first login!');
-    console.log('========================================\n');
+    try {
+      fs.writeFileSync(USERS_FILE, JSON.stringify(defaultUsers, null, 2), { flag: 'wx' });
+      console.log('\n========================================');
+      console.log('Default admin account created:');
+      console.log('  Username: admin');
+      console.log('  Password: admin123');
+      console.log('Change this password after first login!');
+      console.log('========================================\n');
+      return defaultUsers;
+    } catch (writeErr) {
+      if (writeErr.code !== 'EEXIST') throw writeErr;
+      // Another process created the file concurrently — read what it wrote.
+      return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    }
   }
-  return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
 }
 
 function saveUsers(users) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  // Sanitize to known fields only — prevents arbitrary network data from being
+  // persisted to the file system (CodeQL: network data written to file).
+  const safe = users.map(u => ({
+    username: String(u.username || ''),
+    password: String(u.password || ''),
+    role:     String(u.role     || 'user')
+  }));
+  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
 }
 
 function authMiddleware(req, res, next) {
@@ -281,6 +300,17 @@ app.post('/api/references', dbLimiter, authMiddleware, async (req, res) => {
 // ─── PostgreSQL references batch (table view) ────────────────────────────────
 // Accepts optional scopusColumns array to LEFT JOIN scopus_data table.
 // scopus_data is joined on: reference.unique_id = scopus_data.reference_id
+
+// Hardcoded allowlist of every known scopus_data column.
+// Using an explicit Set (not a regex) satisfies CodeQL's "query built from
+// user-controlled sources" check — only these exact strings can reach SQL.
+const ALLOWED_SCOPUS_COLS = new Set([
+  'citation_type', 'citation_count', 'fwci', 'fwci_perc',
+  'citation_count_ns', 'fwci_ns', 'fwci_perc_ns', 'citescore2024',
+  'min_asjc_citescore_percentile_raw', 'patent_citation_count',
+  'corporate', 'num_refs', 'independent_ref_count', 'document_score', 'relation_score'
+]);
+
 app.post('/api/references/batch', dbLimiter, authMiddleware, async (req, res) => {
   const { relationIds, scopusColumns } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json({});
@@ -288,9 +318,9 @@ app.post('/api/references/batch', dbLimiter, authMiddleware, async (req, res) =>
   const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
   if (!validIds.length) return res.json({});
 
-  // Whitelist scopus column names to prevent SQL injection
+  // Only permit columns that are in the hardcoded allowlist above.
   const safeScopusCols = (Array.isArray(scopusColumns) ? scopusColumns : [])
-    .filter(c => /^[a-zA-Z0-9_]+$/.test(c));
+    .filter(c => ALLOWED_SCOPUS_COLS.has(c));
 
   try {
     let sql;
