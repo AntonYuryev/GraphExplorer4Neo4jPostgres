@@ -165,7 +165,7 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
   res.json({ token, username, role: user.role });
 });
 
-app.post('/api/auth/change-password', authMiddleware, (req, res) => {
+app.post('/api/auth/change-password', dbLimiter, authMiddleware, (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   if (!newPassword || newPassword.length < 6) {
     return res.status(400).json({ error: 'New password must be at least 6 characters' });
@@ -181,14 +181,14 @@ app.post('/api/auth/change-password', authMiddleware, (req, res) => {
 });
 
 // Admin: list users
-app.get('/api/auth/users', authMiddleware, (req, res) => {
+app.get('/api/auth/users', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const users = loadUsers();
   res.json(users.map(u => ({ username: u.username, role: u.role })));
 });
 
 // Admin: create user
-app.post('/api/auth/users', authMiddleware, (req, res) => {
+app.post('/api/auth/users', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { username, password, role } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -203,7 +203,7 @@ app.post('/api/auth/users', authMiddleware, (req, res) => {
 });
 
 // Admin: delete user
-app.delete('/api/auth/users/:username', authMiddleware, (req, res) => {
+app.delete('/api/auth/users/:username', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { username } = req.params;
   if (username === 'admin') return res.status(400).json({ error: 'Cannot delete the admin account' });
