@@ -305,6 +305,33 @@ app.post('/api/references/batch', authMiddleware, async (req, res) => {
   }
 });
 
+// ─── PostgreSQL: MedScan ID lookup ───────────────────────────────────────────
+// Accepts an array of Neo4j NodeID values and returns { nodeId: medScanValue }.
+app.post('/api/nodes/medscan', authMiddleware, async (req, res) => {
+  const { nodeIds } = req.body || {};
+  if (!Array.isArray(nodeIds) || !nodeIds.length) return res.json({});
+
+  const validIds = nodeIds.map(String).filter(id => /^-?\d+$/.test(id));
+  if (!validIds.length) return res.json({});
+
+  try {
+    const sql = `
+      SELECT n.id::text AS id, a.value
+      FROM ${PG_SCHEMA}.node AS n
+      JOIN ${PG_SCHEMA}.attr AS a ON a.id = ANY(n.attributes)
+      WHERE a.name = 'MedScan ID'
+      AND n.id = ANY($1::bigint[])
+    `;
+    const result = await pgPool.query(sql, [validIds]);
+    const map = {};
+    result.rows.forEach(row => { map[row.id] = row.value; });
+    res.json(map);
+  } catch (err) {
+    console.error('MedScan lookup error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── PostgreSQL: update reference row ────────────────────────────────────────
 // Column names are validated against actual table columns to prevent SQL injection.
 app.post('/api/references/update', authMiddleware, async (req, res) => {
