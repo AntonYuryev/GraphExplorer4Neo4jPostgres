@@ -47,8 +47,10 @@ const neo4jDriver = neo4j.driver(
   'bolt+ssc://neo4j.lifesciencepsg.com:7687',
   neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
 );
-const NEO4J_DB = 'mammaloct2025new';   // <- change if your database name differs
+const NEO4J_DB = 'mammaloct2025new';   // <- change to your Neo4j database name
 ```
+
+Change `'mammaloct2025new'` to your own Neo4j database name. You can find the database name in the Neo4j Browser under the database selector (top-left dropdown), or by running `:dbs` in the Neo4j Browser console.
 
 **PostgreSQL** (lines ~22–32):
 ```javascript
