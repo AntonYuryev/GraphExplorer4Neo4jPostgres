@@ -16,6 +16,7 @@ let refsCache = {};                          // relId → [postgres rows]
 let typeColorMap = {};                       // relType → hex color
 let colorIdx = 0;
 let tooltipVisible = false;
+let medScanMap = {};   // Neo4j NodeID (string) → MedScan ID value
 let tooltipHideTimer = null;
 let lastMouseX = 0, lastMouseY = 0;
 let tableRows = [];                          // all table rows
@@ -29,6 +30,7 @@ let curationTarget = null;  // element open in curation modal
 let columnDefs = [];         // [{key,label,visible,source,dbField}] — current order
 let availableDbColumns = { reference: [], scopus_data: [] };
 let dragSrcColIdx = null;    // for header drag-and-drop
+let colResizing   = null;    // { thEl, startX, startWidth } while resizing a column
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DIRECT_TYPES = new Set([
@@ -126,6 +128,19 @@ window.addEventListener('DOMContentLoaded', function() {
   document.addEventListener('mousemove', function(e) {
     lastMouseX = e.clientX;
     lastMouseY = e.clientY;
+    // Column resize tracking.
+    if (colResizing) {
+      var dx = e.clientX - colResizing.startX;
+      var newW = Math.max(40, colResizing.startWidth + dx);
+      colResizing.thEl.style.width = newW + 'px';
+    }
+  });
+
+  document.addEventListener('mouseup', function() {
+    if (colResizing) {
+      colResizing = null;
+      document.body.classList.remove('col-resizing');
+    }
   });
   // Hovering the tooltip itself cancels the hide timer; leaving it hides it.
   var tipEl = document.getElementById('tooltip');
@@ -212,6 +227,11 @@ async function api(path, body, auth) {
 
   var res = await fetch(path, opts);
   var data = await res.json().catch(function() { return {}; });
+  if (res.status === 401) {
+    // Token expired or invalid — log out and return to login screen automatically.
+    logout();
+    throw new Error('Session expired. Please log in again.');
+  }
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
@@ -680,6 +700,34 @@ function getRefYear(ref) {
     (ref.publicationdate ? String(ref.publicationdate).slice(0, 4) : '');
 }
 
+// Renders a sentence with ID{medscanId=text} markups.
+// Markups whose medscanId matches regulatorMedScan are colored red;
+// those matching targetMedScan are colored green; others are shown as plain text.
+function colorSentence(text, regulatorMedScan, targetMedScan) {
+  if (!text) return '';
+  var regex = /ID\{([^=}]+)=([^}]*)\}/g;
+  var result = '';
+  var lastIndex = 0;
+  var match;
+  while ((match = regex.exec(text)) !== null) {
+    // Append escaped plain text before this markup
+    result += escHtml(text.slice(lastIndex, match.index));
+    var ids    = match[1].split(',').map(function(s) { return s.trim(); }); // one or more IDs
+    var full   = match[0];   // entire ID{...} markup
+    var color  = null;
+    if (regulatorMedScan && ids.indexOf(String(regulatorMedScan)) !== -1) color = '#e05560';
+    else if (targetMedScan && ids.indexOf(String(targetMedScan))  !== -1) color = '#4daf4a';
+    if (color) {
+      result += '<span style="color:' + color + ';font-weight:600">' + escHtml(full) + '</span>';
+    } else {
+      result += escHtml(full);
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  result += escHtml(text.slice(lastIndex));
+  return result;
+}
+
 function escHtml(s) {
   if (!s) return '';
   return String(s)
@@ -695,6 +743,10 @@ async function switchView(view) {
   document.getElementById('view-table-btn').classList.toggle('active', view === 'table');
   document.getElementById('graph-view').style.display = view === 'graph' ? 'flex' : 'none';
   document.getElementById('table-view').style.display = view === 'table' ? 'flex' : 'none';
+
+  // Always hide tooltip when leaving graph view.
+  tooltipVisible = false;
+  document.getElementById('tooltip').style.display = 'none';
 
   if (view === 'table' && graphData.edges.length > 0) {
     await loadTableData();
@@ -739,6 +791,32 @@ async function loadTableData() {
   var nodeById = {};
   graphData.nodes.forEach(function(n) { nodeById[n.id] = n; });
 
+  // Fetch MedScan IDs for all nodes using their Neo4j NodeID property.
+  var nodeIds = graphData.nodes
+    .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
+    .filter(Boolean);
+  if (nodeIds.length > 0) {
+    try {
+      medScanMap = await api('/api/nodes/medscan', { nodeIds: nodeIds });
+    } catch(err) {
+      console.warn('MedScan lookup failed:', err.message);
+      medScanMap = {};
+    }
+  } else {
+    medScanMap = {};
+  }
+
+  function nodeLabel(node) {
+    if (!node || !node.properties) return '?';
+    return getNodeLabel(node);
+  }
+
+  function nodeMedScan(node) {
+    if (!node || !node.properties) return '';
+    var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
+    return (nid && medScanMap[nid]) ? medScanMap[nid] : '';
+  }
+
   tableRows = [];
   graphData.edges.forEach(function(edge) {
     var srcNode = nodeById[edge.startNodeId];
@@ -750,9 +828,11 @@ async function loadTableData() {
       edgeId: edge.id,
       elementId: edge.elementId || edge.id,
       relId: relId,
-      regulator: getNodeLabel(srcNode || {}),
+      regulator: nodeLabel(srcNode),
+      regulatorMedScan: nodeMedScan(srcNode),
       regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
-      target: getNodeLabel(tgtNode || {}),
+      target: nodeLabel(tgtNode),
+      targetMedScan: nodeMedScan(tgtNode),
       targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
       relationType: edge.type,
       effect: edge.properties.Effect || edge.properties.effect || '',
@@ -813,7 +893,11 @@ function renderTableHeader() {
       + ' ondrop="colDrop(event,' + i + ')"'
       + ' ondragend="colDragEnd(event)"'
       + ' title="Drag to reorder">'
-      + escHtml(col.label) + sortLabel + '</th>';
+      + escHtml(col.label) + sortLabel
+      + '<span class="col-resize-handle" draggable="false"'
+      + ' onmousedown="colResizeStart(event,this.parentNode)"'
+      + ' ondragstart="event.preventDefault();event.stopPropagation()">'
+      + '</span></th>';
   }).join('');
 }
 
@@ -844,6 +928,15 @@ function renderTableRows(rows) {
         else if (col.key === 'sentence') val = row['_ref_msrc'] || '';
         else val = row['_ref_' + col.dbField] != null ? String(row['_ref_' + col.dbField]) : '';
       }
+      if (col.key === 'sentence') {
+        return colorSentence(val != null ? String(val) : '', row.regulatorMedScan, row.targetMedScan);
+      }
+      if (col.key === 'regulator' && row.regulatorMedScan) {
+        return escHtml(val != null ? String(val) : '') + '<br><span style="color:#7a8099;font-size:11px">MedScan ID: ' + escHtml(row.regulatorMedScan) + '</span>';
+      }
+      if (col.key === 'target' && row.targetMedScan) {
+        return escHtml(val != null ? String(val) : '') + '<br><span style="color:#7a8099;font-size:11px">MedScan ID: ' + escHtml(row.targetMedScan) + '</span>';
+      }
       if (col.key === 'pmid' && val) {
         return '<a href="https://pubmed.ncbi.nlm.nih.gov/' + escHtml(String(val)) + '" target="_blank" style="color:#4f8ef7">' + escHtml(String(val)) + '</a>';
       }
@@ -859,6 +952,11 @@ function renderTableRows(rows) {
       var raw = typeof v === 'string' ? v : '';
       return '<td' + cls + ' title="' + raw.replace(/"/g, '&quot;') + '">' + v + '</td>';
     }).join('');
+    // Clicking any table row dismisses a leftover graph tooltip.
+    tr.addEventListener('click', function() {
+      tooltipVisible = false;
+      document.getElementById('tooltip').style.display = 'none';
+    });
     tbody.appendChild(tr);
   });
 }
@@ -899,6 +997,117 @@ function exportTableCSV() {
   var a = document.createElement('a');
   a.href = url; a.download = 'graph-data.csv'; a.click();
   URL.revokeObjectURL(url);
+}
+
+// ─── Export Excel ─────────────────────────────────────────────────────────────
+// Builds an ExcelJS richText array from a sentence with ID{ids=text} markup.
+// Regulator markup → red; target markup → green; plain text → default.
+function buildSentenceRichText(text, regulatorMedScan, targetMedScan) {
+  var plain = function(t) { return { text: t, font: { name: 'Arial', size: 10 } }; };
+  if (!text) return { richText: [plain('')] };
+  var regex = /ID\{([^=}]+)=([^}]*)\}/g;
+  var richText = [];
+  var lastIndex = 0;
+  var match;
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) richText.push(plain(text.slice(lastIndex, match.index)));
+    var ids   = match[1].split(',').map(function(s) { return s.trim(); });
+    var full  = match[0];
+    var color = null;
+    if (regulatorMedScan && ids.indexOf(String(regulatorMedScan)) !== -1) color = 'FFE05560';
+    else if (targetMedScan && ids.indexOf(String(targetMedScan))   !== -1) color = 'FF4DAF4A';
+    if (color) {
+      richText.push({ text: full, font: { name: 'Arial', size: 10, bold: true, color: { argb: color } } });
+    } else {
+      richText.push(plain(full));
+    }
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < text.length) richText.push(plain(text.slice(lastIndex)));
+  if (!richText.length) richText.push(plain(''));
+  return { richText: richText };
+}
+
+function exportTableExcel() {
+  if (typeof ExcelJS === 'undefined') {
+    alert('ExcelJS library not loaded. Please check your internet connection.');
+    return;
+  }
+  var visCols = columnDefs.filter(function(c) { return c.visible; });
+  var wb      = new ExcelJS.Workbook();
+  var sheet   = wb.addWorksheet('Graph Data');
+
+  // Column widths by key
+  var colWidths = {
+    regulator: 22, regulatorType: 16, target: 22, targetType: 16,
+    relationType: 18, effect: 12, numRefs: 8, pmid: 14, doi: 32,
+    year: 8, title: 40, sentence: 60
+  };
+
+  sheet.columns = visCols.map(function(col) {
+    return { key: col.key, width: colWidths[col.key] || 20 };
+  });
+
+  // Header row
+  var headerRow = sheet.getRow(1);
+  visCols.forEach(function(col, ci) {
+    var cell = headerRow.getCell(ci + 1);
+    cell.value = col.label;
+    cell.font  = { name: 'Arial', size: 10, bold: true };
+    cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8EAF0' } };
+    cell.alignment = { vertical: 'middle', wrapText: false };
+  });
+  headerRow.commit();
+
+  // Data rows
+  tableRows.forEach(function(row) {
+    var exRow = sheet.addRow({});
+    visCols.forEach(function(col, ci) {
+      var cell   = exRow.getCell(ci + 1);
+      var val    = row[col.key];
+      var valStr = val != null ? String(val) : '';
+
+      cell.alignment = { vertical: 'top', wrapText: false };
+
+      if (col.key === 'pmid' && valStr) {
+        cell.value = { text: valStr, hyperlink: 'https://pubmed.ncbi.nlm.nih.gov/' + valStr };
+        cell.font  = { name: 'Arial', size: 10, color: { argb: 'FF4F8EF7' }, underline: true };
+      } else if (col.key === 'doi' && valStr) {
+        cell.value = { text: valStr, hyperlink: 'https://doi.org/' + valStr };
+        cell.font  = { name: 'Arial', size: 10, color: { argb: 'FF4F8EF7' }, underline: true };
+      } else if (col.key === 'regulator' && row.regulatorMedScan) {
+        cell.value = { richText: [
+          { text: valStr,                                       font: { name: 'Arial', size: 10 } },
+          { text: '\nMedScan ID: ' + row.regulatorMedScan,     font: { name: 'Arial', size: 9, color: { argb: 'FF7A8099' } } }
+        ]};
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else if (col.key === 'target' && row.targetMedScan) {
+        cell.value = { richText: [
+          { text: valStr,                                     font: { name: 'Arial', size: 10 } },
+          { text: '\nMedScan ID: ' + row.targetMedScan,      font: { name: 'Arial', size: 9, color: { argb: 'FF7A8099' } } }
+        ]};
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else if (col.key === 'sentence') {
+        cell.value     = buildSentenceRichText(valStr, row.regulatorMedScan, row.targetMedScan);
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else {
+        cell.value = valStr;
+        cell.font  = { name: 'Arial', size: 10 };
+      }
+    });
+    exRow.commit();
+  });
+
+  // Download
+  wb.xlsx.writeBuffer().then(function(buffer) {
+    var blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    var url  = URL.createObjectURL(blob);
+    var a    = document.createElement('a');
+    a.href = url; a.download = 'graph-data.xlsx'; a.click();
+    URL.revokeObjectURL(url);
+  }).catch(function(err) {
+    alert('Excel export failed: ' + err.message);
+  });
 }
 
 // ─── Save / Load subgraph ─────────────────────────────────────────────────────
@@ -1271,8 +1480,27 @@ async function saveCuration() {
   }, 900);
 }
 
+// ─── Column resize ────────────────────────────────────────────────────────────
+function colResizeStart(evt, thEl) {
+  evt.preventDefault();
+  evt.stopPropagation();
+  // On first resize, freeze all columns to their current pixel widths
+  // and switch to fixed layout so only the dragged column changes.
+  var table = document.getElementById('data-table');
+  if (table.style.tableLayout !== 'fixed') {
+    Array.from(table.querySelectorAll('thead th')).forEach(function(th) {
+      th.style.width = th.getBoundingClientRect().width + 'px';
+    });
+    table.style.tableLayout = 'fixed';
+  }
+  colResizing = { thEl: thEl, startX: evt.clientX, startWidth: thEl.getBoundingClientRect().width };
+  document.body.classList.add('col-resizing');
+}
+
 // ─── Column drag-and-drop ─────────────────────────────────────────────────────
 function colDragStart(evt, idx) {
+  // Don't start a column drag when the user grabbed the resize handle.
+  if (evt.target.classList.contains('col-resize-handle')) { evt.preventDefault(); return; }
   dragSrcColIdx = idx;
   evt.dataTransfer.effectAllowed = 'move';
   evt.currentTarget.classList.add('col-dragging');
