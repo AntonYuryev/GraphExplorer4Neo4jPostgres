@@ -202,10 +202,15 @@ body {
 #tooltip {
   position: fixed; z-index: 9999;
   background: #1e2130; border: 1px solid #3d4470;
-  border-radius: 8px; padding: 12px 14px;
-  max-width: 420px; max-height: 320px; overflow-y: auto;
+  border-radius: 8px;
+  max-width: 420px; max-height: 320px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.6);
-  pointer-events: none; font-size: 12px; line-height: 1.5;
+  pointer-events: auto; font-size: 12px; line-height: 1.5;
+  overflow: hidden;
+}
+#tooltip-inner {
+  padding: 12px 14px;
+  max-height: 320px; overflow-y: auto;
 }
 .tooltip-rel-header { font-weight: 700; color: #fff; margin-bottom: 8px; font-size: 13px; }
 .tooltip-divider { border: none; border-top: 1px solid #2d3147; margin: 8px 0; }
