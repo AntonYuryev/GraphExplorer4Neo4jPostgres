@@ -14,17 +14,21 @@ app.use(express.static(path.join(__dirname, 'public')));
 // bolt+ssc = encrypted, trust all certificates (including self-signed)
 const neo4jDriver = neo4j.driver(
   'bolt+ssc://neo4j.lifesciencepsg.com:7687',
-  neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
+  neo4j.auth.basic('yuryeva', 'El$evier2024')
 );
 const NEO4J_DB = 'mammaloct2025new';
+
+// ─── PostgreSQL schema ────────────────────────────────────────────────────────
+// Change this to match your schema name (each user may have a different one).
+const PG_SCHEMA = process.env.PG_SCHEMA || 'resnetcustomnov';
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pgPool = new Pool({
   host: 'postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com',
   port: 5432,
   database: 'psgdev',
-  user: 'YOUR_PG_USERNAME',
-  password: 'YOUR_PG_PASSWORD',
+  user: 'psguser',
+  password: 'k4ZHuXWjt8eodjgeZimkCdzJgmAKoI8KPGXZphG4tbt2ujUw1rxSJpLhSHAtVOvx',
   ssl: { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
@@ -233,7 +237,7 @@ app.post('/api/references', authMiddleware, async (req, res) => {
   try {
     const sql = `
       SELECT *
-      FROM resnetcustomnov.reference
+      FROM ${PG_SCHEMA}.reference
       WHERE id = ANY($1::bigint[])
       ORDER BY COALESCE(pubyear::text, '9999'), id
     `;
@@ -242,7 +246,7 @@ app.post('/api/references', authMiddleware, async (req, res) => {
   } catch (err) {
     // Fallback without ORDER BY date in case column name differs
     try {
-      const sql2 = `SELECT * FROM resnetcustomnov.reference WHERE id = ANY($1::bigint[])`;
+      const sql2 = `SELECT * FROM ${PG_SCHEMA}.reference WHERE id = ANY($1::bigint[])`;
       const result2 = await pgPool.query(sql2, [validIds]);
       res.json(result2.rows);
     } catch (err2) {
@@ -253,20 +257,38 @@ app.post('/api/references', authMiddleware, async (req, res) => {
 });
 
 // ─── PostgreSQL references batch (table view) ────────────────────────────────
+// Accepts optional scopusColumns array to LEFT JOIN scopus_data table.
+// scopus_data is joined on: reference.unique_id = scopus_data.reference_id
 app.post('/api/references/batch', authMiddleware, async (req, res) => {
-  const { relationIds } = req.body || {};
+  const { relationIds, scopusColumns } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json({});
 
   const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
   if (!validIds.length) return res.json({});
 
+  // Whitelist scopus column names to prevent SQL injection
+  const safeScopusCols = (Array.isArray(scopusColumns) ? scopusColumns : [])
+    .filter(c => /^[a-zA-Z0-9_]+$/.test(c));
+
   try {
-    const sql = `
-      SELECT *
-      FROM resnetcustomnov.reference
-      WHERE id = ANY($1::bigint[])
-      ORDER BY id, COALESCE(pubyear::text, '9999')
-    `;
+    let sql;
+    if (safeScopusCols.length > 0) {
+      const scopusSelect = safeScopusCols.map(c => `sd."${c}" AS "sd_${c}"`).join(', ');
+      sql = `
+        SELECT r.*, ${scopusSelect}
+        FROM ${PG_SCHEMA}.reference r
+        LEFT JOIN ${PG_SCHEMA}.scopus_data sd ON r.unique_id = sd.reference_id
+        WHERE r.id = ANY($1::bigint[])
+        ORDER BY r.id, COALESCE(r.pubyear::text, '9999')
+      `;
+    } else {
+      sql = `
+        SELECT *
+        FROM ${PG_SCHEMA}.reference
+        WHERE id = ANY($1::bigint[])
+        ORDER BY id, COALESCE(pubyear::text, '9999')
+      `;
+    }
     const result = await pgPool.query(sql, [validIds]);
 
     // Group by relation id (string key to match Neo4j RelationID strings)
@@ -284,7 +306,7 @@ app.post('/api/references/batch', authMiddleware, async (req, res) => {
 });
 
 // ─── PostgreSQL: update reference row ────────────────────────────────────────
-// Whitelisted columns only — prevents SQL injection via column names.
+// Column names are validated against actual table columns to prevent SQL injection.
 app.post('/api/references/update', authMiddleware, async (req, res) => {
   const { id, fields } = req.body || {};
   if (!id || !fields) return res.status(400).json({ error: 'id and fields required' });
@@ -301,12 +323,46 @@ app.post('/api/references/update', authMiddleware, async (req, res) => {
 
   try {
     const result = await pgPool.query(
-      `UPDATE resnetcustomnov.reference SET ${setClauses.join(', ')} WHERE id = $1::bigint`,
+      `UPDATE ${PG_SCHEMA}.reference SET ${setClauses.join(', ')} WHERE id = $1::bigint`,
       params
     );
     res.json({ success: true, updated: result.rowCount });
   } catch (err) {
     console.error('PostgreSQL update reference error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PostgreSQL: list columns for reference and scopus_data tables ────────────
+app.get('/api/schema/columns', authMiddleware, async (req, res) => {
+  try {
+    const refResult = await pgPool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = $1 AND table_name = 'reference'
+       ORDER BY ordinal_position`,
+      [PG_SCHEMA]
+    );
+
+    let scopusColumns = [];
+    try {
+      const scopusResult = await pgPool.query(
+        `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = 'scopus_data'
+         ORDER BY ordinal_position`,
+        [PG_SCHEMA]
+      );
+      scopusColumns = scopusResult.rows.map(r => r.column_name);
+    } catch (e) {
+      // scopus_data table may not exist in all schemas
+    }
+
+    res.json({
+      reference: refResult.rows.map(r => r.column_name),
+      scopus_data: scopusColumns,
+      schema: PG_SCHEMA
+    });
+  } catch (err) {
+    console.error('Schema columns error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -319,7 +375,6 @@ app.post('/api/graph/update-node', authMiddleware, async (req, res) => {
   const props = Object.fromEntries(
     Object.entries(properties).filter(([, v]) => v !== null && v !== undefined)
   );
-
   const session = neo4jDriver.session({ database: NEO4J_DB });
   try {
     try {
@@ -378,7 +433,7 @@ app.post('/api/graph/update-relation', authMiddleware, async (req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\nGraph Explorer running at http://localhost:${PORT}`);
+  console.log('\nGraph Explorer running at http://localhost:' + PORT);
   loadUsers();
 });
 
