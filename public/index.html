@@ -137,27 +137,13 @@
     <div id="table-view" style="display:none">
       <div id="table-toolbar">
         <input type="text" id="table-search" placeholder="Filter rows..." oninput="filterTable(this.value)">
+        <button class="btn-tool" onclick="openColumnsDialog()">⚙ Columns</button>
         <button class="btn-tool" onclick="exportTableCSV()">⬇ Export CSV</button>
         <span id="table-loading-msg" style="display:none;color:#888;font-size:12px">Loading references...</span>
       </div>
       <div id="table-wrapper">
         <table id="data-table">
-          <thead>
-            <tr>
-              <th onclick="sortTable('regulator')">Regulator ⇅</th>
-              <th onclick="sortTable('regulatorType')">Regulator Type ⇅</th>
-              <th onclick="sortTable('target')">Target ⇅</th>
-              <th onclick="sortTable('targetType')">Target Type ⇅</th>
-              <th onclick="sortTable('relationType')">Relation Type ⇅</th>
-              <th onclick="sortTable('effect')">Effect ⇅</th>
-              <th onclick="sortTable('numRefs')"># Refs ⇅</th>
-              <th>PMID</th>
-              <th>DOI</th>
-              <th onclick="sortTable('year')">Year ⇅</th>
-              <th>Title</th>
-              <th>Sentence</th>
-            </tr>
-          </thead>
+          <thead><tr></tr></thead><!-- populated dynamically by renderTableHeader() -->
           <tbody id="table-body"></tbody>
         </table>
       </div>
@@ -230,6 +216,26 @@
 <!-- Right-click context menu -->
 <div id="context-menu" style="display:none">
   <div class="ctx-item" onclick="openCurationFromContext()">✏️ Edit Properties</div>
+</div>
+
+<!-- Columns dialog -->
+<div id="columns-modal" class="modal-backdrop" style="display:none" onclick="closeColumnsModal(event)">
+  <div class="modal-box" style="min-width:500px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+    <h3>Configure Columns</h3>
+    <p style="color:#7a8099;font-size:12px;margin-bottom:14px">Check columns to show. Drag table headers to reorder.</p>
+    <div style="overflow-y:auto;flex:1">
+      <div class="prop-section-title">reference table</div>
+      <div id="col-ref-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+      <div id="col-sd-section">
+        <div class="prop-section-title">scopus_data table</div>
+        <div id="col-sd-list" style="display:flex;flex-wrap:wrap;gap:4px 16px"></div>
+      </div>
+    </div>
+    <div class="modal-actions" style="margin-top:14px">
+      <button class="btn-ghost" onclick="document.getElementById('columns-modal').style.display='none'">Cancel</button>
+      <button class="btn-primary" onclick="applyColumnsDialog()">Apply</button>
+    </div>
+  </div>
 </div>
 
 <!-- Curation modal -->
