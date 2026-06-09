@@ -334,11 +334,20 @@ body {
 }
 .prop-del:hover { color: #e05560; border-color: #e0556060; background: #e0556010; }
 
-/* Table column drag-and-drop */
-#data-table th { cursor: grab; }
+/* Table column drag-and-drop & resize */
+#data-table th { cursor: grab; position: relative; }
 #data-table th.col-dragging { opacity: 0.4; }
 #data-table th.col-drag-over { background: #2d3a5e !important; color: #fff !important; border-top: 2px solid #4f8ef7; }
 .col-sort-arrow { color: #7a8099; font-size: 10px; }
+.col-resize-handle {
+  position: absolute; right: 0; top: 0;
+  width: 6px; height: 100%;
+  cursor: col-resize;
+  user-select: none;
+  z-index: 2;
+}
+.col-resize-handle:hover { background: rgba(79,142,247,0.45); }
+body.col-resizing { cursor: col-resize !important; user-select: none !important; }
 
 /* Columns dialog checkboxes */
 .col-check-row {
