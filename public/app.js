@@ -18,11 +18,13 @@ let colorIdx = 0;
 let tooltipVisible = false;
 let medScanMap = {};   // Neo4j NodeID (string) → MedScan ID value
 let tooltipHideTimer = null;
+let tooltipShowTimer = null;  // delay before tooltip appears (500 ms)
 let lastMouseX = 0, lastMouseY = 0;
 let tableRows = [];                          // all table rows
 let tableSortCol = null;
 let tableSortAsc = true;
 let currentLayout = 'cose';
+let currentSubgraphName = '';   // name from loaded JSON file
 let contextTarget = null;   // element targeted by right-click
 let curationTarget = null;  // element open in curation modal
 
@@ -34,7 +36,8 @@ let colResizing   = null;    // { thEl, startX, startWidth } while resizing a co
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DIRECT_TYPES = new Set([
-  'Binding', 'DirectRegulation', 'ProtModification', 'PromoterBinding', 'ChemicalReaction'
+  'Binding', 'DirectRegulation', 'ProtModification', 'PromoterBinding',
+  'ChemicalReaction', 'miRNAeffect'
 ]);
 
 const COLOR_PALETTE = [
@@ -45,12 +48,48 @@ const COLOR_PALETTE = [
 ];
 
 const NODE_COLORS = {
-  Gene: '#4daf4a', Protein: '#377eb8', Disease: '#e41a1c',
-  Drug: '#ff7f00', Chemical: '#a65628', Pathway: '#984ea3',
-  CellProcess: '#f781bf', Cell: '#1b9e77', Tissue: '#d95f02',
-  Organ: '#e6ab02', SmallMol: '#66c2a5', Virus: '#fc8d62',
-  Bacteria: '#8da0cb', FunctionalClass: '#e78ac3',
-  Complex: '#a6d854', Reaction: '#999999'
+  // Node types — Pathway Studio colour scheme
+  Protein:          '#d32f2f',  // red
+  SmallMol:         '#388e3c',  // green
+  Treatment:        '#1565c0',  // blue
+  Disease:          '#7b1fa2',  // violet
+  CellProcess:      '#f9a825',  // yellow
+  FunctionalClass:  '#e65100',  // orange
+  Complex:          '#7f0000',  // dark red
+  CellObject:       '#757575',  // gray
+  Tissue:           '#6d4c41',  // brown
+  Organ:            '#4a148c',  // dark violet
+  CellType:         '#81d4fa',  // light blue
+  ChemicalReaction: '#212121',  // black
+  // Legacy / fallback node types
+  Gene:             '#388e3c',
+  Drug:             '#1565c0',
+  Chemical:         '#388e3c',
+  Pathway:          '#7b1fa2',
+  Cell:             '#81d4fa',
+  Virus:            '#d32f2f',
+  Bacteria:         '#e65100',
+  Reaction:         '#999999'
+};
+
+// Edge/relation type colours — Pathway Studio colour scheme
+const RELATION_COLORS = {
+  PromoterBinding:       '#388e3c',  // green
+  Binding:               '#7b1fa2',  // violet
+  CellExpression:        '#1565c0',  // blue
+  Expression:            '#1565c0',  // blue
+  DirectRegulation:      '#9e9e9e',  // grey
+  Regulation:            '#9e9e9e',  // grey
+  GeneticChange:         '#6d4c41',  // brown
+  ProtModification:      '#2e7d32',  // dark green
+  ClinicalTrial:         '#4a148c',  // dark violet
+  QuantitativeChange:    '#1a237e',  // strong dark blue
+  MolSynthesis:          '#5c85d6',  // opaque blue
+  MolTransport:          '#9e9e9e',  // grey
+  StateChange:           '#1b5e20',  // darker green (darker than ProtModification)
+  miRNAeffect:           '#d32f2f',  // red
+  Biomarker:             '#6d4c41',  // brown
+  FunctionalAssociation: '#9e9e9e',  // grey
 };
 const DEFAULT_NODE_COLOR = '#5a6a9a';
 
@@ -258,42 +297,48 @@ function initCytoscape() {
   });
 
   // Tooltip on edge hover
-  cy.on('mouseover', 'edge', async function(evt) {
+  cy.on('mouseover', 'edge', function(evt) {
     if (document.getElementById('curation-modal').style.display !== 'none') return;
+    if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
     if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
     var edge = evt.target;
     var pos = evt.originalEvent || { clientX: 0, clientY: 0 };
-    showTooltipLoading();
-    tooltipVisible = true;
-    positionTooltip(pos.clientX, pos.clientY);
-
-    var relId = edge.data('relId');
-    if (relId && refsCache[relId] === undefined) {
-      try {
-        var rows = await api('/api/references', { relationIds: [relId] });
-        refsCache[relId] = rows;
-      } catch(e) { refsCache[relId] = []; }
-    }
-    renderTooltip(edge, refsCache[relId] || []);
+    tooltipShowTimer = setTimeout(async function() {
+      tooltipShowTimer = null;
+      showTooltipLoading();
+      tooltipVisible = true;
+      positionTooltip(lastMouseX, lastMouseY);
+      var relId = edge.data('relId');
+      if (relId && refsCache[relId] === undefined) {
+        try {
+          var rows = await api('/api/references', { relationIds: [relId] });
+          refsCache[relId] = rows;
+        } catch(e) { refsCache[relId] = []; }
+      }
+      renderTooltip(edge, refsCache[relId] || []);
+    }, 500);
   });
 
   cy.on('mouseout', 'edge', function() {
-    // Tooltip stays visible until user clicks empty canvas area.
+    if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
   });
 
   // Tooltip on node hover
   cy.on('mouseover', 'node', function(evt) {
     if (document.getElementById('curation-modal').style.display !== 'none') return;
+    if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
     if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
     var node = evt.target;
-    var pos = evt.originalEvent || { clientX: 0, clientY: 0 };
-    renderNodeTooltip(node);
-    tooltipVisible = true;
-    positionTooltip(pos.clientX, pos.clientY);
+    tooltipShowTimer = setTimeout(function() {
+      tooltipShowTimer = null;
+      renderNodeTooltip(node);
+      tooltipVisible = true;
+      positionTooltip(lastMouseX, lastMouseY);
+    }, 500);
   });
 
   cy.on('mouseout', 'node', function() {
-    // Tooltip stays visible until user clicks empty canvas area.
+    if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
   });
 
   // Node click: highlight neighbourhood
@@ -309,6 +354,7 @@ function initCytoscape() {
       cy.elements().removeClass('faded');
       // Hide tooltip when clicking empty canvas area.
       tooltipVisible = false;
+      if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
       if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
       document.getElementById('tooltip').style.display = 'none';
     }
@@ -351,6 +397,9 @@ function initCytoscape() {
     var props = edgeRaw ? edgeRaw.properties : {};
     showContextMenu(pos.clientX, pos.clientY, 'edge', id, elementId, name, props, relId);
   });
+
+  // Update zoom label on wheel zoom
+  cy.on('zoom', updateZoomLabel);
 
   // Prevent browser default context menu over cy canvas
   document.getElementById('cy').addEventListener('contextmenu', function(e) { e.preventDefault(); });
@@ -417,6 +466,52 @@ function getCyStyle() {
     {
       selector: 'edge.faded',
       style: { 'opacity': 0.08 }
+    },
+    // ── Reaction (hyperedge) nodes ────────────────────────────────────────
+    {
+      selector: 'node[NodeType="Reaction"]',
+      style: {
+        'shape': 'rectangle',
+        'width': 12, 'height': 12,
+        'background-color': '#555',
+        'border-width': 1.5,
+        'border-color': '#999',
+        'label': '',
+        'text-outline-width': 0
+      }
+    },
+    // ── Substrate edges (no arrowhead — reactant into reaction node) ──────
+    {
+      selector: 'edge[relType="Substrate"]',
+      style: {
+        'target-arrow-shape': 'none',
+        'source-arrow-shape': 'none',
+        'line-color': '#888',
+        'line-style': 'solid',
+        'width': 1.5
+      }
+    },
+    // ── Product edges (arrowhead at product node) ─────────────────────────
+    {
+      selector: 'edge[relType="Product"]',
+      style: {
+        'target-arrow-shape': 'triangle',
+        'target-arrow-color': '#888',
+        'line-color': '#888',
+        'line-style': 'solid',
+        'width': 1.5
+      }
+    },
+    // ── Cofactor edges (dashed, no arrow — participates both sides) ───────
+    {
+      selector: 'edge[relType="Cofactor"]',
+      style: {
+        'target-arrow-shape': 'none',
+        'source-arrow-shape': 'none',
+        'line-color': '#aaa',
+        'line-style': 'dashed',
+        'width': 1.5
+      }
     }
   ];
 }
@@ -424,8 +519,8 @@ function getCyStyle() {
 // ─── Graph rendering ──────────────────────────────────────────────────────────
 function getTypeColor(type) {
   if (!typeColorMap[type]) {
-    typeColorMap[type] = COLOR_PALETTE[colorIdx % COLOR_PALETTE.length];
-    colorIdx++;
+    typeColorMap[type] = RELATION_COLORS[type] || COLOR_PALETTE[colorIdx % COLOR_PALETTE.length];
+    if (!RELATION_COLORS[type]) colorIdx++;
   }
   return typeColorMap[type];
 }
@@ -451,6 +546,7 @@ function getEdgeThickness(numRefs) {
 function renderGraph(data, savedPositions) {
   graphData = data;
   refsCache = {};
+  medScanMap = {};
   typeColorMap = {};
   colorIdx = 0;
 
@@ -471,7 +567,9 @@ function renderGraph(data, savedPositions) {
   });
 
   var cyEdges = data.edges.map(function(e) {
-    var numRefs = e.properties.RelationNumberOfReferences;
+    var numRefs = e.properties.RelationNumberOfReferences != null
+      ? e.properties.RelationNumberOfReferences
+      : (Array.isArray(e.properties.references) ? e.properties.references.length : 0);
     return {
       group: 'edges',
       data: {
@@ -487,6 +585,7 @@ function renderGraph(data, savedPositions) {
         confidence: e.properties['Confidence (%)'] != null ? e.properties['Confidence (%)'] : '',
         citationScore: e.properties['Citation score'] != null ? e.properties['Citation score'] : '',
         color: getTypeColor(e.type),
+        isHyperedge: (e.type === 'Substrate' || e.type === 'Product' || e.type === 'Cofactor'),
         thickness: getEdgeThickness(numRefs),
         lineStyle: DIRECT_TYPES.has(e.type) ? 'solid' : 'dashed'
       }
@@ -535,6 +634,30 @@ function applyLayout(name, btn) {
   }
 }
 
+// ─── Zoom controls ────────────────────────────────────────────────────────────
+function updateZoomLabel() {
+  var el = document.getElementById('zoom-level');
+  if (el && cy) el.textContent = Math.round(cy.zoom() * 100) + '%';
+}
+
+function zoomIn() {
+  if (!cy) return;
+  cy.zoom({ level: cy.zoom() * 1.25, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+  updateZoomLabel();
+}
+
+function zoomOut() {
+  if (!cy) return;
+  cy.zoom({ level: cy.zoom() * 0.8, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+  updateZoomLabel();
+}
+
+function zoomFit() {
+  if (!cy) return;
+  cy.fit(cy.elements(), 40);
+  updateZoomLabel();
+}
+
 // ─── Run query ────────────────────────────────────────────────────────────────
 async function runQuery() {
   var query = document.getElementById('cypher-input').value.trim();
@@ -572,6 +695,7 @@ function clearGraph() {
   tableRows = [];
   document.getElementById('table-body').innerHTML = '';
   document.getElementById('graph-empty-state').style.display = 'flex';
+  currentSubgraphName = '';
   document.getElementById('graph-stats').textContent = '';
   document.getElementById('legend-items').innerHTML = '';
 }
@@ -580,14 +704,19 @@ function clearGraph() {
 function updateStats() {
   var n = cy.nodes().length;
   var e = cy.edges().length;
-  document.getElementById('graph-stats').textContent =
-    n + ' node' + (n !== 1 ? 's' : '') + ' · ' + e + ' relation' + (e !== 1 ? 's' : '');
+  var namePrefix = currentSubgraphName
+    ? '<span style="font-weight:600;margin-right:6px">' + escHtml(currentSubgraphName) + '</span>&nbsp;·&nbsp;'
+    : '';
+  document.getElementById('graph-stats').innerHTML =
+    namePrefix + n + ' node' + (n !== 1 ? 's' : '') + ' · ' + e + ' relation' + (e !== 1 ? 's' : '');
 }
 
 function updateLegend() {
   var container = document.getElementById('legend-items');
   container.innerHTML = '';
+  var HYPEREDGE_TYPES = new Set(['Substrate','Product','Cofactor']);
   Object.keys(typeColorMap).forEach(function(type) {
+    if (HYPEREDGE_TYPES.has(type)) return;
     var color = typeColorMap[type];
     var isDirect = DIRECT_TYPES.has(type);
     var div = document.createElement('div');
@@ -667,16 +796,42 @@ function renderTooltip(edge, refs) {
 
 function renderNodeTooltip(node) {
   var el = document.getElementById('tooltip');
-  var name = node.data('Name') || node.data('name') || node.data('label') || '';
-  var description = node.data('Description') || node.data('description') || '';
-  var urn = node.data('URN') || node.data('urn') || '';
-  var nodeType = node.data('nodeType') || '';
+  var data = node.data();
+  // For virtual reaction nodes use ControlType as the display name
+  var isReactionNode = data.nodeType === 'Reaction' || data.NodeType === 'Reaction';
+  var name = isReactionNode
+    ? (data.ControlType || 'Reaction')
+    : (data.Name || data.name || data.label || '');
+  var description = data.Description || data.description || '';
+  var urn = data.URN || data.urn || '';
+  var nodeType = isReactionNode ? '' : (data.nodeType || '');
+
+  // Keys to skip or render separately
+  var HEADER_KEYS = { Name:1, name:1, label:1, Description:1, description:1,
+                      URN:1, urn:1, nodeType:1, NodeType:1, ControlType:1,
+                      id:1, elementId:1, color:1, source:1, target:1,
+                      NumRefs:1, references:1 };
 
   var html = '<div class="tooltip-rel-header">' + escHtml(name);
   if (nodeType) html += ' <span style="color:#7a8099;font-weight:400;font-size:11px">(' + escHtml(nodeType) + ')</span>';
   html += '</div>';
   if (description) html += '<div style="font-size:12px;color:#c8cde8;margin-top:6px;line-height:1.5">' + escHtml(description) + '</div>';
-  if (urn) html += '<div style="font-size:11px;color:#7a8099;margin-top:6px">URN: ' + escHtml(urn) + '</div>';
+
+  // Additional properties (from Neo4j enrichment or original data)
+  var extras = Object.keys(data).filter(function(k) {
+    return !HEADER_KEYS[k] && data[k] != null && data[k] !== '' && typeof data[k] !== 'object';
+  });
+  if (extras.length) {
+    html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:6px">';
+    extras.forEach(function(k) {
+      html += '<div style="font-size:11px;color:#c8cde8;margin-top:3px">'
+        + '<span style="color:#7a8099">' + escHtml(k) + ':</span> ' + escHtml(String(data[k]))
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
+  if (urn) html += '<div style="font-size:11px;color:#7a8099;margin-top:6px;border-top:1px solid #2a2f4a;padding-top:4px">URN: ' + escHtml(urn) + '</div>';
 
   el.style.display = 'block';
   document.getElementById('tooltip-inner').innerHTML = html;
@@ -788,22 +943,41 @@ async function loadTableData() {
   }
   msg.style.display = 'none';
 
-  var nodeById = {};
-  graphData.nodes.forEach(function(n) { nodeById[n.id] = n; });
-
-  // Fetch MedScan IDs for all nodes using their Neo4j NodeID property.
-  var nodeIds = graphData.nodes
-    .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
-    .filter(Boolean);
-  if (nodeIds.length > 0) {
-    try {
-      medScanMap = await api('/api/nodes/medscan', { nodeIds: nodeIds });
-    } catch(err) {
-      console.warn('MedScan lookup failed:', err.message);
-      medScanMap = {};
+  // Supplement with inline references stored in the JSON (RNEF-converted pathways).
+  // These have the same field names (pmid, doi, pubyear, title, msrc) as DB rows.
+  graphData.edges.forEach(function(e) {
+    var relId = e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+    if (relId && !refsGrouped[relId] && e.properties.references && e.properties.references.length) {
+      refsGrouped[relId] = e.properties.references;
     }
-  } else {
-    medScanMap = {};
+  });
+
+  // Index by both current id and original URN so edges that still reference
+  // the original URN local_id (before Neo4j enrichment swaps n.id) still resolve.
+  var nodeById = {};
+  graphData.nodes.forEach(function(n) {
+    nodeById[n.id] = n;
+    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+  });
+
+  // Fetch MedScan IDs only if not already loaded (may have been pre-fetched
+  // eagerly after Neo4j enrichment completed on pathway load).
+  if (Object.keys(medScanMap).length === 0) {
+    var nodeIds = graphData.nodes
+      .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
+      .filter(Boolean);
+    if (nodeIds.length > 0) {
+      msg.style.display = 'inline';
+      msg.textContent = 'Loading matching data from database…';
+      try {
+        medScanMap = await api('/api/nodes/medscan', { nodeIds: nodeIds });
+      } catch(err) {
+        console.warn('MedScan lookup failed:', err.message);
+        medScanMap = {};
+      }
+      msg.textContent = 'Loading references…';
+      msg.style.display = 'none';
+    }
   }
 
   function nodeLabel(node) {
@@ -836,7 +1010,9 @@ async function loadTableData() {
       targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
       relationType: edge.type,
       effect: edge.properties.Effect || edge.properties.effect || '',
-      numRefs: edge.properties.RelationNumberOfReferences || 0
+      numRefs: edge.properties.RelationNumberOfReferences != null
+        ? edge.properties.RelationNumberOfReferences
+        : (Array.isArray(edge.properties.references) ? edge.properties.references.length : 0)
     };
 
     var buildRow = function(ref) {
@@ -1154,6 +1330,12 @@ function loadSubgraph(event) {
   if (!file) return;
   event.target.value = '';
 
+  // Handle RNEF files — send to server for conversion, then open result
+  if (file.name.toLowerCase().endsWith('.rnef')) {
+    loadRnefFile(file);
+    return;
+  }
+
   var reader = new FileReader();
   reader.onload = function(e) {
     try {
@@ -1171,7 +1353,17 @@ function loadSubgraph(event) {
         if (btn) btn.classList.add('active');
       }
 
+      currentSubgraphName = data.name || '';
       renderGraph(data.graphData, data.positions || null);
+
+      // Pre-populate refsCache with inline references from JSON so edge
+      // tooltips work without a PostgreSQL lookup.
+      (data.graphData.edges || []).forEach(function(e) {
+        var relId = e.properties && e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+        if (relId && e.properties.references && e.properties.references.length) {
+          refsCache[relId] = e.properties.references;
+        }
+      });
 
       if (data.positions) {
         cy.nodes().forEach(function(n) {
@@ -1180,11 +1372,181 @@ function loadSubgraph(event) {
         });
         cy.fit(cy.elements(), 40);
       }
+
+      // Enrich nodes from Neo4j using URN property (silent — best-effort)
+      var statsEl = document.getElementById('graph-stats');
+      if (statsEl) {
+        statsEl.innerHTML += ' <span id="enrich-status" style="color:#7a8099;font-size:11px">Loading matching data from database…</span>';
+      }
+      enrichNodesFromNeo4j(data.graphData.nodes || []);
+
     } catch(err) {
       alert('Failed to load subgraph: ' + err.message);
     }
   };
   reader.readAsText(file);
+}
+
+// ─── RNEF file loading ────────────────────────────────────────────────────────
+async function loadRnefFile(file) {
+  var statsEl = document.getElementById('graph-stats');
+  if (statsEl) statsEl.innerHTML = '<span style="color:#7a8099;font-size:11px">Converting RNEF…</span>';
+
+  try {
+    var content = await file.text();
+    // Send as raw text to bypass the global 10 MB JSON body limit on the server.
+    var res = await fetch('/api/convert/rnef', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'Authorization': 'Bearer ' + authToken
+      },
+      body: content
+    });
+    if (res.status === 401) { logout(); throw new Error('Session expired'); }
+    var result = await res.json();
+    if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status));
+    var pathways = result.pathways || [];
+
+    if (pathways.length === 0) {
+      alert('No pathways found in this RNEF file.');
+      if (statsEl) statsEl.innerHTML = '';
+      return;
+    }
+
+    if (pathways.length === 1) {
+      openRnefPathway(pathways[0].data);
+    } else {
+      // Multiple sub-graphs — let user pick
+      var list = document.getElementById('rnef-pathway-list');
+      list.innerHTML = '';
+      pathways.forEach(function(pw) {
+        var btn = document.createElement('button');
+        btn.className = 'btn-tool';
+        btn.style.cssText = 'text-align:left;padding:8px 12px;width:100%;font-size:13px';
+        btn.textContent = pw.name;
+        btn.onclick = function() {
+          document.getElementById('rnef-modal').style.display = 'none';
+          openRnefPathway(pw.data);
+        };
+        list.appendChild(btn);
+      });
+      if (statsEl) statsEl.innerHTML = '';
+      document.getElementById('rnef-modal').style.display = 'flex';
+    }
+  } catch(err) {
+    if (statsEl) statsEl.innerHTML = '';
+    alert('RNEF conversion failed: ' + err.message);
+  }
+}
+
+function openRnefPathway(data) {
+  if (!data.graphData) { alert('Invalid pathway data'); return; }
+  currentSubgraphName = data.name || '';
+  renderGraph(data.graphData, data.positions || null);
+
+  // Pre-populate refsCache with inline references
+  (data.graphData.edges || []).forEach(function(e) {
+    var relId = e.properties && e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+    if (relId && e.properties.references && e.properties.references.length) {
+      refsCache[relId] = e.properties.references;
+    }
+  });
+
+  if (data.positions) {
+    cy.nodes().forEach(function(n) {
+      var pos = data.positions[n.id()];
+      if (pos) n.position(pos);
+    });
+    cy.fit(cy.elements(), 40);
+  }
+
+  var statsEl = document.getElementById('graph-stats');
+  if (statsEl) {
+    statsEl.innerHTML += ' <span id="enrich-status" style="color:#7a8099;font-size:11px">Loading matching data from database…</span>';
+  }
+  enrichNodesFromNeo4j(data.graphData.nodes || []);
+  switchView('graph');
+}
+
+function closeRnefModal(e) {
+  if (e.target === document.getElementById('rnef-modal'))
+    document.getElementById('rnef-modal').style.display = 'none';
+}
+
+// ─── Enrich subgraph nodes from Neo4j by URN ─────────────────────────────────
+function enrichNodesFromNeo4j(jsonNodes) {
+  var urns = jsonNodes
+    .map(function(n) { return n.properties && n.properties.URN; })
+    .filter(Boolean);
+  if (!urns.length) return;
+
+  api('/api/graph/enrich-by-urn', { urns: urns })
+    .then(function(enriched) {
+      var matched = 0;
+      cy.nodes().forEach(function(cyNode) {
+        var urn = cyNode.data('URN');
+        if (!urn || !enriched[urn]) return;
+        matched++;
+        var neo = enriched[urn];
+        // Merge all Neo4j properties (preserve URN)
+        var merged = Object.assign({}, cyNode.data(), neo.properties);
+        merged.URN = urn;
+        // Update display label
+        if (neo.properties.Name) merged.label = neo.properties.Name;
+        // Update node type and color from Neo4j labels
+        if (neo.labels && neo.labels.length) {
+          merged.nodeType = neo.labels[0];
+          merged.color = getNodeColor(neo.labels);
+        }
+        // Swap to Neo4j's native IDs so curation and edge queries work
+        merged.elementId = neo.elementId;
+        cyNode.data(merged);
+        // Also update the backing graphData so table view is consistent
+        var gn = graphData.nodes.find(function(n) { return n.properties && n.properties.URN === urn; });
+        if (gn) {
+          gn.id = neo.id;
+          gn.elementId = neo.elementId;
+          gn.labels = neo.labels;
+          Object.assign(gn.properties, neo.properties);
+        }
+      });
+      // Remove the "Loading matching data…" spinner regardless of match count
+      var enrichSpan = document.getElementById('enrich-status');
+      if (enrichSpan) enrichSpan.remove();
+
+      if (matched > 0) {
+        updateLegend();
+        // Show enrichment count briefly in stats bar
+        var statsEl = document.getElementById('graph-stats');
+        if (statsEl) {
+          var orig = statsEl.innerHTML;
+          statsEl.innerHTML = orig + ' <span style="color:#4caf50;font-size:11px">(+' + matched + ' enriched from Neo4j)</span>';
+          setTimeout(function() { updateStats(); }, 3000);
+        }
+
+        // Eagerly pre-fetch MedScan IDs now that NodeIDs are available,
+        // so Table view is ready instantly when the user opens it.
+        var nodeIds = graphData.nodes
+          .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
+          .filter(Boolean);
+        if (nodeIds.length > 0) {
+          api('/api/nodes/medscan', { nodeIds: nodeIds })
+            .then(function(map) { medScanMap = map; })
+            .catch(function() {});
+        }
+
+        // If Table view is already open, reload it with the enriched data.
+        var tableView = document.getElementById('table-view');
+        if (tableView && tableView.style.display !== 'none') {
+          loadTableData();
+        }
+      }
+    })
+    .catch(function() {
+      var enrichSpan = document.getElementById('enrich-status');
+      if (enrichSpan) enrichSpan.remove();
+    });
 }
 
 // ─── Change password ──────────────────────────────────────────────────────────
@@ -1345,25 +1707,14 @@ async function openCurationModal(type, id, elementId, displayName, properties, r
     if (refs.length === 0) {
       pgSection.innerHTML = '<div class="prop-section-title">PostgreSQL References</div>'
         + '<div style="color:#7a8099;font-size:12px">No references found for this relation.</div>';
-    } else {
-      var pgHtml = '<div class="prop-section-title">PostgreSQL References (' + refs.length + ')</div>';
-      refs.forEach(function(ref, idx) {
-        var rid = String(ref.id);
-        pgHtml += '<div class="pg-ref-block" data-ref-idx="' + idx + '" data-ref-id="' + escHtml(rid) + '">';
-        pgHtml += '<div class="pg-ref-id">Reference ID: ' + escHtml(rid) + '</div>';
-        [
-          ['pmid',    'PMID',    String(ref.pmid    || '')],
-          ['doi',     'DOI',     String(ref.doi     || '')],
-          ['pubyear', 'Year',    String(ref.pubyear || '')],
-          ['title',   'Title',   String(ref.title   || '')],
-          ['msrc',    'Sentence',String(ref.msrc    || '')],
-          ['journal', 'Journal', String(ref.journal || ref.journalname || '')]
-        ].forEach(function(row) {
-          pgHtml += '<div class="pg-ref-row">'
-            + '<span class="pg-ref-label">' + row[1] + '</span>'
-            + '<input class="pg-ref-input" data-field="' + row[0] + '" value="' + escHtml(row[2]) + '">'
-            + '</div>';
-        });
+      var pgHtml = '<div class="prop-section-title">PostgreSQL References</div>';
+      refs.forEach(function(ref) {
+        var year = ref.pubyear ? ' (' + ref.pubyear + ')' : '';
+        pgHtml += '<div class="ref-item">';
+        if (ref.title) pgHtml += '<div class="ref-title">' + escHtml(ref.title) + escHtml(year) + '</div>';
+        if (ref.authors) pgHtml += '<div class="ref-authors">' + escHtml(ref.authors) + '</div>';
+        if (ref.pmid)  pgHtml += '<div class="ref-pmid">PMID: ' + escHtml(ref.pmid) + '</div>';
+        if (ref.msrc)  pgHtml += '<div class="ref-sentence">' + colorSentence(ref.msrc, null, null) + '</div>';
         pgHtml += '</div>';
       });
       pgSection.innerHTML = pgHtml;
@@ -1371,273 +1722,77 @@ async function openCurationModal(type, id, elementId, displayName, properties, r
   }
 }
 
-function renderCurationPropsHTML(properties) {
+function closeCurationModal(e) {
+  if (e.target === e.currentTarget) document.getElementById('curation-modal').style.display = 'none';
+}
+
+function addPropertyRow() {
+  var container = document.getElementById('curation-props-container');
+  var row = document.createElement('div');
+  row.className = 'prop-row';
+  row.innerHTML = '<input class="prop-key" type="text" placeholder="Property name">'
+    + '<input class="prop-val" type="text" placeholder="Value">'
+    + '<button class="prop-delete" onclick="this.closest(\'.prop-row\').remove()" title="Remove">✕</button>';
+  var pgSection = document.getElementById('pg-refs-section');
+  if (pgSection) container.insertBefore(row, pgSection);
+  else container.appendChild(row);
+  row.querySelector('.prop-key').focus();
+}
+
+function renderCurationPropsHTML(props) {
   var html = '';
-  Object.entries(properties).forEach(function(entry) {
-    var k = entry[0], v = entry[1];
-    if (v == null || v === '') return;
-    html += '<div class="prop-row">'
-      + '<input class="prop-key neo-prop-key" value="' + escHtml(String(k)) + '" placeholder="Property name">'
-      + '<input class="prop-val neo-prop-val" value="' + escHtml(String(v)) + '" placeholder="Value">'
-      + '<button class="prop-del" onclick="this.closest(\'.prop-row\').remove()" title="Remove">×</button>'
+  Object.keys(props || {}).forEach(function(key) {
+    var val = props[key] != null ? String(props[key]) : '';
+    html += '<div class="prop-row" data-key="' + escHtml(key) + '">'
+      + '<input class="prop-key" type="text" value="' + escHtml(key) + '" placeholder="Property name">'
+      + '<input class="prop-val" type="text" value="' + escHtml(val) + '" placeholder="Value">'
+      + '<button class="prop-delete" onclick="this.closest(\'.prop-row\').remove()" title="Remove">✕</button>'
       + '</div>';
   });
   return html;
 }
 
-function addPropertyRow() {
-  var container = document.getElementById('curation-props-container');
-  var pgSection = document.getElementById('pg-refs-section');
-  var row = document.createElement('div');
-  row.className = 'prop-row';
-  row.innerHTML = '<input class="prop-key neo-prop-key" value="" placeholder="Property name">'
-    + '<input class="prop-val neo-prop-val" value="" placeholder="Value">'
-    + '<button class="prop-del" onclick="this.closest(\'.prop-row\').remove()" title="Remove">x</button>';
-  if (pgSection) container.insertBefore(row, pgSection);
-  else container.appendChild(row);
-  row.querySelector('.neo-prop-key').focus();
-}
-
-function closeCurationModal(e) {
-  if (e.target === document.getElementById('curation-modal'))
-    document.getElementById('curation-modal').style.display = 'none';
-}
-
 async function saveCuration() {
-  if (!curationTarget) return;
-  var type = curationTarget.type;
-  var elementId = curationTarget.elementId;
-  var relId = curationTarget.relId;
-  var pgRefs = curationTarget.pgRefs;
-
-  var statusEl = document.getElementById('curation-status');
-  statusEl.style.color = '#7a8099';
-  statusEl.textContent = 'Saving...';
+  var status = document.getElementById('curation-status');
+  status.textContent = 'Saving...';
+  status.style.color = '#888';
 
   var container = document.getElementById('curation-props-container');
-  var keyEls = container.querySelectorAll('.neo-prop-key');
-  var valEls = container.querySelectorAll('.neo-prop-val');
-  var neoProps = {};
-  keyEls.forEach(function(keyEl, i) {
-    var k = keyEl.value.trim();
-    var v = valEls[i] ? valEls[i].value.trim() : '';
-    if (k) neoProps[k] = v;
+  var rows = container.querySelectorAll('.prop-row');
+  var props = {};
+  rows.forEach(function(row) {
+    var key = (row.querySelector('.prop-key') || {}).value || '';
+    var val = (row.querySelector('.prop-val') || {}).value || '';
+    if (key.trim()) props[key.trim()] = val;
   });
 
-  var endpoint = type === 'node' ? '/api/graph/update-node' : '/api/graph/update-relation';
   try {
-    await api(endpoint, { elementId: elementId, properties: neoProps });
-  } catch(err) {
-    statusEl.style.color = '#e05560';
-    statusEl.textContent = 'Neo4j error: ' + err.message;
-    return;
-  }
+    var endpoint = curationTarget.type === 'node'
+      ? '/api/graph/update-node'
+      : '/api/graph/update-relation';
+    await api(endpoint, { elementId: curationTarget.elementId, properties: props });
 
-  if (type === 'node') {
-    var nd = graphData.nodes.find(function(n) { return n.id === curationTarget.id; });
-    if (nd) nd.properties = Object.assign({}, nd.properties, neoProps);
-    var cyNode = cy.$id(curationTarget.id);
-    if (cyNode) Object.entries(neoProps).forEach(function(e) { cyNode.data(e[0], e[1]); });
-  } else {
-    var ed = graphData.edges.find(function(e) { return e.id === curationTarget.id; });
-    if (ed) ed.properties = Object.assign({}, ed.properties, neoProps);
-  }
-
-  if (type === 'edge' && pgRefs && pgRefs.length > 0) {
-    var pgSection = document.getElementById('pg-refs-section');
-    if (pgSection) {
-      var blocks = pgSection.querySelectorAll('.pg-ref-block');
-      var pgErrors = [];
-      for (var i = 0; i < blocks.length; i++) {
-        var block = blocks[i];
-        var refId = block.dataset.refId;
-        var fields = {};
-        block.querySelectorAll('.pg-ref-input').forEach(function(input) {
-          fields[input.dataset.field] = input.value.trim();
-        });
-        try {
-          await api('/api/references/update', { id: refId, fields: fields });
-          if (refsCache[relId]) {
-            var cached = refsCache[relId].find(function(r) { return String(r.id) === refId; });
-            if (cached) Object.assign(cached, fields);
-          }
-        } catch(err) {
-          pgErrors.push('Ref ' + refId + ': ' + err.message);
-        }
+    // Reflect changes in the live graph
+    if (curationTarget.type === 'node') {
+      var node = cy.$id(curationTarget.id);
+      if (node.length) {
+        Object.keys(props).forEach(function(k) { node.data(k, props[k]); });
+        if (props.Name) node.data('label', props.Name);
       }
-      if (pgErrors.length) {
-        statusEl.style.color = '#e05560';
-        statusEl.textContent = 'Neo4j saved. PG errors: ' + pgErrors.join('; ');
-        return;
-      }
-    }
-  }
-
-  statusEl.style.color = '#4daf4a';
-  statusEl.textContent = 'Saved successfully!';
-  setTimeout(function() {
-    document.getElementById('curation-modal').style.display = 'none';
-  }, 900);
-}
-
-// ─── Column resize ────────────────────────────────────────────────────────────
-function colResizeStart(evt, thEl) {
-  evt.preventDefault();
-  evt.stopPropagation();
-  // On first resize, freeze all columns to their current pixel widths
-  // and switch to fixed layout so only the dragged column changes.
-  var table = document.getElementById('data-table');
-  if (table.style.tableLayout !== 'fixed') {
-    Array.from(table.querySelectorAll('thead th')).forEach(function(th) {
-      th.style.width = th.getBoundingClientRect().width + 'px';
-    });
-    table.style.tableLayout = 'fixed';
-  }
-  colResizing = { thEl: thEl, startX: evt.clientX, startWidth: thEl.getBoundingClientRect().width };
-  document.body.classList.add('col-resizing');
-}
-
-// ─── Column drag-and-drop ─────────────────────────────────────────────────────
-function colDragStart(evt, idx) {
-  // Don't start a column drag when the user grabbed the resize handle.
-  if (evt.target.classList.contains('col-resize-handle')) { evt.preventDefault(); return; }
-  dragSrcColIdx = idx;
-  evt.dataTransfer.effectAllowed = 'move';
-  evt.currentTarget.classList.add('col-dragging');
-}
-
-function colDragOver(evt) {
-  evt.preventDefault();
-  evt.dataTransfer.dropEffect = 'move';
-  document.querySelectorAll('#data-table th').forEach(function(el) { el.classList.remove('col-drag-over'); });
-  evt.currentTarget.classList.add('col-drag-over');
-}
-
-function colDrop(evt, dropIdx) {
-  evt.preventDefault();
-  if (dragSrcColIdx === null || dragSrcColIdx === dropIdx) return;
-
-  var visCols = columnDefs.filter(function(c) { return c.visible; });
-  var srcKey = visCols[dragSrcColIdx] && visCols[dragSrcColIdx].key;
-  var dstKey = visCols[dropIdx] && visCols[dropIdx].key;
-  if (!srcKey || !dstKey) return;
-
-  var srcDefIdx = columnDefs.findIndex(function(c) { return c.key === srcKey; });
-  var dstDefIdx = columnDefs.findIndex(function(c) { return c.key === dstKey; });
-  if (srcDefIdx < 0 || dstDefIdx < 0) return;
-
-  var moved = columnDefs.splice(srcDefIdx, 1)[0];
-  var newDst = columnDefs.findIndex(function(c) { return c.key === dstKey; });
-  columnDefs.splice(newDst, 0, moved);
-
-  document.querySelectorAll('#data-table th').forEach(function(el) { el.classList.remove('col-drag-over'); });
-  saveColumnConfig();
-  renderTableHeader();
-  renderTableRows(tableRows);
-}
-
-function colDragEnd(evt) {
-  dragSrcColIdx = null;
-  document.querySelectorAll('#data-table th').forEach(function(el) {
-    el.classList.remove('col-dragging', 'col-drag-over');
-  });
-}
-
-// ─── Columns dialog ───────────────────────────────────────────────────────────
-function renderColumnsDialogContent() {
-  var refList   = document.getElementById('col-ref-list');
-  var sdList    = document.getElementById('col-sd-list');
-  var sdSection = document.getElementById('col-sd-section');
-
-  // ── reference table columns (fetched from server) ──────────────────────────
-  var refCols = availableDbColumns.reference || [];
-  refList.innerHTML = refCols.length === 0
-    ? '<div style="color:#7a8099;font-size:12px">Loading columns...</div>'
-    : refCols.map(function(dbField) {
-        var existing = columnDefs.find(function(c) { return c.source === 'reference' && c.dbField === dbField; });
-        var checked  = existing ? existing.visible : false;
-        var label    = COL_DISPLAY_NAMES[dbField] || dbField;
-        return '<label class="col-check-row"><input type="checkbox" data-source="reference" data-field="'
-          + escHtml(dbField) + '"' + (checked ? ' checked' : '') + '> '
-          + escHtml(label) + '</label>';
-      }).join('');
-
-  // ── scopus_data columns (hardcoded list, joined on unique_id=reference_id) ─
-  sdSection.style.display = '';
-  sdList.innerHTML = Object.keys(SCOPUS_COLUMNS).map(function(dbField) {
-    var existing = columnDefs.find(function(c) { return c.source === 'scopus_data' && c.dbField === dbField; });
-    var checked  = existing ? existing.visible : false;
-    var label    = SCOPUS_COLUMNS[dbField];
-    return '<label class="col-check-row"><input type="checkbox" data-source="scopus_data" data-field="'
-      + escHtml(dbField) + '"' + (checked ? ' checked' : '') + '> '
-      + escHtml(label)
-      + ' <span style="color:#7a8099;font-size:10px">(scopus)</span></label>';
-  }).join('');
-}
-
-async function openColumnsDialog() {
-  var modal = document.getElementById('columns-modal');
-  modal.style.display = 'flex';
-
-  if (availableDbColumns.reference.length === 0) {
-    document.getElementById('col-ref-list').innerHTML =
-      '<div style="color:#7a8099;font-size:12px">Loading...</div>';
-    try {
-      var data = await api('/api/schema/columns', null);
-      availableDbColumns = { reference: data.reference || [], scopus_data: data.scopus_data || [] };
-    } catch(e) {
-      document.getElementById('col-ref-list').innerHTML =
-        '<div style="color:#e05560;font-size:12px">Failed to load columns: ' + escHtml(e.message) + '</div>';
-      return;
-    }
-  }
-
-  renderColumnsDialogContent();
-}
-
-function closeColumnsModal(evt) {
-  if (evt.target === document.getElementById('columns-modal'))
-    document.getElementById('columns-modal').style.display = 'none';
-}
-
-async function applyColumnsDialog() {
-  var modal = document.getElementById('columns-modal');
-  var checkboxes = modal.querySelectorAll('input[type="checkbox"]');
-  var needsScopusReload = false;
-
-  checkboxes.forEach(function(cb) {
-    var source = cb.dataset.source;
-    var dbField = cb.dataset.field;
-    var key = source === 'scopus_data' ? ('sd_' + dbField) : dbField;
-    if (source === 'reference') {
-      if (dbField === 'pubyear') key = 'year';
-      else if (dbField === 'msrc') key = 'sentence';
-    }
-    var label = source === 'scopus_data'
-      ? (SCOPUS_COLUMNS[dbField] || dbField)
-      : (COL_DISPLAY_NAMES[dbField] || dbField);
-
-    var existing = columnDefs.find(function(c) { return c.dbField === dbField && c.source === source; });
-
-    if (cb.checked) {
-      if (existing) {
-        existing.visible = true;
-      } else {
-        columnDefs.push({ key: key, label: label, visible: true, source: source, dbField: dbField });
-        if (source === 'scopus_data') needsScopusReload = true;
-      }
+      var gn = graphData.nodes.find(function(n) { return n.id === curationTarget.id; });
+      if (gn) Object.assign(gn.properties, props);
     } else {
-      if (existing) existing.visible = false;
+      var ge = graphData.edges.find(function(e) { return e.id === curationTarget.id; });
+      if (ge) Object.assign(ge.properties, props);
     }
-  });
 
-  modal.style.display = 'none';
-  saveColumnConfig();
-
-  if (needsScopusReload && tableRows.length > 0) {
-    await loadTableData();
-  } else {
-    renderTableHeader();
-    renderTableRows(tableRows);
+    status.textContent = 'Saved!';
+    status.style.color = '#4caf50';
+    setTimeout(function() {
+      document.getElementById('curation-modal').style.display = 'none';
+    }, 900);
+  } catch(err) {
+    status.textContent = 'Error: ' + (err.message || 'Save failed');
+    status.style.color = '#e05560';
   }
 }
