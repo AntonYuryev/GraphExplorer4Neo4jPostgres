@@ -1,4 +1,5 @@
 node_modules/
+CuratedPathways/
 users.json
 *.log
 .DS_Store
