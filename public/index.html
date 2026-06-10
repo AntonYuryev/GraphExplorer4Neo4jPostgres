@@ -91,7 +91,16 @@
       <span class="toolbar-label">Subgraph</span>
       <button class="btn-tool" onclick="promptSaveSubgraph()">💾 Save</button>
       <button class="btn-tool" onclick="document.getElementById('load-file-input').click()">📂 Load</button>
-      <input type="file" id="load-file-input" accept=".json" style="display:none" onchange="loadSubgraph(event)">
+      <input type="file" id="load-file-input" accept=".json,.rnef" style="display:none" onchange="loadSubgraph(event)">
+    </div>
+
+    <!-- Zoom -->
+    <div class="toolbar-group" id="zoom-controls">
+      <span class="toolbar-label">Zoom</span>
+      <button class="btn-tool" onclick="zoomIn()" title="Zoom in">+</button>
+      <button class="btn-tool" onclick="zoomOut()" title="Zoom out">−</button>
+      <button class="btn-tool" onclick="zoomFit()" title="Fit all nodes">Fit</button>
+      <span id="zoom-level" style="font-size:11px;color:#7a8099;min-width:36px;text-align:center;align-self:center">100%</span>
     </div>
 
     <!-- View toggle -->
@@ -249,6 +258,18 @@
       <span id="curation-status" style="font-size:12px;flex:1"></span>
       <button class="btn-ghost" onclick="document.getElementById('curation-modal').style.display='none'">Cancel</button>
       <button class="btn-primary" onclick="saveCuration()">Save to Neo4j</button>
+    </div>
+  </div>
+</div>
+
+<!-- RNEF pathway selection modal (shown when .rnef has multiple sub-graphs) -->
+<div id="rnef-modal" class="modal-backdrop" style="display:none" onclick="closeRnefModal(event)">
+  <div class="modal-box" style="min-width:480px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+    <h3>Select Pathway</h3>
+    <p style="color:#7a8099;font-size:12px;margin-bottom:14px">This file contains multiple pathways. Choose one to open.</p>
+    <div id="rnef-pathway-list" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:6px"></div>
+    <div class="modal-actions" style="margin-top:14px">
+      <button class="btn-ghost" onclick="document.getElementById('rnef-modal').style.display='none'">Cancel</button>
     </div>
   </div>
 </div>
