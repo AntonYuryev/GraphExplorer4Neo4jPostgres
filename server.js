@@ -5,6 +5,8 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { execFile } = require('child_process');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -36,9 +38,24 @@ const dbLimiter = rateLimit({
 // bolt+ssc = encrypted, trust all certificates (including self-signed)
 const neo4jDriver = neo4j.driver(
   'bolt+ssc://neo4j.lifesciencepsg.com:7687',
-  neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
+  neo4j.auth.basic('yuryeva', 'El$evier2024')
 );
 const NEO4J_DB = 'mammaloct2025new';
+// URN property name on Neo4j nodes — change to match your schema (e.g. 'id', '@id', 'URN')
+const NEO4J_URN_PROP = process.env.NEO4J_URN_PROP || 'URN';
+
+// ─── RNEF conversion ──────────────────────────────────────────────────────────
+// Path to rnef_to_json.py — defaults to same directory as server.js.
+// Override with RNEF_SCRIPT env var if placed elsewhere.
+const RNEF_SCRIPT = process.env.RNEF_SCRIPT || path.join(__dirname, 'rnef_to_json.py');
+const PYTHON_CMD  = process.env.PYTHON_CMD  || (() => {
+  // Auto-detect: try python3, python, py in order
+  const { execFileSync } = require('child_process');
+  for (const cmd of ['python3', 'python', 'py']) {
+    try { execFileSync(cmd, ['--version'], { timeout: 3000 }); return cmd; } catch(e) {}
+  }
+  return 'python3'; // fallback — will surface a clear error if missing
+})();
 
 // ─── PostgreSQL schema ────────────────────────────────────────────────────────
 // Change this to match your schema name (each user may have a different one).
@@ -49,8 +66,8 @@ const pgPool = new Pool({
   host: 'postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com',
   port: 5432,
   database: 'psgdev',
-  user: 'YOUR_PG_USERNAME',
-  password: 'YOUR_PG_PASSWORD',
+  user: 'psguser',
+  password: 'k4ZHuXWjt8eodjgeZimkCdzJgmAKoI8KPGXZphG4tbt2ujUw1rxSJpLhSHAtVOvx',
   ssl: { rejectUnauthorized: false },
   max: 10,
   idleTimeoutMillis: 30000,
@@ -136,7 +153,10 @@ function toPlain(val) {
   if (Array.isArray(val)) return val.map(toPlain);
   if (typeof val === 'object' && val !== null) {
     const out = {};
-    for (const [k, v] of Object.entries(val)) out[k] = toPlain(v);
+    for (const [k, v] of Object.entries(val)) {
+      if (v === '_') continue;  // skip empty-marker properties
+      out[k] = toPlain(v);
+    }
     return out;
   }
   return val;
@@ -275,6 +295,45 @@ app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Enrich loaded-subgraph nodes via URN ─────────────────────────────────────
+// Accepts a list of URN strings (from converted pathway JSON files), queries
+// Neo4j for matching nodes, and returns their full property set keyed by URN.
+// The property name used for matching is configured by NEO4J_URN_PROP above.
+app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res) => {
+  const { urns } = req.body || {};
+  if (!Array.isArray(urns) || !urns.length) return res.json({});
+
+  const URN_RE = /^[a-zA-Z0-9:@%.~_-]+$/;
+  const safeUrns = urns.filter(u => typeof u === 'string' && URN_RE.test(u));
+  if (!safeUrns.length) return res.json({});
+
+  // NEO4J_URN_PROP is a server-side constant — safe to interpolate
+  const cypher = 'MATCH (n) WHERE n.`' + NEO4J_URN_PROP + '` IN $urns RETURN n';
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { urns: safeUrns });
+    const enriched = {};
+    result.records.forEach(record => {
+      const node = record.get('n');
+      const urnVal = node.properties[NEO4J_URN_PROP];
+      if (urnVal) {
+        enriched[urnVal] = {
+          id: node.identity.toString(),
+          elementId: node.elementId || node.identity.toString(),
+          labels: node.labels,
+          properties: toPlain(node.properties)
+        };
+      }
+    });
+    res.json(enriched);
+  } catch (err) {
+    console.error('enrich-by-urn error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── PostgreSQL references (tooltip — single edge hover) ──────────────────────
 // RelationID in Neo4j is a string; id in Postgres is bigint.
 // Pass as strings and cast to bigint in SQL to preserve full 64-bit precision.
@@ -403,146 +462,149 @@ app.post('/api/nodes/medscan', dbLimiter, authMiddleware, async (req, res) => {
     result.rows.forEach(row => { map[row.id] = row.value; });
     res.json(map);
   } catch (err) {
-    console.error('MedScan lookup error:', err.message);
+    console.error('MedScan error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── PostgreSQL: update reference row ────────────────────────────────────────
-// Column names are validated against actual table columns to prevent SQL injection.
+// ─── PostgreSQL reference update (curation) ───────────────────────────────────
 app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) => {
-  const { id, fields } = req.body || {};
-  if (!id || !fields) return res.status(400).json({ error: 'id and fields required' });
-
-  const ALLOWED = ['pmid', 'doi', 'title', 'msrc', 'pubyear', 'journal', 'journalname'];
-  const pairs = Object.entries(fields).filter(([k]) => ALLOWED.includes(k));
-  if (!pairs.length) return res.json({ success: true, updated: 0 });
-
-  const params = [String(id)];
-  const setClauses = pairs.map(([k, v], i) => {
-    params.push(v);
-    return `${k} = $${i + 2}`;
-  });
-
+  const { id, msrc } = req.body || {};
+  if (!id || msrc === undefined) return res.status(400).json({ error: 'id and msrc required' });
+  const safeId = /^-?\d+$/.test(String(id)) ? String(id) : null;
+  if (!safeId) return res.status(400).json({ error: 'Invalid id' });
   try {
-    const result = await pgPool.query(
-      `UPDATE ${PG_SCHEMA}.reference SET ${setClauses.join(', ')} WHERE id = $1::bigint`,
-      params
+    await pgPool.query(
+      `UPDATE ${PG_SCHEMA}.reference SET msrc = $1 WHERE id = $2::bigint`,
+      [msrc, safeId]
     );
-    res.json({ success: true, updated: result.rowCount });
+    res.json({ ok: true });
   } catch (err) {
-    console.error('PostgreSQL update reference error:', err.message);
+    console.error('Reference update error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── PostgreSQL: list columns for reference and scopus_data tables ────────────
-app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
+// ─── Neo4j node property update (curation) ───────────────────────────────────
+app.post('/api/graph/update-node', dbLimiter, authMiddleware, async (req, res) => {
+  const { elementId, properties } = req.body || {};
+  if (!elementId || typeof properties !== 'object') {
+    return res.status(400).json({ error: 'elementId and properties required' });
+  }
+  const session = neo4jDriver.session({ database: NEO4J_DB });
   try {
-    const refResult = await pgPool.query(
+    await session.run(
+      'MATCH (n) WHERE elementId(n) = $eid SET n += $props',
+      { eid: elementId, props: properties }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('update-node error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+// ─── Neo4j relation property update (curation) ───────────────────────────────
+app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, res) => {
+  const { elementId, properties } = req.body || {};
+  if (!elementId || typeof properties !== 'object') {
+    return res.status(400).json({ error: 'elementId and properties required' });
+  }
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    await session.run(
+      'MATCH ()-[r]->() WHERE elementId(r) = $eid SET r += $props',
+      { eid: elementId, props: properties }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('update-relation error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+// ─── Schema columns (for Add/Remove columns dialog) ──────────────────────────
+app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
+  const SCOPUS_COL_SQL = {
+    citation_type:  'sd."citation_type"  AS "sd_citation_type"',
+    citation_count: 'sd."citation_count" AS "sd_citation_count"',
+    sjr:            'sd."sjr"            AS "sd_sjr"',
+    snip:           'sd."snip"           AS "sd_snip"',
+    source_title:   'sd."source_title"   AS "sd_source_title"',
+    issn:           'sd."issn"           AS "sd_issn"',
+    volume:         'sd."volume"         AS "sd_volume"',
+    issue:          'sd."issue"          AS "sd_issue"',
+    pages:          'sd."pages"          AS "sd_pages"',
+    open_access:    'sd."open_access"    AS "sd_open_access"',
+    subject_area:   'sd."subject_area"   AS "sd_subject_area"',
+    keywords:       'sd."keywords"       AS "sd_keywords"',
+    abstract:       'sd."abstract"       AS "sd_abstract"',
+    affiliation:    'sd."affiliation"    AS "sd_affiliation"',
+    funding_info:   'sd."funding_info"   AS "sd_funding_info"'
+  };
+  try {
+    const refCols = await pgPool.query(
       `SELECT column_name FROM information_schema.columns
        WHERE table_schema = $1 AND table_name = 'reference'
        ORDER BY ordinal_position`,
       [PG_SCHEMA]
     );
-
-    let scopusColumns = [];
-    try {
-      const scopusResult = await pgPool.query(
-        `SELECT column_name FROM information_schema.columns
-         WHERE table_schema = $1 AND table_name = 'scopus_data'
-         ORDER BY ordinal_position`,
-        [PG_SCHEMA]
-      );
-      scopusColumns = scopusResult.rows.map(r => r.column_name);
-    } catch (e) {
-      // scopus_data table may not exist in all schemas
-    }
-
     res.json({
-      reference: refResult.rows.map(r => r.column_name),
-      scopus_data: scopusColumns,
-      schema: PG_SCHEMA
+      referenceColumns: refCols.rows.map(r => r.column_name),
+      scopusColumns: Object.keys(SCOPUS_COL_SQL)
     });
   } catch (err) {
-    console.error('Schema columns error:', err.message);
+    console.error('schema/columns error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Curation: update node properties ────────────────────────────────────────
-app.post('/api/graph/update-node', dbLimiter, authMiddleware, async (req, res) => {
-  const { elementId, properties } = req.body || {};
-  if (!elementId || !properties) return res.status(400).json({ error: 'elementId and properties required' });
+// ─── RNEF → JSON conversion ───────────────────────────────────────────────────
+// Accepts raw XML text body (Content-Type: text/plain, up to 50 MB) and returns
+// { pathways: [{name, data}, ...] }.  Using text/plain avoids the global 10 MB
+// express.json limit — the body is never JSON-parsed by the global middleware.
+app.post('/api/convert/rnef', express.text({ limit: '50mb', type: 'text/plain' }), authMiddleware, async (req, res) => {
+  const content = req.body;
+  if (!content) return res.status(400).json({ error: 'content required' });
 
-  const props = Object.fromEntries(
-    Object.entries(properties).filter(([, v]) => v !== null && v !== undefined)
-  );
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnef-'));
+  const inputPath = path.join(tmpDir, 'input.rnef');
+  const outDir    = path.join(tmpDir, 'out');
+  fs.mkdirSync(outDir);
+  fs.writeFileSync(inputPath, content, 'utf8');
+
   try {
-    try {
-      await session.run(
-        'MATCH (n) WHERE elementId(n) = $elementId SET n += $props',
-        { elementId, props }
+    await new Promise((resolve, reject) => {
+      execFile(PYTHON_CMD, [RNEF_SCRIPT, inputPath, outDir],
+        { timeout: 120000 },
+        (err, stdout, stderr) => {
+          if (err) reject(new Error(stderr || err.message));
+          else resolve(stdout);
+        }
       );
-    } catch {
-      const numId = neo4j.int(parseInt(elementId, 10));
-      await session.run(
-        'MATCH (n) WHERE id(n) = $numId SET n += $props',
-        { numId, props }
-      );
-    }
-    res.json({ success: true });
+    });
+
+    const files = fs.readdirSync(outDir).filter(f => f.endsWith('.json'));
+    const pathways = files.map(f => {
+      const data = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8'));
+      return { name: data.name || f.replace('.json', ''), data };
+    });
+
+    res.json({ pathways });
   } catch (err) {
-    console.error('Update node error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('RNEF conversion error:', err.message);
+    res.status(500).json({ error: 'Conversion failed: ' + err.message });
   } finally {
-    await session.close();
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch(e) {}
   }
 });
 
-// ─── Curation: update relation properties ────────────────────────────────────
-app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, res) => {
-  const { elementId, properties } = req.body || {};
-  if (!elementId || !properties) return res.status(400).json({ error: 'elementId and properties required' });
-
-  const props = Object.fromEntries(
-    Object.entries(properties).filter(([, v]) => v !== null && v !== undefined)
-  );
-
-  const session = neo4jDriver.session({ database: NEO4J_DB });
-  try {
-    try {
-      await session.run(
-        'MATCH ()-[r]-() WHERE elementId(r) = $elementId SET r += $props',
-        { elementId, props }
-      );
-    } catch {
-      const numId = neo4j.int(parseInt(elementId, 10));
-      await session.run(
-        'MATCH ()-[r]-() WHERE id(r) = $numId SET r += $props',
-        { numId, props }
-      );
-    }
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Update relation error:', err.message);
-    res.status(500).json({ error: err.message });
-  } finally {
-    await session.close();
-  }
-});
-
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('\nGraph Explorer running at http://localhost:' + PORT);
-  loadUsers();
-});
-
-process.on('SIGINT', async () => {
-  console.log('\nShutting down...');
-  await neo4jDriver.close();
-  await pgPool.end();
-  process.exit(0);
+  console.log(`Graph Explorer running on http://localhost:${PORT}`);
 });
