@@ -37,8 +37,8 @@ const dbLimiter = rateLimit({
 // ─── Neo4j ───────────────────────────────────────────────────────────────────
 // bolt+ssc = encrypted, trust all certificates (including self-signed)
 const neo4jDriver = neo4j.driver(
-  'bolt+ssc://neo4j.lifesciencepsg.com:7687',
-  neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
+  'YOUR_NEO4J_URI',
+  neo4j.auth.basic('YOUR_NEO4J_USER', 'YOUR_NEO4J_PASSWORD')
 );
 const NEO4J_DB = 'mammaloct2025new';
 // URN property name on Neo4j nodes — change to match your schema (e.g. 'id', '@id', 'URN')
@@ -63,10 +63,10 @@ const PG_SCHEMA = process.env.PG_SCHEMA || 'resnetcustomnov';
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pgPool = new Pool({
-  host: 'postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com',
+  host: 'YOUR_PG_HOST',
   port: 5432,
-  database: 'psgdev',
-  user: 'YOUR_PG_USERNAME',
+  database: 'YOUR_PG_DATABASE',
+  user: 'YOUR_PG_USER',
   password: 'YOUR_PG_PASSWORD',
   ssl: { rejectUnauthorized: false },
   max: 10,
@@ -75,7 +75,7 @@ const pgPool = new Pool({
 });
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const JWT_SECRET = process.env.JWT_SECRET || 'graph-explorer-jwt-secret-change-in-production';
+const JWT_SECRET = process.env.JWT_SECRET || 'YOUR_JWT_SECRET';
 const USERS_FILE = path.join(__dirname, 'users.json');
 
 function loadUsers() {
@@ -283,10 +283,21 @@ app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
       });
     });
 
-    res.json({
+    const response = {
       nodes: Array.from(nodesMap.values()),
       edges: Array.from(edgesMap.values())
-    });
+    };
+
+    // If no graph elements extracted, include raw tabular data for display
+    if (nodesMap.size === 0 && edgesMap.size === 0 && result.records.length > 0) {
+      const columns = result.records[0].keys;
+      const rows = result.records.map(record =>
+        columns.map(key => toPlain(record.get(key)))
+      );
+      response.table = { columns, rows };
+    }
+
+    res.json(response);
   } catch (err) {
     console.error('Neo4j error:', err.message);
     res.status(500).json({ error: err.message });
@@ -560,6 +571,23 @@ app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('schema/columns error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Raw SQL query (admin only) ───────────────────────────────────────────────
+app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { sql } = req.body;
+  if (!sql || typeof sql !== 'string') return res.status(400).json({ error: 'sql required' });
+  const trimmed = sql.trim().toUpperCase();
+  if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('WITH')) {
+    return res.status(400).json({ error: 'Only SELECT / WITH queries are permitted' });
+  }
+  try {
+    const result = await pgPool.query(sql);
+    res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
