@@ -1,79 +1,70 @@
-# Graph Explorer — Installation & User Guide
+# Graph Explorer
 
-A web app for exploring and curating Neo4j graph data with PostgreSQL reference lookup.
+A web application for exploring and curating biological knowledge graphs stored in **Neo4j**, with **PostgreSQL** reference lookup, RNEF pathway import, multi-tab workspace, and Excel export.
+
+> **Documentation**  
+> 📘 [Graph_Explorer_User_Manual.docx](Graph_Explorer_User_Manual.docx) — step-by-step guide for end users  
+> 📗 [Graph_Explorer_FRD.docx](Graph_Explorer_FRD.docx) — complete functional requirements for developers
 
 ---
 
-## Files to share with colleagues
-
-Send the entire `graph-explorer` folder containing exactly these files:
+## Project files
 
 ```
 graph-explorer/
-  server.js           <- Backend server
-  package.json        <- Dependency list (do not edit)
+  server.js                       Backend server (Node.js/Express)
+  package.json                    Dependency list
+  rnef_to_json.py                 RNEF → JSON converter (called by server)
   public/
-    index.html        <- App HTML
-    app.js            <- Frontend logic
-    app.css           <- Styles
+    index.html                    App HTML & modals
+    app.js                        All frontend logic (~3 000 lines)
+    app.css                       Styles
+  Graph_Explorer_User_Manual.docx End-user guide
+  Graph_Explorer_FRD.docx         Functional requirements document
 ```
-
-Zip the folder and share it. Do **not** include `public/INDEX~1.zip` if present — it is a temp file.
 
 ---
 
 ## Prerequisites
 
-**Node.js v18 or later** must be installed on the machine running the server.
+**Node.js v18 or later** — download from https://nodejs.org (choose the LTS installer).
 
-- Download: https://nodejs.org/en/download (choose the LTS installer for your OS)
-- Verify installation: open a terminal and run `node --version`
+**Python 3** — required for RNEF file conversion. Usually pre-installed on Mac/Linux; download from https://python.org on Windows.
 
 The machine also needs network access to:
 - Neo4j at `neo4j.lifesciencepsg.com:7687`
 - PostgreSQL at `postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com:5432`
 
-(VPN may be required if you are off-site.)
+(VPN may be required off-site.)
 
 ---
 
-## Configuring database credentials
+## Configuration
 
-Each user must set their own Neo4j and PostgreSQL credentials in `server.js` before starting the app. Open `server.js` in any text editor and update the two sections near the top of the file:
+Open `server.js` in any text editor and fill in your credentials near the top of the file:
 
-**Neo4j** (lines ~15–19):
+**Neo4j**
 ```javascript
 const neo4jDriver = neo4j.driver(
-  'bolt+ssc://neo4j.lifesciencepsg.com:7687',
-  neo4j.auth.basic('YOUR_NEO4J_USERNAME', 'YOUR_NEO4J_PASSWORD')
+  'YOUR_NEO4J_URI',
+  neo4j.auth.basic('YOUR_NEO4J_USER', 'YOUR_NEO4J_PASSWORD')
 );
-const NEO4J_DB = 'mammaloct2025new';   // <- change to your Neo4j database name
+const NEO4J_DB = 'YOUR_NEO4J_DATABASE';
 ```
 
-Change `'mammaloct2025new'` to your own Neo4j database name. You can find the database name in the Neo4j Browser under the database selector (top-left dropdown), or by running `:dbs` in the Neo4j Browser console.
-
-**PostgreSQL** (lines ~22–32):
+**PostgreSQL**
 ```javascript
 const pgPool = new Pool({
-  host: 'postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com',
-  port: 5432,
-  database: 'psgdev',
-  user: 'YOUR_PG_USERNAME',
+  host:     'YOUR_PG_HOST',
+  port:     5432,
+  database: 'YOUR_PG_DATABASE',
+  user:     'YOUR_PG_USER',
   password: 'YOUR_PG_PASSWORD',
-  ssl: { rejectUnauthorized: false },
-  ...
+  ssl: { rejectUnauthorized: false }
 });
 ```
 
-Replace `YOUR_NEO4J_USERNAME`, `YOUR_NEO4J_PASSWORD`, `YOUR_PG_USERNAME`, and `YOUR_PG_PASSWORD` with your own credentials. The host, port, and database name are shared and should stay the same unless your DBA tells you otherwise.
-
-**PostgreSQL schema** (line ~35):
-```javascript
-const PG_SCHEMA = process.env.PG_SCHEMA || 'resnetcustomnov';
-```
-
-Change `'resnetcustomnov'` to your own schema name. Alternatively, set it without editing the file by passing an environment variable when starting the server:
-
+**PostgreSQL schema** — set via environment variable or edit the default in `server.js`:
 ```
 PG_SCHEMA=myschema node server.js          # Mac / Linux
 set PG_SCHEMA=myschema && node server.js   # Windows Command Prompt
@@ -82,128 +73,116 @@ $env:PG_SCHEMA="myschema"; node server.js  # Windows PowerShell
 
 ---
 
-## Installation (one-time)
+## Installation
 
-1. Unzip the folder to any location, e.g. `C:\graph-explorer\`
-
-2. Open a terminal (**Command Prompt** or **PowerShell** on Windows; **Terminal** on Mac/Linux)
-
-3. Navigate to the folder:
-   ```
-   cd C:\graph-explorer
-   ```
-
-4. Install dependencies (downloads ~10 MB of libraries into a `node_modules` subfolder):
-   ```
-   npm install
-   ```
+```bash
+cd graph-explorer
+npm install
+```
 
 ---
 
-## Starting the app
+## Starting the server
 
-Each time you want to use the app:
+```bash
+node server.js
+# → Graph Explorer running at http://localhost:3000
+```
 
-1. Open a terminal and go to the project folder:
-   ```
-   cd C:\graph-explorer
-   ```
+Open **http://localhost:3000** in your browser.  
+Stop the server with **Ctrl+C**.
 
-2. Start the server:
-   ```
-   node server.js
-   ```
-   You should see:
-   ```
-   Graph Explorer running at http://localhost:3000
-   ```
+### Default admin account
 
-3. Open your browser and go to: **http://localhost:3000**
-
-4. To stop the server, press **Ctrl+C** in the terminal.
-
----
-
-## First login
-
-A default admin account is created automatically on the very first run:
-
-| Username | Password   |
-|----------|------------|
+| Username | Password  |
+|----------|-----------|
 | `admin`  | `admin123` |
 
-**Change this password immediately** after logging in — click "Change Password" in the top-right header.
-
-The admin account can create additional user accounts via the **Users** button in the header.
+Change this password immediately after first login (header → **Change Password**).
 
 ---
 
-## Features
+## Feature overview
 
-| Feature | How to use |
-|---------|------------|
-| Run a Cypher query | Type in the query box, press **▶ Run** or Ctrl+Enter |
-| Change graph layout | Toolbar: Force / Hierarchical / Circular / Concentric / Grid |
-| Move nodes | Drag nodes to reposition manually |
-| Node/edge tooltip | Hover over a node or edge |
-| Edit properties | Right-click any node or edge → **Edit Properties** |
-| Table view | Click **Table** in the toolbar top-right |
-| Filter table | Type in the "Filter rows..." box |
-| Export CSV | Table view → **⬇ Export CSV** |
-| Save subgraph | Click **💾 Save** → enter a name → downloads a `.json` file |
-| Load subgraph | Click **📂 Load** → pick a previously saved `.json` file |
+| Category | Feature |
+|---|---|
+| **Graph** | Cytoscape.js canvas with node/edge tooltips, neighborhood highlighting, drag-to-reposition |
+| **Layouts** | CoSE (default), Dagre, Circle, Concentric, Grid |
+| **Node types** | Color-coded by biological type (Protein, Gene, SmallMol, Disease, …) |
+| **Edge types** | Color-coded by relation type; thickness ∝ reference count; solid = direct, dashed = indirect |
+| **Clone nodes** | Nodes that appear more than once (RNEF pathways); gold double-border; manual cloning via right-click |
+| **Reaction nodes** | Hyperedge intermediaries for multi-participant reactions (from RNEF) |
+| **Tabs** | Multiple independent graph sessions in one browser window |
+| **File I/O** | Open/Save JSON subgraphs; open RNEF pathway files (single or multi-pathway with tab per pathway) |
+| **Table view** | References mode (one row/reference) and Relations mode (one row/edge) |
+| **Columns** | Add/remove/reorder/resize columns; reference, Neo4j, and Scopus data columns |
+| **Sentence coloring** | MedScan entity markup highlighted red (regulator) and green (target) |
+| **Export** | CSV and Excel (.xlsx) with rich-text sentence coloring and hyperlinked PMIDs/DOIs |
+| **Selection** | Click, box-select, select all, invert; Move mode vs. box-select mode |
+| **Clipboard** | Copy/paste nodes and edges across tabs |
+| **Curation** | Right-click any node or edge → Edit Properties → saves directly to Neo4j |
+| **User management** | Admin can add/remove users and assign roles (admin/user) |
+| **SQL query** | Admin can run read-only PostgreSQL SELECT queries from the browser |
+| **Security** | JWT auth (12 h), bcrypt passwords, rate limiting, credential redaction for GitHub |
 
 ---
 
 ## Sample Cypher queries
 
 ```cypher
--- Fetch 50 relations
+// 50 relations
 MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 50
 
--- Genes connected to a specific protein
+// Genes connected to a protein
 MATCH (g:Gene)-[r]->(p:Protein {name:'TP53'}) RETURN g, r, p LIMIT 30
 
--- Path between two nodes (up to 2 hops)
+// Paths up to 2 hops from a node
 MATCH path=(a {name:'BRCA1'})-[*1..2]-(b) RETURN path LIMIT 40
+
+// Small molecules in a pathway
+MATCH (s:SmallMol)-[r]-(t) RETURN s, r, t LIMIT 50
 ```
 
 ---
 
-## Running on a shared server (optional)
-
-If you want colleagues to access the app without running it locally on each machine,
-deploy it once on a shared Linux server:
+## Running on a shared server
 
 ```bash
-# Install Node.js (Ubuntu/Debian)
+# Ubuntu/Debian — install Node.js
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt-get install -y nodejs
+sudo apt-get install -y nodejs python3
 
-# Copy project files to the server, then:
 cd /path/to/graph-explorer
 npm install
 node server.js
 ```
 
-To keep the server running after you log out, use **pm2**:
+To keep the server running after logout, use **pm2**:
 ```bash
 npm install -g pm2
 pm2 start server.js --name graph-explorer
-pm2 save
-pm2 startup   # follow the printed instructions to auto-start on reboot
+pm2 save && pm2 startup
 ```
 
-Colleagues then open: `http://<server-ip>:3000`
+Colleagues connect at: `http://<server-ip>:3000`
 
 ---
 
 ## Troubleshooting
 
 | Problem | Fix |
-|---------|-----|
-| `node: command not found` | Install Node.js from https://nodejs.org |
+|---|---|
+| `node: command not found` | Install Node.js ≥ 18 from https://nodejs.org |
 | `Cannot find module 'express'` | Run `npm install` inside the project folder |
-| Login page is blank / errors in browser console | Check the terminal window for error messages |
-| Cannot reach Neo4j or PostgreSQL | Confirm you have VPN/network access to those servers |
-| Port 3000 already in use | Use a different port: `PORT=3001 node server.js` (Mac/Linux) or `set PORT=3001 && node server.js` (Windows) |
+| RNEF conversion fails | Ensure Python 3 is installed and on PATH |
+| Cannot reach Neo4j / PostgreSQL | Check VPN and verify credentials in `server.js` |
+| Port 3000 already in use | `PORT=3001 node server.js` (Mac/Linux) · `set PORT=3001 && node server.js` (Windows) |
+| Session expired after 12 hours | Log in again; save your work with File → Save Subgraph before long breaks |
+
+---
+
+## Security notes
+
+- Credentials in `server.js` are redacted by `github-upload.js` before upload — **never commit `server.js` directly** without running through the upload script.
+- The `/api/sql-query` endpoint accepts SELECT/WITH statements only and is restricted to admin users.
+- JWT tokens expire after 12 hours.
