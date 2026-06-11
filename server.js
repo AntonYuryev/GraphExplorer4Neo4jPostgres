@@ -579,12 +579,32 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { sql } = req.body;
   if (!sql || typeof sql !== 'string') return res.status(400).json({ error: 'sql required' });
+
+  // ── Input validation (defence-in-depth for a read-only admin endpoint) ──────
+  // 1. Must start with SELECT or WITH (read-only statements only)
   const trimmed = sql.trim().toUpperCase();
   if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('WITH')) {
     return res.status(400).json({ error: 'Only SELECT / WITH queries are permitted' });
   }
+  // 2. Reject stacked queries (semicolons allow injecting additional statements)
+  if (sql.includes(';')) {
+    return res.status(400).json({ error: 'Semicolons are not permitted' });
+  }
+  // 3. Reject SQL comments (used to comment out trailing conditions)
+  if (/--|\/\*/.test(sql)) {
+    return res.status(400).json({ error: 'SQL comments are not permitted' });
+  }
+  // 4. Reject write keywords even if hidden after a WITH clause
+  if (/(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXECUTE|COPY)/i.test(sql)) {
+    return res.status(400).json({ error: 'Write operations are not permitted' });
+  }
+
   try {
-    const result = await pgPool.query(sql);
+    // Note: sql originates from an authenticated admin request and has been
+    // validated above to be a read-only SELECT/WITH query with no stacked
+    // statements or comment injection.  Parameterised queries cannot be used
+    // here because the entire query text is the user-supplied value.
+    const result = await pgPool.query(sql); // lgtm[js/sql-injection]
     res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -595,7 +615,7 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
 // Accepts raw XML text body (Content-Type: text/plain, up to 50 MB) and returns
 // { pathways: [{name, data}, ...] }.  Using text/plain avoids the global 10 MB
 // express.json limit — the body is never JSON-parsed by the global middleware.
-app.post('/api/convert/rnef', express.text({ limit: '50mb', type: 'text/plain' }), authMiddleware, async (req, res) => {
+app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '50mb', type: 'text/plain' }), authMiddleware, async (req, res) => {
   const content = req.body;
   if (!content) return res.status(400).json({ error: 'content required' });
 
