@@ -55,7 +55,7 @@
       <span id="app-title">Graph Explorer</span>
     </div>
     <div id="header-center">
-      <div id="graph-stats"></div>
+      <div id="graph-stats"></div><button onclick="zoomOut()" title="Zoom Out" style="margin-left:10px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">−</button><button id="fit-btn" onclick="zoomFit()" title="Fit graph to window" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">Fit</button><button onclick="zoomIn()" title="Zoom In" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">+</button>
     </div>
     <div id="header-right">
       <span id="current-user-label"></span>
@@ -65,8 +65,119 @@
     </div>
   </header>
 
-  <!-- Query bar -->
-  <div id="query-bar">
+  <!-- Menu bar -->
+  <div id="menubar">
+
+    <!-- File -->
+    <div class="menu-entry" id="me-file">
+      <div class="menu-label" onclick="toggleMenu('me-file')" onmouseenter="hoverMenu('me-file')">File</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" onclick="document.getElementById('load-file-input').click();closeMenus()">Load subgraph</div>
+        <div class="menu-item" onclick="promptSaveSubgraph();closeMenus()">Save subgraph</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="exportTableCSV();closeMenus()">Export CSV</div>
+        <div class="menu-item" onclick="exportTableExcel();closeMenus()">Export Excel</div>
+      </div>
+    </div>
+
+    <!-- Database -->
+    <div class="menu-entry" id="me-database">
+      <div class="menu-label" onclick="toggleMenu('me-database')" onmouseenter="hoverMenu('me-database')">Database</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" onclick="focusCypherInput();closeMenus()">Neo4j Cypher</div>
+        <div class="menu-item" onclick="openSqlDialog();closeMenus()">Postgres SQL</div>
+      </div>
+    </div>
+
+    <!-- View -->
+    <div class="menu-entry" id="me-view">
+      <div class="menu-label" onclick="toggleMenu('me-view')" onmouseenter="hoverMenu('me-view')">View</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" onclick="switchView('graph');closeMenus()"><span class="menu-check" id="mc-view-graph">✓</span>Graph</div>
+        <div class="menu-item has-sub" onclick="selectTableMode('relation')"><span class="menu-check" id="mc-view-relation"></span>Relations
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="toggleFilterRows();closeMenus()"><span class="menu-check" id="mc-filter-rows"></span>Filter rows</div>
+          </div>
+        </div>
+        <div class="menu-item has-sub" onclick="selectTableMode('reference')"><span class="menu-check" id="mc-view-reference"></span>References
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="toggleFilterRows();closeMenus()"><span class="menu-check" id="mc-filter-rows-ref"></span>Filter rows</div>
+          </div>
+        </div>
+        <div id="view-graph-items">
+          <div class="menu-separator"></div>
+          <div class="menu-item has-sub">Zoom
+            <div class="menu-submenu">
+              <div class="menu-item" onclick="zoomIn();closeMenus()">Zoom In</div>
+              <div class="menu-item" onclick="zoomOut();closeMenus()">Zoom Out</div>
+              <div class="menu-item" onclick="zoomFit();closeMenus()">Fit</div>
+              <div class="menu-item menu-item-passive"><span id="zoom-level" style="color:#7a8099">100%</span></div>
+            </div>
+          </div>
+          <div class="menu-separator"></div>
+          <div class="menu-item has-sub">Layout
+            <div class="menu-submenu">
+              <div class="menu-item" onclick="menuApplyLayout('cose');closeMenus()"><span class="menu-check" id="mc-cose">✓</span>Force</div>
+              <div class="menu-item" onclick="menuApplyLayout('grid');closeMenus()"><span class="menu-check" id="mc-grid"></span>Grid</div>
+              <div class="menu-item" onclick="menuApplyLayout('dagre');closeMenus()"><span class="menu-check" id="mc-dagre"></span>Hierarchical</div>
+              <div class="menu-item" onclick="menuApplyLayout('circle');closeMenus()"><span class="menu-check" id="mc-circle"></span>Circular</div>
+              <div class="menu-item" onclick="menuApplyLayout('concentric');closeMenus()"><span class="menu-check" id="mc-concentric"></span>Concentric</div>
+            </div>
+          </div>
+          <div class="menu-separator"></div>
+          <div class="menu-item" id="me-move-mode" onclick="toggleMoveMode();closeMenus()"><span class="menu-check" id="mc-move-mode"></span>Move</div>
+        </div>
+        <div id="view-table-items" style="display:none">
+          <div class="menu-separator"></div>
+          <div class="menu-item has-sub">Columns
+            <div class="menu-submenu">
+              <div class="menu-item" onclick="openColumnsDialog();closeMenus()">Add / Remove</div>
+              <div class="menu-item" onclick="autofitColumns();closeMenus()">Autofit</div>
+              <div class="menu-item" onclick="colorSentencesNow();closeMenus()">Color sentences</div>
+            </div>
+          </div>
+          <div class="menu-item" onclick="toggleFilterRows();closeMenus()"><span class="menu-check" id="mc-filter-rows-view"></span>Filter rows</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Select -->
+    <div class="menu-entry" id="me-select">
+      <div class="menu-label" onclick="toggleMenu('me-select')" onmouseenter="hoverMenu('me-select')">Select</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" id="me-select-area" onclick="toggleBoxSelect();closeMenus()">By area</div>
+        <div class="menu-item" onclick="selectAllNodes();closeMenus()">Nodes</div>
+        <div class="menu-item" onclick="selectAllEdges();closeMenus()">Relations</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="invertSelection();closeMenus()">Invert selection</div>
+      </div>
+    </div>
+
+    <!-- Edit -->
+    <div class="menu-entry" id="me-edit">
+      <div class="menu-label" onclick="toggleMenu('me-edit')" onmouseenter="hoverMenu('me-edit')">Edit</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" onclick="copySelection();closeMenus()">Copy</div>
+        <div class="menu-item" id="mi-paste" onclick="pasteClipboard();closeMenus()">Paste</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="deleteSelection();closeMenus()">Delete selected</div>
+      </div>
+    </div>
+
+    <div id="menubar-right">
+      <span id="selection-info"></span>
+    </div>
+
+  </div><!-- /menubar -->
+
+  <!-- Tab bar -->
+  <div id="tab-bar">
+    <div id="tab-list"></div>
+    <button id="tab-new-btn" onclick="createNewTab()" title="Open new tab">+</button>
+  </div>
+
+  <!-- Query bar (hidden by default; toggled via Database → Neo4j Cypher) -->
+  <div id="query-bar" style="display:none">
     <textarea id="cypher-input" placeholder="Enter Cypher query — e.g.: MATCH (n)-[r]->(m) RETURN n, r, m LIMIT 50" rows="2" onkeydown="handleQueryKeydown(event)"></textarea>
     <div id="query-actions">
       <button class="btn-primary" onclick="runQuery()" id="run-btn">▶ Run</button>
@@ -74,41 +185,8 @@
     </div>
   </div>
 
-  <!-- Toolbar -->
-  <div id="toolbar">
-    <!-- Layout -->
-    <div class="toolbar-group">
-      <span class="toolbar-label">Layout</span>
-      <button class="btn-tool active" data-layout="cose" onclick="applyLayout('cose',this)">Force</button>
-      <button class="btn-tool" data-layout="dagre" onclick="applyLayout('dagre',this)">Hierarchical</button>
-      <button class="btn-tool" data-layout="circle" onclick="applyLayout('circle',this)">Circular</button>
-      <button class="btn-tool" data-layout="concentric" onclick="applyLayout('concentric',this)">Concentric</button>
-      <button class="btn-tool" data-layout="grid" onclick="applyLayout('grid',this)">Grid</button>
-    </div>
-
-    <!-- Save/Load -->
-    <div class="toolbar-group">
-      <span class="toolbar-label">Subgraph</span>
-      <button class="btn-tool" onclick="promptSaveSubgraph()">💾 Save</button>
-      <button class="btn-tool" onclick="document.getElementById('load-file-input').click()">📂 Load</button>
-      <input type="file" id="load-file-input" accept=".json,.rnef" style="display:none" onchange="loadSubgraph(event)">
-    </div>
-
-    <!-- Zoom -->
-    <div class="toolbar-group" id="zoom-controls">
-      <span class="toolbar-label">Zoom</span>
-      <button class="btn-tool" onclick="zoomIn()" title="Zoom in">+</button>
-      <button class="btn-tool" onclick="zoomOut()" title="Zoom out">−</button>
-      <button class="btn-tool" onclick="zoomFit()" title="Fit all nodes">Fit</button>
-      <span id="zoom-level" style="font-size:11px;color:#7a8099;min-width:36px;text-align:center;align-self:center">100%</span>
-    </div>
-
-    <!-- View toggle -->
-    <div class="toolbar-group" style="margin-left:auto">
-      <button class="btn-tool active" id="view-graph-btn" onclick="switchView('graph')">Graph</button>
-      <button class="btn-tool" id="view-table-btn" onclick="switchView('table')">Table</button>
-    </div>
-  </div>
+  <!-- Hidden file input for subgraph load -->
+  <input type="file" id="load-file-input" accept=".json,.rnef" style="display:none" onchange="loadSubgraph(event)">
 
   <!-- Main content area -->
   <div id="content-area">
@@ -118,9 +196,9 @@
       <div id="graph-canvas-wrapper">
         <div id="cy"></div>
         <div id="graph-empty-state">
-          <p>Run a Cypher query to visualize the graph</p>
-          <code>MATCH (n)-[r]-&gt;(m) RETURN n, r, m LIMIT 50</code>
+          <p>Build the graph by using Database&nbsp;&#x2192;&nbsp;Neo4j Cypher or Copy/Pasting from another pathway</p>
         </div>
+        <div id="query-result-overlay" style="display:none"></div>
         <div id="graph-loading" style="display:none">
           <div class="spinner"></div>
           <span>Querying Neo4j...</span>
@@ -145,10 +223,7 @@
     <!-- Table view (hidden by default) -->
     <div id="table-view" style="display:none">
       <div id="table-toolbar">
-        <input type="text" id="table-search" placeholder="Filter rows..." oninput="filterTable(this.value)">
-        <button class="btn-tool" onclick="openColumnsDialog()">⚙ Columns</button>
-        <button class="btn-tool" onclick="exportTableCSV()">⬇ Export CSV</button>
-        <button class="btn-tool" onclick="exportTableExcel()">⬇ Export Excel</button>
+        <input type="text" id="table-search" placeholder="Filter rows..." oninput="filterTable(this.value)" style="display:none">
         <span id="table-loading-msg" style="display:none;color:#888;font-size:12px">Loading references...</span>
       </div>
       <div id="table-wrapper">
@@ -160,6 +235,19 @@
     </div>
 
   </div><!-- /content-area -->
+
+  <!-- SQL Query modal -->
+  <div id="sql-modal" class="modal-backdrop" style="display:none" onclick="closeSqlModal(event)">
+    <div class="modal-box" style="width:680px;max-width:95vw" onclick="event.stopPropagation()">
+      <h3>Postgres SQL Query</h3>
+      <textarea id="sql-input" rows="4" placeholder="SELECT * FROM relations LIMIT 20" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#12151f;color:#e0e0e0;border:1px solid #2d3147;border-radius:6px;font-family:'Courier New',monospace;font-size:12px;resize:vertical;outline:none;margin-bottom:10px"></textarea>
+      <div id="sql-results" style="max-height:320px;overflow:auto;font-size:12px"></div>
+      <div class="modal-actions" style="margin-top:12px">
+        <button class="btn-ghost" onclick="document.getElementById('sql-modal').style.display='none'">Close</button>
+        <button class="btn-primary" onclick="runSqlQuery()">▶ Run</button>
+      </div>
+    </div>
+  </div>
 
 </div><!-- /app -->
 
@@ -226,6 +314,9 @@
 <!-- Right-click context menu -->
 <div id="context-menu" style="display:none">
   <div class="ctx-item" onclick="openCurationFromContext()">✏️ Edit Properties</div>
+  <div class="ctx-item" id="ctx-clone" onclick="cloneNodeFromContext()" style="display:none">🔗 Clone node</div>
+  <div class="ctx-separator" id="ctx-sep-clone" style="display:none"></div>
+  <div class="ctx-item" id="ctx-unclone" onclick="removeCloneFromContext()" style="display:none">🗑️ Remove clone</div>
 </div>
 
 <!-- Columns dialog -->
@@ -234,10 +325,18 @@
     <h3>Configure Columns</h3>
     <p style="color:#7a8099;font-size:12px;margin-bottom:14px">Check columns to show. Drag table headers to reorder.</p>
     <div style="overflow-y:auto;flex:1">
-      <div class="prop-section-title">reference table</div>
-      <div id="col-ref-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+      <div class="prop-section-title">graph columns (both views)</div>
+      <div id="col-graph-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+      <div id="col-neo4j-section">
+        <div class="prop-section-title">Neo4j edge properties (Relation view)</div>
+        <div id="col-neo4j-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+      </div>
+      <div id="col-ref-section">
+        <div class="prop-section-title">reference table columns (Reference view)</div>
+        <div id="col-ref-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+      </div>
       <div id="col-sd-section">
-        <div class="prop-section-title">scopus_data table</div>
+        <div class="prop-section-title">scopus_data table (Reference view)</div>
         <div id="col-sd-list" style="display:flex;flex-wrap:wrap;gap:4px 16px"></div>
       </div>
     </div>
@@ -264,12 +363,18 @@
 
 <!-- RNEF pathway selection modal (shown when .rnef has multiple sub-graphs) -->
 <div id="rnef-modal" class="modal-backdrop" style="display:none" onclick="closeRnefModal(event)">
-  <div class="modal-box" style="min-width:480px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
-    <h3>Select Pathway</h3>
-    <p style="color:#7a8099;font-size:12px;margin-bottom:14px">This file contains multiple pathways. Choose one to open.</p>
-    <div id="rnef-pathway-list" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:6px"></div>
-    <div class="modal-actions" style="margin-top:14px">
+  <div class="modal-box" style="width:520px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden" onclick="event.stopPropagation()">
+    <h3>Select Pathways</h3>
+    <p style="color:#7a8099;font-size:12px;margin-bottom:10px">Check the pathways to open — each opens in its own tab.</p>
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#7a8099;margin-bottom:8px;cursor:pointer">
+      <input type="checkbox" id="rnef-select-all" onchange="toggleAllRnefCheckboxes(this)">
+      Select all
+    </label>
+    <div id="rnef-pathway-list" style="overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:4px"></div>
+    <div class="modal-actions" style="margin-top:14px;align-items:center">
+      <span id="rnef-select-hint" style="display:none;color:#e05560;font-size:12px;flex:1">Select at least one pathway.</span>
       <button class="btn-ghost" onclick="document.getElementById('rnef-modal').style.display='none'">Cancel</button>
+      <button class="btn-primary" onclick="openSelectedRnefPathways()">Open Selected</button>
     </div>
   </div>
 </div>
