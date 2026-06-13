@@ -111,7 +111,19 @@ function makePgPool(cfg) {
 }
 
 let pgPool    = makePgPool(appSettings.postgres);
-let PG_SCHEMA = appSettings.postgres.schema || 'resnetcustomnov';
+
+// Validate schema name: must be a plain SQL identifier (letters, digits, underscores).
+// This sanitises every downstream ${PG_SCHEMA} interpolation, preventing SQL injection
+// regardless of how the schema was configured (settings.json or the Settings UI).
+function sanitizeSchemaName(name) {
+  const s = (typeof name === 'string' ? name : '') || 'resnetcustomnov';
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(s)) {
+    throw new Error(`Unsafe PostgreSQL schema name rejected: "${s}"`);
+  }
+  return s;
+}
+
+let PG_SCHEMA = sanitizeSchemaName(appSettings.postgres.schema);
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'YOUR_JWT_SECRET';
@@ -392,7 +404,7 @@ app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, a
   // Commit: end old pool, switch to new
   try { await pgPool.end(); } catch(e) {}
   pgPool    = testPool;
-  PG_SCHEMA = cfg.schema;
+  PG_SCHEMA = sanitizeSchemaName(cfg.schema);
   appSettings.postgres = cfg;
   saveAppSettings(appSettings);
   res.json({ success: true });
@@ -760,23 +772,9 @@ app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, re
 
 // ─── Schema columns (for Add/Remove columns dialog) ──────────────────────────
 app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
-  const SCOPUS_COL_SQL = {
-    citation_type:  'sd."citation_type"  AS "sd_citation_type"',
-    citation_count: 'sd."citation_count" AS "sd_citation_count"',
-    sjr:            'sd."sjr"            AS "sd_sjr"',
-    snip:           'sd."snip"           AS "sd_snip"',
-    source_title:   'sd."source_title"   AS "sd_source_title"',
-    issn:           'sd."issn"           AS "sd_issn"',
-    volume:         'sd."volume"         AS "sd_volume"',
-    issue:          'sd."issue"          AS "sd_issue"',
-    pages:          'sd."pages"          AS "sd_pages"',
-    open_access:    'sd."open_access"    AS "sd_open_access"',
-    subject_area:   'sd."subject_area"   AS "sd_subject_area"',
-    keywords:       'sd."keywords"       AS "sd_keywords"',
-    abstract:       'sd."abstract"       AS "sd_abstract"',
-    affiliation:    'sd."affiliation"    AS "sd_affiliation"',
-    funding_info:   'sd."funding_info"   AS "sd_funding_info"'
-  };
+  // scopusColumns is derived from the module-level SCOPUS_COL_SQL map so it
+  // always stays in sync with the columns the /api/references/batch endpoint
+  // actually queries.
   try {
     const refCols = await pgPool.query(
       `SELECT column_name FROM information_schema.columns
