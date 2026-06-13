@@ -24,9 +24,13 @@ let tableRows = [];                          // all table rows
 let tableSortCol = null;
 let tableSortAsc = true;
 let currentLayout = 'cose';
+let currentStyle  = 'default';
 let currentSubgraphName = '';   // name from loaded JSON file
 let contextTarget = null;   // element targeted by right-click
 let curationTarget = null;  // element open in curation modal
+let undoStack = [];          // stack of {graphData, positions} snapshots for undo
+let focusNodeId = null;      // reference node for alignment operations
+let _loadedPropertyNames = new Set();  // property names loaded via "Load node properties" dialog
 
 // ─── Tab system state ─────────────────────────────────────────────────────────
 let tabs = [];               // [{id, name, snapshot}]
@@ -56,29 +60,43 @@ const COLOR_PALETTE = [
   '#2ca02c','#ff9896','#aec7e8','#ffbb78','#98df8a'
 ];
 
+// Returns '#000000' or '#ffffff' — whichever contrasts better against the given hex color.
+function contrastColor(hex) {
+  if (!hex || hex.length < 7) return '#ffffff';
+  var r = parseInt(hex.slice(1, 3), 16);
+  var g = parseInt(hex.slice(3, 5), 16);
+  var b = parseInt(hex.slice(5, 7), 16);
+  var luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.5 ? '#000000' : '#ffffff';
+}
+
 const NODE_COLORS = {
   // Node types — Pathway Studio colour scheme
-  Protein:          '#d32f2f',  // red
-  SmallMol:         '#388e3c',  // green
-  Treatment:        '#1565c0',  // blue
-  Disease:          '#7b1fa2',  // violet
-  CellProcess:      '#f9a825',  // yellow
-  FunctionalClass:  '#e65100',  // orange
-  Complex:          '#7f0000',  // dark red
-  CellObject:       '#757575',  // gray
-  Tissue:           '#6d4c41',  // brown
-  Organ:            '#4a148c',  // dark violet
-  CellType:         '#81d4fa',  // light blue
-  ChemicalReaction: '#212121',  // black
+  Protein:           '#d32f2f',  // red
+  SmallMol:          '#00C853',  // bright green
+  Treatment:         '#1565c0',  // blue
+  Disease:           '#CC5500',  // burnt orange
+  CellProcess:       '#f9a825',  // yellow
+  FunctionalClass:   '#e65100',  // orange
+  Complex:           '#7f0000',  // dark red
+  CellObject:        '#757575',  // gray
+  Tissue:            '#6d4c41',  // brown
+  Organ:             '#4a148c',  // dark violet
+  CellType:          '#81d4fa',  // light blue
+  GeneticVariant:    '#FF6D00',  // vibrant orange
+  ClinicalParameter: '#5C6BC0',  // slate blue
+  MedicalProcedure:  '#5dd6c5',  // teal
+  Pathogen:          '#61DE2A',  // toxic green
+  Virus:             '#B5BF50',  // bright chartreuse
+  ChemicalReaction:  '#212121',  // black
   // Legacy / fallback node types
-  Gene:             '#388e3c',
-  Drug:             '#1565c0',
-  Chemical:         '#388e3c',
-  Pathway:          '#7b1fa2',
-  Cell:             '#81d4fa',
-  Virus:            '#d32f2f',
-  Bacteria:         '#e65100',
-  Reaction:         '#999999'
+  Gene:              '#388e3c',
+  Drug:              '#1565c0',
+  Chemical:          '#00C853',
+  Pathway:           '#7b1fa2',
+  Cell:              '#81d4fa',
+  Bacteria:          '#61DE2A',
+  Reaction:          '#999999'
 };
 
 // Edge/relation type colours — Pathway Studio colour scheme
@@ -305,7 +323,9 @@ function showApp() {
   document.getElementById('app').style.display = 'flex';
   document.getElementById('current-user-label').textContent = currentUser;
   if (currentRole === 'admin') {
-    document.getElementById('admin-btn').style.display = '';
+    document.getElementById('admin-btn') && (document.getElementById('admin-btn').style.display = '');
+    document.getElementById('settings-users-item').style.display = '';
+    document.getElementById('settings-db-section').style.display = '';
   }
   // Load saved column config or fall back to defaults
   columnDefs = loadColumnConfig() || DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
@@ -434,13 +454,24 @@ function initCytoscape() {
   // Node click: highlight neighbourhood
   cy.on('tap', 'node', function(evt) {
     var node = evt.target;
+    var isCtrl = evt.originalEvent && (evt.originalEvent.ctrlKey || evt.originalEvent.metaKey);
+    if (isCtrl) {
+      // Ctrl+click: designate this node as alignment anchor without changing neighbourhood fade
+      setFocusNode(node.id());
+      return;
+    }
     cy.elements().removeClass('faded');
     var hood = node.closedNeighborhood();
     cy.elements().not(hood).addClass('faded');
+    // Regular click also sets focus and shows resize handles
+    setFocusNode(node.id());
+    showResizeHandles(node);
   });
 
   cy.on('tap', function(evt) {
     if (evt.target === cy) {
+      setFocusNode(null);
+      hideResizeHandles();
       cy.elements().removeClass('faded');
       // Hide tooltip when clicking empty canvas area.
       tooltipVisible = false;
@@ -450,9 +481,14 @@ function initCytoscape() {
     }
   });
 
-  // Save positions on node drag
-  cy.on('dragfree', 'node', function() {
+  // Resize handles: hide while dragging node, restore after
+  cy.on('grab', 'node', function(evt) {
+    if (_rhNode && evt.target.id() === _rhNode.id()) hideResizeHandles();
+  });
+  cy.on('dragfree', 'node', function(evt) {
     currentLayout = 'manual';
+    // Re-show handles if this was the focused node
+    if (focusNodeId && evt.target.id() === focusNodeId) showResizeHandles(evt.target);
   });
 
   // Right-click on node
@@ -466,7 +502,9 @@ function initCytoscape() {
     var id = node.id();
     var elementId = node.data('elementId') || id;
     var name = node.data('Name') || node.data('name') || node.data('label') || id;
-    var SKIP = { id:1, elementId:1, label:1, color:1, nodeType:1, source:1, target:1 };
+    var SKIP = { id:1, elementId:1, label:1, color:1, nodeType:1, source:1, target:1,
+                 customColor:1, customTextColor:1, highlightColor:1, rnefShape:1,
+                 nodeWidth:1, nodeHeight:1, nodeFontSize:1, isClone:1, cloneOf:1 };
     var props = {};
     Object.keys(node.data()).forEach(function(k) {
       if (SKIP[k]) return;
@@ -498,6 +536,10 @@ function initCytoscape() {
 
   // Update zoom label on wheel zoom
   cy.on('zoom', updateZoomLabel);
+  cy.on('zoom pan', repositionResizeHandles);
+  cy.on('position', 'node', function(evt) {
+    if (_rhNode && evt.target.id() === _rhNode.id()) repositionResizeHandles();
+  });
 
   // Prevent browser default context menu over cy canvas
   document.getElementById('cy').addEventListener('contextmenu', function(e) { e.preventDefault(); });
@@ -566,7 +608,7 @@ function menuApplyLayout(name) {
 }
 
 function updateLayoutMenu(name) {
-  ['cose','dagre','circle','concentric','grid'].forEach(function(l) {
+  ['cose','dagre','circle','concentric','grid','klay'].forEach(function(l) {
     var el = document.getElementById('mc-' + l);
     if (el) el.textContent = (l === name) ? '✓' : '';
   });
@@ -669,6 +711,132 @@ function focusCypherInput() {
 }
 
 // ─── SQL query dialog ─────────────────────────────────────────────────────────
+// ─── Load Node Properties ─────────────────────────────────────────────────────
+async function openLoadNodePropertiesDialog() {
+  var modal  = document.getElementById('load-props-modal');
+  var list   = document.getElementById('load-props-list');
+  var status = document.getElementById('load-props-status');
+  list.innerHTML = '<span style="color:#7a8099;font-size:12px">Loading…</span>';
+  status.textContent = '';
+  modal.style.display = 'flex';
+
+  if (!graphData || !graphData.nodes || !graphData.nodes.length) {
+    list.innerHTML = '<span style="color:#7a8099;font-size:12px">No pathway loaded.</span>';
+    return;
+  }
+
+  // Collect numeric NodeIDs from current pathway
+  var nodeIds = [];
+  graphData.nodes.forEach(function(n) {
+    var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+    if (nid && /^-?\d+$/.test(nid)) nodeIds.push(nid);
+  });
+
+  try {
+    var names = await api('/api/nodes/property-names', { nodeIds: nodeIds });
+    if (!Array.isArray(names) || !names.length) {
+      list.innerHTML = '<span style="color:#7a8099;font-size:12px">No properties found for nodes in this pathway.</span>';
+      return;
+    }
+    list.innerHTML = names.map(function(n) {
+      var id = 'lpp-' + n.replace(/[^a-zA-Z0-9]/g, '_');
+      return '<label style="display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap;cursor:pointer">'
+        + '<input type="checkbox" id="' + id + '" data-prop="' + escHtml(n) + '">'
+        + escHtml(n) + '</label>';
+    }).join('');
+  } catch (err) {
+    list.innerHTML = '<span style="color:#e05560;font-size:12px">' + escHtml(err.message) + '</span>';
+  }
+}
+
+function closeLoadPropsModal(e) {
+  var modal = document.getElementById('load-props-modal');
+  if (!e || e.target === modal) modal.style.display = 'none';
+}
+
+function loadPropsSelectAll(checked) {
+  document.querySelectorAll('#load-props-list input[type=checkbox]')
+    .forEach(function(cb) { cb.checked = checked; });
+}
+
+async function executeLoadNodeProperties() {
+  var status = document.getElementById('load-props-status');
+  var btn    = document.getElementById('load-props-upload-btn');
+
+  var selected = Array.from(document.querySelectorAll('#load-props-list input[type=checkbox]:checked'))
+    .map(function(cb) { return cb.getAttribute('data-prop'); });
+  if (!selected.length) { status.textContent = 'Select at least one property.'; return; }
+
+  if (!cy || !graphData) { status.textContent = 'No pathway loaded.'; return; }
+
+  // Collect node IDs and URNs from current pathway
+  var nodeIds = [], urns = [];
+  graphData.nodes.forEach(function(n) {
+    var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (nid && /^-?\d+$/.test(nid)) nodeIds.push(nid);
+    else if (urn) urns.push(urn);
+  });
+
+  if (!nodeIds.length && !urns.length) {
+    status.textContent = 'No nodes with database IDs found in pathway.';
+    return;
+  }
+
+  btn.disabled = true;
+  status.textContent = 'Loading…';
+  try {
+    var result = await api('/api/nodes/load-properties', { nodeIds: nodeIds, urns: urns, properties: selected });
+    var byNodeId = result.byNodeId || {};
+    var byUrn    = result.byUrn    || {};
+
+    // Build URN → cy element lookup.
+    // IMPORTANT: after enrichNodesFromNeo4j, graphData.nodes[i].id is updated to the
+    // Neo4j integer ID but the cy element ID remains the original URN string.
+    // Using cy.getElementById(n.id) fails for enriched RNEF nodes — use URN instead.
+    var urnToCyNode = {};
+    cy.nodes().forEach(function(cyNode) {
+      var urn = cyNode.data('URN');
+      if (urn) urnToCyNode[String(urn)] = cyNode;
+    });
+
+    var annotated = 0;
+    graphData.nodes.forEach(function(n) {
+      var props = null;
+      var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+      var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+      if (nid && byNodeId[nid]) props = byNodeId[nid];
+      else if (urn && byUrn[urn]) props = byUrn[urn];
+      if (!props) return;
+
+      // Update backing graphData
+      Object.assign(n.properties, props);
+
+      // Update live cy element — prefer URN-based lookup, fall back to n.id
+      var cyNode = (urn && urnToCyNode[urn]) ? urnToCyNode[urn] : cy.getElementById(n.id);
+      if (cyNode && cyNode.length) {
+        Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+        annotated++;
+      }
+    });
+
+    if (annotated > 0) {
+      // Track which property names were loaded so the tooltip can show them first
+      selected.forEach(function(k) { _loadedPropertyNames.add(k); });
+      document.getElementById('load-props-modal').style.display = 'none';
+    } else {
+      var total = Object.keys(byNodeId).length + Object.keys(byUrn).length;
+      status.style.color = '#f9a825';
+      status.textContent = 'No matching nodes found in database (' + total + ' DB matches, ' + annotated + ' pathway nodes annotated).';
+    }
+  } catch (err) {
+    status.style.color = '#e05560';
+    status.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function openSqlDialog() {
   document.getElementById('sql-modal').style.display = 'flex';
   document.getElementById('sql-results').innerHTML = '';
@@ -735,6 +903,11 @@ function getCyStyle() {
       selector: 'node:selected',
       style: { 'border-width': 3, 'border-color': '#FFD700', 'border-opacity': 1 }
     },
+    // ── Focus node — white border ring, used as alignment reference ───────────
+    {
+      selector: 'node.focus-node',
+      style: { 'border-width': 4, 'border-color': '#ffffff', 'border-opacity': 1 }
+    },
     {
       selector: 'node.faded',
       style: { 'opacity': 0.2 }
@@ -767,6 +940,22 @@ function getCyStyle() {
       selector: 'edge.faded',
       style: { 'opacity': 0.08 }
     },
+    // ── Effect-based arrow shapes (default for all views) ────────────────
+    {
+      selector: 'edge[effect="Positive"]',
+      style: {
+        'target-arrow-shape': 'triangle',
+        'target-label': '⊕',
+        'target-text-offset': 35,
+        'target-text-background-opacity': 0
+      }
+    },
+    {
+      selector: 'edge[effect="Negative"]',
+      style: {
+        'target-arrow-shape': 'tee'
+      }
+    },
     // ── Reaction (hyperedge) nodes ────────────────────────────────────────
     {
       selector: 'node[NodeType="Reaction"]',
@@ -778,6 +967,130 @@ function getCyStyle() {
         'border-color': '#999',
         'label': '',
         'text-outline-width': 0
+      }
+    },
+    // ── Per-NodeType shapes, gradient fills, borders ────────────────────────
+    // Protein — vertical oval, red gradient
+    { selector: 'node[NodeType="Protein"]', style: {
+        'shape': 'ellipse', 'width': 32, 'height': 50,
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#E78D8D #d32f2f', 'background-gradient-stop-positions': '0 1'
+    }},
+    // SmallMol — circle, bright green gradient
+    { selector: 'node[NodeType="SmallMol"]', style: {
+        'shape': 'ellipse',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#73E1A0 #00C853', 'background-gradient-stop-positions': '0 1',
+        'color': '#000000', 'text-outline-color': 'rgba(255,255,255,0.88)', 'text-outline-width': 2
+    }},
+    // Treatment — 8-pointed starburst, blue gradient
+    { selector: 'node[NodeType="Treatment"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '0 -1  0.153 -0.370  0.707 -0.707  0.370 -0.153  1 0  0.370 0.153  0.707 0.707  0.153 0.370  0 1  -0.153 0.370  -0.707 0.707  -0.370 0.153  -1 0  -0.370 -0.153  -0.707 -0.707  -0.153 -0.370',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#7EAADC #1565c0', 'background-gradient-stop-positions': '0 1'
+    }},
+    // Disease — tall roundrectangle (Emerald Diamond), burnt orange gradient
+    { selector: 'node[NodeType="Disease"]', style: {
+        'shape': 'roundrectangle', 'width': 42, 'height': 62,
+        'text-wrap': 'wrap', 'text-max-width': '38px',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#E3A273 #CC5500', 'background-gradient-stop-positions': '0 1'
+    }},
+    // CellProcess — stadium (wide roundrectangle), yellow gradient
+    { selector: 'node[NodeType="CellProcess"]', style: {
+        'shape': 'roundrectangle', 'width': 'label', 'height': 34,
+        'padding': '10px', 'text-wrap': 'wrap', 'text-max-width': '160px',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#FCCF87 #f9a825', 'background-gradient-stop-positions': '0 1',
+        'color': '#000000', 'text-outline-color': 'rgba(255,255,255,0.88)', 'text-outline-width': 2
+    }},
+    // FunctionalClass — hexagon, orange gradient
+    { selector: 'node[NodeType="FunctionalClass"]', style: {
+        'shape': 'hexagon',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#F19F73 #e65100', 'background-gradient-stop-positions': '0 1'
+    }},
+    // Complex — vesica piscis (vertical lens), dark red gradient
+    { selector: 'node[NodeType="Complex"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '0 -1  0.35 -0.87  0.5 0  0.35 0.87  0 1  -0.35 0.87  -0.5 0  -0.35 -0.87',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#B97373 #7f0000', 'background-gradient-stop-positions': '0 1'
+    }},
+    // CellObject — vertical oval, gray gradient
+    { selector: 'node[NodeType="CellObject"]', style: {
+        'shape': 'ellipse', 'width': 32, 'height': 50,
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#B3B3B3 #757575', 'background-gradient-stop-positions': '0 1'
+    }},
+    // Tissue — stadium (wide roundrectangle), brown gradient
+    { selector: 'node[NodeType="Tissue"]', style: {
+        'shape': 'roundrectangle', 'width': 'label', 'height': 34,
+        'padding': '10px', 'text-wrap': 'wrap', 'text-max-width': '160px',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#AF9D97 #6d4c41', 'background-gradient-stop-positions': '0 1'
+    }},
+    // Organ — kidney/bean shape, dark violet gradient, gray solid border
+    { selector: 'node[NodeType="Organ"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '0 -1  0.7 -0.7  1 0  0.7 0.7  0 1  -0.5 0.9  -0.5 0.3  0 0.1  0 -0.1  -0.5 -0.3  -0.5 -0.9',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#9B7EC0 #4a148c', 'background-gradient-stop-positions': '0 1',
+        'border-width': 2, 'border-color': '#808080', 'border-style': 'solid'
+    }},
+    // CellType / Cell — amoeba-like polygon, light blue gradient
+    { selector: 'node[NodeType="CellType"], node[NodeType="Cell"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '0.800 -0.000 0.866 -0.500 0.350 -0.606 0.000 -0.920 -0.310 -0.537 -0.762 -0.440 -0.760 -0.000 -0.866 0.500 -0.330 0.572 -0.000 0.820 0.480 0.831 0.624 0.360',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#BAE7FC #81d4fa', 'background-gradient-stop-positions': '0 1',
+        'color': '#000000', 'text-outline-color': 'rgba(255,255,255,0.88)', 'text-outline-width': 2
+    }},
+    // GeneticVariant — triangle (delta), vibrant orange gradient
+    { selector: 'node[NodeType="GeneticVariant"]', style: {
+        'shape': 'triangle',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#FFAF73 #FF6D00', 'background-gradient-stop-positions': '0 1'
+    }},
+    // ClinicalParameter — plus/cross shape, slate blue gradient, dashed border
+    { selector: 'node[NodeType="ClinicalParameter"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '-0.3 -1  0.3 -1  0.3 -0.3  1 -0.3  1 0.3  0.3 0.3  0.3 1  -0.3 1  -0.3 0.3  -1 0.3  -1 -0.3  -0.3 -0.3',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#A5AEDC #5C6BC0', 'background-gradient-stop-positions': '0 1',
+        'border-width': 2, 'border-color': '#5C6BC0', 'border-style': 'dashed'
+    }},
+    // MedicalProcedure — right-pointing chevron, teal gradient
+    { selector: 'node[NodeType="MedicalProcedure"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '-1 -0.5  0.1 -0.5  0.1 -1  1 0  0.1 1  0.1 0.5  -1 0.5',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#A6E8DF #5dd6c5', 'background-gradient-stop-positions': '0 1',
+        'color': '#000000', 'text-outline-color': 'rgba(255,255,255,0.88)', 'text-outline-width': 2
+    }},
+    // Pathogen — 8-pointed starburst, toxic green gradient
+    { selector: 'node[NodeType="Pathogen"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '0 -1  0.153 -0.370  0.707 -0.707  0.370 -0.153  1 0  0.370 0.153  0.707 0.707  0.153 0.370  0 1  -0.153 0.370  -0.707 0.707  -0.370 0.153  -1 0  -0.370 -0.153  -0.707 -0.707  -0.153 -0.370',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#A8ED8A #61DE2A', 'background-gradient-stop-positions': '0 1',
+        'color': '#000000', 'text-outline-color': 'rgba(255,255,255,0.88)', 'text-outline-width': 2
+    }},
+    // Virus — spiked circle (corona, 8 spikes), chartreuse gradient
+    { selector: 'node[NodeType="Virus"]', style: {
+        'shape': 'polygon',
+        'shape-polygon-points': '0 -1  0.211 -0.508  0.707 -0.707  0.508 -0.211  1 0  0.508 0.211  0.707 0.707  0.211 0.508  0 1  -0.211 0.508  -0.707 0.707  -0.508 0.211  -1 0  -0.508 -0.211  -0.707 -0.707  -0.211 -0.508',
+        'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
+        'background-gradient-stop-colors': '#D6DC9F #B5BF50', 'background-gradient-stop-positions': '0 1',
+        'color': '#000000', 'text-outline-color': 'rgba(255,255,255,0.88)', 'text-outline-width': 2
+    }},
+    // ── RNEF-preserved rectangular nodes ─────────────────────────────────────
+    {
+      selector: 'node[rnefShape="rectangle"]',
+      style: {
+        'shape': 'rectangle', 'width': 'label', 'height': 'label',
+        'padding': '5px', 'text-wrap': 'wrap', 'text-max-width': '162px'
       }
     },
     // ── Substrate edges (no arrowhead — reactant into reaction node) ──────
@@ -813,6 +1126,14 @@ function getCyStyle() {
         'width': 1.5
       }
     },
+    // ── Undirected edges (from RNEF in-out links) — no arrowhead ─────────────
+    {
+      selector: 'edge.undirected',
+      style: {
+        'target-arrow-shape': 'none',
+        'source-arrow-shape': 'none'
+      }
+    },
     // ── Clone nodes — double border to signal "same entity, different position"
     {
       selector: 'node[?isClone]',
@@ -829,6 +1150,29 @@ function getCyStyle() {
         'border-width': 4,
         'border-color': '#FFD700',
         'border-opacity': 1
+      }
+    },
+    // ── Custom node color (overrides gradient fill) ───────────────────────────
+    {
+      selector: 'node[customColor]',
+      style: {
+        'background-fill':    'solid',
+        'background-color':   'data(customColor)',
+        'text-outline-color': 'data(customColor)'
+      }
+    },
+    {
+      selector: 'node[customTextColor]',
+      style: { 'color': 'data(customTextColor)' }
+    },
+    // ── Highlight aura — underlay circle drawn outside the node boundary ────
+    {
+      selector: 'node[highlightColor]',
+      style: {
+        'underlay-color':   'data(highlightColor)',
+        'underlay-opacity': 0.45,
+        'underlay-padding': 18,
+        'underlay-shape':   'ellipse'
       }
     }
   ];
@@ -856,9 +1200,11 @@ function getNodeColor(labels) {
 }
 
 function getEdgeThickness(numRefs) {
-  // Min 2px (easy to hover), max 5px for 3+ references
-  var n = Math.min(Number(numRefs) || 0, 3);
-  return 2 + (n / 3) * 3;
+  var n = Number(numRefs) || 0;
+  if (n <= 0) return 2;
+  if (n === 1) return 4;
+  if (n === 2) return 6;
+  return 7; // 3+
 }
 
 function renderGraph(data, savedPositions) {
@@ -878,7 +1224,16 @@ function renderGraph(data, savedPositions) {
     };
     if (n.isClone) d.isClone = true;
     if (n.cloneOf) d.cloneOf = n.cloneOf;
+    // Spread Neo4j properties into the Cytoscape data object, but guard against
+    // the "id" property (Neo4j nodes sometimes have a property literally named
+    // "id" that holds the database integer).  enrichNodesFromNeo4j now renames
+    // it to "databaseID", but any snapshot saved before that fix might still
+    // carry n.properties.id.  Restore d.id from n.id afterwards to be safe.
     Object.assign(d, n.properties);
+    d.id = n.id;        // ensure Cytoscape node ID is never clobbered by n.properties.id
+    if (!d.NodeType) d.NodeType = d.nodeType;  // Neo4j: type is a label, not a property
+    if (n.isClone) d.isClone = true;
+    if (n.cloneOf) d.cloneOf = n.cloneOf;
     return {
       group: 'nodes',
       data: d,
@@ -890,12 +1245,25 @@ function renderGraph(data, savedPositions) {
     };
   });
 
-  var cyEdges = data.edges.map(function(e) {
+  // Build a set of all node IDs that will exist in cy so we can skip dangling edges
+  var cyNodeIdSet = new Set(data.nodes.map(function(n) { return String(n.id); }));
+
+  var skippedEdges = 0;
+  var cyEdges = [];
+  data.edges.forEach(function(e) {
+    // Skip edges whose source or target node is not in this graph — prevents
+    // Cytoscape "nonexistent source/target" crash on files saved with dangling edges.
+    if (!cyNodeIdSet.has(String(e.startNodeId)) || !cyNodeIdSet.has(String(e.endNodeId))) {
+      skippedEdges++;
+      return;
+    }
     var numRefs = e.properties.RelationNumberOfReferences != null
       ? e.properties.RelationNumberOfReferences
       : (Array.isArray(e.properties.references) ? e.properties.references.length : 0);
-    return {
+    var undirected = e.properties.directed === false;
+    cyEdges.push({
       group: 'edges',
+      classes: undirected ? 'undirected' : '',
       data: {
         id: e.id,
         elementId: e.elementId || e.id,
@@ -913,11 +1281,37 @@ function renderGraph(data, savedPositions) {
         thickness: getEdgeThickness(numRefs),
         lineStyle: DIRECT_TYPES.has(e.type) ? 'solid' : 'dashed'
       }
-    };
+    });
   });
+  if (skippedEdges > 0) console.warn('renderGraph: skipped ' + skippedEdges + ' edge(s) with missing endpoints.');
 
+  focusNodeId = null;   // focus class is lost when elements are destroyed
   cy.elements().remove();
   cy.add(cyNodes.concat(cyEdges));
+
+  // Restore highlight inline styles for nodes that carry highlightColor in data.
+  // The stylesheet selector handles this on first render, but explicit inline styles
+  // ensure the aura is visible immediately on tab-switch / renderGraph calls.
+  cy.nodes('[highlightColor]').forEach(function(n) {
+    var c = n.data('highlightColor');
+    if (c) {
+      n.style({ 'underlay-color': c, 'underlay-opacity': 0.45, 'underlay-padding': 18, 'underlay-shape': 'ellipse' });
+    }
+  });
+  cy.nodes('[nodeWidth]').forEach(function(n) {
+    var w = n.data('nodeWidth');
+    var h = n.data('nodeHeight') || w;
+    var f = n.data('nodeFontSize');
+    if (w) n.style({ width: w, height: h, 'font-size': f || BASE_NODE_FONT });
+  });
+  cy.nodes('[customColor]').forEach(function(n) {
+    var c = n.data('customColor');
+    if (c) {
+      var tc = contrastColor(c);
+      n.data('customTextColor', tc);
+      n.style({ 'background-color': c, 'text-outline-color': tc === '#000000' ? 'rgba(255,255,255,0.88)' : c, 'text-outline-width': 2, 'color': tc });
+    }
+  });
 
   // Belt-and-suspenders: explicitly apply saved positions after add().
   // The position field in cy.add() element specs is not always honoured
@@ -967,7 +1361,11 @@ function applyLayout(name, btn) {
     dagre:     { name: 'dagre',     rankDir: 'TB', nodeSep: 60, rankSep: 80, animate: false, fit: true, padding: 40 },
     circle:    { name: 'circle',    animate: false, fit: true, padding: 40 },
     concentric:{ name: 'concentric',animate: false, fit: true, padding: 40, minNodeSpacing: 40 },
-    grid:      { name: 'grid',      animate: false, fit: true, padding: 40, avoidOverlap: true }
+    grid:      { name: 'grid',      animate: false, fit: true, padding: 40, avoidOverlap: true },
+    klay:      { name: 'klay',      animate: false, fit: true, padding: 40,
+                 klay: { direction: 'DOWN', edgeRouting: 'ORTHOGONAL',
+                         nodeLayering: 'LONGEST_PATH', nodePlacement: 'BRANDES_KOEPF',
+                         inLayerSpacingFactor: 1.0, edgeSpacingFactor: 0.5 } }
   };
 
   var config = layoutConfigs[name] || layoutConfigs.cose;
@@ -1046,6 +1444,9 @@ function clearGraph() {
   refsCache = {};
   medScanMap = {};
   tableRows = [];
+  undoStack = [];
+  var btn = document.getElementById('undo-btn');
+  if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; }
   document.getElementById('table-body').innerHTML = '';
   document.getElementById('graph-empty-state').style.display = 'flex';
   hideQueryResultTable();
@@ -1177,11 +1578,23 @@ function renderNodeTooltip(node) {
   var urn = data.URN || data.urn || '';
   var nodeType = isReactionNode ? '' : (data.nodeType || '');
 
-  // Keys to skip or render separately
+  // Keys already rendered in the header or to be placed in specific sections
   var HEADER_KEYS = { Name:1, name:1, label:1, Description:1, description:1,
                       URN:1, urn:1, nodeType:1, NodeType:1, ControlType:1,
                       id:1, elementId:1, color:1, source:1, target:1,
-                      NumRefs:1, references:1, isClone:1, cloneOf:1 };
+                      NumRefs:1, references:1, isClone:1, cloneOf:1,
+                      // internal styling / service properties
+                      rnefShape:1, customColor:1, customTextColor:1,
+                      highlightColor:1, nodeWidth:1, nodeHeight:1, nodeFontSize:1,
+                      thickness:1, directed:1, RelationID:1 };
+  // Priority fields shown immediately after description
+  var PRIORITY_FIELDS = ['Localization', 'localization', 'Notes', 'notes', 'Aliases', 'aliases'];
+  // Service fields shown at the very bottom
+  var SERVICE_FIELDS  = ['createdAt', 'updatedAt', 'NodeID', 'URN', 'urn'];
+  var SERVICE_SET = {};
+  SERVICE_FIELDS.forEach(function(k) { SERVICE_SET[k] = 1; });
+  var PRIORITY_SET = {};
+  PRIORITY_FIELDS.forEach(function(k) { PRIORITY_SET[k] = 1; });
 
   var html = '<div class="tooltip-rel-header">' + escHtml(name);
   if (nodeType) html += ' <span style="color:#7a8099;font-weight:400;font-size:11px">(' + escHtml(nodeType) + ')</span>';
@@ -1189,21 +1602,62 @@ function renderNodeTooltip(node) {
   if (data.isClone) html += '<div style="font-size:11px;color:#FFD700;margin-top:3px">⬦ Clone — same entity as original</div>';
   if (description) html += '<div style="font-size:12px;color:#c8cde8;margin-top:6px;line-height:1.5">' + escHtml(description) + '</div>';
 
-  // Additional properties (from Neo4j enrichment or original data)
-  var extras = Object.keys(data).filter(function(k) {
-    return !HEADER_KEYS[k] && data[k] != null && data[k] !== '' && typeof data[k] !== 'object';
-  });
-  if (extras.length) {
-    html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:6px">';
-    extras.forEach(function(k) {
-      html += '<div style="font-size:11px;color:#c8cde8;margin-top:3px">'
-        + '<span style="color:#7a8099">' + escHtml(k) + ':</span> ' + escHtml(String(data[k]))
-        + '</div>';
+  function renderPropRow(k, val) {
+    return '<div style="font-size:11px;color:#c8cde8;margin-top:3px">'
+      + '<span style="color:#7a8099">' + escHtml(k) + ':</span> ' + escHtml(String(val))
+      + '</div>';
+  }
+
+  // 0. User-loaded properties (from "Load node properties" dialog) — shown first, highlighted
+  if (_loadedPropertyNames.size > 0) {
+    var loadedHtml = '';
+    _loadedPropertyNames.forEach(function(k) {
+      var val = data[k];
+      if (val != null && val !== '' && typeof val !== 'object') {
+        loadedHtml += '<div style="font-size:11px;color:#c8cde8;margin-top:3px">'
+          + '<span style="color:#5dd6c5;font-weight:600">' + escHtml(k) + ':</span> ' + escHtml(String(val))
+          + '</div>';
+      }
     });
+    if (loadedHtml) {
+      html += '<div style="margin-top:8px;border-top:1px solid #2a4040;padding-top:6px;'
+            + 'background:rgba(93,214,197,0.06);border-radius:4px;padding:6px 6px 2px">'
+            + '<div style="font-size:10px;color:#5dd6c5;margin-bottom:4px;letter-spacing:0.04em">DB PROPERTIES</div>'
+            + loadedHtml + '</div>';
+    }
+  }
+
+  // 1. Priority fields: Localization, Notes, Aliases
+  var priorityHtml = '';
+  PRIORITY_FIELDS.forEach(function(k) {
+    if (data[k] != null && data[k] !== '' && typeof data[k] !== 'object') {
+      priorityHtml += renderPropRow(k, data[k]);
+    }
+  });
+  if (priorityHtml) html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:6px">' + priorityHtml + '</div>';
+
+  // 2. Other fields (not header, not priority, not service, not already shown in loaded section)
+  var otherExtras = Object.keys(data).filter(function(k) {
+    return !HEADER_KEYS[k] && !PRIORITY_SET[k] && !SERVICE_SET[k] && !_loadedPropertyNames.has(k)
+        && data[k] != null && data[k] !== '' && typeof data[k] !== 'object';
+  });
+  if (otherExtras.length) {
+    html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:6px">';
+    otherExtras.forEach(function(k) { html += renderPropRow(k, data[k]); });
     html += '</div>';
   }
 
-  if (urn) html += '<div style="font-size:11px;color:#7a8099;margin-top:6px;border-top:1px solid #2a2f4a;padding-top:4px">URN: ' + escHtml(urn) + '</div>';
+  // 3. Service fields: createdAt, updatedAt, NodeID, URN
+  var serviceHtml = '';
+  SERVICE_FIELDS.forEach(function(k) {
+    var val = data[k];
+    if (val != null && val !== '' && typeof val !== 'object') {
+      serviceHtml += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">' + escHtml(k) + ':</span> ' + escHtml(String(val))
+        + '</div>';
+    }
+  });
+  if (serviceHtml) html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:4px">' + serviceHtml + '</div>';
 
   el.style.display = 'block';
   document.getElementById('tooltip-inner').innerHTML = html;
@@ -1422,6 +1876,49 @@ async function loadTableData() {
     }
   });
 
+  // Auto-fetch node properties for any active node_prop columns
+  var nodePropCols = columnDefs.filter(function(c) { return c.source === 'node_prop' && c.visible; });
+  if (nodePropCols.length > 0) {
+    var npNodeIds = [], npUrns = [];
+    graphData.nodes.forEach(function(n) {
+      var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+      var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+      if (nid && /^-?\d+$/.test(nid)) npNodeIds.push(nid);
+      else if (urn) npUrns.push(urn);
+    });
+    if (npNodeIds.length || npUrns.length) {
+      // Only request props not yet loaded on the first node — avoids redundant fetches
+      var propNames = nodePropCols.map(function(c) { return c.dbField; });
+      try {
+        msg.style.display = 'inline';
+        msg.textContent = 'Loading node properties…';
+        var npResult = await api('/api/nodes/load-properties', { nodeIds: npNodeIds, urns: npUrns, properties: propNames });
+        var npById = npResult.byNodeId || {};
+        var npByUrn = npResult.byUrn   || {};
+        // Build URN→cy lookup for data update (same fix as executeLoadNodeProperties)
+        var urnToCyNode = {};
+        if (cy) cy.nodes().forEach(function(cyNode) {
+          var u = cyNode.data('URN');
+          if (u) urnToCyNode[String(u)] = cyNode;
+        });
+        graphData.nodes.forEach(function(n) {
+          var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+          var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+          var props = (nid && npById[nid]) ? npById[nid] : (urn && npByUrn[urn]) ? npByUrn[urn] : null;
+          if (!props) return;
+          Object.assign(n.properties, props);
+          var cyNode = (urn && urnToCyNode[urn]) ? urnToCyNode[urn] : (cy ? cy.getElementById(n.id) : null);
+          if (cyNode && cyNode.length) Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+          propNames.forEach(function(k) { _loadedPropertyNames.add(k); });
+        });
+        msg.style.display = 'none';
+      } catch(e) {
+        msg.style.display = 'none';
+        console.warn('Node property fetch failed:', e.message);
+      }
+    }
+  }
+
   // Index by both current id and original URN so edges that still reference
   // the original URN local_id (before Neo4j enrichment swaps n.id) still resolve.
   var nodeById = {};
@@ -1519,6 +2016,14 @@ async function loadTableData() {
           if (col.source === 'reference' || col.source === 'scopus_data') row[col.key] = '';
         });
       }
+      // Node property columns — reg from source node, tgt from target node
+      columnDefs.forEach(function(col) {
+        if (col.source === 'node_prop') {
+          var node = col.nodeRole === 'tgt' ? tgtNode : srcNode;
+          row[col.key] = (node && node.properties && node.properties[col.dbField] != null)
+            ? String(node.properties[col.dbField]) : '';
+        }
+      });
       return row;
     };
 
@@ -1533,7 +2038,39 @@ async function loadTableData() {
   renderTableRows(tableRows);
 }
 
-function loadRelationData() {
+async function loadRelationData() {
+  // Auto-fetch node properties for any active node_prop columns
+  var relNpCols = columnDefs.filter(function(c) { return c.source === 'node_prop' && c.visible; });
+  if (relNpCols.length > 0) {
+    var rnpNodeIds = [], rnpUrns = [];
+    graphData.nodes.forEach(function(n) {
+      var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+      var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+      if (nid && /^-?\d+$/.test(nid)) rnpNodeIds.push(nid);
+      else if (urn) rnpUrns.push(urn);
+    });
+    if (rnpNodeIds.length || rnpUrns.length) {
+      var rnpNames = relNpCols.map(function(c) { return c.dbField; });
+      try {
+        var rnpResult = await api('/api/nodes/load-properties', { nodeIds: rnpNodeIds, urns: rnpUrns, properties: rnpNames });
+        var rnpById = rnpResult.byNodeId || {};
+        var rnpByUrn = rnpResult.byUrn   || {};
+        var urnToCy = {};
+        if (cy) cy.nodes().forEach(function(cyNode) { var u = cyNode.data('URN'); if (u) urnToCy[String(u)] = cyNode; });
+        graphData.nodes.forEach(function(n) {
+          var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+          var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+          var props = (nid && rnpById[nid]) ? rnpById[nid] : (urn && rnpByUrn[urn]) ? rnpByUrn[urn] : null;
+          if (!props) return;
+          Object.assign(n.properties, props);
+          var cyNode = (urn && urnToCy[urn]) ? urnToCy[urn] : (cy ? cy.getElementById(n.id) : null);
+          if (cyNode && cyNode.length) Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+          rnpNames.forEach(function(k) { _loadedPropertyNames.add(k); });
+        });
+      } catch(e) { console.warn('Node property fetch failed (relation view):', e.message); }
+    }
+  }
+
   var nodeById = {};
   graphData.nodes.forEach(function(n) {
     nodeById[n.id] = n;
@@ -1589,6 +2126,10 @@ function loadRelationData() {
     columnDefs.forEach(function(col) {
       if (col.source === 'neo4j') {
         row[col.key] = edge.properties[col.dbField] != null ? String(edge.properties[col.dbField]) : '';
+      } else if (col.source === 'node_prop') {
+        var npNode = col.nodeRole === 'tgt' ? tgtNode : srcNode;
+        row[col.key] = (npNode && npNode.properties && npNode.properties[col.dbField] != null)
+          ? String(npNode.properties[col.dbField]) : '';
       }
     });
     return row;
@@ -1602,8 +2143,8 @@ function renderTableHeader() {
   if (!thead) return;
   var visCols = columnDefs.filter(function(c) {
     if (!c.visible) return false;
-    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j';
-    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data';
+    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
   });
   thead.innerHTML = visCols.map(function(col, i) {
     var sortAttr = col.source === 'graph' ? ' onclick="sortTable(\'' + col.key + '\')"' : '';
@@ -1625,8 +2166,8 @@ function renderTableHeader() {
 function renderTableRows(rows) {
   var visCols = columnDefs.filter(function(c) {
     if (!c.visible) return false;
-    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j';
-    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data';
+    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
   });
   var tbody = document.getElementById('table-body');
   tbody.innerHTML = '';
@@ -1818,6 +2359,73 @@ async function openColumnsDialog() {
     });
   }
 
+  // ── Node properties (both views) ──────────────────────────────────────────
+  var nodePropSection = document.getElementById('col-nodeprops-section');
+  var nodePropList    = document.getElementById('col-nodeprops-list');
+  var nodePropNote    = document.getElementById('col-nodeprops-note');
+  nodePropList.innerHTML = '';
+  nodePropNote.textContent = '';
+
+  // Collect nodeIds from current pathway to fetch available property names
+  var npNodeIds = [];
+  if (graphData && graphData.nodes) {
+    graphData.nodes.forEach(function(n) {
+      var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+      if (nid && /^-?\d+$/.test(nid)) npNodeIds.push(nid);
+    });
+  }
+
+  if (!npNodeIds.length) {
+    if (nodePropSection) nodePropSection.style.display = 'none';
+  } else {
+    if (nodePropSection) nodePropSection.style.display = '';
+    // Build lookup: propName → {reg: colDef, tgt: colDef}
+    var existingNpMap = {};
+    columnDefs.forEach(function(c) {
+      if (c.source === 'node_prop') {
+        var m = c.key.match(/^np_(reg|tgt)_(.+)$/);
+        if (m) {
+          if (!existingNpMap[m[2]]) existingNpMap[m[2]] = {};
+          existingNpMap[m[2]][m[1]] = c;
+        }
+      }
+    });
+
+    // Fetch available property names for nodes in the current pathway
+    api('/api/nodes/property-names', { nodeIds: npNodeIds })
+      .then(function(propNames) {
+        if (!propNames || !propNames.length) {
+          nodePropNote.textContent = 'No properties found for nodes in this pathway.';
+          return;
+        }
+        nodePropNote.textContent = 'Each property adds two columns: Regulator and Target. Data fetched automatically when table loads.';
+        propNames.forEach(function(propName) {
+          // Ensure both reg and tgt column defs exist
+          if (!existingNpMap[propName]) existingNpMap[propName] = {};
+          if (!existingNpMap[propName].reg) {
+            var rc = { key: 'np_reg_' + propName, label: 'Regulator ' + propName, visible: false, source: 'node_prop', dbField: propName, nodeRole: 'reg' };
+            columnDefs.push(rc);
+            existingNpMap[propName].reg = rc;
+          }
+          if (!existingNpMap[propName].tgt) {
+            var tc = { key: 'np_tgt_' + propName, label: 'Target ' + propName, visible: false, source: 'node_prop', dbField: propName, nodeRole: 'tgt' };
+            columnDefs.push(tc);
+            existingNpMap[propName].tgt = tc;
+          }
+          // One checkbox controls both reg+tgt columns
+          var isChecked = existingNpMap[propName].reg.visible || existingNpMap[propName].tgt.visible;
+          var lb = document.createElement('label');
+          lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
+          lb.innerHTML = '<input type="checkbox" data-node-prop="' + escHtml(propName) + '"'
+            + (isChecked ? ' checked' : '') + '> ' + escHtml(propName);
+          nodePropList.appendChild(lb);
+        });
+      })
+      .catch(function() {
+        nodePropNote.textContent = 'Could not load property list from database.';
+      });
+  }
+
   document.getElementById('columns-modal').style.display = 'flex';
 }
 
@@ -1826,11 +2434,30 @@ function closeColumnsModal(e) {
     document.getElementById('columns-modal').style.display = 'none';
 }
 
+function resetColumnsToDefault() {
+  try { localStorage.removeItem(COL_CONFIG_KEY); } catch(e) {}
+  columnDefs = DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
+  document.getElementById('columns-modal').style.display = 'none';
+  columnWidths = null;
+  if (document.getElementById('table-view').style.display !== 'none') {
+    if (tableViewMode === 'relation') { loadRelationData(); }
+    else { tableRows = []; loadTableData(); }
+  }
+}
+
 function applyColumnsDialog() {
   document.querySelectorAll('[data-col-key]').forEach(function(cb) {
     var key = cb.getAttribute('data-col-key');
     var col = columnDefs.find(function(c) { return c.key === key; });
     if (col) col.visible = cb.checked;
+  });
+  // node_prop checkboxes each control a reg+tgt pair
+  document.querySelectorAll('[data-node-prop]').forEach(function(cb) {
+    var propName = cb.getAttribute('data-node-prop');
+    ['np_reg_' + propName, 'np_tgt_' + propName].forEach(function(key) {
+      var col = columnDefs.find(function(c) { return c.key === key; });
+      if (col) col.visible = cb.checked;
+    });
   });
   saveColumnConfig();
   document.getElementById('columns-modal').style.display = 'none';
@@ -2090,13 +2717,18 @@ function confirmSave() {
   var positions = {};
   cy.nodes().forEach(function(n) { positions[n.id()] = { x: n.position('x'), y: n.position('y') }; });
 
+  // Strip edges whose endpoints aren't in the node list before saving.
+  var nodeIdSet = new Set(graphData.nodes.map(function(n) { return String(n.id); }));
+  var cleanEdges = graphData.edges.filter(function(e) {
+    return nodeIdSet.has(String(e.startNodeId)) && nodeIdSet.has(String(e.endNodeId));
+  });
   var saveData = {
     name: name,
     query: currentQuery,
     savedAt: new Date().toISOString(),
     layout: currentLayout,
     positions: positions,
-    graphData: graphData
+    graphData: { nodes: graphData.nodes, edges: cleanEdges }
   };
 
   var blob = new Blob([JSON.stringify(saveData, null, 2)], { type: 'application/json' });
@@ -2206,7 +2838,12 @@ async function loadRnefFile(file) {
       body: content
     });
     if (res.status === 401) { logout(); throw new Error('Session expired'); }
-    var result = await res.json();
+    if (res.status === 413) throw new Error('File too large for the server. Ask your administrator to increase the server upload limit.');
+    var text = await res.text();
+    var result;
+    try { result = JSON.parse(text); } catch(e) {
+      throw new Error('Server returned an unexpected response (status ' + res.status + '). The file may be too large.');
+    }
     if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status));
     var pathways = result.pathways || [];
 
@@ -2385,7 +3022,23 @@ function enrichNodesFromNeo4j(jsonNodes) {
           if (!urn || !enriched[urn]) return;
           matched++;
           var neo = enriched[urn];
-          var merged = Object.assign({}, cyNode.data(), neo.properties);
+          // ── CRITICAL ──────────────────────────────────────────────────────────
+          // Neo4j nodes often have a *property* literally named "id" (the internal
+          // database integer).  If we let that field flow into cyNode.data() it
+          // overwrites _private.data.id on every cy node whose URN matches —
+          // including clone nodes.  Once a clone's cy id() is silently changed to
+          // the integer, every downstream operation that calls node.id() (merge,
+          // captureTabState, …) receives the wrong value, producing dangling edge
+          // references and "nonexistant source" errors on tab restore.
+          // Fix: rename the Neo4j property to "databaseID" so it never collides
+          // with the Cytoscape element id, then explicitly restore merged.id.
+          var safeProps = Object.assign({}, neo.properties);
+          if (safeProps.id !== undefined) {
+            safeProps.databaseID = safeProps.id;
+            delete safeProps.id;
+          }
+          var merged = Object.assign({}, cyNode.data(), safeProps);
+          merged.id  = cyNode.id();   // never let neo.properties overwrite cy id
           merged.URN = urn;
           if (neo.properties.Name) merged.label = neo.properties.Name;
           if (neo.labels && neo.labels.length) {
@@ -2394,13 +3047,13 @@ function enrichNodesFromNeo4j(jsonNodes) {
           }
           merged.elementId = neo.elementId;
           cyNode.data(merged);
-          var gn = targetGD.nodes.find(function(n) { return n.properties && n.properties.URN === urn; });
+          var gn = targetGD.nodes.find(function(n) { return !n.isClone && n.properties && n.properties.URN === urn; });
           if (gn) {
             var oldId = gn.id;
             gn.id = neo.id;
             gn.elementId = neo.elementId;
             gn.labels = neo.labels;
-            Object.assign(gn.properties, neo.properties);
+            Object.assign(gn.properties, safeProps);
             gn.properties.URN = urn;
             if (oldId !== neo.id) {
               targetGD.edges.forEach(function(e) {
@@ -2416,14 +3069,19 @@ function enrichNodesFromNeo4j(jsonNodes) {
         urns.forEach(function(urn) {
           if (!enriched[urn]) return;
           var neo = enriched[urn];
-          var gn = targetGD.nodes.find(function(n) { return n.properties && n.properties.URN === urn; });
+          var safeProps = Object.assign({}, neo.properties);
+          if (safeProps.id !== undefined) {
+            safeProps.databaseID = safeProps.id;
+            delete safeProps.id;
+          }
+          var gn = targetGD.nodes.find(function(n) { return !n.isClone && n.properties && n.properties.URN === urn; });
           if (!gn) return;
           matched++;
           var oldId = gn.id;
           gn.id = neo.id;
           gn.elementId = neo.elementId;
           gn.labels = neo.labels;
-          Object.assign(gn.properties, neo.properties);
+          Object.assign(gn.properties, safeProps);
           gn.properties.URN = urn;
           if (oldId !== neo.id) {
             targetGD.edges.forEach(function(e) {
@@ -2485,6 +3143,120 @@ function enrichNodesFromNeo4j(jsonNodes) {
         if (enrichSpan) enrichSpan.remove();
       }
     });
+}
+
+// ─── Settings dropdown menu ───────────────────────────────────────────────────
+function toggleSettingsMenu(e) {
+  e.stopPropagation();
+  var dd = document.getElementById('settings-dropdown');
+  dd.style.display = dd.style.display === 'none' ? 'block' : 'none';
+}
+function closeSettingsMenu() {
+  var dd = document.getElementById('settings-dropdown');
+  if (dd) dd.style.display = 'none';
+}
+// Close when clicking outside
+document.addEventListener('click', function(e) {
+  var wrap = document.getElementById('settings-menu-wrap');
+  if (wrap && !wrap.contains(e.target)) closeSettingsMenu();
+});
+
+// ─── Neo4j settings dialog ────────────────────────────────────────────────────
+async function openNeo4jSettings() {
+  var errEl = document.getElementById('neo4j-settings-error');
+  var okEl  = document.getElementById('neo4j-settings-success');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  try {
+    var s = await api('/api/settings/neo4j');
+    document.getElementById('ns-url').value      = s.url      || '';
+    document.getElementById('ns-database').value = s.database || '';
+    document.getElementById('ns-username').value = s.username || '';
+    document.getElementById('ns-password').value = '';  // never pre-fill password
+  } catch(e) { /* show empty form */ }
+  document.getElementById('neo4j-settings-modal').style.display = 'flex';
+}
+function closeNeo4jSettingsModal(e) {
+  if (!e || e.target === document.getElementById('neo4j-settings-modal'))
+    document.getElementById('neo4j-settings-modal').style.display = 'none';
+}
+async function saveNeo4jSettings() {
+  var errEl = document.getElementById('neo4j-settings-error');
+  var okEl  = document.getElementById('neo4j-settings-success');
+  var btn   = document.getElementById('ns-save-btn');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  var payload = {
+    url:      document.getElementById('ns-url').value.trim(),
+    database: document.getElementById('ns-database').value.trim(),
+    username: document.getElementById('ns-username').value.trim(),
+    password: document.getElementById('ns-password').value  // blank = keep current
+  };
+  if (!payload.url || !payload.database || !payload.username) {
+    errEl.textContent = 'URL, database, and username are required.';
+    errEl.style.display = 'block'; return;
+  }
+  btn.disabled = true; btn.textContent = 'Testing…';
+  try {
+    await api('/api/settings/neo4j', payload, 'POST');
+    okEl.textContent = 'Saved! Neo4j reconnected successfully.';
+    okEl.style.display = 'block';
+    setTimeout(function() { document.getElementById('neo4j-settings-modal').style.display = 'none'; }, 1500);
+  } catch(err) {
+    errEl.textContent = err.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test & Save';
+  }
+}
+
+// ─── Postgres settings dialog ─────────────────────────────────────────────────
+async function openPostgresSettings() {
+  var errEl = document.getElementById('pg-settings-error');
+  var okEl  = document.getElementById('pg-settings-success');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  try {
+    var s = await api('/api/settings/postgres');
+    document.getElementById('pgs-host').value     = s.host     || '';
+    document.getElementById('pgs-port').value     = s.port     || 5432;
+    document.getElementById('pgs-database').value = s.database || '';
+    document.getElementById('pgs-schema').value   = s.schema   || '';
+    document.getElementById('pgs-username').value = s.username || '';
+    document.getElementById('pgs-password').value = '';  // never pre-fill password
+  } catch(e) { /* show empty form */ }
+  document.getElementById('postgres-settings-modal').style.display = 'flex';
+}
+function closePostgresSettingsModal(e) {
+  if (!e || e.target === document.getElementById('postgres-settings-modal'))
+    document.getElementById('postgres-settings-modal').style.display = 'none';
+}
+async function savePostgresSettings() {
+  var errEl = document.getElementById('pg-settings-error');
+  var okEl  = document.getElementById('pg-settings-success');
+  var btn   = document.getElementById('pgs-save-btn');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  var payload = {
+    host:     document.getElementById('pgs-host').value.trim(),
+    port:     parseInt(document.getElementById('pgs-port').value) || 5432,
+    database: document.getElementById('pgs-database').value.trim(),
+    schema:   document.getElementById('pgs-schema').value.trim(),
+    username: document.getElementById('pgs-username').value.trim(),
+    password: document.getElementById('pgs-password').value
+  };
+  if (!payload.host || !payload.database || !payload.schema || !payload.username) {
+    errEl.textContent = 'Host, database, schema, and username are required.';
+    errEl.style.display = 'block'; return;
+  }
+  btn.disabled = true; btn.textContent = 'Testing…';
+  try {
+    await api('/api/settings/postgres', payload, 'POST');
+    okEl.textContent = 'Saved! Postgres reconnected successfully.';
+    okEl.style.display = 'block';
+    setTimeout(function() { document.getElementById('postgres-settings-modal').style.display = 'none'; }, 1500);
+  } catch(err) {
+    errEl.textContent = err.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test & Save';
+  }
 }
 
 // ─── Change password ──────────────────────────────────────────────────────────
@@ -2598,9 +3370,17 @@ function showContextMenu(x, y, type, id, elementId, displayName, properties, rel
   var cloneEl   = document.getElementById('ctx-clone');
   var sepEl     = document.getElementById('ctx-sep-clone');
   var uncloneEl = document.getElementById('ctx-unclone');
-  if (cloneEl)   cloneEl.style.display   = isNode && !alreadyClone ? '' : 'none';
+  if (cloneEl)   cloneEl.style.display   = isNode ? '' : 'none';
   if (sepEl)     sepEl.style.display     = isNode ? '' : 'none';
   if (uncloneEl) uncloneEl.style.display = isNode && alreadyClone ? '' : 'none';
+
+  // Show "Merge selected clones" when 2+ selected nodes are clones
+  var selectedCloneCount = cy ? cy.nodes(':selected').filter(function(n) { return n.data('isClone'); }).length : 0;
+  var showMerge = selectedCloneCount >= 2;
+  var sepMergeEl   = document.getElementById('ctx-sep-merge');
+  var mergeCloneEl = document.getElementById('ctx-merge-clones');
+  if (sepMergeEl)   sepMergeEl.style.display   = showMerge ? '' : 'none';
+  if (mergeCloneEl) mergeCloneEl.style.display = showMerge ? '' : 'none';
 
   menu.style.left = x + 'px';
   menu.style.top = y + 'px';
@@ -2674,34 +3454,500 @@ function cloneNode(sourceId) {
   updateStats();
 }
 
+// Helper: strip the clone-edge prefix to get the original edge id.
+// Clone edges are created as  cloneId + '__e__' + originalEdgeId
+function _baseEdgeId(edgeId) {
+  var idx = edgeId.indexOf('__e__');
+  return idx >= 0 ? edgeId.substring(idx + 5) : edgeId;
+}
+
+// ─── Focus node & alignment ───────────────────────────────────────────────────
+
+function setFocusNode(id) {
+  if (cy) cy.nodes('.focus-node').removeClass('focus-node');
+  focusNodeId = id || null;
+  if (focusNodeId && cy) {
+    var n = cy.getElementById(focusNodeId);
+    if (n.length) n.addClass('focus-node');
+  }
+}
+
+var _alignHintTimer = null;
+function showAlignHint(msg) {
+  var toast = document.getElementById('align-toast');
+  if (!toast) return;
+  toast.textContent = msg;
+  toast.style.display = 'block';
+  clearTimeout(_alignHintTimer);
+  _alignHintTimer = setTimeout(function() { toast.style.display = 'none'; }, 3000);
+}
+
+function alignNodesHorizontally() {
+  if (!cy) return;
+  var sel = cy.nodes(':selected');
+  if (sel.length < 2) { showAlignHint('Select 2 or more nodes first'); return; }
+  if (!focusNodeId || !cy.getElementById(focusNodeId).length) {
+    showAlignHint('Ctrl+click a node to set it as the anchor');
+    return;
+  }
+  pushUndo();
+  var refY = cy.getElementById(focusNodeId).position('y');
+  sel.forEach(function(n) { n.position('y', refY); });
+  currentLayout = 'manual';
+}
+
+function alignNodesVertically() {
+  if (!cy) return;
+  var sel = cy.nodes(':selected');
+  if (sel.length < 2) { showAlignHint('Select 2 or more nodes first'); return; }
+  if (!focusNodeId || !cy.getElementById(focusNodeId).length) {
+    showAlignHint('Ctrl+click a node to set it as the anchor');
+    return;
+  }
+  pushUndo();
+  var refX = cy.getElementById(focusNodeId).position('x');
+  sel.forEach(function(n) { n.position('x', refX); });
+  currentLayout = 'manual';
+}
+
+// ─── Manual resize handles ────────────────────────────────────────────────────
+
+var _rhNode        = null;   // cy node whose handles are showing
+var _rhDragging    = false;
+var _rhHandle      = null;   // 'TL'|'TC'|'TR'|'ML'|'MR'|'BL'|'BC'|'BR'
+var _rhStartMouse  = null;   // {x,y} screen px at drag start
+var _rhStartW      = 0;
+var _rhStartH      = 0;
+var _rhStartPos    = null;   // node center in model coords at drag start
+var _rhWasPanning  = false;  // saved panning state before handle drag
+var _rhStartF      = 0;      // font size at drag start
+
+var _RH_DEFS = [
+  { id:'TL', cursor:'nw-resize' }, { id:'TC', cursor:'n-resize'  }, { id:'TR', cursor:'ne-resize' },
+  { id:'ML', cursor:'w-resize'  },                                   { id:'MR', cursor:'e-resize'  },
+  { id:'BL', cursor:'sw-resize' }, { id:'BC', cursor:'s-resize'  }, { id:'BR', cursor:'se-resize' }
+];
+
+function _rhBBox(node) {
+  var pos = node.position(), zoom = cy.zoom(), pan = cy.pan();
+  var w = node.width(), h = node.height();
+  var sx = pos.x * zoom + pan.x, sy = pos.y * zoom + pan.y;
+  return {
+    left: sx - w/2*zoom, top: sy - h/2*zoom,
+    right: sx + w/2*zoom, bottom: sy + h/2*zoom,
+    cx: sx, cy: sy
+  };
+}
+
+function _rhHandlePos(bb, id) {
+  switch (id) {
+    case 'TL': return { x: bb.left,  y: bb.top    };
+    case 'TC': return { x: bb.cx,    y: bb.top    };
+    case 'TR': return { x: bb.right, y: bb.top    };
+    case 'ML': return { x: bb.left,  y: bb.cy     };
+    case 'MR': return { x: bb.right, y: bb.cy     };
+    case 'BL': return { x: bb.left,  y: bb.bottom };
+    case 'BC': return { x: bb.cx,    y: bb.bottom };
+    case 'BR': return { x: bb.right, y: bb.bottom };
+  }
+}
+
+function showResizeHandles(node) {
+  _rhNode = node;
+  var ov = document.getElementById('resize-handles-overlay');
+  if (!ov) return;
+  ov.innerHTML = '';
+  var bb = _rhBBox(node);
+  _RH_DEFS.forEach(function(def) {
+    var p = _rhHandlePos(bb, def.id);
+    var el = document.createElement('div');
+    el.className = 'resize-handle';
+    el.dataset.handle = def.id;
+    el.style.cursor = def.cursor;
+    el.style.left = p.x + 'px';
+    el.style.top  = p.y + 'px';
+    el.addEventListener('mousedown', _rhMouseDown);
+    ov.appendChild(el);
+  });
+}
+
+function hideResizeHandles() {
+  _rhNode = null;
+  var ov = document.getElementById('resize-handles-overlay');
+  if (ov) ov.innerHTML = '';
+}
+
+function repositionResizeHandles() {
+  if (!_rhNode) return;
+  var ov = document.getElementById('resize-handles-overlay');
+  if (!ov) return;
+  var bb = _rhBBox(_rhNode);
+  ov.querySelectorAll('.resize-handle').forEach(function(el) {
+    var p = _rhHandlePos(bb, el.dataset.handle);
+    el.style.left = p.x + 'px';
+    el.style.top  = p.y + 'px';
+  });
+}
+
+function _rhMouseDown(e) {
+  e.preventDefault(); e.stopPropagation();
+  if (!_rhNode) return;
+  pushUndo();   // snapshot before manual resize so it's undoable
+  _rhDragging   = true;
+  _rhHandle     = e.currentTarget.dataset.handle;
+  _rhStartMouse = { x: e.clientX, y: e.clientY };
+  _rhStartW     = _rhNode.width();
+  _rhStartH     = _rhNode.height();
+  _rhStartF     = _rhNode.data('nodeFontSize') || _rhNode.pstyle('font-size').pfValue || BASE_NODE_FONT;
+  _rhStartPos   = { x: _rhNode.position('x'), y: _rhNode.position('y') };
+  _rhWasPanning = cy.userPanningEnabled();
+  cy.userPanningEnabled(false);   // prevent canvas pan during handle drag
+  document.addEventListener('mousemove', _rhMouseMove);
+  document.addEventListener('mouseup',   _rhMouseUp);
+}
+
+function _rhMouseMove(e) {
+  if (!_rhDragging || !_rhNode) return;
+  var zoom = cy.zoom();
+  var dx = (e.clientX - _rhStartMouse.x) / zoom;
+  var dy = (e.clientY - _rhStartMouse.y) / zoom;
+  var h = _rhHandle;
+
+  var newW = _rhStartW, newH = _rhStartH;
+  var newX = _rhStartPos.x, newY = _rhStartPos.y;
+
+  // Width: left handles move left edge (negative dx = grow), right = positive
+  if (h === 'TL' || h === 'ML' || h === 'BL') {
+    newW = Math.max(20, _rhStartW - dx);
+    newX = _rhStartPos.x + (_rhStartW - newW) / 2;
+  } else if (h === 'TR' || h === 'MR' || h === 'BR') {
+    newW = Math.max(20, _rhStartW + dx);
+    newX = _rhStartPos.x + (newW - _rhStartW) / 2;
+  }
+  // Height: top handles move top edge, bottom = positive
+  if (h === 'TL' || h === 'TC' || h === 'TR') {
+    newH = Math.max(20, _rhStartH - dy);
+    newY = _rhStartPos.y + (_rhStartH - newH) / 2;
+  } else if (h === 'BL' || h === 'BC' || h === 'BR') {
+    newH = Math.max(20, _rhStartH + dy);
+    newY = _rhStartPos.y + (newH - _rhStartH) / 2;
+  }
+
+  // Scale font proportionally to geometric mean of new dimensions
+  var scale = Math.sqrt((newW * newH) / (_rhStartW * _rhStartH));
+  var newF  = Math.max(6, Math.round(_rhStartF * scale * 10) / 10);
+  _rhNode.style({ width: Math.round(newW), height: Math.round(newH), 'font-size': newF });
+  _rhNode.position({ x: newX, y: newY });
+  repositionResizeHandles();
+}
+
+function _rhMouseUp() {
+  if (!_rhDragging) return;
+  _rhDragging = false;
+  cy.userPanningEnabled(_rhWasPanning);
+  document.removeEventListener('mousemove', _rhMouseMove);
+  document.removeEventListener('mouseup',   _rhMouseUp);
+  if (!_rhNode) return;
+
+  // Persist to data + graphData
+  var newW = Math.round(_rhNode.width());
+  var newH = Math.round(_rhNode.height());
+  var newF2 = parseFloat(_rhNode.style('font-size')) || BASE_NODE_FONT;
+  _rhNode.data('nodeWidth',    newW);
+  _rhNode.data('nodeHeight',   newH);
+  _rhNode.data('nodeFontSize', newF2);
+  var id = _rhNode.id();
+  var gn = graphData.nodes.find(function(n) { return n.id === id; });
+  if (!gn) {
+    var urn = _rhNode.data('URN');
+    if (urn) gn = graphData.nodes.find(function(n) { return !n.isClone && n.properties && n.properties.URN === urn; });
+  }
+  if (gn) {
+    if (!gn.properties) gn.properties = {};
+    gn.properties.nodeWidth    = newW;
+    gn.properties.nodeHeight   = newH;
+    gn.properties.nodeFontSize = newF2;
+  }
+  // Sync position to tab snapshot
+  if (tabs && tabs[activeTabIdx]) {
+    var snap = tabs[activeTabIdx].snapshot;
+    if (snap && snap.positions) snap.positions[id] = _rhNode.position();
+  }
+}
+
+// ─── Node resize ──────────────────────────────────────────────────────────────
+
+var BASE_NODE_SIZE = 44;
+var BASE_NODE_FONT = 11;
+
+function resizeSelectedNodes(factor) {
+  if (!cy) return;
+  var sel = cy.nodes(':selected');
+  if (sel.length === 0) return;
+  pushUndo();
+  sel.forEach(function(node) {
+    var id  = node.id();
+    // Use stored size if available, else fall back to actual rendered dimensions
+    var curW = node.data('nodeWidth')    || node.width()  || BASE_NODE_SIZE;
+    var curH = node.data('nodeHeight')   || node.height() || curW;
+    var curF = node.data('nodeFontSize') || BASE_NODE_FONT;
+    var newW = Math.max(20, Math.round(curW * factor));
+    var newH = Math.max(20, Math.round(curH * factor));
+    var newF = Math.max(6,  Math.round(curF * factor * 10) / 10);
+    node.data('nodeWidth',    newW);
+    node.data('nodeHeight',   newH);
+    node.data('nodeFontSize', newF);
+    node.style({ width: newW, height: newH, 'font-size': newF });
+    // Sync to graphData for tab-switch and JSON persistence
+    var gn = graphData.nodes.find(function(n) { return n.id === id; });
+    if (!gn) {
+      var urn = node.data('URN');
+      if (urn) gn = graphData.nodes.find(function(n) { return !n.isClone && n.properties && n.properties.URN === urn; });
+    }
+    if (gn) {
+      if (!gn.properties) gn.properties = {};
+      gn.properties.nodeWidth    = newW;
+      gn.properties.nodeHeight   = newH;
+      gn.properties.nodeFontSize = newF;
+    }
+  });
+}
+
+// ─── Highlight ────────────────────────────────────────────────────────────────
+
+var _highlightTargetIds = [];   // IDs captured at picker-open time
+
+function toggleHighlightPicker(event) {
+  if (event) event.stopPropagation();
+  var picker = document.getElementById('highlight-picker');
+  if (!picker) return;
+  if (picker.style.display === 'flex') {
+    picker.style.display = 'none';
+    _highlightTargetIds = [];
+    return;
+  }
+  // Only open if at least one node is selected; snapshot IDs now
+  if (!cy) return;
+  var sel = cy.nodes(':selected');
+  if (sel.length === 0) return;
+  _highlightTargetIds = sel.map(function(n) { return n.id(); });
+  var btn = document.getElementById('highlight-btn');
+  var rect = btn.getBoundingClientRect();
+  picker.style.top  = (rect.bottom + 5) + 'px';
+  picker.style.left = rect.left + 'px';
+  picker.style.display = 'flex';
+}
+
+function hideHighlightPicker() {
+  var picker = document.getElementById('highlight-picker');
+  if (picker) picker.style.display = 'none';
+}
+
+function applyHighlightStyle(node, color) {
+  if (color) {
+    node.data('highlightColor', color);
+    node.style({
+      'underlay-color':   color,
+      'underlay-opacity': 0.45,
+      'underlay-padding': 18,
+      'underlay-shape':   'ellipse'
+    });
+  } else {
+    node.removeData('highlightColor');
+    node.style({
+      'underlay-opacity': 0,
+      'underlay-padding': 0
+    });
+  }
+}
+
+function setHighlightColor(color) {
+  hideHighlightPicker();
+  if (!cy) return;
+  pushUndo();
+  var ids = _highlightTargetIds.length ? _highlightTargetIds : cy.nodes(':selected').map(function(n) { return n.id(); });
+  _highlightTargetIds = [];
+  ids.forEach(function(id) {
+    var node = cy.getElementById(id);
+    if (!node || node.length === 0) return;
+    applyHighlightStyle(node, color);
+    // Sync to graphData for tab-switch and JSON-save persistence
+    var gn = graphData.nodes.find(function(n) { return n.id === id; });
+    if (!gn) {
+      var urn = node.data('URN');
+      if (urn) gn = graphData.nodes.find(function(n) { return !n.isClone && n.properties && n.properties.URN === urn; });
+    }
+    if (gn) {
+      if (!gn.properties) gn.properties = {};
+      if (color) {
+        gn.properties.highlightColor = color;
+      } else {
+        delete gn.properties.highlightColor;
+      }
+    }
+  });
+}
+
+// Close picker when clicking anywhere outside it
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#highlight-picker') && !e.target.closest('#highlight-btn')) {
+    hideHighlightPicker();
+    _highlightTargetIds = [];
+  }
+});
+
+// ─── Node color change ────────────────────────────────────────────────────────
+
+var _colorTargetIds = [];
+
+function toggleNodeColorPicker(event) {
+  if (event) event.stopPropagation();
+  var picker = document.getElementById('nodecolor-picker');
+  if (!picker) return;
+  if (picker.style.display === 'flex') {
+    picker.style.display = 'none';
+    _colorTargetIds = [];
+    return;
+  }
+  if (!cy) return;
+  var sel = cy.nodes(':selected');
+  if (sel.length === 0) return;
+  _colorTargetIds = sel.map(function(n) { return n.id(); });
+  var btn = document.getElementById('nodecolor-btn');
+  var rect = btn.getBoundingClientRect();
+  picker.style.top  = (rect.bottom + 5) + 'px';
+  picker.style.left = rect.left + 'px';
+  picker.style.display = 'flex';
+}
+
+function hideNodeColorPicker() {
+  var picker = document.getElementById('nodecolor-picker');
+  if (picker) picker.style.display = 'none';
+  var row = document.getElementById('nodecolor-wheel-row');
+  if (row) row.style.display = 'none';
+}
+
+function _applyColorToNodes(ids, color) {
+  ids.forEach(function(id) {
+    var node = cy.getElementById(id);
+    if (!node || node.length === 0) return;
+    if (color) {
+      var tc = contrastColor(color);
+      node.data('customColor', color);
+      node.data('customTextColor', tc);
+      node.style({ 'background-color': color, 'text-outline-color': color, 'color': tc });
+    } else {
+      node.removeData('customColor');
+      node.removeData('customTextColor');
+      // Restore the original auto-color from node type
+      var origColor = node.data('color');
+      node.style({ 'background-color': origColor, 'text-outline-color': origColor, 'color': '' });
+    }
+    // Persist to graphData
+    var gn = graphData.nodes.find(function(n) { return n.id === id; });
+    if (!gn) {
+      var urn = node.data('URN');
+      if (urn) gn = graphData.nodes.find(function(n) { return !n.isClone && n.properties && n.properties.URN === urn; });
+    }
+    if (gn) {
+      if (!gn.properties) gn.properties = {};
+      if (color) { gn.properties.customColor = color; gn.properties.customTextColor = contrastColor(color); }
+      else        { delete gn.properties.customColor; delete gn.properties.customTextColor; }
+    }
+  });
+}
+
+function applyNodeColor(color) {
+  hideNodeColorPicker();
+  if (!cy) return;
+  var ids = _colorTargetIds.length ? _colorTargetIds : cy.nodes(':selected').map(function(n) { return n.id(); });
+  _colorTargetIds = [];
+  if (ids.length === 0) return;
+  pushUndo();
+  _applyColorToNodes(ids, color);
+}
+
+function openNodeColorWheel() {
+  var row = document.getElementById('nodecolor-wheel-row');
+  if (row) row.style.display = row.style.display === 'flex' ? 'none' : 'flex';
+}
+
+function applyMoreNodeColor(color) {
+  hideNodeColorPicker();
+  var row = document.getElementById('nodecolor-wheel-row');
+  if (row) row.style.display = 'none';
+  if (!cy || !color) return;
+  var ids = _colorTargetIds.length ? _colorTargetIds : cy.nodes(':selected').map(function(n) { return n.id(); });
+  _colorTargetIds = [];
+  if (ids.length === 0) return;
+  pushUndo();
+  _applyColorToNodes(ids, color);
+}
+
+document.addEventListener('click', function(e) {
+  if (!e.target.closest('#nodecolor-picker') && !e.target.closest('#nodecolor-btn')) {
+    hideNodeColorPicker();
+  }
+});
+
+// ─── Undo ─────────────────────────────────────────────────────────────────────
+
+function pushUndo() {
+  var snapshot = captureTabState();
+  undoStack.push({ graphData: snapshot.graphData, positions: snapshot.positions });
+  var btn = document.getElementById('undo-btn');
+  if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+}
+
+function undoGraphOperation() {
+  if (undoStack.length === 0) return;
+  var prev = undoStack.pop();
+  graphData = JSON.parse(JSON.stringify(prev.graphData));
+  renderGraph(graphData, prev.positions);
+  applyStyle(currentStyle);   // restore current visual style (metabolic, effect, etc.)
+  // Keep active tab snapshot in sync
+  if (tabs && tabs[activeTabIdx]) {
+    tabs[activeTabIdx].snapshot = captureTabState();
+  }
+  var btn = document.getElementById('undo-btn');
+  if (btn) {
+    btn.disabled = undoStack.length === 0;
+    btn.style.opacity = undoStack.length === 0 ? '0.4' : '1';
+  }
+}
+
 function cloneNodeFromContext() {
   hideContextMenu();
   if (!contextTarget || contextTarget.type !== 'node') return;
+  pushUndo();
 
   var sourceId = contextTarget.id;
   if (!cy) return;
   var src = cy.getElementById(sourceId);
   if (!src || src.length === 0) return;
 
-  var connectedEdges = src.connectedEdges().toArray();
-
-  // No edges — fall back to single clone
-  if (connectedEdges.length === 0) {
-    cloneNode(sourceId);
-    return;
-  }
-
   var srcData      = src.data();
   var srcPos       = src.position();
   var srcUrn       = srcData.URN;
-  var srcGraphNode = graphData.nodes.find(function(n) {
-    return n.id === sourceId ||
-           (srcUrn && n.properties && n.properties.URN === srcUrn && !n.isClone);
-  });
-  var srcGnId      = srcGraphNode ? srcGraphNode.id : sourceId;
-  var cloneOf      = srcData.cloneOf || sourceId;
+  // Step 1: exact graphData-ID match (covers clones and un-enriched originals).
+  var srcGraphNode = graphData.nodes.find(function(n) { return n.id === sourceId; });
+  // Step 2: URN fallback for enriched originals whose graphData id was updated
+  // to a Neo4j integer while the cy node id stayed as the URN string.
+  // Important: do NOT let this fallback fire when sourceId is a clone id —
+  // the original non-clone with the same URN would be found first otherwise,
+  // leading to the wrong srcGnId and removing the original instead of the clone.
+  if (!srcGraphNode) {
+    srcGraphNode = graphData.nodes.find(function(n) {
+      return srcUrn && n.properties && n.properties.URN === srcUrn && !n.isClone;
+    });
+  }
 
-  // Spread clones in a circle around the original position
+  var srcGnId = srcGraphNode ? srcGraphNode.id : sourceId;
+  var cloneOf = srcData.cloneOf || sourceId;
+
+  // Create N clones — one per connected edge — each clone gets exactly 1 edge.
+  // The original node is removed once all edges have been redistributed.
+  var connectedEdges = src.connectedEdges().toArray();
   var n      = connectedEdges.length;
   var radius = 80;
 
@@ -2709,7 +3955,6 @@ function cloneNodeFromContext() {
     var angle   = (2 * Math.PI * i / n) - Math.PI / 2;
     var cloneId = sourceId + '__clone__' + Date.now() + '_' + i;
 
-    // Add clone node to Cytoscape
     cy.add({
       group: 'nodes',
       data: Object.assign({}, srcData, {
@@ -2722,21 +3967,6 @@ function cloneNodeFromContext() {
       }
     });
 
-    // Move this edge's endpoint(s) from original to clone, then re-add
-    var ed = Object.assign({}, edge.data());
-    if (ed.source === sourceId) ed.source = cloneId;
-    if (ed.target === sourceId) ed.target = cloneId;
-    edge.remove();
-    cy.add({ group: 'edges', data: ed });
-
-    // Keep graphData.edges in sync
-    var gde = graphData.edges.find(function(e) { return e.id === ed.id; });
-    if (gde) {
-      if (gde.startNodeId === srcGnId) gde.startNodeId = cloneId;
-      if (gde.endNodeId   === srcGnId) gde.endNodeId   = cloneId;
-    }
-
-    // Add clone to graphData.nodes
     graphData.nodes.push({
       id: cloneId, elementId: cloneId,
       labels:    srcGraphNode ? (srcGraphNode.labels || []).slice() : [srcData.nodeType || 'Unknown'],
@@ -2749,11 +3979,126 @@ function cloneNodeFromContext() {
                                         label: undefined, color: undefined,
                                         nodeType: undefined })
     });
+
+    // Move this edge from the original to its clone
+    var ed = Object.assign({}, edge.data());
+    edge.remove();
+    cy.add({
+      group: 'edges',
+      data: Object.assign({}, ed, {
+        source: ed.source === sourceId ? cloneId : ed.source,
+        target: ed.target === sourceId ? cloneId : ed.target
+      })
+    });
+
+    var gde = graphData.edges.find(function(e) { return e.id === ed.id; });
+    if (gde) {
+      if (gde.startNodeId === srcGnId) gde.startNodeId = cloneId;
+      if (gde.endNodeId   === srcGnId) gde.endNodeId   = cloneId;
+    }
   });
 
-  // Remove the original — all its edges have been redistributed to clones
+  // Remove the original — all edges redistributed to clones
   src.remove();
   graphData.nodes = graphData.nodes.filter(function(n) { return n.id !== srcGnId; });
+
+  updateStats();
+}
+
+function mergeSelectedClonesFromContext() {
+  hideContextMenu();
+  if (!cy) return;
+  pushUndo();
+
+  // Collect all selected clone nodes
+  var selectedClones = cy.nodes(':selected').filter(function(n) {
+    return n.data('isClone');
+  });
+
+  if (selectedClones.length < 2) return;
+
+  // Group by cloneOf so we merge only clones of the same original together
+  var groups = {};
+  selectedClones.forEach(function(n) {
+    var cloneOf = n.data('cloneOf');
+    if (!groups[cloneOf]) groups[cloneOf] = [];
+    groups[cloneOf].push(n);
+  });
+
+  Object.keys(groups).forEach(function(cloneOf) {
+    var group = groups[cloneOf];
+    if (group.length < 2) return; // Nothing to merge for this original
+
+    // First node in the group is the survivor; rest are merged into it
+    var survivor   = group[0];
+    var survivorId = survivor.id();
+
+    for (var i = 1; i < group.length; i++) {
+      var victim   = group[i];
+      var victimId = victim.id();
+
+      // Redirect each edge that touches the victim over to the survivor.
+      // Edges that are duplicates of edges already on the survivor are discarded.
+      victim.connectedEdges().forEach(function(edge) {
+        var ed     = Object.assign({}, edge.data());
+        var newSrc = ed.source === victimId ? survivorId : ed.source;
+        var newTgt = ed.target === victimId ? survivorId : ed.target;
+
+        // Save the graphData record BEFORE removing (it holds type + properties)
+        var gde = graphData.edges.find(function(e) { return e.id === ed.id; });
+
+        // Remove victim's edge from cy and graphData
+        edge.remove();
+        graphData.edges = graphData.edges.filter(function(e) { return e.id !== ed.id; });
+
+        if (newSrc === newTgt) return;  // would be self-loop — discard
+
+        // Discard if survivor already has an edge cloned from the same original
+        // (two clones of Na+ both had Clone→MT; after merge survivor would have two survivor→MT)
+        var baseId = _baseEdgeId(ed.id);
+        var isDupe = cy.edges().some(function(e) {
+          return _baseEdgeId(e.id()) === baseId &&
+                 e.source().id() === newSrc &&
+                 e.target().id() === newTgt;
+        });
+        if (isDupe) return;
+
+        // Re-add to cy (don't mutate ed — use a fresh merge)
+        cy.add({ group: 'edges', data: Object.assign({}, ed, { source: newSrc, target: newTgt }) });
+
+        // Push a properly-structured graphData edge.
+        // IMPORTANT: graphData edges store graphData node IDs (which may be Neo4j
+        // integers after enrichment), NOT cy node IDs (which are URN strings).
+        // Only swap the endpoint that literally equals victimId — leave all other
+        // endpoints (e.g. the Neo4j-integer IDs of neighbour nodes) untouched.
+        if (gde) {
+          graphData.edges.push(Object.assign({}, gde, {
+            startNodeId: gde.startNodeId === victimId ? survivorId : gde.startNodeId,
+            endNodeId:   gde.endNodeId   === victimId ? survivorId : gde.endNodeId
+          }));
+        } else {
+          // Fallback: reconstruct from cy data fields
+          graphData.edges.push({
+            id:          ed.id,
+            elementId:   ed.elementId || ed.id,
+            type:        ed.relType || '',
+            startNodeId: newSrc,
+            endNodeId:   newTgt,
+            properties: {
+              RelationID: ed.relId  || ed.id,
+              Effect:     ed.effect || '',
+              NumRefs:    ed.numRefs || 0,
+              references: []
+            }
+          });
+        }
+      });
+
+      // Remove victim from Cytoscape and graphData
+      victim.remove();
+      graphData.nodes = graphData.nodes.filter(function(n) { return n.id !== victimId; });
+    }
+  });
 
   updateStats();
 }
@@ -2761,16 +4106,23 @@ function cloneNodeFromContext() {
 function removeCloneFromContext() {
   hideContextMenu();
   if (!contextTarget || contextTarget.type !== 'node') return;
+  pushUndo();
   var id = contextTarget.id;
   if (!cy) return;
   var node = cy.getElementById(id);
   if (!node || !node.data('isClone')) return;
 
-  // Remove from Cytoscape
+  // Remove clone and all its connected edges from Cytoscape
+  // (node.remove() automatically removes connected cy edges)
   node.remove();
 
   // Remove from graphData.nodes
   graphData.nodes = graphData.nodes.filter(function(n) { return n.id !== id; });
+
+  // Remove all graphData edges that referenced this clone (pre-existing bug fix)
+  graphData.edges = graphData.edges.filter(function(e) {
+    return e.startNodeId !== id && e.endNodeId !== id;
+  });
 
   updateStats();
 }
@@ -2912,6 +4264,7 @@ function emptyTabSnapshot() {
     tableRows:           [],
     currentSubgraphName: '',
     currentLayout:       'cose',
+    currentStyle:        'default',
     currentQuery:        '',
     positions:           {},
     tableViewMode:       'reference'
@@ -2948,6 +4301,7 @@ function captureTabState() {
     tableRows:           JSON.parse(JSON.stringify(tableRows)),
     currentSubgraphName: currentSubgraphName,
     currentLayout:       currentLayout,
+    currentStyle:        currentStyle,
     currentQuery:        currentQuery,
     positions:           positions,
     tableViewMode:       tableViewMode
@@ -2966,12 +4320,14 @@ function applyTabState(snapshot) {
   graphData           = JSON.parse(JSON.stringify(s.graphData));
   currentSubgraphName = s.currentSubgraphName || '';
   currentLayout       = s.currentLayout || 'cose';
+  currentStyle        = s.currentStyle  || 'default';
   currentQuery        = s.currentQuery || '';
 
   var qEl = document.getElementById('cypher-input');
   if (qEl) qEl.value = currentQuery;
 
   updateLayoutMenu(currentLayout);
+  updateStyleMenu(currentStyle);
 
   if (graphData.nodes.length === 0 && graphData.edges.length === 0) {
     if (cy) cy.elements().remove();
@@ -2984,6 +4340,7 @@ function applyTabState(snapshot) {
   } else {
     var hasPos = s.positions && Object.keys(s.positions).length > 0;
     renderGraph(graphData, hasPos ? s.positions : null);
+    applyStyle(currentStyle);
     // renderGraph resets refsCache/medScanMap — restore saved values
     refsCache  = Object.assign({}, s.refsCache);
     medScanMap = Object.assign({}, s.medScanMap);
@@ -3190,14 +4547,32 @@ function pasteClipboard() {
   cy.elements(':selected').unselect();
   var idMap = {};
   var offset = 60;
+  var mergedNodes = 0;
+  var skippedEdges = 0;
+
+  // Build URN → existing cy node ID map for merge detection
+  var urnToExistingCyId = {};
+  cy.nodes().forEach(function(cyNode) {
+    var urn = cyNode.data('URN');
+    if (urn) urnToExistingCyId[String(urn)] = cyNode.id();
+  });
+
   graphClipboard.nodes.forEach(function(n) {
+    var srcUrn = n.data.URN;
+
+    // If a node with the same URN already exists, merge instead of duplicating
+    if (srcUrn && urnToExistingCyId[String(srcUrn)]) {
+      idMap[n.data.id] = urnToExistingCyId[String(srcUrn)];
+      mergedNodes++;
+      return;
+    }
+
     var newId = n.data.id + '__paste__' + Date.now() + Math.random().toString(36).slice(2, 6);
     idMap[n.data.id] = newId;
     var newData = Object.assign({}, n.data, { id: newId, elementId: newId });
     var newNode = cy.add({ group: 'nodes', data: newData,
       position: { x: n.position.x + offset, y: n.position.y + offset } });
     newNode.select();
-    var srcUrn = n.data.URN;
     var srcGn = n.raw || graphData.nodes.find(function(gn) {
       return gn.id === n.data.id ||
              (srcUrn && gn.properties && gn.properties.URN === srcUrn);
@@ -3208,9 +4583,51 @@ function pasteClipboard() {
       properties: srcGn ? Object.assign({}, srcGn.properties) : {}
     });
   });
+
+  // Build identity set for existing edges to detect duplicates.
+  // Identity rule (mirrors Pathway Studio):
+  //   Primary:   RelationID from Neo4j
+  //   Fallback:  (source, target, type, effect, mechanism) — same direction
+  var existingEdgeKeys = new Set();
+  cy.edges().forEach(function(cyEdge) {
+    var relId = cyEdge.data('relId') || cyEdge.data('RelationID');
+    if (relId) existingEdgeKeys.add('rid:' + String(relId));
+    var src  = cyEdge.data('source');
+    var tgt  = cyEdge.data('target');
+    var type = cyEdge.data('relType') || '';
+    var eff  = cyEdge.data('effect')  || '';
+    var mech = cyEdge.data('mechanism') || '';
+    existingEdgeKeys.add('struct:' + src + '|' + tgt + '|' + type + '|' + eff + '|' + mech);
+  });
+
   graphClipboard.edges.forEach(function(e) {
     var newSrc = idMap[e.data.source] || e.data.source;
     var newTgt = idMap[e.data.target] || e.data.target;
+
+    // Check RelationID identity
+    var relId = e.data.relId
+      || (e.raw && e.raw.properties && e.raw.properties.RelationID)
+      || null;
+    if (relId && existingEdgeKeys.has('rid:' + String(relId))) {
+      skippedEdges++;
+      return;
+    }
+
+    // Check structural identity (uses merged node IDs so duplicates via shared
+    // nodes are also caught)
+    var type = e.data.relType || '';
+    var eff  = e.data.effect  || '';
+    var mech = e.data.mechanism || '';
+    var structKey = 'struct:' + newSrc + '|' + newTgt + '|' + type + '|' + eff + '|' + mech;
+    if (existingEdgeKeys.has(structKey)) {
+      skippedEdges++;
+      return;
+    }
+
+    // Register this edge so subsequent clipboard edges don't duplicate each other
+    if (relId) existingEdgeKeys.add('rid:' + String(relId));
+    existingEdgeKeys.add(structKey);
+
     var newEid = e.data.id + '__paste__' + Date.now() + Math.random().toString(36).slice(2, 6);
     cy.add({ group: 'edges',
       data: Object.assign({}, e.data, { id: newEid, elementId: newEid, source: newSrc, target: newTgt }) });
@@ -3237,20 +4654,27 @@ function pasteClipboard() {
       });
     }
   });
+
   tableRows = [];
   var pastedNodes = graphClipboard.nodes.map(function(n) {
     return n.raw || { properties: n.data };
   });
   fetchMedScanForNodes(pastedNodes);
   setTimeout(function() { cy.fit(cy.elements(), 40); }, 50);
-  var nc = graphClipboard.nodes.length, ec = graphClipboard.edges.length;
+
+  var newNodes  = graphClipboard.nodes.length - mergedNodes;
+  var newEdges  = graphClipboard.edges.length - skippedEdges;
   var parts = [];
-  if (nc) parts.push(nc + ' node' + (nc !== 1 ? 's' : ''));
-  if (ec) parts.push(ec + ' edge' + (ec !== 1 ? 's' : ''));
+  if (newNodes  > 0) parts.push(newNodes  + ' node' + (newNodes  !== 1 ? 's' : '') + ' added');
+  if (mergedNodes > 0) parts.push(mergedNodes + ' node' + (mergedNodes !== 1 ? 's' : '') + ' merged');
+  if (newEdges  > 0) parts.push(newEdges  + ' edge' + (newEdges  !== 1 ? 's' : '') + ' added');
+  if (skippedEdges > 0) parts.push(skippedEdges + ' duplicate edge' + (skippedEdges !== 1 ? 's' : '') + ' skipped');
+  if (!parts.length) parts.push('nothing new to paste');
+
   var statsEl = document.getElementById('graph-stats');
   if (statsEl) {
-    statsEl.innerHTML = '<span style="color:#4f8ef7">' + parts.join(' and ') + ' pasted</span>';
-    setTimeout(updateStats, 2500);
+    statsEl.innerHTML = '<span style="color:#4f8ef7">' + parts.join(', ') + '</span>';
+    setTimeout(updateStats, 3000);
   } else { updateStats(); }
 }
 
@@ -3258,9 +4682,206 @@ function deleteSelection() {
   if (!cy) return;
   var sel = cy.elements(':selected');
   if (sel.length === 0) return;
+  pushUndo();
   var selIds = new Set(sel.map(function(el) { return el.id(); }));
   sel.remove();
   graphData.nodes = graphData.nodes.filter(function(n) { return !selIds.has(n.id); });
   graphData.edges = graphData.edges.filter(function(e) { return !selIds.has(e.id); });
   updateStats();
 }
+
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+function menuApplyStyle(name) {
+  closeMenus();
+  applyStyle(name);
+  if (tabs && tabs[activeTabIdx]) tabs[activeTabIdx].snapshot = captureTabState();
+}
+
+function updateStyleMenu(name) {
+  ['default', 'effect', 'metabolic'].forEach(function(s) {
+    var el = document.getElementById('mc-style-' + s);
+    if (el) el.textContent = (s === name) ? '✓' : '';
+  });
+}
+
+// ─── Wrap label at ~25 chars for Metabolic style ─────────────────────────────
+function wrapLabelForMetabolic(text) {
+  var MAX = 25;
+  if (!text || text.length <= MAX) return text;
+  var lines = [];
+  var remaining = text;
+  while (remaining.length > MAX) {
+    // Prefer breaking after a hyphen or at a space within the first MAX chars
+    var breakAt = -1;
+    for (var i = MAX; i > 0; i--) {
+      var ch = remaining[i];
+      if (ch === '-') { breakAt = i + 1; break; }   // include the hyphen
+      if (ch === ' ') { breakAt = i;     break; }   // exclude the space
+    }
+    if (breakAt <= 0) breakAt = MAX;                 // hard break if no delimiter
+    lines.push(remaining.substring(0, breakAt));
+    remaining = remaining.substring(breakAt).replace(/^ /, '');
+  }
+  if (remaining) lines.push(remaining);
+  return lines.join('\n');
+}
+
+function applyStyle(name) {
+  currentStyle = name || 'default';
+  updateStyleMenu(currentStyle);
+  if (!cy) return;
+
+  if (currentStyle === 'default') {
+    // Remove inline overrides — stylesheet takes over again
+    cy.edges().forEach(function(e) {
+      e.removeStyle('line-color target-arrow-color source-arrow-color');
+    });
+    cy.nodes().forEach(function(n) {
+      if (n.data('NodeType') === 'Reaction') return;
+      n.removeStyle(
+        'label shape width height padding background-color background-fill color ' +
+        'text-outline-width border-width border-color border-style text-wrap text-max-width'
+      );
+      // Re-apply manual resize if the node was previously resized
+      var w = n.data('nodeWidth');
+      var h = n.data('nodeHeight') || w;
+      var f = n.data('nodeFontSize');
+      if (w) n.style({ width: w, height: h, 'font-size': f || BASE_NODE_FONT });
+    });
+
+  } else if (currentStyle === 'effect') {
+    cy.edges().forEach(function(e) {
+      var effect = (e.data('effect') || '').toLowerCase();
+      var color = effect === 'positive' ? '#43a047'   // green
+                : effect === 'negative' ? '#e53935'   // red
+                :                         '#9e9e9e';  // gray (unknown/none)
+      e.style({
+        'line-color':          color,
+        'target-arrow-color':  color,
+        'source-arrow-color':  color
+      });
+    });
+
+  } else if (currentStyle === 'metabolic') {
+    // Edge colors by effect (same as 'effect' style)
+    cy.edges().forEach(function(e) {
+      var effect = (e.data('effect') || '').toLowerCase();
+      var color = effect === 'positive' ? '#43a047'
+                : effect === 'negative' ? '#e53935'
+                :                         '#9e9e9e';
+      e.style({ 'line-color': color, 'target-arrow-color': color, 'source-arrow-color': color });
+    });
+
+    // Rectangle nodes auto-sized to their label
+    cy.nodes().forEach(function(n) {
+      if (n.data('NodeType') === 'Reaction') return;   // keep tiny reaction dot
+      var isSmallMol = n.data('NodeType') === 'SmallMol';
+      var bgColor    = isSmallMol ? '#ffffff' : (n.data('color') || '#555555');
+      var textColor  = isSmallMol ? '#000000' : '#ffffff';
+      var borderW    = isSmallMol ? 1.5 : 0;
+
+      var rawLabel = n.data('label') || '';
+      var wrappedLabel = wrapLabelForMetabolic(rawLabel);
+      // Respect manually-set size so undo restores the right dimensions
+      var manualW = n.data('nodeWidth');
+      var manualH = n.data('nodeHeight');
+      var manualF = n.data('nodeFontSize');
+      n.style({
+        'label':              wrappedLabel,
+        'shape':              'rectangle',
+        'background-fill':    'solid',
+        'width':              manualW ? manualW : 'label',
+        'height':             manualH ? manualH : (manualW ? manualW : 'label'),
+        'padding':            manualW ? '0px' : '5px',
+        'background-color':    bgColor,
+        'color':               textColor,
+        'text-outline-color':  textColor === '#000000' ? 'rgba(255,255,255,0.88)' : bgColor,
+        'text-outline-width':  2,
+        'font-size':          (manualF || 11) + (manualF ? 'px' : 'px'),
+        'text-wrap':          'wrap',
+        'border-width':       borderW,
+        'border-color':       '#555555'
+      });
+    });
+  }
+}
+
+
+// ─── Find nodes ───────────────────────────────────────────────────────────────
+var _findPopupOpen = false;
+
+function toggleFindPopup(event) {
+  if (event) event.stopPropagation();
+  var popup = document.getElementById('find-popup');
+  if (!popup) return;
+  if (_findPopupOpen) {
+    hideFindPopup();
+  } else {
+    var btn = document.getElementById('find-btn');
+    if (btn) {
+      var rect = btn.getBoundingClientRect();
+      popup.style.top = (rect.bottom + 6) + 'px';
+      popup.style.left = rect.left + 'px';
+    }
+    popup.style.display = 'block';
+    _findPopupOpen = true;
+    document.getElementById('find-result').textContent = '';
+    var inp = document.getElementById('find-input');
+    if (inp) { inp.value = ''; setTimeout(function() { inp.focus(); }, 50); }
+  }
+}
+
+function hideFindPopup() {
+  var popup = document.getElementById('find-popup');
+  if (popup) popup.style.display = 'none';
+  _findPopupOpen = false;
+}
+
+// Keys to skip when searching node data (internal / styling)
+var _findSkipKeys = {
+  id: true, elementId: true, isClone: true, cloneOf: true,
+  color: true, nodeWidth: true, nodeHeight: true, nodeFontSize: true,
+  customColor: true, customTextColor: true, highlightColor: true, rnefShape: true
+};
+
+function executeNodeSearch() {
+  if (!cy) return;
+  var inp = document.getElementById('find-input');
+  var resultEl = document.getElementById('find-result');
+  if (!inp || !resultEl) return;
+  var q = inp.value.trim().toLowerCase();
+  if (!q) { resultEl.textContent = 'Enter a search term.'; return; }
+
+  var matched = cy.nodes().filter(function(node) {
+    var d = node.data();
+    for (var key in d) {
+      if (_findSkipKeys[key]) continue;
+      var val = d[key];
+      if (val === null || val === undefined) continue;
+      if (String(val).toLowerCase().indexOf(q) !== -1) return true;
+    }
+    return false;
+  });
+
+  cy.elements().unselect();
+  if (matched.length > 0) {
+    matched.select();
+    resultEl.textContent = matched.length + ' node' + (matched.length === 1 ? '' : 's') + ' found.';
+    if (matched.length === 1) {
+      cy.animate({ center: { eles: matched }, zoom: cy.zoom() < 1 ? 1 : cy.zoom() }, { duration: 300 });
+    }
+  } else {
+    resultEl.textContent = 'No nodes matched "' + inp.value.trim() + '".';
+  }
+}
+
+// Close find popup when clicking outside
+document.addEventListener('click', function(e) {
+  if (!_findPopupOpen) return;
+  var popup = document.getElementById('find-popup');
+  var btn = document.getElementById('find-btn');
+  if (popup && !popup.contains(e.target) && e.target !== btn) {
+    hideFindPopup();
+  }
+});
