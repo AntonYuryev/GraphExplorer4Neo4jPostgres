@@ -55,12 +55,28 @@
       <span id="app-title">Graph Explorer</span>
     </div>
     <div id="header-center">
-      <div id="graph-stats"></div><button onclick="zoomOut()" title="Zoom Out" style="margin-left:10px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">−</button><button id="fit-btn" onclick="zoomFit()" title="Fit graph to window" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">Fit</button><button onclick="zoomIn()" title="Zoom In" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">+</button>
+      <div id="graph-stats"></div><button id="undo-btn" onclick="undoGraphOperation()" title="Undo last graph operation" disabled style="margin-left:10px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer;opacity:0.4">↩</button><button onclick="zoomOut()" title="Zoom Out" style="margin-left:6px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">−</button><button id="fit-btn" onclick="zoomFit()" title="Fit graph to window" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">Fit</button><button onclick="zoomIn()" title="Zoom In" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">+</button><button onclick="alignNodesHorizontally()" title="Align selected nodes horizontally (same Y as focus node)" style="margin-left:6px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 26 16" width="22" height="13" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="1" y1="8" x2="25" y2="8" stroke="#5a6080" stroke-width="1.2"/><circle cx="5"  cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="13" cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="21" cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/></svg></button><button onclick="alignNodesVertically()" title="Align selected nodes vertically (same X as focus node)" style="margin-left:2px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 16 26" width="13" height="22" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="8" y1="1" x2="8" y2="25" stroke="#5a6080" stroke-width="1.2"/><circle cx="8" cy="5"  r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="8" cy="13" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="8" cy="21" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/></svg></button><button id="highlight-btn" onclick="toggleHighlightPicker(event)" title="Highlight selected nodes" style="margin-left:8px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 20 20" width="16" height="16" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><circle cx="10" cy="10" r="9.5" fill="#e74c3c" fill-opacity="0.75"/><circle cx="10" cy="10" r="5" fill="#f1c40f"/></svg></button><button id="nodecolor-btn" onclick="toggleNodeColorPicker(event)" title="Change node color" style="margin-left:2px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 28 22" width="19" height="12" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="7" y1="7" x2="21" y2="7" stroke="#5a6080" stroke-width="1.5"/><line x1="7" y1="7" x2="14" y2="18" stroke="#5a6080" stroke-width="1.5"/><line x1="21" y1="7" x2="14" y2="18" stroke="#5a6080" stroke-width="1.5"/><circle cx="7" cy="7" r="5.5" fill="#e74c3c"/><circle cx="21" cy="7" r="5.5" fill="#f1c40f"/><circle cx="14" cy="18" r="5.5" fill="#3498db"/></svg></button><button id="find-btn" onclick="toggleFindPopup(event)" title="Find nodes on graph" style="margin-left:8px;padding:2px 6px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 16 16" width="14" height="14" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><circle cx="6.5" cy="6.5" r="4.5" fill="none" stroke="#7a8099" stroke-width="1.6"/><line x1="10" y1="10" x2="14.5" y2="14.5" stroke="#7a8099" stroke-width="1.6" stroke-linecap="round"/></svg></button><button onclick="resizeSelectedNodes(1.3)" title="Increase node size" style="margin-left:8px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">⊕</button><button onclick="resizeSelectedNodes(0.77)" title="Decrease node size" style="margin-left:2px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">⊖</button>
     </div>
     <div id="header-right">
       <span id="current-user-label"></span>
-      <button class="btn-ghost" onclick="openChangePassword()">Change Password</button>
-      <button class="btn-ghost" id="admin-btn" onclick="openUserManagement()" style="display:none">Users</button>
+      <!-- Settings dropdown -->
+      <div id="settings-menu-wrap" style="position:relative;display:inline-block">
+        <button class="btn-ghost" onclick="toggleSettingsMenu(event)">⚙ Settings ▾</button>
+        <div id="settings-dropdown" style="display:none;position:absolute;right:0;top:100%;background:#1e2235;border:1px solid #2a2f4a;border-radius:6px;min-width:160px;z-index:9999;box-shadow:0 4px 16px rgba(0,0,0,0.4)">
+          <!-- Admin sub-section -->
+          <div style="padding:4px 0;border-bottom:1px solid #2a2f4a">
+            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">Admin</div>
+            <div class="settings-item" onclick="openChangePassword();closeSettingsMenu()">Change Password</div>
+            <div class="settings-item" id="settings-users-item" style="display:none" onclick="openUserManagement();closeSettingsMenu()">Users</div>
+          </div>
+          <!-- DB connections (admin only) -->
+          <div id="settings-db-section" style="display:none;padding:4px 0">
+            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">Database</div>
+            <div class="settings-item" onclick="openNeo4jSettings();closeSettingsMenu()">Neo4j</div>
+            <div class="settings-item" onclick="openPostgresSettings();closeSettingsMenu()">Postgres</div>
+          </div>
+        </div>
+      </div>
       <button class="btn-danger-ghost" onclick="logout()">Sign Out</button>
     </div>
   </header>
@@ -86,6 +102,8 @@
       <div class="menu-dropdown">
         <div class="menu-item" onclick="focusCypherInput();closeMenus()">Neo4j Cypher</div>
         <div class="menu-item" onclick="openSqlDialog();closeMenus()">Postgres SQL</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="openLoadNodePropertiesDialog();closeMenus()">Load node properties</div>
       </div>
     </div>
 
@@ -122,6 +140,15 @@
               <div class="menu-item" onclick="menuApplyLayout('dagre');closeMenus()"><span class="menu-check" id="mc-dagre"></span>Hierarchical</div>
               <div class="menu-item" onclick="menuApplyLayout('circle');closeMenus()"><span class="menu-check" id="mc-circle"></span>Circular</div>
               <div class="menu-item" onclick="menuApplyLayout('concentric');closeMenus()"><span class="menu-check" id="mc-concentric"></span>Concentric</div>
+              <div class="menu-item" onclick="menuApplyLayout('klay');closeMenus()"><span class="menu-check" id="mc-klay"></span>Orthogonal</div>
+            </div>
+          </div>
+          <div class="menu-separator"></div>
+          <div class="menu-item has-sub">Styles
+            <div class="menu-submenu">
+              <div class="menu-item" onclick="menuApplyStyle('default');closeMenus()"><span class="menu-check" id="mc-style-default">✓</span>Default</div>
+              <div class="menu-item" onclick="menuApplyStyle('effect');closeMenus()"><span class="menu-check" id="mc-style-effect"></span>By Effect</div>
+                <div class="menu-item" onclick="menuApplyStyle('metabolic');closeMenus()"><span class="menu-check" id="mc-style-metabolic"></span>Metabolic</div>
             </div>
           </div>
           <div class="menu-separator"></div>
@@ -195,6 +222,7 @@
     <div id="graph-view">
       <div id="graph-canvas-wrapper">
         <div id="cy"></div>
+        <div id="resize-handles-overlay"></div>
         <div id="graph-empty-state">
           <p>Build the graph by using Database&nbsp;&#x2192;&nbsp;Neo4j Cypher or Copy/Pasting from another pathway</p>
         </div>
@@ -317,6 +345,8 @@
   <div class="ctx-item" id="ctx-clone" onclick="cloneNodeFromContext()" style="display:none">🔗 Clone node</div>
   <div class="ctx-separator" id="ctx-sep-clone" style="display:none"></div>
   <div class="ctx-item" id="ctx-unclone" onclick="removeCloneFromContext()" style="display:none">🗑️ Remove clone</div>
+  <div class="ctx-separator" id="ctx-sep-merge" style="display:none"></div>
+  <div class="ctx-item" id="ctx-merge-clones" onclick="mergeSelectedClonesFromContext()" style="display:none">🔀 Merge selected clones</div>
 </div>
 
 <!-- Columns dialog -->
@@ -339,10 +369,84 @@
         <div class="prop-section-title">scopus_data table (Reference view)</div>
         <div id="col-sd-list" style="display:flex;flex-wrap:wrap;gap:4px 16px"></div>
       </div>
+      <div id="col-nodeprops-section" style="display:none">
+        <div class="prop-section-title" style="margin-top:12px">node properties (both views)</div>
+        <div id="col-nodeprops-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:4px"></div>
+        <div id="col-nodeprops-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
+      </div>
     </div>
     <div class="modal-actions" style="margin-top:14px">
+      <button class="btn-ghost" style="margin-right:auto;color:#e05560" onclick="resetColumnsToDefault()">Reset to defaults</button>
       <button class="btn-ghost" onclick="document.getElementById('columns-modal').style.display='none'">Cancel</button>
       <button class="btn-primary" onclick="applyColumnsDialog()">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Neo4j settings modal -->
+<div id="neo4j-settings-modal" class="modal-backdrop" style="display:none" onclick="closeNeo4jSettingsModal(event)">
+  <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
+    <h3>Neo4j Connection</h3>
+    <div id="neo4j-settings-error" class="error-msg" style="display:none"></div>
+    <div id="neo4j-settings-success" class="success-msg" style="display:none"></div>
+    <label style="font-size:12px;color:#7a8099">URL</label>
+    <input type="text" id="ns-url" placeholder="bolt+ssc://host:7687" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Database name</label>
+    <input type="text" id="ns-database" placeholder="neo4j" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Username</label>
+    <input type="text" id="ns-username" placeholder="neo4j" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Password</label>
+    <input type="password" id="ns-password" placeholder="Leave blank to keep current" autocomplete="new-password">
+    <p style="font-size:11px;color:#7a8099;margin-top:6px">Connection is tested before saving. Server reconnects without restart.</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeNeo4jSettingsModal()">Cancel</button>
+      <button class="btn-primary" id="ns-save-btn" onclick="saveNeo4jSettings()">Test &amp; Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Postgres settings modal -->
+<div id="postgres-settings-modal" class="modal-backdrop" style="display:none" onclick="closePostgresSettingsModal(event)">
+  <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
+    <h3>Postgres Connection</h3>
+    <div id="pg-settings-error" class="error-msg" style="display:none"></div>
+    <div id="pg-settings-success" class="success-msg" style="display:none"></div>
+    <label style="font-size:12px;color:#7a8099">Host</label>
+    <input type="text" id="pgs-host" placeholder="hostname or IP" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Port</label>
+    <input type="number" id="pgs-port" placeholder="5432" value="5432" min="1" max="65535" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Database name</label>
+    <input type="text" id="pgs-database" placeholder="postgres" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Schema</label>
+    <input type="text" id="pgs-schema" placeholder="public" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Username</label>
+    <input type="text" id="pgs-username" placeholder="postgres" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Password</label>
+    <input type="password" id="pgs-password" placeholder="Leave blank to keep current" autocomplete="new-password">
+    <p style="font-size:11px;color:#7a8099;margin-top:6px">Connection is tested before saving. Server reconnects without restart.</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePostgresSettingsModal()">Cancel</button>
+      <button class="btn-primary" id="pgs-save-btn" onclick="savePostgresSettings()">Test &amp; Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Load node properties modal -->
+<div id="load-props-modal" class="modal-backdrop" style="display:none" onclick="closeLoadPropsModal(event)">
+  <div class="modal-box" style="min-width:480px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+    <h3>Load Node Properties</h3>
+    <p style="color:#7a8099;font-size:12px;margin-bottom:10px">Select properties to add to nodes in the current pathway.</p>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button class="btn-ghost" style="font-size:11px;padding:3px 10px" onclick="loadPropsSelectAll(true)">Select all</button>
+      <button class="btn-ghost" style="font-size:11px;padding:3px 10px" onclick="loadPropsSelectAll(false)">Deselect all</button>
+    </div>
+    <div id="load-props-list" style="overflow-y:auto;flex:1;display:flex;flex-wrap:wrap;gap:4px 16px;align-content:flex-start;min-height:80px">
+      <span style="color:#7a8099;font-size:12px">Loading…</span>
+    </div>
+    <div id="load-props-status" style="min-height:18px;font-size:12px;color:#7a8099;margin-top:8px"></div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn-ghost" onclick="closeLoadPropsModal()">Cancel</button>
+      <button class="btn-primary" id="load-props-upload-btn" onclick="executeLoadNodeProperties()">Load</button>
     </div>
   </div>
 </div>
@@ -383,8 +487,56 @@
 <script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
 <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
 <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<script src="https://unpkg.com/klayjs@0.4.1/klay.js"></script>
+<script src="https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
 <script src="app.js"></script>
+
+<!-- Align hint toast -->
+<div id="align-toast" style="display:none;position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#2a2f45;border:1px solid #5a6080;color:#c8cfe0;padding:7px 18px;border-radius:6px;font-size:12px;z-index:9999;pointer-events:none;white-space:nowrap;box-shadow:0 3px 12px rgba(0,0,0,0.5)"></div>
+
+<!-- Node color picker -->
+<div id="nodecolor-picker" style="display:none;position:fixed;z-index:9999;background:#1e2235;border:1px solid #3a3f55;border-radius:8px;padding:8px 10px;gap:6px;align-items:center;box-shadow:0 4px 16px rgba(0,0,0,0.5);flex-wrap:wrap;max-width:280px;">
+  <span style="font-size:10px;color:#7a8099;width:100%;display:block;margin-bottom:2px">Node color:</span>
+  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+    <button onclick="applyNodeColor('#e74c3c')" title="Red"    style="width:22px;height:22px;border-radius:50%;background:#e74c3c;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor('#e67e22')" title="Orange" style="width:22px;height:22px;border-radius:50%;background:#e67e22;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor('#f1c40f')" title="Yellow" style="width:22px;height:22px;border-radius:50%;background:#f1c40f;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor('#2ecc71')" title="Green"  style="width:22px;height:22px;border-radius:50%;background:#2ecc71;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor('#3498db')" title="Blue"   style="width:22px;height:22px;border-radius:50%;background:#3498db;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor('#9b59b6')" title="Purple" style="width:22px;height:22px;border-radius:50%;background:#9b59b6;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor('#e91e8c')" title="Pink"   style="width:22px;height:22px;border-radius:50%;background:#e91e8c;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="applyNodeColor(null)"      title="Reset to default" style="width:22px;height:22px;border-radius:50%;background:#2a2f45;border:2px solid #5a6080;cursor:pointer;padding:0;color:#aaa;font-size:13px;line-height:1">✕</button>
+    <button onclick="openNodeColorWheel()" title="More colors…" style="padding:1px 7px;font-size:10px;background:transparent;border:1px solid #5a6080;border-radius:4px;color:#aaa;cursor:pointer;white-space:nowrap">···</button>
+  </div>
+  <div id="nodecolor-wheel-row" style="display:none;width:100%;margin-top:6px;gap:6px;align-items:center;">
+    <input type="color" id="node-color-input" value="#3498db" style="width:40px;height:26px;padding:1px;border:1px solid #5a6080;border-radius:4px;cursor:pointer;background:transparent">
+    <button onclick="applyMoreNodeColor(document.getElementById('node-color-input').value)" style="padding:2px 10px;font-size:10px;background:#2a2f45;border:1px solid #5a6080;border-radius:4px;color:#ccc;cursor:pointer">Apply</button>
+  </div>
+</div>
+
+<!-- Highlight color picker -->
+<div id="highlight-picker" style="display:none;position:fixed;z-index:9999;background:#1e2235;border:1px solid #3a3f55;border-radius:8px;padding:8px 10px;gap:6px;align-items:center;box-shadow:0 4px 16px rgba(0,0,0,0.5);">
+  <span style="font-size:10px;color:#7a8099;margin-right:2px;white-space:nowrap">Pick color:</span>
+  <button onclick="setHighlightColor('#e74c3c')" title="Red"    style="width:22px;height:22px;border-radius:50%;background:#e74c3c;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor('#e67e22')" title="Orange" style="width:22px;height:22px;border-radius:50%;background:#e67e22;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor('#f1c40f')" title="Yellow" style="width:22px;height:22px;border-radius:50%;background:#f1c40f;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor('#2ecc71')" title="Green"  style="width:22px;height:22px;border-radius:50%;background:#2ecc71;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor('#3498db')" title="Blue"   style="width:22px;height:22px;border-radius:50%;background:#3498db;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor('#9b59b6')" title="Purple" style="width:22px;height:22px;border-radius:50%;background:#9b59b6;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor('#e91e8c')" title="Pink"   style="width:22px;height:22px;border-radius:50%;background:#e91e8c;border:2px solid transparent;cursor:pointer;padding:0"></button>
+  <button onclick="setHighlightColor(null)"      title="Remove highlight" style="width:22px;height:22px;border-radius:50%;background:#2a2f45;border:2px solid #5a6080;cursor:pointer;padding:0;color:#aaa;font-size:13px;line-height:1">✕</button>
+</div>
+
+<!-- Find nodes popup -->
+<div id="find-popup" style="display:none;position:fixed;z-index:9999;background:#1e2235;border:1px solid #3a3f55;border-radius:8px;padding:10px 12px;box-shadow:0 4px 16px rgba(0,0,0,0.5);min-width:260px;">
+  <div style="display:flex;align-items:center;gap:6px">
+    <input id="find-input" type="text" placeholder="Search node properties..." onkeydown="if(event.key==='Enter')executeNodeSearch();if(event.key==='Escape')hideFindPopup();"
+      style="flex:1;padding:4px 8px;font-size:12px;background:#2a2f45;border:1px solid #5a6080;border-radius:4px;color:#ccc;outline:none"/>
+    <button onclick="executeNodeSearch()" style="padding:4px 10px;font-size:12px;background:#2a2f45;border:1px solid #5a6080;border-radius:4px;color:#ccc;cursor:pointer">Find</button>
+  </div>
+  <div id="find-result" style="margin-top:6px;font-size:11px;color:#7a8099;min-height:16px"></div>
+</div>
 
 </body>
 </html>
