@@ -481,8 +481,13 @@ function initCytoscape() {
     }
   });
 
-  // Resize handles: hide while dragging node, restore after
+  // Resize handles: hide while dragging node, restore after.
+  // Also dismiss the tooltip immediately on grab so it doesn't block dragging.
   cy.on('grab', 'node', function(evt) {
+    if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
+    if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+    tooltipVisible = false;
+    document.getElementById('tooltip').style.display = 'none';
     if (_rhNode && evt.target.id() === _rhNode.id()) hideResizeHandles();
   });
   cy.on('dragfree', 'node', function(evt) {
@@ -2699,9 +2704,15 @@ function exportTableExcel() {
 // ─── Save / Load subgraph ─────────────────────────────────────────────────────
 function promptSaveSubgraph() {
   if (!cy || !cy.nodes().length) { alert('No graph to save.'); return; }
-  document.getElementById('save-name-input').value = '';
+  // Pre-fill with the current tab name so repeat saves don't require retyping
+  var suggested = (tabs[activeTabIdx] && tabs[activeTabIdx].name) || currentSubgraphName || '';
+  document.getElementById('save-name-input').value = suggested;
   document.getElementById('save-modal').style.display = 'flex';
-  setTimeout(function() { document.getElementById('save-name-input').focus(); }, 100);
+  setTimeout(function() {
+    var inp = document.getElementById('save-name-input');
+    inp.focus();
+    inp.select();
+  }, 100);
 }
 
 function closeSaveModal(e) {
@@ -2738,6 +2749,11 @@ function confirmSave() {
   a.download = name.replace(/[^a-z0-9_\-]/gi, '_') + '.json';
   a.click();
   URL.revokeObjectURL(url);
+
+  // Sync tab name and subgraph name to match the saved file
+  currentSubgraphName = name;
+  updateCurrentTabName(name);
+  updateStats();
 }
 
 function loadSubgraph(event) {
