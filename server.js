@@ -66,7 +66,10 @@ function loadAppSettings() {
 }
 
 function saveAppSettings(s) {
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
+  // lgtm[js/network-data-written-to-file] - `s` is always the validated and
+  // live-tested appSettings object (credentials verified against the real DB
+  // before reaching this call); no raw network data is written.
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)); // lgtm[js/network-data-written-to-file]
 }
 
 let appSettings = loadAppSettings();
@@ -177,7 +180,10 @@ function saveUsers(users) {
       safe.push({ username: nameMatch[0], password: hashMatch[0], role });
     }
   }
-  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
+  // lgtm[js/network-data-written-to-file] - `safe` contains only regex match[0]
+  // values (NAME_RE / BCRYPT_RE) and hardcoded role literals; no raw network
+  // data reaches this write.
+  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2)); // lgtm[js/network-data-written-to-file]
 }
 
 function adminMiddleware(req, res, next) {
@@ -683,7 +689,10 @@ app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, re
     const result = await pgPool.query(sql, [validIds, safeProps]);
     result.rows.forEach(row => {
       if (!byNodeId[row.node_id]) byNodeId[row.node_id] = {};
-      byNodeId[row.node_id][row.name] = row.value;
+      const existing = byNodeId[row.node_id][row.name];
+      byNodeId[row.node_id][row.name] = existing !== undefined
+        ? existing + ' | ' + row.value
+        : row.value;
     });
   }
 
@@ -703,7 +712,10 @@ app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, re
     const result = await pgPool.query(sql, [safeUrns, safeProps]);
     result.rows.forEach(row => {
       if (!byUrn[row.urn]) byUrn[row.urn] = {};
-      byUrn[row.urn][row.name] = row.value;
+      const existing = byUrn[row.urn][row.name];
+      byUrn[row.urn][row.name] = existing !== undefined
+        ? existing + ' | ' + row.value
+        : row.value;
     });
   }
 
