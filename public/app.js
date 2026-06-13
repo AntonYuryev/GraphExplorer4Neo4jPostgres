@@ -1618,9 +1618,11 @@ function renderNodeTooltip(node) {
     var loadedHtml = '';
     _loadedPropertyNames.forEach(function(k) {
       var val = data[k];
-      if (val != null && val !== '' && typeof val !== 'object') {
+      // val is always a string from the server (multi-values joined with " | ")
+      if (val != null && val !== '') {
+        var display = Array.isArray(val) ? val.join(' | ') : String(val);
         loadedHtml += '<div style="font-size:11px;color:#c8cde8;margin-top:3px">'
-          + '<span style="color:#5dd6c5;font-weight:600">' + escHtml(k) + ':</span> ' + escHtml(String(val))
+          + '<span style="color:#5dd6c5;font-weight:600">' + escHtml(k) + ':</span> ' + escHtml(display)
           + '</div>';
       }
     });
@@ -4215,7 +4217,6 @@ function renderCurationPropsHTML(props) {
   Object.keys(props || {}).forEach(function(key) {
     var val = props[key] != null ? String(props[key]) : '';
     html += '<div class="prop-row" data-key="' + escHtml(key) + '">'
-      + '<input class="prop-key" type="text" value="' + escHtml(key) + '" placeholder="Property name">'
       + '<input class="prop-val" type="text" value="' + escHtml(val) + '" placeholder="Value">'
       + '<button class="prop-delete" onclick="this.closest(\'.prop-row\').remove()" title="Remove">✕</button>'
       + '</div>';
@@ -4274,16 +4275,17 @@ async function saveCuration() {
 
 function emptyTabSnapshot() {
   return {
-    graphData:           { nodes: [], edges: [] },
-    refsCache:           {},
-    medScanMap:          {},
-    tableRows:           [],
-    currentSubgraphName: '',
-    currentLayout:       'cose',
-    currentStyle:        'default',
-    currentQuery:        '',
-    positions:           {},
-    tableViewMode:       'reference'
+    graphData:            { nodes: [], edges: [] },
+    refsCache:            {},
+    medScanMap:           {},
+    tableRows:            [],
+    currentSubgraphName:  '',
+    currentLayout:        'cose',
+    currentStyle:         'default',
+    currentQuery:         '',
+    positions:            {},
+    tableViewMode:        'reference',
+    loadedPropertyNames:  []
   };
 }
 
@@ -4318,9 +4320,10 @@ function captureTabState() {
     currentSubgraphName: currentSubgraphName,
     currentLayout:       currentLayout,
     currentStyle:        currentStyle,
-    currentQuery:        currentQuery,
+    currentQuery:        (document.getElementById('cypher-input') || {}).value || currentQuery,
     positions:           positions,
-    tableViewMode:       tableViewMode
+    tableViewMode:       tableViewMode,
+    loadedPropertyNames: Array.from(_loadedPropertyNames)
   };
 }
 
@@ -4338,6 +4341,7 @@ function applyTabState(snapshot) {
   currentLayout       = s.currentLayout || 'cose';
   currentStyle        = s.currentStyle  || 'default';
   currentQuery        = s.currentQuery || '';
+  _loadedPropertyNames = new Set(Array.isArray(s.loadedPropertyNames) ? s.loadedPropertyNames : []);
 
   var qEl = document.getElementById('cypher-input');
   if (qEl) qEl.value = currentQuery;
