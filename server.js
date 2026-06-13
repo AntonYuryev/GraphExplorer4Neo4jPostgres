@@ -34,45 +34,84 @@ const dbLimiter = rateLimit({
   message: { error: 'Too many requests. Please slow down and try again shortly.' }
 });
 
+// ─── Persistent settings (settings.json) ─────────────────────────────────────
+// Connection credentials are stored here so admins can update them via the UI
+// without restarting the server.  The file lives next to server.js and is never
+// served to clients (it is outside the public/ directory).
+const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+
+const DEFAULT_SETTINGS = {
+  neo4j: {
+    url:      'YOUR_NEO4J_URI',
+    database: 'mammaloct2025new',
+    username: 'YOUR_NEO4J_USER',
+    password: 'YOUR_NEO4J_PASSWORD'
+  },
+  postgres: {
+    host:     'YOUR_PG_HOST',
+    port:     5432,
+    database: 'YOUR_PG_DATABASE',
+    schema:   'resnetcustomnov',
+    username: 'YOUR_PG_USER',
+    password: 'YOUR_PG_PASSWORD'
+  }
+};
+
+function loadAppSettings() {
+  try {
+    if (fs.existsSync(SETTINGS_FILE))
+      return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+  } catch(e) { console.error('Failed to read settings.json:', e.message); }
+  return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));  // deep copy
+}
+
+function saveAppSettings(s) {
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
+}
+
+let appSettings = loadAppSettings();
+
 // ─── Neo4j ───────────────────────────────────────────────────────────────────
-// bolt+ssc = encrypted, trust all certificates (including self-signed)
-const neo4jDriver = neo4j.driver(
-  'YOUR_NEO4J_URI',
-  neo4j.auth.basic('YOUR_NEO4J_USER', 'YOUR_NEO4J_PASSWORD')
-);
-const NEO4J_DB = 'mammaloct2025new';
 // URN property name on Neo4j nodes — change to match your schema (e.g. 'id', '@id', 'URN')
 const NEO4J_URN_PROP = process.env.NEO4J_URN_PROP || 'URN';
+
+function makeNeo4jDriver(cfg) {
+  return neo4j.driver(cfg.url, neo4j.auth.basic(cfg.username, cfg.password));
+}
+
+let neo4jDriver = makeNeo4jDriver(appSettings.neo4j);
+let NEO4J_DB    = appSettings.neo4j.database;
 
 // ─── RNEF conversion ──────────────────────────────────────────────────────────
 // Path to rnef_to_json.py — defaults to same directory as server.js.
 // Override with RNEF_SCRIPT env var if placed elsewhere.
 const RNEF_SCRIPT = process.env.RNEF_SCRIPT || path.join(__dirname, 'rnef_to_json.py');
 const PYTHON_CMD  = process.env.PYTHON_CMD  || (() => {
-  // Auto-detect: try python3, python, py in order
+  // Auto-detect: try py first (Windows Launcher), then python3, then python
   const { execFileSync } = require('child_process');
-  for (const cmd of ['python3', 'python', 'py']) {
+  for (const cmd of ['py', 'python3', 'python']) {
     try { execFileSync(cmd, ['--version'], { timeout: 3000 }); return cmd; } catch(e) {}
   }
-  return 'python3'; // fallback — will surface a clear error if missing
+  return 'py'; // fallback — will surface a clear error if missing
 })();
 
-// ─── PostgreSQL schema ────────────────────────────────────────────────────────
-// Change this to match your schema name (each user may have a different one).
-const PG_SCHEMA = process.env.PG_SCHEMA || 'resnetcustomnov';
-
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
-const pgPool = new Pool({
-  host: 'YOUR_PG_HOST',
-  port: 5432,
-  database: 'YOUR_PG_DATABASE',
-  user: 'YOUR_PG_USER',
-  password: 'YOUR_PG_PASSWORD',
-  ssl: { rejectUnauthorized: false },
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-});
+function makePgPool(cfg) {
+  return new Pool({
+    host:     cfg.host,
+    port:     cfg.port || 5432,
+    database: cfg.database,
+    user:     cfg.username,
+    password: cfg.password,
+    ssl: { rejectUnauthorized: false },
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+  });
+}
+
+let pgPool    = makePgPool(appSettings.postgres);
+let PG_SCHEMA = appSettings.postgres.schema || 'resnetcustomnov';
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'YOUR_JWT_SECRET';
@@ -129,6 +168,11 @@ function saveUsers(users) {
   fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
 }
 
+function adminMiddleware(req, res, next) {
+  if (req.user && req.user.role === 'admin') return next();
+  res.status(403).json({ error: 'Admin only' });
+}
+
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) {
@@ -178,16 +222,21 @@ function processValue(val, nodesMap, edgesMap) {
     }
   } else if (ctor === 'Relationship') {
     const id = val.identity.toString();
+    const startId = val.start.toString();
+    const endId   = val.end.toString();
     if (!edgesMap.has(id)) {
       edgesMap.set(id, {
         id,
         elementId: val.elementId || id,
         type: val.type,
-        startNodeId: val.start.toString(),
-        endNodeId: val.end.toString(),
+        startNodeId: startId,
+        endNodeId: endId,
         properties: toPlain(val.properties)
       });
     }
+    // Endpoint stubs are added in a post-processing step after all records
+    // are iterated, so real node records encountered later in the same result
+    // set are not pre-empted by a stub.
   } else if (ctor === 'Path') {
     val.segments.forEach(seg => {
       processValue(seg.start, nodesMap, edgesMap);
@@ -266,6 +315,89 @@ app.delete('/api/auth/users/:username', dbLimiter, authMiddleware, (req, res) =>
   res.json({ message: 'User deleted' });
 });
 
+// ─── Connection settings (admin only) ────────────────────────────────────────
+app.get('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, (req, res) => {
+  res.json({
+    url:      appSettings.neo4j.url,
+    database: appSettings.neo4j.database,
+    username: appSettings.neo4j.username,
+    password: appSettings.neo4j.password
+  });
+});
+
+app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
+  const { url, database, username, password } = req.body || {};
+  if (!url || !database || !username) return res.status(400).json({ error: 'url, database, and username are required' });
+
+  const cfg = {
+    url:      String(url).trim(),
+    database: String(database).trim(),
+    username: String(username).trim(),
+    password: password ? String(password) : appSettings.neo4j.password
+  };
+
+  // Test the new connection before committing
+  const testDriver = makeNeo4jDriver(cfg);
+  try {
+    const session = testDriver.session({ database: cfg.database });
+    await session.run('RETURN 1');
+    await session.close();
+  } catch(e) {
+    await testDriver.close();
+    return res.status(400).json({ error: 'Connection test failed: ' + e.message });
+  }
+
+  // Commit: close old driver, switch to new
+  try { await neo4jDriver.close(); } catch(e) {}
+  neo4jDriver = testDriver;
+  NEO4J_DB    = cfg.database;
+  appSettings.neo4j = cfg;
+  saveAppSettings(appSettings);
+  res.json({ success: true });
+});
+
+app.get('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, (req, res) => {
+  res.json({
+    host:     appSettings.postgres.host,
+    port:     appSettings.postgres.port,
+    database: appSettings.postgres.database,
+    schema:   appSettings.postgres.schema,
+    username: appSettings.postgres.username,
+    password: appSettings.postgres.password
+  });
+});
+
+app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
+  const { host, port, database, schema, username, password } = req.body || {};
+  if (!host || !database || !schema || !username) return res.status(400).json({ error: 'host, database, schema, and username are required' });
+
+  const cfg = {
+    host:     String(host).trim(),
+    port:     parseInt(port) || 5432,
+    database: String(database).trim(),
+    schema:   String(schema).trim(),
+    username: String(username).trim(),
+    password: password ? String(password) : appSettings.postgres.password
+  };
+
+  // Test the new connection before committing
+  const testPool = makePgPool(cfg);
+  try {
+    await testPool.query('SELECT 1');
+  } catch(e) {
+    await testPool.end();
+    return res.status(400).json({ error: 'Connection test failed: ' + e.message });
+  }
+
+  // Commit: end old pool, switch to new
+  try { await pgPool.end(); } catch(e) {}
+  pgPool    = testPool;
+  PG_SCHEMA = cfg.schema;
+  appSettings.postgres = cfg;
+  saveAppSettings(appSettings);
+  res.json({ success: true });
+});
+
 // ─── Neo4j query ─────────────────────────────────────────────────────────────
 app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
   const { query } = req.body || {};
@@ -281,6 +413,19 @@ app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
       record.keys.forEach(key => {
         processValue(record.get(key), nodesMap, edgesMap);
       });
+    });
+
+    // Post-processing: add stub nodes for any relationship endpoints that were
+    // not returned as Node objects in the query result (e.g. bare RETURN r).
+    // Done here — not inside processValue — so real nodes returned later in the
+    // same record set always take precedence over stubs.
+    edgesMap.forEach(edge => {
+      if (!nodesMap.has(edge.startNodeId)) {
+        nodesMap.set(edge.startNodeId, { id: edge.startNodeId, elementId: edge.startNodeId, labels: [], properties: {} });
+      }
+      if (!nodesMap.has(edge.endNodeId)) {
+        nodesMap.set(edge.endNodeId, { id: edge.endNodeId, elementId: edge.endNodeId, labels: [], properties: {} });
+      }
     });
 
     const response = {
@@ -478,6 +623,81 @@ app.post('/api/nodes/medscan', dbLimiter, authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Node property names filtered to current pathway nodes ───────────────────
+app.post('/api/nodes/property-names', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeIds = [] } = req.body || {};
+  const validIds = nodeIds.map(String).filter(id => /^-?\d+$/.test(id));
+  if (!validIds.length) return res.json([]);
+
+  try {
+    const result = await pgPool.query(
+      `SELECT DISTINCT a.name
+       FROM ${PG_SCHEMA}.node n
+       JOIN ${PG_SCHEMA}.attr a ON a.id = ANY(n.attributes)
+       WHERE n.id = ANY($1::bigint[])
+       ORDER BY a.name`,
+      [validIds]
+    );
+    res.json(result.rows.map(r => r.name));
+  } catch (err) {
+    console.error('property-names error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Load selected node properties for pathway nodes ─────────────────────────
+// Matches by numeric NodeID (Neo4j nodes) and/or URN string (RNEF nodes).
+// Returns { byNodeId: { "123": {prop:val,...} }, byUrn: { "urn:...": {prop:val,...} } }
+app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeIds = [], urns = [], properties = [] } = req.body || {};
+
+  const PROP_RE = /^[A-Za-z0-9 _\-().]+$/;
+  const safeProps = properties.filter(p => typeof p === 'string' && PROP_RE.test(p));
+  if (!safeProps.length) return res.json({ byNodeId: {}, byUrn: {} });
+
+  const byNodeId = {};
+  const byUrn    = {};
+
+  // ── Query by numeric NodeID ──────────────────────────────────────────────────
+  const validIds = nodeIds.map(String).filter(id => /^-?\d+$/.test(id));
+  if (validIds.length) {
+    const sql = `
+      SELECT n.id::text AS node_id, a.name, a.value
+      FROM ${PG_SCHEMA}.node AS n
+      JOIN ${PG_SCHEMA}.attr AS a ON a.id = ANY(n.attributes)
+      WHERE n.id = ANY($1::bigint[])
+        AND a.name = ANY($2::text[])
+    `;
+    const result = await pgPool.query(sql, [validIds, safeProps]);
+    result.rows.forEach(row => {
+      if (!byNodeId[row.node_id]) byNodeId[row.node_id] = {};
+      byNodeId[row.node_id][row.name] = row.value;
+    });
+  }
+
+  // ── Query by URN string ──────────────────────────────────────────────────────
+  const URN_RE  = /^[a-zA-Z0-9:@%.~_\-]+$/;
+  const safeUrns = urns.filter(u => typeof u === 'string' && URN_RE.test(u));
+  if (safeUrns.length) {
+    const sql = `
+      SELECT a_urn.value AS urn, a.name, a.value
+      FROM ${PG_SCHEMA}.node AS n
+      JOIN ${PG_SCHEMA}.attr AS a_urn ON a_urn.id = ANY(n.attributes)
+      JOIN ${PG_SCHEMA}.attr AS a     ON a.id     = ANY(n.attributes)
+      WHERE a_urn.name = 'URN'
+        AND a_urn.value = ANY($1::text[])
+        AND a.name = ANY($2::text[])
+    `;
+    const result = await pgPool.query(sql, [safeUrns, safeProps]);
+    result.rows.forEach(row => {
+      if (!byUrn[row.urn]) byUrn[row.urn] = {};
+      byUrn[row.urn][row.name] = row.value;
+    });
+  }
+
+  res.json({ byNodeId, byUrn });
+});
+
 // ─── PostgreSQL reference update (curation) ───────────────────────────────────
 app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) => {
   const { id, msrc } = req.body || {};
@@ -615,7 +835,7 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
 // Accepts raw XML text body (Content-Type: text/plain, up to 50 MB) and returns
 // { pathways: [{name, data}, ...] }.  Using text/plain avoids the global 10 MB
 // express.json limit — the body is never JSON-parsed by the global middleware.
-app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '50mb', type: 'text/plain' }), authMiddleware, async (req, res) => {
+app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '500mb', type: 'text/plain' }), authMiddleware, async (req, res) => {
   const content = req.body;
   if (!content) return res.status(400).json({ error: 'content required' });
 
@@ -628,7 +848,7 @@ app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '50mb', type: 'te
   try {
     await new Promise((resolve, reject) => {
       execFile(PYTHON_CMD, [RNEF_SCRIPT, inputPath, outDir],
-        { timeout: 120000 },
+        { timeout: 600000 },   // 10 min — large RNEF files (80+ MB) can take a while
         (err, stdout, stderr) => {
           if (err) reject(new Error(stderr || err.message));
           else resolve(stdout);
