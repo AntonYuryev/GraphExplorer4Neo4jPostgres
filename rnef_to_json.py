@@ -102,7 +102,7 @@ def convert_resnet(resnet, out_dir):
                         'type': 'Substrate',
                         'startNodeId': ref, 'endNodeId': eid,
                         'properties': {
-                            'RelationID': eid, 'Effect': '',
+                            'URN': eid, 'Effect': '',
                             'NumRefs': len(references),
                             'references': references,
                             'directed': True
@@ -118,7 +118,7 @@ def convert_resnet(resnet, out_dir):
                         'type': 'Product',
                         'startNodeId': eid, 'endNodeId': ref,
                         'properties': {
-                            'RelationID': eid, 'Effect': '',
+                            'URN': eid, 'Effect': '',
                             'NumRefs': len(references),
                             'references': references,
                             'directed': True
@@ -144,7 +144,7 @@ def convert_resnet(resnet, out_dir):
                     'id': eid, 'elementId': eid, 'type': control_type,
                     'startNodeId': start, 'endNodeId': end,
                     'properties': {
-                        'RelationID': eid, 'Effect': effect,
+                        'URN': eid, 'Effect': effect,
                         'NumRefs': len(references), 'references': references,
                         'directed': directed
                     }
@@ -249,7 +249,7 @@ def convert_resnet(resnet, out_dir):
         has_ce = bool(clone_map.get(end))
         if not has_cs and not has_ce:
             continue
-        relation_id = edge['properties'].get('RelationID', edge_id)
+        relation_id = edge['properties'].get('URN', edge_id)
         effect_stripped = re.sub(r':(positive|negative|unknown)$', '', relation_id, flags=re.IGNORECASE)
         cp = ctrl_pos_map.get(relation_id) or ctrl_pos_map.get(effect_stripped)
         if cp:
