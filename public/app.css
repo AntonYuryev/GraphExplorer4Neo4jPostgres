@@ -82,21 +82,44 @@ body {
   flex-shrink: 0;
 }
 #cypher-input {
-  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
   resize: none;
+  overflow: hidden;          /* height is driven by content, no scrollbar */
   padding: 8px 12px;
   border: 1px solid #2d3147;
   border-radius: 6px;
   background: #12151f;
   color: #e0e0e0;
   font-family: 'Courier New', monospace;
-  font-size: 12px;
+  font-size: 13px;
   outline: none;
   line-height: 1.5;
   transition: border-color 0.2s;
+  min-height: 36px;
+  max-height: 200px;
+  display: block;
 }
 #cypher-input:focus { border-color: #4f8ef7; }
+#cypher-editor-wrap { flex: 1; min-width: 0; }
 #query-actions { display: flex; flex-direction: column; gap: 6px; }
+
+/* Lint error/warning panel below the textarea */
+#cypher-lint-panel {
+  margin-top: 4px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: 'Courier New', monospace;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 80px;
+  overflow-y: auto;
+}
+#cypher-lint-panel.lint-ok    { background: #0d1f0d; color: #5dd6c5; border: 1px solid #1a4030; }
+#cypher-lint-panel.lint-error { background: #1f0d0d; color: #f09090; border: 1px solid #4a1a1a; }
+#cypher-lint-panel.lint-warn  { background: #1f1a0a; color: #f0c060; border: 1px solid #4a3a10; }
 
 /* Menu bar */
 #menubar {
@@ -518,6 +541,21 @@ body.col-resizing * { cursor: col-resize !important; user-select: none; }
   flex-shrink: 0;
 }
 .tab-close:hover { opacity: 1; color: #e05560; }
+.tab-running-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #4f8ef7;
+  flex-shrink: 0;
+  animation: tab-pulse 1s ease-in-out infinite;
+}
+@keyframes tab-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.25; }
+}
+.tab-item.tab-dragging { opacity: 0.35; }
+.tab-item.tab-drag-over-left  { border-left:  2px solid #4f8ef7; }
+.tab-item.tab-drag-over-right { border-right: 2px solid #4f8ef7; }
 #tab-new-btn {
   background: none;
   border: none;
