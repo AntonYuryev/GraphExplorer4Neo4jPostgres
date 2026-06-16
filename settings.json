@@ -1,7 +1,7 @@
 {
   "neo4j": {
     "url": "YOUR_NEO4J_URI",
-    "database": "resnetapr2026",
+    "database": "resnetmay2026",
     "username": "YOUR_NEO4J_USER",
     "password": "YOUR_NEO4J_PASSWORD"
   },
