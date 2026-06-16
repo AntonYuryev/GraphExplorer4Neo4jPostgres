@@ -16,6 +16,14 @@ let refsCache = {};                          // relId → [postgres rows]
 let typeColorMap = {};                       // relType → hex color
 let colorIdx = 0;
 let tooltipVisible = false;
+let tooltipMouseInside = false;  // true while mouse cursor is inside the tooltip element
+let tooltipRefSortAsc = true;    // true = oldest first, false = newest first
+let tooltipCurrentRefs = [];     // refs array saved for sort toggle
+let tooltipCurrentEdge = null;   // cy edge element currently shown in tooltip
+let pendingMatchSpan = null;     // #match-rnef-status span waiting to be cleared after tooltip renders
+let matchedRelIds = new Set();   // relIds newly matched by matchRnefRelationsToNeo4j
+let matchingInProgress = false;  // true while matchRnefRelationsToNeo4j API call is in flight
+let tabDragSrcIdx = -1;          // index of tab being dragged
 let medScanMap = {};   // Neo4j NodeID (string) → MedScan ID value
 let tooltipHideTimer = null;
 let tooltipShowTimer = null;  // delay before tooltip appears (500 ms)
@@ -29,6 +37,7 @@ let currentSubgraphName = '';   // name from loaded JSON file
 let contextTarget = null;   // element targeted by right-click
 let curationTarget = null;  // element open in curation modal
 let undoStack = [];          // stack of {graphData, positions} snapshots for undo
+let redoStack = [];          // stack of {graphData, positions} snapshots for redo
 let focusNodeId = null;      // reference node for alignment operations
 let _loadedPropertyNames = new Set();  // property names loaded via "Load node properties" dialog
 
@@ -154,7 +163,8 @@ const NEO4J_PROP_DEFS = [
   { prop: 'Phase',                          label: 'Phase' },
   { prop: 'QuantitativeType',               label: 'QuantitativeType' },
   { prop: 'RelationID',                     label: 'Relation ID' },
-  { prop: 'RelationNumberOfSentences',      label: 'Assertion count' },
+  // RelationNumberOfSentences is exposed as a graph-source column ('numSentences')
+  // so it appears in both Relation and Reference views — omitted here to avoid duplication.
   { prop: 'Source',                         label: 'Source' },
   { prop: 'Tissue',                         label: 'Tissue' },
   { prop: 'updatedAt',                      label: 'updatedAt' },
@@ -207,10 +217,11 @@ const DEFAULT_COLUMNS = [
   { key: 'targetType',    label: 'Target Type',    visible: true,  source: 'graph' },
   { key: 'relationType',  label: 'Relation Type',  visible: true,  source: 'graph' },
   { key: 'effect',        label: 'Effect',         visible: true,  source: 'graph' },
-  { key: 'numRefs',       label: 'Reference count', visible: true,  source: 'graph',     sortKey: 'numRefs' },
+  { key: 'numRefs',       label: 'Reference count',  visible: true,  source: 'graph', numeric: true },
+  { key: 'numSentences',  label: 'Assertion count',  visible: true,  source: 'graph', numeric: true },
   { key: 'pmid',          label: 'PMID',           visible: true,  source: 'reference', dbField: 'pmid' },
   { key: 'doi',           label: 'DOI',            visible: true,  source: 'reference', dbField: 'doi' },
-  { key: 'year',          label: 'Year',           visible: true,  source: 'reference', dbField: 'pubyear' },
+  { key: 'year',          label: 'Year',           visible: true,  source: 'reference', dbField: 'pubyear', numeric: true },
   { key: 'title',         label: 'Title',          visible: true,  source: 'reference', dbField: 'title' },
   { key: 'sentence',      label: 'Sentence',       visible: true,  source: 'reference', dbField: 'msrc' }
 ];
@@ -223,7 +234,15 @@ window.addEventListener('DOMContentLoaded', function() {
     currentUser = sessionStorage.getItem('currentUser');
     currentRole = sessionStorage.getItem('currentRole');
     showApp();
+    _loadSchema(); // Preload schema if already logged in
   }
+  // Hide autocomplete dropdown when textarea loses focus
+  document.addEventListener('focusout', function(e) {
+    if (e.target && e.target.id === 'cypher-input') {
+      // Small delay so mousedown on suggestion fires first
+      setTimeout(_acHide, 150);
+    }
+  });
   // Track cursor so renderTooltip can re-position after content is set.
   document.addEventListener('mousemove', function(e) {
     lastMouseX = e.clientX;
@@ -264,12 +283,31 @@ window.addEventListener('DOMContentLoaded', function() {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'i') {
       e.preventDefault();
       invertSelection();
+    } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      undoGraphOperation();
+    } else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
+      e.preventDefault();
+      redoGraphOperation();
     } else if (e.key === 'Delete') {
       deleteSelection();
     }
   });
 
   var tipEl = document.getElementById('tooltip');
+  // Handle sort-button click BEFORE the blanket event suppressor below.
+  tipEl.addEventListener('click', function(e) {
+    var btn = e.target.closest('#tooltip-sort-btn');
+    if (!btn) return;
+    e.stopPropagation();
+    tooltipRefSortAsc = !tooltipRefSortAsc;
+    var block = document.getElementById('tooltip-refs-block');
+    if (block && block.parentNode) {
+      var tmp = document.createElement('div');
+      tmp.innerHTML = renderRefsHtml(tooltipCurrentRefs, tooltipRefSortAsc);
+      block.parentNode.replaceChild(tmp.firstChild, block);
+    }
+  }, { capture: true });
   // Prevent tooltip events from reaching Cytoscape (pan/zoom).
   ['mousedown', 'mouseup', 'mousemove', 'click', 'wheel',
    'pointerdown', 'pointerup', 'pointermove',
@@ -280,10 +318,14 @@ window.addEventListener('DOMContentLoaded', function() {
     }, { capture: true, passive: false });
   });
   // Keep tooltip alive while mouse is over it; hide when mouse leaves it.
+  // Also set tooltipMouseInside so Cytoscape mouseover on underlying nodes/edges
+  // cannot replace the current tooltip while the cursor is inside it.
   tipEl.addEventListener('mouseenter', function() {
+    tooltipMouseInside = true;
     if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
   });
   tipEl.addEventListener('mouseleave', function() {
+    tooltipMouseInside = false;
     if (tooltipVisible) hideTooltipDelayed();
   });
 });
@@ -309,6 +351,8 @@ async function handleLogin(e) {
     sessionStorage.setItem('currentUser', currentUser);
     sessionStorage.setItem('currentRole', currentRole);
     showApp();
+    // Preload schema for autocomplete in background
+    _loadSchema();
   } catch (err) {
     errEl.textContent = err.message;
     errEl.style.display = 'block';
@@ -329,11 +373,22 @@ function showApp() {
   }
   // Load saved column config or fall back to defaults
   columnDefs = loadColumnConfig() || DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
+  // Migration: inject numSentences column if absent (added after initial release)
+  if (!columnDefs.find(function(c) { return c.key === 'numSentences'; })) {
+    var numRefsIdx = columnDefs.findIndex(function(c) { return c.key === 'numRefs'; });
+    var newCol = { key: 'numSentences', label: 'Assertion count', visible: true, source: 'graph', numeric: true };
+    if (numRefsIdx >= 0) columnDefs.splice(numRefsIdx + 1, 0, newCol);
+    else columnDefs.push(newCol);
+  }
+  // Migration: ensure numeric flag is set on numRefs (may be absent in older saved configs)
+  var numRefsCol = columnDefs.find(function(c) { return c.key === 'numRefs'; });
+  if (numRefsCol) numRefsCol.numeric = true;
   // Fetch available DB column lists (used by Columns dialog)
   api('/api/schema/columns', null).then(function(data) {
     availableDbColumns = { reference: data.reference || [], scopus_data: data.scopus_data || [] };
   }).catch(function() {});
   initCytoscape();
+  setTimeout(_loadSchema, 200); // Preload schema for autocomplete
 
   // Initialize tab system with one empty tab
   tabs = [{ id: Date.now(), name: 'Pathway 1', snapshot: emptyTabSnapshot() }];
@@ -355,6 +410,22 @@ function logout() {
 }
 
 // ─── API helper ───────────────────────────────────────────────────────────────
+function setProgressMsg(msg) {
+  var el = document.getElementById('progress-msg');
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.style.display = 'inline-block'; }
+  else      { el.textContent = '';  el.style.display = 'none'; }
+}
+
+function formatEta(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 90) return Math.ceil(seconds) + ' sec';
+  return Math.ceil(seconds / 60) + ' min';
+}
+
+// Yield to the event loop so the browser can repaint before starting heavy sync work.
+function yieldToUI() { return new Promise(function(r) { setTimeout(r, 0); }); }
+
 async function api(path, body, auth) {
   if (auth === undefined) auth = true;
   var opts = {
@@ -401,6 +472,7 @@ function initCytoscape() {
   // Tooltip on edge hover
   cy.on('mouseover', 'edge', function(evt) {
     if (document.getElementById('curation-modal').style.display !== 'none') return;
+    if (tooltipMouseInside) return;  // don't replace tooltip while cursor is inside it
     if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
     if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
     var edge = evt.target;
@@ -410,21 +482,25 @@ function initCytoscape() {
       showTooltipLoading();
       tooltipVisible = true;
       positionTooltip(lastMouseX, lastMouseY);
-      var relId = edge.data('relId');
-      if (relId && refsCache[relId] === undefined) {
+      var relId  = edge.data('relId');
+      var relIds = edge.data('relIds') || (relId ? [relId] : []);
+      // Fetch refs for all RelationIDs (merged edge may have several); cache under primary relId
+      var cacheKey = relId || (relIds.length ? relIds[0] : null);
+      if (cacheKey && refsCache[cacheKey] === undefined) {
         try {
-          var rows = await api('/api/references', { relationIds: [relId] });
-          refsCache[relId] = rows;
-        } catch(e) { refsCache[relId] = []; }
+          var rows = await api('/api/references', { relationIds: relIds.length ? relIds : [cacheKey] });
+          refsCache[cacheKey] = rows;
+        } catch(e) { refsCache[cacheKey] = []; }
       }
       // Fall back to inline references stored in graphData.edges (e.g. pasted or RNEF edges)
-      var refs = (relId && refsCache[relId]) || [];
+      var refs = (cacheKey && refsCache[cacheKey]) || [];
       if (!refs.length) {
         var edgeRaw = graphData.edges.find(function(ge) { return ge.id === edge.id(); });
         if (edgeRaw && edgeRaw.properties && Array.isArray(edgeRaw.properties.references)) {
           refs = edgeRaw.properties.references;
         }
       }
+      tooltipCurrentEdge = edge;
       renderTooltip(edge, refs);
     }, 500);
   });
@@ -436,6 +512,7 @@ function initCytoscape() {
   // Tooltip on node hover
   cy.on('mouseover', 'node', function(evt) {
     if (document.getElementById('curation-modal').style.display !== 'none') return;
+    if (tooltipMouseInside) return;  // don't replace tooltip while cursor is inside it
     if (tooltipShowTimer) { clearTimeout(tooltipShowTimer); tooltipShowTimer = null; }
     if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
     var node = evt.target;
@@ -489,6 +566,8 @@ function initCytoscape() {
     tooltipVisible = false;
     document.getElementById('tooltip').style.display = 'none';
     if (_rhNode && evt.target.id() === _rhNode.id()) hideResizeHandles();
+    // Snapshot before drag so each node move is independently undoable
+    pushUndo();
   });
   cy.on('dragfree', 'node', function(evt) {
     currentLayout = 'manual';
@@ -703,14 +782,368 @@ function selectAllEdges() {
   cy.edges().select();
 }
 
+// ─── Cypher query bar: auto-resize + live linting ────────────────────────────
+
+function getCypherQuery() {
+  return (document.getElementById('cypher-input') || {}).value || '';
+}
+function setCypherQuery(val) {
+  var el = document.getElementById('cypher-input');
+  if (!el) return;
+  el.value = val || '';
+  cypherAutoResize(el);
+}
+
+// Grow/shrink the textarea to fit its content (single line minimum).
+function cypherAutoResize(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+}
+
+// Called on every keystroke (oninput handler in HTML).
+var _lintDebounce = null;
+
+// ─── Cypher Schema Autocomplete ───────────────────────────────────────────────
+var _schemaCache = null;          // { labels, relTypes, propKeys }
+var _acSelectedIdx = -1;          // currently highlighted row index
+var _acItems = [];                 // current suggestion list
+
+var CYPHER_KEYWORDS = [
+  'MATCH','OPTIONAL MATCH','WHERE','RETURN','WITH','UNWIND','CREATE','MERGE',
+  'SET','REMOVE','DELETE','DETACH DELETE','FOREACH','CALL','YIELD','UNION',
+  'ORDER BY','SKIP','LIMIT','AS','DISTINCT','NOT','AND','OR','XOR','IN',
+  'STARTS WITH','ENDS WITH','CONTAINS','IS NULL','IS NOT NULL','EXISTS',
+  'COUNT','COLLECT','SUM','AVG','MIN','MAX','KEYS','LABELS','TYPE','ID',
+  'toInteger','toString','toFloat','toLower','toUpper','trim','split','size',
+  'head','last','tail','range','coalesce','datetime','date','time','duration',
+  'shortestPath','allShortestPaths','nodes','relationships','length'
+];
+
+function _loadSchema() {
+  if (_schemaCache) return Promise.resolve(_schemaCache);
+  if (!authToken) return Promise.resolve(null);   // not logged in yet
+  return fetch('/api/graph/schema', {
+    headers: { 'Authorization': 'Bearer ' + authToken }
+  })
+  .then(function(r) { return r.ok ? r.json() : null; })
+  .then(function(d) {
+    if (d && d.labels) _schemaCache = d;  // only cache valid schema response
+    return _schemaCache;
+  })
+  .catch(function() { return null; });
+  // Note: on failure _schemaCache stays null so next keystroke retries
+}
+
+// Invalidate schema cache when user reconnects to a different DB
+function _invalidateSchemaCache() { _schemaCache = null; }
+
+function _acShow(items, ta) {
+  var box = document.getElementById('cypher-autocomplete');
+  if (!box) return;
+  _acItems = items;
+  _acSelectedIdx = -1;
+  if (!items.length) { _acHide(); return; }
+  box.innerHTML = '';
+  items.forEach(function(item, i) {
+    var row = document.createElement('div');
+    row.textContent = item.text;
+    row.style.cssText = 'padding:4px 12px;cursor:pointer;color:' + (item.kind === 'keyword' ? '#e5c07b' : item.kind === 'label' ? '#98c379' : item.kind === 'reltype' ? '#61afef' : '#c678dd') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    row.dataset.idx = i;
+    row.addEventListener('mousedown', function(e) {
+      e.preventDefault();
+      _acAccept(ta, items[i]);
+    });
+    row.addEventListener('mouseover', function() {
+      _acSetIdx(parseInt(row.dataset.idx), box);
+    });
+    box.appendChild(row);
+  });
+  box.style.display = 'block';
+}
+
+function _acHide() {
+  var box = document.getElementById('cypher-autocomplete');
+  if (box) box.style.display = 'none';
+  _acItems = [];
+  _acSelectedIdx = -1;
+}
+
+function _acSetIdx(idx, box) {
+  if (!box) box = document.getElementById('cypher-autocomplete');
+  if (!box) return;
+  _acSelectedIdx = idx;
+  Array.from(box.children).forEach(function(row, i) {
+    row.style.background = (i === idx) ? '#2a3050' : 'transparent';
+  });
+}
+
+function _acAccept(ta, item) {
+  var val = ta.value;
+  var pos = ta.selectionStart;
+  // find start of the current token being typed
+  var tokenStart = pos;
+  if (item.kind === 'label' || item.kind === 'propkey') {
+    // back up over word chars
+    while (tokenStart > 0 && /[\w]/.test(val[tokenStart - 1])) tokenStart--;
+  } else if (item.kind === 'reltype') {
+    while (tokenStart > 0 && /[\w]/.test(val[tokenStart - 1])) tokenStart--;
+  } else {
+    // keyword — back up over letters
+    while (tokenStart > 0 && /[A-Za-z_]/.test(val[tokenStart - 1])) tokenStart--;
+  }
+  var insert = item.text;
+  ta.value = val.substring(0, tokenStart) + insert + val.substring(pos);
+  ta.selectionStart = ta.selectionEnd = tokenStart + insert.length;
+  _acHide();
+  onCypherInput(ta);
+}
+
+function _acHandleKey(e) {
+  var box = document.getElementById('cypher-autocomplete');
+  if (!box || box.style.display === 'none' || !_acItems.length) return false;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    _acSetIdx(Math.min(_acSelectedIdx + 1, _acItems.length - 1), box);
+    return true;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    _acSetIdx(Math.max(_acSelectedIdx - 1, 0), box);
+    return true;
+  }
+  if (e.key === 'Tab' || e.key === 'Enter') {
+    if (_acSelectedIdx >= 0 && _acItems[_acSelectedIdx]) {
+      e.preventDefault();
+      _acAccept(e.target, _acItems[_acSelectedIdx]);
+      return true;
+    }
+  }
+  if (e.key === 'Escape') {
+    _acHide();
+    return true;
+  }
+  return false;
+}
+
+// Detect autocomplete context from cursor position and trigger suggestions
+function _acTrigger(ta) {
+  var val = ta.value;
+  var pos = ta.selectionStart;
+  var before = val.substring(0, pos);
+
+  // Don't show inside a string literal
+  var inStr = false, strChar = '';
+  for (var ci = 0; ci < before.length; ci++) {
+    var ch = before[ci];
+    if (!inStr && (ch === "'" || ch === '"')) { inStr = true; strChar = ch; }
+    else if (inStr && ch === strChar && before[ci-1] !== '\\') inStr = false;
+  }
+  if (inStr) { _acHide(); return; }
+
+  // Context: after (: or [: → node label / rel type
+  var mLabel = before.match(/\((?:[^()]*:)?\s*([\w]*)$/);
+  var mRel   = before.match(/\[(?:[^\[\]]*:)?\s*([\w]*)$/);
+
+  // Context: after . or { → property key
+  var mProp  = before.match(/[\w\)}\]]\.([\w]*)$/) || before.match(/\{[^{}]*([\w]*)$/);
+
+  // Generic word at cursor → keywords
+  var mWord  = before.match(/(?:^|[\s,])([A-Za-z_][\w ]*)$/);
+
+  _loadSchema().then(function(schema) {
+    var suggestions = [];
+    var typed = '';
+
+    if (mRel) {
+      // relationship type context
+      typed = mRel[1] || '';
+      var pool = schema ? schema.relTypes : [];
+      suggestions = pool
+        .filter(function(t) { return t.toLowerCase().startsWith(typed.toLowerCase()); })
+        .slice(0, 20)
+        .map(function(t) { return { text: t, kind: 'reltype' }; });
+    } else if (mLabel) {
+      // node label context
+      typed = mLabel[1] || '';
+      var pool = schema ? schema.labels : [];
+      suggestions = pool
+        .filter(function(l) { return l.toLowerCase().startsWith(typed.toLowerCase()); })
+        .slice(0, 20)
+        .map(function(l) { return { text: l, kind: 'label' }; });
+    } else if (mProp) {
+      // property key context
+      typed = mProp[1] || '';
+      var pool = schema ? schema.propKeys : [];
+      suggestions = pool
+        .filter(function(k) { return k.toLowerCase().startsWith(typed.toLowerCase()); })
+        .slice(0, 20)
+        .map(function(k) { return { text: k, kind: 'propkey' }; });
+    } else if (mWord) {
+      typed = mWord[1].replace(/\s+$/, '');
+      if (typed.length >= 2) {
+        suggestions = CYPHER_KEYWORDS
+          .filter(function(kw) { return kw.toLowerCase().startsWith(typed.toLowerCase()); })
+          .slice(0, 12)
+          .map(function(kw) { return { text: kw, kind: 'keyword' }; });
+      }
+    }
+
+    if (suggestions.length) {
+      _acShow(suggestions, ta);
+    } else {
+      _acHide();
+    }
+  });
+}
+
+function onCypherInput(ta) {
+  cypherAutoResize(ta);
+  // Autocomplete
+  _acTrigger(ta);
+  // Immediate structural check (brackets / quotes)
+  var structErr = cypherStructuralCheck(ta.value);
+  if (structErr) { showCypherLint('error', structErr); return; }
+  showCypherLint(null);   // clear panel while EXPLAIN is pending
+  // Debounce Neo4j EXPLAIN lint
+  if (_lintDebounce) clearTimeout(_lintDebounce);
+  _lintDebounce = setTimeout(function() {
+    _lintDebounce = null;
+    runCypherExplainLint(ta.value);
+  }, 1200);
+}
+
+// Check bracket/quote balance. Returns error string or null.
+function cypherStructuralCheck(text) {
+  var stack = [];
+  var OPEN  = { '(': ')', '[': ']', '{': '}' };
+  var CLOSE = new Set([')', ']', '}']);
+  var inSingle = false, inDouble = false, inBacktick = false;
+
+  for (var i = 0; i < text.length; i++) {
+    var c = text[i];
+    var prev = i > 0 ? text[i - 1] : '';
+
+    if (!inDouble && !inBacktick && c === "'") {
+      if (inSingle && prev !== '\\') inSingle = false;
+      else if (!inSingle) inSingle = true;
+      continue;
+    }
+    if (!inSingle && !inBacktick && c === '"') {
+      if (inDouble && prev !== '\\') inDouble = false;
+      else if (!inDouble) inDouble = true;
+      continue;
+    }
+    if (!inSingle && !inDouble && c === '`') { inBacktick = !inBacktick; continue; }
+    if (inSingle || inDouble || inBacktick) continue;
+
+    // Skip // line comments
+    if (c === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+
+    if (OPEN[c]) {
+      stack.push(c);
+    } else if (CLOSE.has(c)) {
+      var expected = OPEN[stack[stack.length - 1]];
+      if (stack.length && expected === c) { stack.pop(); }
+      else { return 'Unmatched "' + c + '" at position ' + i; }
+    }
+  }
+  if (inSingle)   return 'Unclosed single-quote string';
+  if (inDouble)   return 'Unclosed double-quote string';
+  if (inBacktick) return 'Unclosed backtick identifier';
+  if (stack.length) return 'Unclosed "' + stack[stack.length - 1] + '"';
+
+  // Extra syntactic checks on the text outside string literals
+  var stripped = _stripCypherStrings(text);
+  // Dot followed by whitespace then identifier: r. Source  or  r. r.Source
+  if (/\.\s+[\w]/.test(stripped)) {
+    var _dm = stripped.match(/\b(\w+)\.\s+/);
+    var _hint = _dm ? '"' + _dm[1] + '.\u2026"' : 'a property access';
+    return 'Invalid property access: space after "." in ' + _hint + ' (remove the space)';
+  }
+  // Consecutive dots
+  if (/\w\.\.[\w]/.test(stripped))
+    return 'Invalid property access: consecutive dots';
+
+  return null;
+}
+
+// Strip string literals → spaces for structural pattern checks.
+function _stripCypherStrings(text) {
+  var out = '', inS = false, inD = false, inB = false;
+  for (var i = 0; i < text.length; i++) {
+    var c = text[i], prev = i > 0 ? text[i-1] : '';
+    if (!inD && !inB && c === "'") { inS = !inS; out += ' '; continue; }
+    if (!inS && !inB && c === '"') { inD = !inD; out += ' '; continue; }
+    if (!inS && !inD && c === '`') { inB = !inB; out += ' '; continue; }
+    out += (inS || inD || inB) ? ' ' : c;
+  }
+  return out;
+}
+
+
+// Detect semantic issues EXPLAIN misses (runtime type errors etc.)
+function cypherSemanticWarn(text) {
+  var stripped = _stripCypherStrings(text);
+
+  // Bare property access used as a boolean condition:
+  //   WHERE r.Prop AND ...  /  AND r.Prop RETURN ...  /  WHERE r.Prop<EOL>
+  // False-positive guard: skip if immediately followed by a comparison operator
+  var boolRe = /\b(?:WHERE|AND|OR)\s+(\w+\.\w+)\s*(?=AND\b|OR\b|RETURN\b|WITH\b|LIMIT\b|ORDER\b|SKIP\b|$)/gi;
+  var m;
+  while ((m = boolRe.exec(stripped)) !== null) {
+    // Make sure what follows the property isn't a comparison operator
+    var after = stripped.slice(m.index + m[0].length);
+    if (/^\s*[=<>!]|^\s+(?:IS|IN|CONTAINS|STARTS|ENDS)\b/i.test(after)) continue;
+    return '\u26a0 Possible type error: "' + m[1] + '" is used as a boolean — ' +
+           'did you mean "' + m[1] + ' > 0" or "' + m[1] + ' IS NOT NULL"?';
+  }
+  return null;
+}
+
+async function runCypherExplainLint(text) {
+  if (!text.trim() || !authToken) return;
+  try {
+    var result = await api('/api/graph/lint', { query: text });
+    if (!result.ok && result.error) {
+      var e = result.error;
+      var msg = e.message
+        .replace(/^Neo\.\w+\.\w+\.\w+:\s*/i, '')            // strip Neo4j error code prefix
+        .replace(/\s*\(line\s+\d+,\s+column\s+\d+.*$/i, '') // strip position suffix
+        .trim();
+      var loc = '';
+      if (e.line != null) loc = ' (line ' + (e.line + 1) + ', col ' + (e.column + 1) + ')';
+      showCypherLint('error', msg + loc);
+    } else {
+      // EXPLAIN passed — still check for semantic issues EXPLAIN can't catch
+      var semWarn = cypherSemanticWarn(text);
+      if (semWarn) {
+        showCypherLint('warn', semWarn);
+      } else {
+        showCypherLint('ok', '✓ Syntax OK');
+      }
+    }
+  } catch(_) { /* network error — stay silent */ }
+}
+
+function showCypherLint(level, msg) {
+  var panel = document.getElementById('cypher-lint-panel');
+  if (!panel) return;
+  if (!level) { panel.style.display = 'none'; panel.textContent = ''; return; }
+  panel.className = 'lint-' + level;
+  panel.textContent = msg || '';
+  panel.style.display = 'block';
+}
+
 function focusCypherInput() {
   var bar = document.getElementById('query-bar');
-  if (bar) {
-    var wasHidden = bar.style.display === 'none';
-    bar.style.display = wasHidden ? '' : 'none';
-    if (wasHidden) {
-      var el = document.getElementById('cypher-input');
-      if (el) { el.focus(); el.select(); }
+  if (!bar) return;
+  var wasHidden = bar.style.display === 'none';
+  bar.style.display = wasHidden ? '' : 'none';
+  if (wasHidden) {
+    var el = document.getElementById('cypher-input');
+    if (el) {
+      cypherAutoResize(el);
+      setTimeout(function() { el.focus(); el.select(); }, 10);
     }
   }
 }
@@ -795,14 +1228,18 @@ async function executeLoadNodeProperties() {
     var byNodeId = result.byNodeId || {};
     var byUrn    = result.byUrn    || {};
 
-    // Build URN → cy element lookup.
+    // Build URN → [cy elements] lookup (array so clones with same URN are all included).
     // IMPORTANT: after enrichNodesFromNeo4j, graphData.nodes[i].id is updated to the
     // Neo4j integer ID but the cy element ID remains the original URN string.
     // Using cy.getElementById(n.id) fails for enriched RNEF nodes — use URN instead.
-    var urnToCyNode = {};
+    var urnToCyNodes = {};
     cy.nodes().forEach(function(cyNode) {
       var urn = cyNode.data('URN');
-      if (urn) urnToCyNode[String(urn)] = cyNode;
+      if (urn) {
+        var key = String(urn);
+        if (!urnToCyNodes[key]) urnToCyNodes[key] = [];
+        urnToCyNodes[key].push(cyNode);
+      }
     });
 
     var annotated = 0;
@@ -817,11 +1254,20 @@ async function executeLoadNodeProperties() {
       // Update backing graphData
       Object.assign(n.properties, props);
 
-      // Update live cy element — prefer URN-based lookup, fall back to n.id
-      var cyNode = (urn && urnToCyNode[urn]) ? urnToCyNode[urn] : cy.getElementById(n.id);
-      if (cyNode && cyNode.length) {
-        Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+      // Update all cy elements sharing this URN (covers original + RNEF clones).
+      // Fall back to direct ID lookup for enriched nodes whose n.id became a Neo4j integer.
+      var cyNodesForUrn = (urn && urnToCyNodes[urn]) ? urnToCyNodes[urn] : null;
+      if (cyNodesForUrn) {
+        cyNodesForUrn.forEach(function(cyNode) {
+          Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+        });
         annotated++;
+      } else {
+        var cyNode = cy.getElementById(String(n.id));
+        if (cyNode && cyNode.length) {
+          Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+          annotated++;
+        }
       }
     });
 
@@ -951,8 +1397,7 @@ function getCyStyle() {
       style: {
         'target-arrow-shape': 'triangle',
         'target-label': '⊕',
-        'target-text-offset': 35,
-        'target-text-background-opacity': 0
+        'target-text-offset': 35
       }
     },
     {
@@ -1004,7 +1449,9 @@ function getCyStyle() {
     }},
     // CellProcess — stadium (wide roundrectangle), yellow gradient
     { selector: 'node[NodeType="CellProcess"]', style: {
-        'shape': 'roundrectangle', 'width': 'label', 'height': 34,
+        'shape': 'roundrectangle',
+        'width': function(n){ var l=(n.data('label')||'').length; return Math.min(Math.max(50,l*6.5+20),175); },
+        'height': 34,
         'padding': '10px', 'text-wrap': 'wrap', 'text-max-width': '160px',
         'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
         'background-gradient-stop-colors': '#FCCF87 #f9a825', 'background-gradient-stop-positions': '0 1',
@@ -1031,7 +1478,9 @@ function getCyStyle() {
     }},
     // Tissue — stadium (wide roundrectangle), brown gradient
     { selector: 'node[NodeType="Tissue"]', style: {
-        'shape': 'roundrectangle', 'width': 'label', 'height': 34,
+        'shape': 'roundrectangle',
+        'width': function(n){ var l=(n.data('label')||'').length; return Math.min(Math.max(50,l*6.5+20),175); },
+        'height': 34,
         'padding': '10px', 'text-wrap': 'wrap', 'text-max-width': '160px',
         'background-fill': 'linear-gradient', 'background-gradient-direction': 'to-bottom',
         'background-gradient-stop-colors': '#AF9D97 #6d4c41', 'background-gradient-stop-positions': '0 1'
@@ -1094,7 +1543,9 @@ function getCyStyle() {
     {
       selector: 'node[rnefShape="rectangle"]',
       style: {
-        'shape': 'rectangle', 'width': 'label', 'height': 'label',
+        'shape': 'rectangle',
+        'width':  function(n){ var l=(n.data('label')||'').length; return Math.min(Math.max(40,l*6.5+10),172); },
+        'height': function(n){ var l=(n.data('label')||'').length; var cpl=Math.floor(162/6.5); var lines=Math.max(1,Math.ceil(l/cpl)); return Math.max(24,lines*16+10); },
         'padding': '5px', 'text-wrap': 'wrap', 'text-max-width': '162px'
       }
     },
@@ -1204,6 +1655,22 @@ function getNodeColor(labels) {
   return DEFAULT_NODE_COLOR;
 }
 
+// Returns the number of unique papers in a reference array, counted by the first
+// available stable identifier per row (DOI → EMBASE → PII → PUI → NCT_ID).
+// Rows with no identifier are not counted, ensuring refCount ≤ refs.length.
+function calcRefCount(refs) {
+  if (!Array.isArray(refs) || !refs.length) return 0;
+  var idSet = new Set();
+  refs.forEach(function(r) {
+    if      (r.doi)    idSet.add('DOI:'    + String(r.doi).toLowerCase().trim());
+    else if (r.embase) idSet.add('EMBASE:' + String(r.embase).trim());
+    else if (r.pii)    idSet.add('PII:'    + String(r.pii).trim());
+    else if (r.pui)    idSet.add('PUI:'    + String(r.pui).trim());
+    else if (r.nct_id) idSet.add('NCT_ID:' + String(r.nct_id).trim());
+  });
+  return idSet.size;
+}
+
 function getEdgeThickness(numRefs) {
   var n = Number(numRefs) || 0;
   if (n <= 0) return 2;
@@ -1211,6 +1678,153 @@ function getEdgeThickness(numRefs) {
   if (n === 2) return 6;
   return 7; // 3+
 }
+
+// Normalize effect values to title-case for CSS selector matching.
+// Neo4j stores 'positive'/'negative' (lowercase); stylesheet selectors expect
+// 'Positive'/'Negative'. Also maps '_' and 'unknown' variants to '' (no effect).
+function normEffectDisplay(v) {
+  if (!v) return '';
+  const s = String(v);
+  if (s === '_' || s.toLowerCase() === 'unknown') return '';
+  if (s.toLowerCase() === 'positive') return 'Positive';
+  if (s.toLowerCase() === 'negative') return 'Negative';
+  return s;
+}
+
+// ─── Shared graph-merge helpers ──────────────────────────────────────────────
+// All operations that add nodes/edges from Neo4j (Expand, Find relations, etc.)
+// must call mergeGraphData() so node/edge data is assembled exactly once, the
+// same way renderGraph() does it.
+
+/** Build the Cytoscape data object for one graphData node — mirrors renderGraph. */
+function _buildCyNodeData(n) {
+  var d = {
+    id: n.id,
+    elementId: n.elementId || n.id,
+    label: getNodeLabel(n),
+    color: getNodeColor(n.labels),
+    nodeType: (n.labels && n.labels[0]) || 'Unknown'
+  };
+  if (n.isClone) d.isClone = true;
+  if (n.cloneOf)  d.cloneOf = n.cloneOf;
+  Object.assign(d, n.properties);
+  d.id = n.id;                            // guard: n.properties.id must never overwrite cy id
+  if (!d.NodeType) d.NodeType = d.nodeType;
+  return d;
+}
+
+/** Build the Cytoscape data object for one graphData edge — mirrors renderGraph.
+ *  srcCyId / tgtCyId are the already-resolved Cytoscape node IDs (may differ
+ *  from e.startNodeId / e.endNodeId after URN-based anchor resolution). */
+function _buildCyEdgeData(e, srcCyId, tgtCyId) {
+  var p = e.properties || {};
+  var _inlineRefs = Array.isArray(p.references) && p.references.length ? p.references : null;
+  var numRefs = _inlineRefs
+    ? calcRefCount(_inlineRefs)
+    : (p.RelationNumberOfReferences != null ? p.RelationNumberOfReferences : 0);
+  var undirected = p.directed === false || !p.directed && !DIRECT_TYPES.has(e.type || '');
+  return {
+    id:           e.id,
+    elementId:    e.elementId || e.id,
+    source:       srcCyId,
+    target:       tgtCyId,
+    relType:      e.type || '',
+    relId:        p.RelationID != null ? String(p.RelationID) : '',
+    relIds:       Array.isArray(p.RelationIDs) ? p.RelationIDs : null,
+    edgeURN:      p.URN != null ? String(p.URN) : '',
+    numRefs:      numRefs,
+    effect:       normEffectDisplay(p.Effect || p.effect || ''),
+    mechanism:    p.Mechanism || p.mechanism || '',
+    confidence:   p['Confidence (%)'] != null ? p['Confidence (%)'] : '',
+    citationScore: p['Citation score'] != null ? p['Citation score'] : '',
+    color:        getTypeColor(e.type || ''),
+    isHyperedge:  (e.type === 'Substrate' || e.type === 'Product' || e.type === 'Cofactor'),
+    thickness:    getEdgeThickness(numRefs),
+    lineStyle:    DIRECT_TYPES.has(e.type || '') ? 'solid' : 'dashed',
+    directed:     !undirected
+  };
+}
+
+/**
+ * Merge server-returned { nodes, edges } into the live graph without replacing
+ * existing elements.  Handles the anchor-node ID mismatch: the server uses Neo4j
+ * internal IDs while the canvas may use different IDs for nodes loaded earlier.
+ * Bridges the gap via URN lookup exactly once here, so callers never need to
+ * worry about ID translation.
+ *
+ * Returns { addedNodes, addedEdges } counts.
+ */
+function mergeGraphData(newData) {
+  var newNodes = newData.nodes || [];
+  var newEdges = newData.edges || [];
+
+  // ── Step 1: build URN → cy-id map from the live canvas ──────────────────
+  var urnToCyId = {};
+  cy.nodes().not('[?isClone]').forEach(function(n) {
+    var urn = n.data('URN') || n.data('urn');
+    if (urn) urnToCyId[String(urn)] = n.id();
+  });
+
+  // ── Step 2: neo4j-internal-id → cy-id (for endpoint resolution in edges) ─
+  var neo4jToCy = {};
+
+  // Pre-pass: map IDs of returned nodes that already exist on canvas (anchors)
+  newNodes.forEach(function(n) {
+    var nid = String(n.id);
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (urn && urnToCyId[urn]) neo4jToCy[nid] = urnToCyId[urn];
+  });
+
+  // ── Step 3: collect existing IDs for dedup ───────────────────────────────
+  var existingEdgeIds = new Set();
+  graphData.edges.forEach(function(e) { existingEdgeIds.add(String(e.id)); });
+
+  // ── Step 4: add new nodes ────────────────────────────────────────────────
+  var addedNodes = 0;
+  newNodes.forEach(function(n) {
+    var nid = String(n.id);
+    if (neo4jToCy[nid]) return;            // already on canvas (anchor)
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (urn && urnToCyId[urn]) { neo4jToCy[nid] = urnToCyId[urn]; return; }
+
+    // Genuinely new node
+    neo4jToCy[nid] = nid;
+    if (urn) urnToCyId[urn] = nid;
+    graphData.nodes.push(n);
+    addedNodes++;
+    cy.add({
+      group: 'nodes',
+      data: _buildCyNodeData(n),
+      position: { x: Math.random() * 200 - 100, y: Math.random() * 200 - 100 }
+    });
+  });
+
+  // ── Step 5: add new edges ────────────────────────────────────────────────
+  var addedEdges = 0;
+  newEdges.forEach(function(e) {
+    var eid = String(e.id);
+    if (existingEdgeIds.has(eid)) return;
+    existingEdgeIds.add(eid);
+
+    var srcCyId = neo4jToCy[String(e.startNodeId)];
+    var tgtCyId = neo4jToCy[String(e.endNodeId)];
+    if (!srcCyId || !tgtCyId) return;
+    if (!cy.getElementById(srcCyId).length || !cy.getElementById(tgtCyId).length) return;
+
+    graphData.edges.push(e);
+    addedEdges++;
+    var undirected = !(e.properties && e.properties.directed !== false &&
+                       (e.properties.directed || DIRECT_TYPES.has(e.type || '')));
+    cy.add({
+      group: 'edges',
+      classes: undirected ? 'undirected' : '',
+      data: _buildCyEdgeData(e, srcCyId, tgtCyId)
+    });
+  });
+
+  return { addedNodes: addedNodes, addedEdges: addedEdges };
+}
+
 
 function renderGraph(data, savedPositions) {
   graphData = data;
@@ -1262,9 +1876,13 @@ function renderGraph(data, savedPositions) {
       skippedEdges++;
       return;
     }
-    var numRefs = e.properties.RelationNumberOfReferences != null
-      ? e.properties.RelationNumberOfReferences
-      : (Array.isArray(e.properties.references) ? e.properties.references.length : 0);
+    // When inline refs are present, derive both counts from them so they stay
+    // consistent with each other (Neo4j values may be from a different snapshot).
+    var _inlineRefs = Array.isArray(e.properties.references) && e.properties.references.length
+                      ? e.properties.references : null;
+    var numRefs = _inlineRefs
+      ? calcRefCount(_inlineRefs)
+      : (e.properties.RelationNumberOfReferences != null ? e.properties.RelationNumberOfReferences : 0);
     var undirected = e.properties.directed === false;
     cyEdges.push({
       group: 'edges',
@@ -1276,8 +1894,10 @@ function renderGraph(data, savedPositions) {
         target: e.endNodeId,
         relType: e.type,
         relId: e.properties.RelationID != null ? String(e.properties.RelationID) : '',
+        relIds: Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs : null,
+        edgeURN: e.properties.URN != null ? String(e.properties.URN) : '',
         numRefs: numRefs,
-        effect: e.properties.Effect || e.properties.effect || '',
+        effect: normEffectDisplay(e.properties.Effect || e.properties.effect || ''),
         mechanism: e.properties.Mechanism || e.properties.mechanism || '',
         confidence: e.properties['Confidence (%)'] != null ? e.properties['Confidence (%)'] : '',
         citationScore: e.properties['Citation score'] != null ? e.properties['Citation score'] : '',
@@ -1323,14 +1943,20 @@ function renderGraph(data, savedPositions) {
   // reliably (e.g. when the cy container is hidden during batch adds),
   // so we set positions again here before the preset layout runs.
   if (savedPositions) {
+    var _bsFound = 0, _bsMiss = 0, _bsMissSample = [];
     cy.nodes().forEach(function(n) {
       var pos = savedPositions[n.id()];
       if (!pos && !n.data('isClone')) {
         var urn = n.data('URN');
         if (urn) pos = savedPositions[urn];
       }
-      if (pos) n.position(pos);
+      if (pos) { n.position(pos); _bsFound++; }
+      else {
+        _bsMiss++;
+        if (_bsMissSample.length < 2) _bsMissSample.push('id=' + n.id() + ' URN=' + n.data('URN'));
+      }
     });
+    console.log('[TAB-DEBUG] renderGraph belt-and-suspenders: found=' + _bsFound + ' notFound=' + _bsMiss + (_bsMissSample.length ? ' missing=' + _bsMissSample.join(';') : ''));
   }
 
   document.getElementById('graph-empty-state').style.display =
@@ -1340,6 +1966,7 @@ function renderGraph(data, savedPositions) {
   updateStats();
 
   if (savedPositions) {
+    console.log('[TAB-DEBUG][' + Date.now() + '] renderGraph: using PRESET layout (savedPositions provided)');
     cy.layout({ name: 'preset' }).run();
     // Preset layout places nodes at exact coordinates but does NOT adjust the
     // viewport.  The fit must be deferred one animation frame so the browser
@@ -1347,9 +1974,18 @@ function renderGraph(data, savedPositions) {
     // container dimensions — otherwise it fits against a zero-size box and the
     // graph stays invisible until the user presses Fit manually.
     requestAnimationFrame(function() {
-      if (cy) { cy.resize(); cy.fit(cy.elements(), 40); updateZoomLabel(); }
+      if (cy) {
+        cy.resize();
+        var _bb = cy.elements().boundingBox();
+        console.log('[TAB-DEBUG] RAF fit: nodes=' + cy.nodes().length +
+          ' bb=(' + Math.round(_bb.x1) + ',' + Math.round(_bb.y1) + ')→(' + Math.round(_bb.x2) + ',' + Math.round(_bb.y2) + ')' +
+          ' spread=(' + Math.round(_bb.x2 - _bb.x1) + 'x' + Math.round(_bb.y2 - _bb.y1) + ')');
+        cy.fit(cy.elements(), 40);
+        updateZoomLabel();
+      }
     });
   } else {
+    console.trace('[TAB-DEBUG][' + Date.now() + '] renderGraph: using ALGORITHM layout (no savedPositions) currentLayout=' + currentLayout);
     applyLayout(currentLayout);
   }
 }
@@ -1358,6 +1994,7 @@ function renderGraph(data, savedPositions) {
 function applyLayout(name, btn) {
   if (!cy || !cy.nodes().length) return;
   currentLayout = name;
+  console.trace('[TAB-DEBUG][' + Date.now() + '] applyLayout called with: ' + name);
 
   updateLayoutMenu(name);
 
@@ -1406,10 +2043,492 @@ function zoomFit() {
 }
 
 // ─── Run query ────────────────────────────────────────────────────────────────
+// ─── In-memory large-query exports (FR-2 / FR-3 / FR-4) ─────────────────────
+// Shared Excel writer — accepts pre-built rows + isRelMode flag + filename.
+// Mirrors exportTableExcel() but operates on caller-supplied rows so it can be
+// used without touching tableRows / relationRows global state.
+async // Build an ExcelJS buffer from rows without triggering a download.
+// Separated so callers can build multiple buffers in parallel then download in order.
+async function buildExcelBuffer(rows, isRelMode, plainText) {
+  var visCols = columnDefs.filter(function(c) {
+    if (!c.visible) return false;
+    if (isRelMode) return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
+  });
+
+  var wb    = new ExcelJS.Workbook();
+  var sheet = wb.addWorksheet('Graph Data');
+  var colWidths = {
+    regulator: 22, regulatorType: 16, target: 22, targetType: 16,
+    relationType: 18, effect: 12, numRefs: 8, pmid: 14, doi: 32,
+    year: 8, title: 40, sentence: 60
+  };
+  sheet.columns = visCols.map(function(col) {
+    return { key: col.key, width: colWidths[col.key] || 20 };
+  });
+  var hRow = sheet.getRow(1);
+  visCols.forEach(function(col, ci) {
+    var cell = hRow.getCell(ci + 1);
+    cell.value = col.label;
+    cell.font  = { name: 'Arial', size: 10, bold: true };
+    cell.fill  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8EAF0' } };
+    cell.alignment = { vertical: 'middle', wrapText: false };
+  });
+  hRow.commit();
+
+  rows.forEach(function(row) {
+    var exRow = sheet.addRow({});
+    visCols.forEach(function(col, ci) {
+      var cell   = exRow.getCell(ci + 1);
+      var val    = row[col.key];
+      var valStr = val != null ? String(val) : '';
+      cell.alignment = { vertical: 'top', wrapText: false };
+      if (col.key === 'pmid' && valStr) {
+        cell.value = { text: valStr, hyperlink: 'https://pubmed.ncbi.nlm.nih.gov/' + valStr };
+        cell.font  = { name: 'Arial', size: 10, color: { argb: 'FF4F8EF7' }, underline: true };
+      } else if (col.key === 'doi' && valStr) {
+        cell.value = { text: valStr, hyperlink: 'https://doi.org/' + valStr };
+        cell.font  = { name: 'Arial', size: 10, color: { argb: 'FF4F8EF7' }, underline: true };
+      } else if (col.key === 'regulator' && row.regulatorMedScan) {
+        cell.value = { richText: [
+          { text: valStr,                                     font: { name: 'Arial', size: 10 } },
+          { text: '\nMedScan ID: ' + row.regulatorMedScan,   font: { name: 'Arial', size: 9, color: { argb: 'FF7A8099' } } }
+        ]};
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else if (col.key === 'target' && row.targetMedScan) {
+        cell.value = { richText: [
+          { text: valStr,                                   font: { name: 'Arial', size: 10 } },
+          { text: '\nMedScan ID: ' + row.targetMedScan,    font: { name: 'Arial', size: 9, color: { argb: 'FF7A8099' } } }
+        ]};
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else if (col.key === 'sentence') {
+        cell.value     = plainText ? valStr : buildSentenceRichText(valStr, row.regulatorMedScan, row.targetMedScan);
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else {
+        // Write as number when: column is flagged numeric, or the raw value is
+        // already a JS number (Neo4j numeric properties such as Relation score,
+        // Confidence %, etc.).  Also covers year (numeric string → number).
+        var numVal = (col.numeric && valStr !== '') ? Number(valStr)
+                   : (typeof val === 'number'      ? val
+                   :  NaN);
+        if (isFinite(numVal)) {
+          cell.value = numVal;
+          cell.numFmt = Number.isInteger(numVal) ? '0' : '0.##';
+        } else {
+          cell.value = valStr;
+        }
+        cell.font = { name: 'Arial', size: 10 };
+      }
+    });
+    exRow.commit();
+  });
+
+  return await wb.xlsx.writeBuffer();
+}
+
+function downloadBuffer(buffer, filename) {
+  var blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  var url  = URL.createObjectURL(blob);
+  var a    = document.createElement('a'); a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function writeRowsToExcel(rows, isRelMode, filename, plainText) {
+  if (typeof ExcelJS === 'undefined') {
+    alert('ExcelJS library not loaded. Please check your internet connection.'); return;
+  }
+  try {
+    var buffer = await buildExcelBuffer(rows, isRelMode, plainText);
+    downloadBuffer(buffer, filename);
+  } catch (err) { alert('Excel export failed: ' + err.message); }
+}
+
+// Shared: run query in-memory and build node/edge lookup + MedScan map.
+// Returns { qNodes, qEdges, nodeById, medScan } or null on error.
+async function _fetchQueryData(query) {
+  var qData;
+  try { qData = await api('/api/graph/query', { query }); }
+  catch (err) { alert('Query error: ' + err.message); return null; }
+
+  var qNodes = qData.nodes || [];
+  var qEdges = qData.edges || [];
+
+  // nodeById index (by id and URN)
+  var nodeById = {};
+  qNodes.forEach(function(n) {
+    nodeById[n.id] = n;
+    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+  });
+
+  // Fetch MedScan IDs for nodes that have a Neo4j NodeID
+  var nodeIds = qNodes
+    .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
+    .filter(Boolean);
+  var medScan = {};
+  if (nodeIds.length > 0) {
+    try {
+      var fetched = await api('/api/nodes/medscan', { nodeIds });
+      Object.assign(medScan, fetched);
+    } catch(e) { console.warn('MedScan lookup failed:', e.message); }
+  }
+
+  return { qNodes, qEdges, nodeById, medScan };
+}
+
+// Export References — mirrors loadTableData row-building, no UI side effects.
+async function exportQueryReferences(query) {
+  setProgressMsg('⏳ Fetching relations from database…');
+  var ctx = await _fetchQueryData(query);
+  if (!ctx) { setProgressMsg(null); return; }
+  var { qEdges, nodeById, medScan } = ctx;
+
+  setProgressMsg('⏳ Fetching references… (' + qEdges.length + ' relations)');
+  // Collect relation IDs and fetch references
+  var relIds = [];
+  qEdges.forEach(function(e) {
+    if (Array.isArray(e.properties.RelationIDs))
+      e.properties.RelationIDs.forEach(function(id) { if (id != null) relIds.push(String(id)); });
+    else if (e.properties.RelationID != null) relIds.push(String(e.properties.RelationID));
+  });
+
+  var refsGrouped = {};
+  if (relIds.length > 0) {
+    var scopusCols = columnDefs.filter(function(c) { return c.source === 'scopus_data'; }).map(function(c) { return c.dbField; });
+    var CHUNK       = 200;
+    var CONCURRENCY = 4;   // parallel requests in flight at once
+
+    // Split into chunks
+    var _chunks = [];
+    for (var _ci = 0; _ci < relIds.length; _ci += CHUNK)
+      _chunks.push(relIds.slice(_ci, _ci + CHUNK));
+
+    var _completed  = 0;
+    var _total      = _chunks.length;
+    var _totalIds   = relIds.length;
+    var _startTime  = Date.now();
+
+    // Fetch one chunk, with Scopus fallback on error
+    async function _fetchChunk(chunk) {
+      try {
+        return await api('/api/references/batch', { relationIds: chunk, scopusColumns: scopusCols });
+      } catch(e) {
+        if (scopusCols.length > 0) {
+          try { return await api('/api/references/batch', { relationIds: chunk, scopusColumns: [] }); }
+          catch(e2) {}
+        }
+        return {};
+      }
+    }
+
+    // Concurrency-limited pool — workers pull from _chunks as they finish (as_completed style)
+    var _qIdx = 0;
+    async function _worker() {
+      while (_qIdx < _chunks.length) {
+        var _i     = _qIdx++;
+        var _part  = await _fetchChunk(_chunks[_i]);
+        Object.assign(refsGrouped, _part);
+        _completed++;
+        var _doneIds = Math.min(_completed * CHUNK, _totalIds);
+        var _elapsed = (Date.now() - _startTime) / 1000;
+        var _eta     = (_completed > 1) ? formatEta(_elapsed / _completed * (_total - _completed)) : '';
+        setProgressMsg('⏳ Fetching references… (' + _doneIds + ' / ' + _totalIds +
+                       (_eta ? '  ·  ~' + _eta + ' left' : '') + ')');
+      }
+    }
+
+    // Launch CONCURRENCY workers in parallel; each drains the queue independently
+    var _workers = [];
+    for (var _w = 0; _w < Math.min(CONCURRENCY, _chunks.length); _w++) _workers.push(_worker());
+    await Promise.all(_workers);
+  }
+
+  function nodeLabel(node) { return node ? getNodeLabel(node) : '?'; }
+  function nodeMedScanLocal(node) {
+    if (!node || !node.properties) return '';
+    var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
+    return (nid && medScan[nid]) ? medScan[nid] : '';
+  }
+
+  setProgressMsg('⏳ Building rows…');
+  await yieldToUI();
+  var rows = [];
+  qEdges.forEach(function(edge) {
+    var srcNode = nodeById[edge.startNodeId];
+    var tgtNode = nodeById[edge.endNodeId];
+    var relId = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var refs = [];
+    for (var ri = 0; ri < relIdsArr.length; ri++) {
+      var _r = refsGrouped[relIdsArr[ri]];
+      if (_r && _r.length) { refs = _r; break; }
+    }
+    var base = {
+      edgeId: edge.id, elementId: edge.elementId || edge.id,
+      relId: relIdsArr.join(', ') || relId,
+      regulator: nodeLabel(srcNode), regulatorMedScan: nodeMedScanLocal(srcNode),
+      regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      target: nodeLabel(tgtNode), targetMedScan: nodeMedScanLocal(tgtNode),
+      targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      relationType: edge.type,
+      effect: normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
+      numRefs: edge.properties.RelationNumberOfReferences || 0,
+      numSentences: edge.properties.RelationNumberOfSentences || 0,
+    };
+    var buildRow = function(ref) {
+      var row = Object.assign({}, base);
+      if (ref) {
+        Object.keys(ref).forEach(function(k) {
+          row[k.startsWith('sd_') ? k : ('_ref_' + k)] = ref[k];
+        });
+        columnDefs.forEach(function(col) {
+          if (col.source === 'reference') {
+            if (col.key === 'year') row.year = getRefYear(ref);
+            else if (col.key === 'sentence') row.sentence = ref.msrc || '';
+            else row[col.key] = ref[col.dbField] != null ? String(ref[col.dbField]) : '';
+          } else if (col.source === 'scopus_data') {
+            row[col.key] = ref['sd_' + col.dbField] != null ? String(ref['sd_' + col.dbField]) : '';
+          }
+        });
+      } else {
+        columnDefs.forEach(function(col) {
+          if (col.source === 'reference' || col.source === 'scopus_data') row[col.key] = '';
+        });
+      }
+      return row;
+    };
+    if (refs.length === 0) rows.push(buildRow(null));
+    else refs.forEach(function(ref) { rows.push(buildRow(ref)); });
+  });
+
+  var MAX_ROWS   = 20000;
+  var _parts     = Math.ceil(rows.length / MAX_ROWS);
+  var _plain     = _parts > 1;
+  if (_parts > 1) {
+    setProgressMsg(null);
+    var _proceed = confirm('Number of exported rows exceeded ' + MAX_ROWS.toLocaleString() + ' limit ' +
+                           '(' + rows.length.toLocaleString() + ' rows). ' +
+                           'Sentence coloring is disabled. The export will be split into ' + _parts + ' files.\n\n' +
+                           'Click OK to continue or Cancel to abort.');
+    if (!_proceed) return;
+  }
+
+  if (typeof ExcelJS === 'undefined') {
+    alert('ExcelJS library not loaded. Please check your internet connection.');
+    setProgressMsg(null); return;
+  }
+
+  // Build all buffers in parallel (concurrency 3), download in order as they finish.
+  var GEN_CONCURRENCY = 3;
+  var _slices = [];
+  var _fnames = [];
+  for (var _pi = 0; _pi < _parts; _pi++) {
+    _slices.push(rows.slice(_pi * MAX_ROWS, (_pi + 1) * MAX_ROWS));
+    _fnames.push('query-references-part' + (_pi + 1) + '.xlsx');
+  }
+
+  var _buffers  = new Array(_parts);
+  var _genDone  = 0;
+  var _genIdx   = 0;
+  var _genStart = Date.now();
+  var _note     = _plain ? ' · plain text' : '';
+
+  function _updateGenProgress() {
+    var _elapsed = (Date.now() - _genStart) / 1000;
+    var _eta     = (_genDone > 1) ? formatEta(_elapsed / _genDone * (_parts - _genDone)) : '';
+    setProgressMsg('⏳ Building Excel parts… (' + _genDone + ' / ' + _parts + _note +
+                   (_eta ? '  ·  ~' + _eta + ' left' : '') + ')');
+  }
+
+  // Worker: pulls from queue, builds buffer, stores at index
+  async function _genWorker() {
+    while (_genIdx < _parts) {
+      var _i       = _genIdx++;
+      _buffers[_i] = await buildExcelBuffer(_slices[_i], false, _plain);
+      _slices[_i]  = null;   // free row data immediately
+      _genDone++;
+      _updateGenProgress();
+    }
+  }
+
+  // Generate all parts in parallel
+  var _workers = [];
+  for (var _w = 0; _w < Math.min(GEN_CONCURRENCY, _parts); _w++) _workers.push(_genWorker());
+  await Promise.all(_workers);
+
+  // Bundle into one ZIP and download — single browser confirmation
+  if (_parts === 1) {
+    setProgressMsg('⏳ Downloading…');
+    await yieldToUI();
+    downloadBuffer(_buffers[0], 'query-references.xlsx');
+  } else {
+    setProgressMsg('⏳ Zipping ' + _parts + ' files…');
+    await yieldToUI();
+    var _zip = new JSZip();
+    for (var _zi = 0; _zi < _parts; _zi++) {
+      _zip.file(_fnames[_zi], _buffers[_zi]);
+      _buffers[_zi] = null;   // free memory as we go
+    }
+    var _zipBuf = await _zip.generateAsync({ type: 'arraybuffer',
+                                             compression: 'DEFLATE',
+                                             compressionOptions: { level: 1 } });
+    downloadBuffer(_zipBuf, 'query-references.zip');
+  }
+  setProgressMsg(null);
+}
+
+// Export Relations — mirrors loadRelationData row-building, no UI side effects.
+async function exportQueryRelations(query) {
+  setProgressMsg('⏳ Fetching relations from database…');
+  var ctx = await _fetchQueryData(query);
+  if (!ctx) { setProgressMsg(null); return; }
+  var { qEdges, nodeById, medScan } = ctx;
+
+  function nodeLabel(node) { return node ? getNodeLabel(node) : '?'; }
+  function nodeMedScanLocal(node) {
+    if (!node || !node.properties) return '';
+    var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
+    return (nid && medScan[nid]) ? medScan[nid] : '';
+  }
+
+  // Ensure NEO4J_PROP_DEFS columns exist (same logic as loadRelationData)
+  var existingNeo4j = {};
+  columnDefs.forEach(function(c) { if (c.source === 'neo4j') existingNeo4j[c.dbField] = c; });
+  NEO4J_PROP_DEFS.forEach(function(def) {
+    if (!existingNeo4j[def.prop]) {
+      var newCol = { key: 'neo4j_' + def.prop, label: def.label, visible: false, source: 'neo4j', dbField: def.prop };
+      columnDefs.push(newCol); existingNeo4j[def.prop] = newCol;
+    }
+  });
+
+  var rows = qEdges.map(function(edge) {
+    var srcNode = nodeById[edge.startNodeId];
+    var tgtNode = nodeById[edge.endNodeId];
+    var relId = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var row = {
+      edgeId: edge.id, elementId: edge.elementId || edge.id,
+      relId: relIdsArr.length > 1 ? relIdsArr.join(', ') : relId,
+      regulator: nodeLabel(srcNode), regulatorMedScan: nodeMedScanLocal(srcNode),
+      regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      target: nodeLabel(tgtNode), targetMedScan: nodeMedScanLocal(tgtNode),
+      targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      relationType: edge.type,
+      effect: normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
+      numRefs: edge.properties.RelationNumberOfReferences || 0,
+      numSentences: edge.properties.RelationNumberOfSentences || '',
+    };
+    columnDefs.forEach(function(col) {
+      if (col.source === 'neo4j') {
+        row[col.key] = edge.properties[col.dbField] != null ? String(edge.properties[col.dbField]) : '';
+      } else if (col.source === 'node_prop') {
+        var npNode = col.nodeRole === 'tgt' ? tgtNode : srcNode;
+        row[col.key] = (npNode && npNode.properties && npNode.properties[col.dbField] != null)
+          ? String(npNode.properties[col.dbField]) : '';
+      }
+    });
+    return row;
+  });
+
+  var MAX_ROWS = 100000;
+  var _parts = Math.ceil(rows.length / MAX_ROWS);
+  for (var _pi = 0; _pi < _parts; _pi++) {
+    var _slice = rows.slice(_pi * MAX_ROWS, (_pi + 1) * MAX_ROWS);
+    var _label = _parts > 1 ? ' (part ' + (_pi + 1) + ' of ' + _parts + ')' : '';
+    setProgressMsg('⏳ Formatting Excel' + _label + '… (' + _slice.length + ' rows)');
+    await yieldToUI();
+    var _fname = _parts > 1 ? 'query-relations-part' + (_pi + 1) + '.xlsx' : 'query-relations.xlsx';
+    var _plain = _parts > 1;
+    await writeRowsToExcel(_slice, true, _fname, _plain);
+    if (_pi < _parts - 1) await new Promise(function(r) {{ setTimeout(r, 800); }});
+  }
+  setProgressMsg(null);
+}
+
+
+// Pending query stored when large-query intercept modal fires
+var _largeQueryPending = null;
+
+function closeLargeQueryModal() {
+  _largeQueryPending = null;
+  document.getElementById('large-query-modal').style.display = 'none';
+}
+
+async function largeQueryExport(mode) {
+  var query = _largeQueryPending;
+  closeLargeQueryModal();
+  if (!query) return;
+  if (mode === 'references') await exportQueryReferences(query);
+  else                       await exportQueryRelations(query);
+}
+
 async function runQuery() {
-  var query = document.getElementById('cypher-input').value.trim();
+  var query = getCypherQuery().trim();
   if (!query) return;
   currentQuery = query;
+
+  // ── Pre-execution count check (FR-1.1 / FR-1.2) ──────────────────────────
+  var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
+  var _limitVal   = _limitMatch ? parseInt(_limitMatch[1], 10) : Infinity;
+  var _edgeCount  = _limitVal;
+  var _tooLarge   = false;
+
+  // Fast intercept: LIMIT >= 1000 — skip counting, just show modal.
+  if (_limitVal >= 1000) {
+    // Still run count(*) so we can show the real number, but with a 5 s timeout.
+    setProgressMsg('⏳ Counting matching relations…');
+  } else {
+    setProgressMsg('⏳ Counting matching relations…');
+  }
+
+  try {
+    // Wrap the count API call with a 5-second timeout via AbortController.
+    var _abortCtrl   = new AbortController();
+    var _abortTimer  = setTimeout(function() { _abortCtrl.abort(); }, 5000);
+    var _countOpts   = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json',
+                 'Authorization': authToken ? 'Bearer ' + authToken : '' },
+      body: JSON.stringify({ query: query }),
+      signal: _abortCtrl.signal
+    };
+    var _cRes  = await fetch('/api/graph/count-query', _countOpts);
+    clearTimeout(_abortTimer);
+    var countRes = await _cRes.json().catch(function() { return {}; });
+    setProgressMsg(null);
+    if (countRes && typeof countRes.edgeCount === 'number') {
+      _edgeCount = countRes.edgeCount;
+      if (_edgeCount >= 1000) _tooLarge = true;
+    } else if (_limitVal >= 1000) {
+      _tooLarge = true;
+    }
+  } catch (countErr) {
+    setProgressMsg(null);
+    if (countErr.name === 'AbortError') {
+      console.warn('count-query timed out — proceeding with main query');
+      // Timeout: if there is already a LIMIT >= 1000, still intercept.
+      if (_limitVal >= 1000) _tooLarge = true;
+      // No LIMIT + timeout → let the query run; the result may be large but we
+      // cannot know for sure, so don't block the user.
+    } else {
+      console.warn('count-query failed:', countErr.message);
+      if (_limitVal >= 1000) _tooLarge = true;
+    }
+  }
+
+  if (_tooLarge) {
+    _largeQueryPending = query;
+    var _countStr = isFinite(_edgeCount) ? _edgeCount.toLocaleString() : 'more than 1,000';
+    document.getElementById('large-query-msg').textContent =
+      'The query returns ' + _countStr + ' edges. ' +
+      'The results with more than 1,000 edges cannot be displayed in the App. ' +
+      'Would you like to export the results to Excel instead?';
+    document.getElementById('large-query-modal').style.display = 'flex';
+    return;
+  }
+
+  var startTabId = tabs[activeTabIdx].id;
+  tabs[activeTabIdx].running = true;
+  renderTabBar();
 
   document.getElementById('graph-loading').style.display = 'flex';
   document.getElementById('graph-empty-state').style.display = 'none';
@@ -1418,25 +2537,68 @@ async function runQuery() {
   try {
     var data = await api('/api/graph/query', { query: query });
     var shortQ = query.length > 40 ? query.substring(0, 40) + '…' : query;
-    updateCurrentTabName(shortQ);
-    if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
-      showQueryResultTable(data.table);
-    } else {
-      hideQueryResultTable();
-      renderGraph(data);
-      if (document.getElementById('table-view').style.display !== 'none') {
-        await loadTableData();
+    var startTabIdx = tabs.findIndex(function(t) { return t.id === startTabId; });
+    if (startTabIdx < 0) return; // tab was closed while query ran
+
+    if (startTabIdx === activeTabIdx) {
+      // Still on the originating tab — render normally
+      updateCurrentTabName(shortQ);
+      if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
+        showQueryResultTable(data.table);
+      } else {
+        hideQueryResultTable();
+        renderGraph(data);
+        if (document.getElementById('table-view').style.display !== 'none') {
+          await loadTableData();
+        }
       }
+    } else {
+      // User switched away — store results so they appear when they come back
+      tabs[startTabIdx].name = shortQ;
+      tabs[startTabIdx].snapshot.pendingGraphData = data;
     }
   } catch(err) {
-    alert('Query error: ' + err.message);
+    var startTabIdx = tabs.findIndex(function(t) { return t.id === startTabId; });
+    if (startTabIdx === activeTabIdx) {
+      alert('Query error: ' + err.message);
+    } else if (startTabIdx >= 0) {
+      tabs[startTabIdx].snapshot.pendingQueryError = err.message;
+    }
   } finally {
-    document.getElementById('graph-loading').style.display = 'none';
-    document.getElementById('run-btn').disabled = false;
+    var startTabIdx = tabs.findIndex(function(t) { return t.id === startTabId; });
+    if (startTabIdx >= 0) tabs[startTabIdx].running = false;
+    if (startTabIdx === activeTabIdx) {
+      document.getElementById('graph-loading').style.display = 'none';
+      document.getElementById('run-btn').disabled = false;
+    }
+    renderTabBar();
   }
 }
 
 function handleQueryKeydown(e) {
+  var ta = e.target;
+
+  // Autocomplete keyboard navigation
+  if (_acHandleKey(e)) return;
+
+  // Wrap selected text in quotes/backticks when a quote key is pressed with an active selection.
+  // e.g. double-click "BRCA1" then press ' → 'BRCA1'
+  if (e.key === "'" || e.key === '"' || e.key === '`') {
+    var start = ta.selectionStart, end = ta.selectionEnd;
+    if (start !== end) {
+      e.preventDefault();
+      var q = e.key;
+      var selected = ta.value.substring(start, end);
+      ta.setRangeText(q + selected + q, start, end, 'end');
+      // Keep just the inner word selected (cursor sits after closing quote
+      // but the word itself remains highlighted so the user can re-quote or retype).
+      ta.selectionStart = start + 1;
+      ta.selectionEnd   = start + 1 + selected.length;
+      onCypherInput(ta);
+      return;
+    }
+  }
+
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault();
     runQuery();
@@ -1510,6 +2672,7 @@ function hideTooltipDelayed() {
   tooltipHideTimer = setTimeout(function() {
     tooltipVisible = false;
     tooltipHideTimer = null;
+    tooltipCurrentEdge = null;
     document.getElementById('tooltip').style.display = 'none';
   }, 800);
 }
@@ -1518,6 +2681,68 @@ function showTooltipLoading() {
   var el = document.getElementById('tooltip');
   el.style.display = 'block';
   document.getElementById('tooltip-inner').innerHTML = '<div class="tooltip-loading">Loading references…</div>';
+}
+
+function renderRefsHtml(refs, asc) {
+  var btnLabel = asc ? '↑ oldest first' : '↓ newest first';
+  var btnTitle = asc ? 'Switch to newest first' : 'Switch to oldest first';
+  var out = '<div id="tooltip-refs-block">';
+  if (refs.length > 1) {
+    out += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">'
+      + '<span style="font-size:11px;color:#7a8099">References</span>'
+      + '<button id="tooltip-sort-btn" title="' + btnTitle + '" '
+      + 'style="font-size:10px;color:#7a8099;background:none;border:1px solid #2a2f4a;border-radius:3px;'
+      + 'padding:1px 5px;cursor:pointer;line-height:1.4">' + btnLabel + '</button>'
+      + '</div>';
+  }
+  var sorted = refs.slice().sort(function(a, b) {
+    var ya = parseInt(a.pubyear || a.year || 0, 10);
+    var yb = parseInt(b.pubyear || b.year || 0, 10);
+    return asc ? ya - yb : yb - ya;
+  });
+  var display = sorted.slice(0, 3);
+  if (display.length === 0) {
+    out += '<div class="tooltip-no-data">No references in database</div>';
+  } else {
+    // Display labels for identifier columns (shown as "Label: value" in meta line)
+    var ID_COLS = [
+      { key: 'doi',    label: 'DOI' },
+      { key: 'pmid',   label: 'PMID' },
+      { key: 'embase', label: 'Embase' },
+      { key: 'pii',    label: 'PII' },
+      { key: 'pui',    label: 'PUI' },
+      { key: 'nct_id', label: 'NCT_ID' },
+    ];
+    display.forEach(function(ref, i) {
+      if (i > 0) out += '<hr class="tooltip-divider">';
+      var year = getRefYear(ref);
+      var journal = ref.journal || ref.journalname || ref.journaltitle || ref.source || '';
+      var sentence = ref.msrc || '';
+      // Find best available identifier: doi first, then first non-null fallback
+      var idLabel = '', idValue = '';
+      for (var ci = 0; ci < ID_COLS.length; ci++) {
+        var v = ref[ID_COLS[ci].key];
+        if (v != null && String(v).trim() !== '') {
+          idLabel = ID_COLS[ci].label;
+          idValue = String(v).trim();
+          break;
+        }
+      }
+      out += '<div class="tooltip-ref">';
+      var metaParts = [];
+      if (year) metaParts.push(escHtml(year));
+      if (journal) metaParts.push(escHtml(journal));
+      if (idLabel) metaParts.push('<span style="color:#8a9ab8">' + escHtml(idLabel) + ':</span> ' + escHtml(idValue));
+      out += '<div class="tooltip-meta">' + metaParts.join(' · ') + '</div>';
+      if (sentence) out += '<div class="tooltip-sentence">' + escHtml(sentence) + '</div>';
+      out += '</div>';
+    });
+    if (refs.length > 3) {
+      out += '<div style="font-size:11px;color:#7a8099;margin-top:6px">+' + (refs.length - 3) + ' more reference(s)</div>';
+    }
+  }
+  out += '</div>';
+  return out;
 }
 
 function renderTooltip(edge, refs) {
@@ -1530,45 +2755,94 @@ function renderTooltip(edge, refs) {
   var effect = edge.data('effect');
   var mechanism = edge.data('mechanism');
   var numRefs = edge.data('numRefs');
+  // If actual refs were passed in (freshly loaded), derive the count from them
+  // so the header always matches the list — even when the cy edge data was
+  // computed before background reference fetching completed.  Also write the
+  // correct count back to the cy element so future tooltip opens don't need to
+  // re-derive it.
+  if (refs && refs.length > 0) {
+    var freshCount = calcRefCount(refs);
+    if (freshCount !== numRefs) {
+      numRefs = freshCount;
+      try { edge.data('numRefs', numRefs); edge.data('thickness', getEdgeThickness(numRefs)); } catch(e) {}
+    }
+  }
   var confidence = edge.data('confidence');
   var citationScore = edge.data('citationScore');
 
-  var html = '<div class="tooltip-rel-header">' + relType;
-  var parts = [];
-  if (effect && String(effect).trim()) parts.push(String(effect).trim());
-  if (mechanism && String(mechanism).trim()) parts.push(String(mechanism).trim());
-  if (parts.length) html += ' <span style="color:#7a8099;font-weight:400;font-size:11px">(' + escHtml(parts.join(' · ')) + ')</span>';
-  html += '</div>';
-  html += '<div style="font-size:11px;color:#7a8099;margin-bottom:6px">' + escHtml(srcLabel) + ' → ' + escHtml(tgtLabel) + '</div>';
+  var NONDIRECTIONAL = new Set(['Binding','CellExpression','FunctionalAssociation','Metabolization','Paralog']);
+  var isNonDir = NONDIRECTIONAL.has(relType);
+  var normEff  = effect ? String(effect).trim().toLowerCase() : '';
+
+  // Directional connector with effect sign:
+  //   positive → green →+    negative → red —|    none → grey →
+  //   non-directional → grey —
+  var arrowHtml;
+  if (isNonDir) {
+    arrowHtml = ' <span style="color:#9e9e9e">—</span> ';
+  } else if (normEff === 'positive') {
+    arrowHtml = ' <span style="color:#43a047;font-weight:700">&#x2192;+</span> ';
+  } else if (normEff === 'negative') {
+    arrowHtml = ' <span style="color:#e53935;font-weight:700">&#x2014;|</span> ';
+  } else {
+    arrowHtml = ' <span style="color:#9e9e9e">&#x2192;</span> ';
+  }
+
+  // Full triple on one line: SourceNode — RelationType →+ TargetNode
+  var html = '<div class="tooltip-rel-header">'
+    + escHtml(srcLabel)
+    + ' <span style="color:#7a8099;font-weight:400">—</span> '
+    + relType
+    + arrowHtml
+    + escHtml(tgtLabel)
+    + '</div>';
+
+  if (mechanism && String(mechanism).trim()) {
+    html += '<div style="font-size:11px;color:#7a8099;margin-bottom:4px">Mechanism: '
+      + escHtml(String(mechanism).trim()) + '</div>';
+  }
 
   var metaLine = (numRefs || 0) + ' reference(s)';
   if (confidence !== '' && confidence != null) metaLine += ' · Confidence: ' + confidence + '%';
   if (citationScore !== '' && citationScore != null) metaLine += ' · Citation score: ' + citationScore;
   html += '<div style="font-size:11px;color:#7a8099;margin-bottom:8px">' + metaLine + '</div>';
 
-  var display = refs.slice(0, 3);
-  if (display.length === 0) {
-    html += '<div class="tooltip-no-data">No references in database</div>';
-  } else {
-    display.forEach(function(ref, i) {
-      if (i > 0) html += '<hr class="tooltip-divider">';
-      var year = getRefYear(ref);
-      var journal = ref.journal || ref.journalname || ref.journaltitle || ref.source || '';
-      var sentence = ref.msrc || '';
-      html += '<div class="tooltip-ref">';
-      html += '<div class="tooltip-meta">' + year + (journal ? ' · ' + escHtml(journal) : '') + '</div>';
-      if (sentence) html += '<div class="tooltip-sentence">' + escHtml(sentence) + '</div>';
-      html += '</div>';
-    });
-    if (refs.length > 3) {
-      html += '<div style="font-size:11px;color:#7a8099;margin-top:6px">+' + (refs.length - 3) + ' more reference(s)</div>';
+  tooltipCurrentRefs = refs;
+  html += renderRefsHtml(refs, tooltipRefSortAsc);
+
+  // Service fields — RelationID (Neo4j) and/or URN (RNEF) shown at bottom in muted style
+  var relId   = edge.data('relId');
+  var relIds  = edge.data('relIds') || (relId ? [relId] : []);
+  var edgeURN = edge.data('edgeURN');
+  if (relIds.length > 0 || (edgeURN && edgeURN !== '')) {
+    html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:4px">';
+    if (relIds.length > 0) {
+      html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">RelationID:</span> ' + escHtml(relIds.join(', '))
+        + '</div>';
     }
+    if (edgeURN && edgeURN !== '') {
+      html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">URN:</span> ' + escHtml(String(edgeURN))
+        + '</div>';
+    }
+    html += '</div>';
   }
 
   el.style.display = 'block';
   document.getElementById('tooltip-inner').innerHTML = html;
   // Re-position now that full content is rendered and real dimensions are known.
   positionTooltip(lastMouseX, lastMouseY);
+
+  // If a "Matching relations" status message is waiting to be cleared, remove it
+  // now that the tooltip is actually showing a RelationID — this is the moment
+  // the user can see the ID, so the message has served its purpose.
+  var _tipRelIds = edge.data('relIds') || (edge.data('relId') ? [edge.data('relId')] : []);
+  if (pendingMatchSpan && _tipRelIds.some(function(id) { return matchedRelIds.has(id); })) {
+    pendingMatchSpan.remove();
+    pendingMatchSpan = null;
+    matchedRelIds.clear();
+  }
 }
 
 function renderNodeTooltip(node) {
@@ -1743,7 +3017,7 @@ async function switchView(view) {
 
   if (view === 'table' && graphData.edges.length > 0) {
     if (tableViewMode === 'relation') {
-      loadRelationData();
+      await loadRelationData();
     } else {
       if (tableRows.length > 0) {
         renderTableHeader();
@@ -1751,6 +3025,24 @@ async function switchView(view) {
       } else {
         await loadTableData();
       }
+    }
+    // Re-apply active sort (survives tab switches and mode changes)
+    if (tableSortCol) {
+      var _src = tableViewMode === 'relation' ? relationRows : tableRows;
+      var _colDef = columnDefs.find(function(c) { return c.key === tableSortCol; });
+      var _numeric = _colDef && _colDef.numeric;
+      var _sorted = _src.slice().sort(function(a, b) {
+        var av = a[tableSortCol], bv = b[tableSortCol];
+        if (_numeric) {
+          var an = av !== '' && av != null ? Number(av) : -Infinity;
+          var bn = bv !== '' && bv != null ? Number(bv) : -Infinity;
+          return tableSortAsc ? an - bn : bn - an;
+        }
+        av = String(av || '').toLowerCase();
+        bv = String(bv || '').toLowerCase();
+        return tableSortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+      });
+      renderTableRows(_sorted);
     }
     requestAnimationFrame(function() {
       if (columnWidths === null) { autofitColumns(); } else { applyColumnWidths(); }
@@ -1841,10 +3133,14 @@ async function colorSentencesNow() {
 }
 
 async function loadTableData() {
-  var relIds = graphData.edges
-    .map(function(e) { return e.properties.RelationID; })
-    .filter(function(id) { return id != null; })
-    .map(function(id) { return String(id); });
+  var relIds = [];
+  graphData.edges.forEach(function(e) {
+    if (Array.isArray(e.properties.RelationIDs)) {
+      e.properties.RelationIDs.forEach(function(id) { if (id != null) relIds.push(String(id)); });
+    } else if (e.properties.RelationID != null) {
+      relIds.push(String(e.properties.RelationID));
+    }
+  });
 
   var msg = document.getElementById('table-loading-msg');
   msg.style.display = 'inline';
@@ -1874,12 +3170,44 @@ async function loadTableData() {
   }
   msg.style.display = 'none';
 
+  // Fetch RelationNumberOfSentences from Neo4j for edges that have a RelationID
+  // but no value yet (RNEF-matched edges, similar relations).
+  var missingNosIds = relIds.filter(function(id) {
+    var e = graphData.edges.find(function(ge) {
+      var ids = Array.isArray(ge.properties.RelationIDs) ? ge.properties.RelationIDs
+              : (ge.properties.RelationID != null ? [String(ge.properties.RelationID)] : []);
+      return ids.indexOf(id) >= 0;
+    });
+    return e && e.properties.RelationNumberOfSentences == null;
+  });
+  if (missingNosIds.length > 0) {
+    try {
+      var nosMap = await api('/api/relations/properties',
+        { relationIds: missingNosIds, properties: ['RelationNumberOfSentences'] });
+      graphData.edges.forEach(function(e) {
+        var ids = Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs
+                : (e.properties.RelationID != null ? [String(e.properties.RelationID)] : []);
+        for (var i = 0; i < ids.length; i++) {
+          var entry = nosMap[ids[i]];
+          if (entry && entry.RelationNumberOfSentences != null) {
+            e.properties.RelationNumberOfSentences = entry.RelationNumberOfSentences;
+            break;
+          }
+        }
+      });
+    } catch(err) {
+      console.warn('RelationNumberOfSentences fetch failed:', err.message);
+    }
+  }
+
   // Supplement with inline references stored in the JSON (RNEF-converted pathways).
   // These have the same field names (pmid, doi, pubyear, title, msrc) as DB rows.
   graphData.edges.forEach(function(e) {
     var relId = e.properties.RelationID != null ? String(e.properties.RelationID) : '';
-    if (relId && !refsGrouped[relId] && e.properties.references && e.properties.references.length) {
-      refsGrouped[relId] = e.properties.references;
+    // For merged edges, also index refs under each of their RelationIDs
+    var allIds = Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs : (relId ? [relId] : []);
+    if (e.properties.references && e.properties.references.length) {
+      allIds.forEach(function(id) { if (id && !refsGrouped[id]) refsGrouped[id] = e.properties.references; });
     }
   });
 
@@ -1977,12 +3305,18 @@ async function loadTableData() {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
     var relId = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
-    var refs = relId ? (refsGrouped[relId] || []) : [];
+    var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var relIdDisplay = relIdsArr.join(', ') || relId;
+    var refs = [];
+    for (var ri = 0; ri < relIdsArr.length; ri++) {
+      var _r = refsGrouped[relIdsArr[ri]];
+      if (_r && _r.length) { refs = _r; break; }
+    }
 
     var base = {
       edgeId: edge.id,
       elementId: edge.elementId || edge.id,
-      relId: relId,
+      relId: relIdDisplay,
       regulator: nodeLabel(srcNode),
       regulatorMedScan: nodeMedScan(srcNode),
       regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
@@ -1990,10 +3324,15 @@ async function loadTableData() {
       targetMedScan: nodeMedScan(tgtNode),
       targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
       relationType: edge.type,
-      effect: edge.properties.Effect || edge.properties.effect || '',
-      numRefs: edge.properties.RelationNumberOfReferences != null
-        ? edge.properties.RelationNumberOfReferences
-        : (Array.isArray(edge.properties.references) ? edge.properties.references.length : 0)
+      effect: normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
+      // Derive both counts from the same source to prevent numRefs > numSentences.
+      // Inline refs (from PostgreSQL) take priority; fall back to Neo4j stored values.
+      numRefs: (Array.isArray(edge.properties.references) && edge.properties.references.length)
+        ? calcRefCount(edge.properties.references)
+        : (edge.properties.RelationNumberOfReferences != null ? edge.properties.RelationNumberOfReferences : 0),
+      numSentences: (Array.isArray(edge.properties.references) && edge.properties.references.length)
+        ? edge.properties.references.length
+        : (edge.properties.RelationNumberOfSentences != null ? Number(edge.properties.RelationNumberOfSentences) : '')
     };
 
     var buildRow = function(ref) {
@@ -2078,6 +3417,25 @@ async function loadRelationData() {
     }
   }
 
+  // Fetch RelationNumberOfSentences for edges that don't have it yet
+  var relMissingIds = graphData.edges
+    .filter(function(e) { return e.properties.RelationID != null && e.properties.RelationNumberOfSentences == null; })
+    .map(function(e) { return String(e.properties.RelationID); });
+  if (relMissingIds.length > 0) {
+    try {
+      var relNosMap = await api('/api/relations/properties',
+        { relationIds: relMissingIds, properties: ['RelationNumberOfSentences'] });
+      graphData.edges.forEach(function(e) {
+        var id = e.properties.RelationID != null ? String(e.properties.RelationID) : null;
+        if (id && relNosMap[id] && relNosMap[id].RelationNumberOfSentences != null) {
+          e.properties.RelationNumberOfSentences = relNosMap[id].RelationNumberOfSentences;
+        }
+      });
+    } catch(err) {
+      console.warn('RelationNumberOfSentences fetch failed (relation view):', err.message);
+    }
+  }
+
   var nodeById = {};
   graphData.nodes.forEach(function(n) {
     nodeById[n.id] = n;
@@ -2117,7 +3475,11 @@ async function loadRelationData() {
     var row = {
       edgeId:           edge.id,
       elementId:        edge.elementId || edge.id,
-      relId:            edge.properties.RelationID != null ? String(edge.properties.RelationID) : '',
+      relId:            (function() {
+                          var ids = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : null;
+                          var primary = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+                          return ids && ids.length > 1 ? ids.join(', ') : primary;
+                        })(),
       regulator:        nodeLabel(srcNode),
       regulatorMedScan: nodeMedScan(srcNode),
       regulatorType:    (srcNode && srcNode.labels && srcNode.labels[0]) || '',
@@ -2125,10 +3487,13 @@ async function loadRelationData() {
       targetMedScan:    nodeMedScan(tgtNode),
       targetType:       (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
       relationType:     edge.type,
-      effect:           edge.properties.Effect || edge.properties.effect || '',
-      numRefs:          edge.properties.RelationNumberOfReferences != null
-                          ? edge.properties.RelationNumberOfReferences
-                          : (Array.isArray(edge.properties.references) ? edge.properties.references.length : 0)
+      effect:           normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
+      numRefs:      (Array.isArray(edge.properties.references) && edge.properties.references.length)
+                          ? calcRefCount(edge.properties.references)
+                          : (edge.properties.RelationNumberOfReferences != null ? edge.properties.RelationNumberOfReferences : 0),
+      numSentences: (Array.isArray(edge.properties.references) && edge.properties.references.length)
+                          ? edge.properties.references.length
+                          : (edge.properties.RelationNumberOfSentences != null ? Number(edge.properties.RelationNumberOfSentences) : '')
     };
     columnDefs.forEach(function(col) {
       if (col.source === 'neo4j') {
@@ -2154,8 +3519,8 @@ function renderTableHeader() {
     return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
   });
   thead.innerHTML = visCols.map(function(col, i) {
-    var sortAttr = col.source === 'graph' ? ' onclick="sortTable(\'' + col.key + '\')"' : '';
-    var sortLabel = col.source === 'graph' ? ' <span class="col-sort-arrow">⇅</span>' : '';
+    var sortAttr = ' onclick="sortTable(\'' + col.key + '\')"';
+    var sortLabel = ' <span class="col-sort-arrow">⇅</span>';
     return '<th data-col-idx="' + i + '" draggable="true"' + sortAttr
       + ' ondragstart="colDragStart(event,' + i + ')"'
       + ' ondragover="colDragOver(event)"'
@@ -2235,9 +3600,10 @@ function renderTableRows(rows) {
 }
 
 function filterTable(q) {
-  if (!q) { renderTableRows(tableRows); return; }
+  var sourceRows = tableViewMode === 'relation' ? relationRows : tableRows;
+  if (!q) { renderTableRows(sourceRows); return; }
   var lower = q.toLowerCase();
-  var filtered = tableRows.filter(function(row) {
+  var filtered = sourceRows.filter(function(row) {
     return Object.values(row).some(function(v) { return v && String(v).toLowerCase().includes(lower); });
   });
   renderTableRows(filtered);
@@ -2250,9 +3616,18 @@ function sortTable(col) {
     tableSortCol = col;
     tableSortAsc = true;
   }
-  var sorted = tableRows.slice().sort(function(a, b) {
-    var av = String(a[col] || '').toLowerCase();
-    var bv = String(b[col] || '').toLowerCase();
+  var sourceRows = tableViewMode === 'relation' ? relationRows : tableRows;
+  var colDef = columnDefs.find(function(c) { return c.key === col; });
+  var isNumeric = colDef && colDef.numeric;
+  var sorted = sourceRows.slice().sort(function(a, b) {
+    var av = a[col], bv = b[col];
+    if (isNumeric) {
+      var an = av !== '' && av != null ? Number(av) : -Infinity;
+      var bn = bv !== '' && bv != null ? Number(bv) : -Infinity;
+      return tableSortAsc ? an - bn : bn - an;
+    }
+    av = String(av || '').toLowerCase();
+    bv = String(bv || '').toLowerCase();
     return tableSortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
   });
   renderTableRows(sorted);
@@ -2578,11 +3953,50 @@ function captureColumnWidths() {
   });
 }
 
+// Returns the currently-displayed rows respecting active filter and sort state.
+// Used by both export functions so exports always match what the user sees.
+function getActiveTableRows() {
+  var sourceRows = tableViewMode === 'relation' ? relationRows : tableRows;
+
+  // Apply filter (match what filterTable() does)
+  var filterInput = document.getElementById('table-search');
+  var q = filterInput ? filterInput.value.trim().toLowerCase() : '';
+  var rows = q
+    ? sourceRows.filter(function(row) {
+        return Object.values(row).some(function(v) { return v && String(v).toLowerCase().includes(q); });
+      })
+    : sourceRows.slice();
+
+  // Apply sort (match what sortTable() does)
+  if (tableSortCol) {
+    var colDef = columnDefs.find(function(c) { return c.key === tableSortCol; });
+    var isNumeric = colDef && colDef.numeric;
+    rows = rows.slice().sort(function(a, b) {
+      var av = a[tableSortCol], bv = b[tableSortCol];
+      if (isNumeric) {
+        var an = av !== '' && av != null ? Number(av) : -Infinity;
+        var bn = bv !== '' && bv != null ? Number(bv) : -Infinity;
+        return tableSortAsc ? an - bn : bn - an;
+      }
+      av = String(av || '').toLowerCase();
+      bv = String(bv || '').toLowerCase();
+      return tableSortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+    });
+  }
+  return rows;
+}
+
 function exportTableCSV() {
-  var visCols = columnDefs.filter(function(c) { return c.visible; });
+  var isRelMode = tableViewMode === 'relation';
+  var rows = getActiveTableRows();
+  var visCols = columnDefs.filter(function(c) {
+    if (!c.visible) return false;
+    if (isRelMode) return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
+  });
   var esc = function(v) { return '"' + String(v || '').replace(/"/g, '""') + '"'; };
   var lines = [visCols.map(function(c) { return esc(c.label); }).join(',')];
-  tableRows.forEach(function(row) {
+  rows.forEach(function(row) {
     lines.push(visCols.map(function(c) { return esc(row[c.key]); }).join(','));
   });
   var blob = new Blob([lines.join('\n')], { type: 'text/csv' });
@@ -2626,7 +4040,13 @@ function exportTableExcel() {
     alert('ExcelJS library not loaded. Please check your internet connection.');
     return;
   }
-  var visCols = columnDefs.filter(function(c) { return c.visible; });
+  var isRelMode = tableViewMode === 'relation';
+  var exportRows = getActiveTableRows();
+  var visCols = columnDefs.filter(function(c) {
+    if (!c.visible) return false;
+    if (isRelMode) return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
+  });
   var wb      = new ExcelJS.Workbook();
   var sheet   = wb.addWorksheet('Graph Data');
 
@@ -2653,7 +4073,7 @@ function exportTableExcel() {
   headerRow.commit();
 
   // Data rows
-  tableRows.forEach(function(row) {
+  exportRows.forEach(function(row) {
     var exRow = sheet.addRow({});
     visCols.forEach(function(col, ci) {
       var cell   = exRow.getCell(ci + 1);
@@ -2776,7 +4196,7 @@ function loadSubgraph(event) {
       if (!data.graphData) throw new Error('Invalid file format');
 
       if (data.query) {
-        document.getElementById('cypher-input').value = data.query;
+        setCypherQuery(data.query);
         currentQuery = data.query;
       }
 
@@ -2940,9 +4360,11 @@ function openRnefPathway(data) {
 
   var statsEl = document.getElementById('graph-stats');
   if (statsEl) {
-    statsEl.innerHTML += ' <span id="enrich-status" style="color:#7a8099;font-size:11px">Loading matching data from database…</span>';
+    statsEl.innerHTML += ' <span id="enrich-status" style="color:#7a8099;font-size:11px">Loading matching data from database…</span>'
+      + ' <span id="match-rnef-status" style="color:#4caf50;font-size:11px">· Matching relations…</span>';
   }
   enrichNodesFromNeo4j(data.graphData.nodes || []);
+  matchRnefRelationsToNeo4j();
   switchView('graph');
 }
 
@@ -2950,6 +4372,1436 @@ function closeRnefModal(e) {
   if (e.target === document.getElementById('rnef-modal'))
     document.getElementById('rnef-modal').style.display = 'none';
 }
+
+// ── Match RNEF relations to Neo4j relations, annotating them with RelationID ──
+// Runs silently after an RNEF pathway loads.  Builds two batches:
+//   batch          – regular (1 regulator → 1 target) edges
+//   hyperedgeBatch – ChemicalReaction edges (many regulators / many targets)
+// On success, updates both graphData and cy so the RelationID appears in tooltips.
+async function matchRnefRelationsToNeo4j() {
+  if (!graphData || !cy) return;
+
+  // Capture the tab index NOW (synchronously) so the async response knows
+  // which tab it belongs to even if the user switches before it arrives.
+  var matchTabIdx = activeTabIdx;
+  matchingInProgress = true;
+
+  // Normalize effect: RNEF "Unknown" and "_" mean the same as missing.
+  function normEffect(v) {
+    if (!v || v === 'Unknown' || v === '_') return '';
+    return String(v);
+  }
+
+  // Build a nodeId → URN map (needed to resolve startNodeId/endNodeId to URNs).
+  var nodeUrnById = {};
+  graphData.nodes.forEach(function(n) {
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (urn) nodeUrnById[String(n.id)] = urn;
+  });
+
+  // Build a reactionNodeId → { rURNs, tURNs } map for ChemicalReaction hyperedges.
+  var reactionData = {};
+  graphData.nodes.forEach(function(n) {
+    if (n.labels && n.labels.includes('Reaction')) {
+      reactionData[String(n.id)] = { rURNs: [], tURNs: [] };
+    }
+  });
+  graphData.edges.forEach(function(e) {
+    var endId = String(e.endNodeId), startId = String(e.startNodeId);
+    if (e.type === 'Substrate' && reactionData[endId]) {
+      var urn = nodeUrnById[startId];
+      if (urn) reactionData[endId].rURNs.push(urn);
+    } else if (e.type === 'Product' && reactionData[startId]) {
+      var urn = nodeUrnById[endId];
+      if (urn) reactionData[startId].tURNs.push(urn);
+    }
+  });
+
+  var batch = [], hyperedgeBatch = [];
+
+  graphData.edges.forEach(function(e) {
+    if (!e.properties || !e.properties.URN) return;        // not an RNEF edge
+    if (e.properties.RelationID != null) return;           // already annotated
+    var relURN = String(e.properties.URN);
+    var relType = e.type;
+    var effect    = normEffect(e.properties.Effect || e.properties.effect || '');
+    var mechanism = e.properties.Mechanism || e.properties.mechanism || '';
+
+    if (relType === 'Substrate' || relType === 'Product') return;  // handled via Reaction node
+
+    if (relType === 'ChemicalReaction') {
+      var rURN = nodeUrnById[String(e.startNodeId)];
+      var tURN = nodeUrnById[String(e.endNodeId)];
+      if (rURN && tURN) batch.push({ rURN: rURN, tURN: tURN, relType: relType, effect: effect, mechanism: mechanism, relURN: relURN });
+      return;
+    }
+
+    var rURN = nodeUrnById[String(e.startNodeId)];
+    var tURN = nodeUrnById[String(e.endNodeId)];
+    if (rURN && tURN) {
+      batch.push({ rURN: rURN, tURN: tURN, relType: relType, effect: effect, mechanism: mechanism, relURN: relURN });
+    }
+  });
+
+  // Reaction nodes → hyperedge batch entries
+  Object.keys(reactionData).forEach(function(reactId) {
+    var rd = reactionData[reactId];
+    if (!rd.rURNs.length || !rd.tURNs.length) return;
+    var reactNode = graphData.nodes.find(function(n) { return String(n.id) === reactId; });
+    if (!reactNode || !reactNode.properties || !reactNode.properties.URN) return;
+    if (reactNode.properties.RelationID != null) return;  // already annotated
+    hyperedgeBatch.push({
+      rURNs:     rd.rURNs,
+      tURNs:     rd.tURNs,
+      effect:    '',
+      mechanism: '',
+      relURN:    String(reactNode.properties.URN)
+    });
+  });
+
+  if (!batch.length && !hyperedgeBatch.length) {
+    // All edges already carry RelationID (e.g. pathway saved after a previous
+    // matching run).  No need to call the match API, but we still need to:
+    //   1. Fetch references for edges that have RelationID but no references
+    //   2. Clean up the status span and matchingInProgress flag
+    var preRelIds = [];
+    graphData.edges.forEach(function(e) {
+      if (!e.properties) return;
+      if (Array.isArray(e.properties.references) && e.properties.references.length) return; // already has refs
+      if (Array.isArray(e.properties.RelationIDs)) {
+        e.properties.RelationIDs.forEach(function(id) { if (id != null) preRelIds.push(String(id)); });
+      } else if (e.properties.RelationID != null) {
+        preRelIds.push(String(e.properties.RelationID));
+      }
+    });
+    // Also pre-populate refsCache from inline refs already present in graphData
+    graphData.edges.forEach(function(e) {
+      var relId = e.properties && e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+      if (relId && Array.isArray(e.properties.references) && e.properties.references.length) {
+        refsCache[relId] = e.properties.references;
+      }
+    });
+    var matchSpan = document.getElementById('match-rnef-status');
+    if (preRelIds.length) {
+      try {
+        var preRefsGrouped = await api('/api/references/batch', { relationIds: preRelIds, scopusColumns: [] });
+        function preRefSentenceKey(msrc) {
+          if (!msrc) return '';
+          return msrc.slice(0, 100).replace(/ID\{[^}]*\}/g, '').slice(0, 30);
+        }
+        function preRefKey(ref) {
+          var sentence = preRefSentenceKey(ref.msrc || '');
+          if (ref.doi)  return 'doi:'  + String(ref.doi).toLowerCase().trim()  + ' ' + sentence;
+          if (ref.pmid) return 'pmid:' + String(ref.pmid).trim()               + ' ' + sentence;
+          return 'cnt:' + (ref.pubyear || '') + ' ' + (ref.journal || '') + ' ' + sentence;
+        }
+        var isCurrentTabPre = (activeTabIdx === matchTabIdx);
+        var targetGDpre = isCurrentTabPre
+          ? graphData
+          : (tabs[matchTabIdx] && tabs[matchTabIdx].snapshot && tabs[matchTabIdx].snapshot.graphData);
+        var urnToCyEdgePre = {};
+        if (isCurrentTabPre) {
+          cy.edges().forEach(function(cyEdge) {
+            var u = cyEdge.data('edgeURN');
+            if (u) urnToCyEdgePre[String(u)] = cyEdge;
+          });
+        }
+        if (targetGDpre) {
+          targetGDpre.edges.forEach(function(e) {
+            if (!e.properties || e.properties.RelationID == null) return;
+            var relId = String(e.properties.RelationID);
+            var dbRefs     = preRefsGrouped[relId] || [];
+            var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
+            var allRefs    = inlineRefs.concat(dbRefs);
+            var seenKeys   = new Set();
+            var dedupedRefs = allRefs.filter(function(ref) {
+              var k = preRefKey(ref);
+              if (seenKeys.has(k)) return false;
+              seenKeys.add(k);
+              return true;
+            });
+            var refCount = calcRefCount(dedupedRefs);
+            e.properties.references                 = dedupedRefs;
+            e.properties.RelationNumberOfReferences = refCount;
+            e.properties.RelationNumberOfSentences  = dedupedRefs.length;
+            // Cache under every ID the edge carries (relId = primary; also RelationIDs array)
+            var _preAllIds = Array.isArray(e.properties.RelationIDs)
+              ? e.properties.RelationIDs.map(String)
+              : (relId ? [relId] : []);
+            _preAllIds.forEach(function(rid) {
+              refsCache[rid] = dedupedRefs;
+              if (!isCurrentTabPre && tabs[matchTabIdx] && tabs[matchTabIdx].snapshot) {
+                tabs[matchTabIdx].snapshot.refsCache[rid] = dedupedRefs;
+              }
+            });
+            if (isCurrentTabPre) {
+              var cyEdge = urnToCyEdgePre[String(e.properties.URN || '')];
+              if (cyEdge) {
+                cyEdge.data('numRefs',      refCount);
+                cyEdge.data('numSentences', dedupedRefs.length);
+                cyEdge.data('thickness',    getEdgeThickness(refCount));
+              }
+            }
+          });
+        }
+        if (matchSpan) { matchSpan.textContent = '· references loaded'; setTimeout(function() { if (matchSpan.parentNode) matchSpan.remove(); }, 3000); }
+      } catch (preRefErr) {
+        console.warn('matchRnefRelationsToNeo4j (pre-annotated): reference fetch failed:', preRefErr.message);
+        if (matchSpan && matchSpan.parentNode) matchSpan.remove();
+      }
+    } else {
+      if (matchSpan && matchSpan.parentNode) matchSpan.remove();
+    }
+    matchingInProgress = false;
+    return;
+  }
+
+  try {
+    var mapping = await api('/api/relations/match-rnef', { batch: batch, hyperedgeBatch: hyperedgeBatch });
+    var matched = 0;
+
+    var isCurrentTab = (activeTabIdx === matchTabIdx);
+
+    // Choose target graphData: live global if still on this tab, otherwise
+    // the tab's snapshot (same pattern as enrichNodesFromNeo4j).
+    var targetGD = isCurrentTab
+      ? graphData
+      : (tabs[matchTabIdx] && tabs[matchTabIdx].snapshot && tabs[matchTabIdx].snapshot.graphData);
+    if (!targetGD) return;
+
+    if (!isCurrentTab) {
+      // ── Background tab: annotate snapshot graphData only ──────────────────
+      // cy belongs to the active tab — do not touch it.
+      // When the user switches back, applyTabState → renderGraph will read
+      // RelationID from the snapshot and populate cy edge relId correctly.
+      targetGD.edges.forEach(function(e) {
+        if (!e.properties || !e.properties.URN) return;
+        var match = mapping[String(e.properties.URN)];
+        if (!match) return;
+        var relId = match.id || match;
+        e.properties.RelationID = relId;
+        if (match.numSentences != null) e.properties.RelationNumberOfSentences = match.numSentences;
+        matched++;
+      });
+      targetGD.nodes.forEach(function(n) {
+        if (!n.labels || !n.labels.includes('Reaction')) return;
+        var nodeURN = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+        if (!nodeURN) return;
+        var match = mapping[nodeURN];
+        if (!match) return;
+        n.properties.RelationID = match.id || match;
+      });
+      if (matched > 0) {
+        console.log('matchRnefRelationsToNeo4j (background tab ' + matchTabIdx + '): annotated ' + matched + ' edge(s)');
+
+        // ── Background tab: also fetch references so refsCache and snapshot are
+        //    populated when the user switches back ──────────────────────────────
+        var bgRelIds = [];
+        targetGD.edges.forEach(function(e) {
+          if (!e.properties) return;
+          if (Array.isArray(e.properties.RelationIDs)) {
+            e.properties.RelationIDs.forEach(function(id) { if (id != null) bgRelIds.push(String(id)); });
+          } else if (e.properties.RelationID != null) {
+            bgRelIds.push(String(e.properties.RelationID));
+          }
+        });
+        if (bgRelIds.length) {
+          try {
+            var bgRefsGrouped = await api('/api/references/batch', { relationIds: bgRelIds, scopusColumns: [] });
+
+            function bgRefSentenceKey(msrc) {
+              if (!msrc) return '';
+              return msrc.slice(0, 100).replace(/ID\{[^}]*\}/g, '').slice(0, 30);
+            }
+            function bgRefKey(ref) {
+              var sentence = bgRefSentenceKey(ref.msrc || '');
+              if (ref.doi)  return 'doi:'  + String(ref.doi).toLowerCase().trim()  + '\x00' + sentence;
+              if (ref.pmid) return 'pmid:' + String(ref.pmid).trim()               + '\x00' + sentence;
+              return 'cnt:' + (ref.pubyear || '') + '\x00' + (ref.journal || '') + '\x00' + sentence;
+            }
+
+            targetGD.edges.forEach(function(e) {
+              if (!e.properties || e.properties.RelationID == null) return;
+              var relId = String(e.properties.RelationID);
+              var dbRefs     = bgRefsGrouped[relId] || [];
+              var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
+              var allRefs    = inlineRefs.concat(dbRefs);
+              var seenKeys   = new Set();
+              var dedupedRefs = allRefs.filter(function(ref) {
+                var k = bgRefKey(ref);
+                if (seenKeys.has(k)) return false;
+                seenKeys.add(k);
+                return true;
+              });
+              var refCount = calcRefCount(dedupedRefs);
+              e.properties.references                 = dedupedRefs;
+              e.properties.RelationNumberOfReferences = refCount;
+              e.properties.RelationNumberOfSentences  = dedupedRefs.length;
+              // Cache under every ID the edge carries (relId = primary; also RelationIDs array)
+              var _bgAllIds = Array.isArray(e.properties.RelationIDs)
+                ? e.properties.RelationIDs.map(String)
+                : (relId ? [relId] : []);
+              _bgAllIds.forEach(function(rid) {
+                refsCache[rid] = dedupedRefs;
+                // Also persist into the snapshot's own refsCache so applyTabState
+                // doesn't overwrite the entry when it does refsCache = Object.assign({}, s.refsCache)
+                if (tabs[matchTabIdx] && tabs[matchTabIdx].snapshot) {
+                  tabs[matchTabIdx].snapshot.refsCache[rid] = dedupedRefs;
+                }
+              });
+            });
+            console.log('matchRnefRelationsToNeo4j (background tab ' + matchTabIdx + '): references fetched for ' + bgRelIds.length + ' relation(s)');
+          } catch (bgRefErr) {
+            console.warn('matchRnefRelationsToNeo4j (background): reference fetch failed:', bgRefErr.message);
+          }
+        }
+      }
+      return;
+    }
+
+    // ── Current tab: update both graphData and live cy edges ─────────────────
+    matchedRelIds.clear();
+
+    // Apply RelationID back to graphData.edges and live cy edges.
+    targetGD.edges.forEach(function(e) {
+      if (!e.properties || !e.properties.URN) return;
+      var relURN = String(e.properties.URN);
+      var match  = mapping[relURN];
+      if (!match) return;
+      var relId  = match.id || match;
+
+      e.properties.RelationID = relId;
+      if (match.numSentences != null) e.properties.RelationNumberOfSentences = match.numSentences;
+      cy.edges().forEach(function(cyEdge) {
+        var urn = cyEdge.data('edgeURN');
+        if (urn && String(urn) === relURN) {
+          cyEdge.data('relId', relId);
+          matchedRelIds.add(relId);
+          matched++;
+        }
+      });
+    });
+
+    // Also annotate Reaction-node entries in graphData.nodes
+    targetGD.nodes.forEach(function(n) {
+      if (!n.labels || !n.labels.includes('Reaction')) return;
+      var nodeURN = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+      if (!nodeURN) return;
+      var match = mapping[nodeURN];
+      if (!match) return;
+      var relId = match.id || match;
+      n.properties.RelationID = relId;
+      var reactCyId = String(n.id);
+      cy.edges().forEach(function(cyEdge) {
+        var src = cyEdge.data('source'), tgt = cyEdge.data('target');
+        if (src === reactCyId || tgt === reactCyId) {
+          cyEdge.data('relId', relId);
+          matchedRelIds.add(relId);
+          matched++;
+        }
+      });
+    });
+
+    // ── Fetch and merge references for all newly matched edges ──────────────────
+    // Uses the same assertion-level dedup key as mergeSimilarRelations so that
+    // inline RNEF references and Neo4j DB references are combined without
+    // creating duplicate rows for the same assertion.
+    if (matched > 0) {
+      var newRelIds = Array.from(matchedRelIds);
+      try {
+        var matchedRefsGrouped = await api('/api/references/batch', { relationIds: newRelIds, scopusColumns: [] });
+
+        // Assertion-level key: identical to refKey / refSentenceKey in mergeSimilarRelations
+        function mRefSentenceKey(msrc) {
+          if (!msrc) return '';
+          return msrc.slice(0, 100).replace(/ID\{[^}]*\}/g, '').slice(0, 30);
+        }
+        function mRefKey(ref) {
+          var sentence = mRefSentenceKey(ref.msrc || '');
+          if (ref.doi)  return 'doi:'  + String(ref.doi).toLowerCase().trim()  + '\x00' + sentence;
+          if (ref.pmid) return 'pmid:' + String(ref.pmid).trim()               + '\x00' + sentence;
+          return 'cnt:' + (ref.pubyear || '') + '\x00' + (ref.journal || '') + '\x00' + sentence;
+        }
+
+        // Build URN → cy edge map (only valid if still on same tab)
+        var urnToCyEdgeMatch = {};
+        if (activeTabIdx === matchTabIdx) {
+          cy.edges().forEach(function(cyEdge) {
+            var u = cyEdge.data('edgeURN');
+            if (u) urnToCyEdgeMatch[String(u)] = cyEdge;
+          });
+        }
+
+        targetGD.edges.forEach(function(e) {
+          if (!e.properties || e.properties.RelationID == null) return;
+          var relId = String(e.properties.RelationID);
+          if (!matchedRelIds.has(relId)) return;
+
+          var dbRefs     = matchedRefsGrouped[relId] || [];
+          var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
+
+          // Merge inline RNEF refs (from XML) with DB refs, deduplicating at assertion level
+          var allRefs = inlineRefs.concat(dbRefs);
+          var seenKeys = new Set();
+          var dedupedRefs = allRefs.filter(function(ref) {
+            var k = mRefKey(ref);
+            if (seenKeys.has(k)) return false;
+            seenKeys.add(k);
+            return true;
+          });
+
+          var refCount = calcRefCount(dedupedRefs);
+
+          // Update graphData edge (persists into saved JSON / table view)
+          e.properties.references                 = dedupedRefs;
+          e.properties.RelationNumberOfReferences = refCount;
+          e.properties.RelationNumberOfSentences  = dedupedRefs.length;
+
+          // Update refsCache so tooltip and table show merged refs immediately
+          refsCache[relId] = dedupedRefs;
+
+          // Update cy edge display values (only when still on the same tab)
+          if (activeTabIdx === matchTabIdx) {
+            var cyEdge = urnToCyEdgeMatch[String(e.properties.URN || '')];
+            if (cyEdge) {
+              cyEdge.data('numRefs',      refCount);
+              cyEdge.data('numSentences', dedupedRefs.length);
+              cyEdge.data('thickness',    getEdgeThickness(refCount));
+            }
+          }
+        });
+
+        // Re-render open tooltip so reference count reflects the newly fetched data
+        if (tooltipVisible && tooltipCurrentEdge && activeTabIdx === matchTabIdx) {
+          var _tipRelId  = tooltipCurrentEdge.data('relId');
+          var _tipRelIds = tooltipCurrentEdge.data('relIds') || (_tipRelId ? [_tipRelId] : []);
+          var _tipRefs   = null;
+          for (var _ti = 0; _ti < _tipRelIds.length; _ti++) {
+            if (refsCache[_tipRelIds[_ti]] !== undefined) { _tipRefs = refsCache[_tipRelIds[_ti]]; break; }
+          }
+          if (_tipRefs !== null) renderTooltip(tooltipCurrentEdge, _tipRefs);
+        }
+
+      } catch (refErr) {
+        console.warn('matchRnefRelationsToNeo4j: reference fetch failed:', refErr.message);
+      }
+    }
+
+    var matchSpan = document.getElementById('match-rnef-status');
+    if (matchSpan) {
+      if (matched > 0) {
+        matchSpan.textContent = '· ' + matched + ' relation(s) matched';
+        matchSpan.style.color = '#4caf50';
+
+        // If a tooltip is already open for a just-matched edge, re-render it now.
+        if (tooltipVisible && tooltipCurrentEdge && tooltipCurrentEdge.data('relId')) {
+          var relId = tooltipCurrentEdge.data('relId');
+          var refs = refsCache[relId];
+          if (refs === undefined) {
+            api('/api/references', { relationIds: [relId] })
+              .then(function(rows) { refsCache[relId] = rows; renderTooltip(tooltipCurrentEdge, rows); })
+              .catch(function() { refsCache[relId] = []; renderTooltip(tooltipCurrentEdge, []); });
+          } else {
+            renderTooltip(tooltipCurrentEdge, refs);
+          }
+        }
+
+        pendingMatchSpan = matchSpan;
+        setTimeout(function() {
+          if (pendingMatchSpan === matchSpan) {
+            pendingMatchSpan = null;
+            matchedRelIds.clear();
+            if (matchSpan.parentNode) matchSpan.remove();
+          }
+        }, 60000);
+
+      } else {
+        matchSpan.remove();
+      }
+    }
+    if (matched > 0) {
+      console.log('matchRnefRelationsToNeo4j: annotated ' + matched + ' cy edge(s)');
+    }
+  } catch (err) {
+    // Non-fatal — RNEF pathways work fine without RelationID annotation
+    console.warn('matchRnefRelationsToNeo4j failed:', err.message);
+    if (activeTabIdx === matchTabIdx) {
+      var matchSpan = document.getElementById('match-rnef-status');
+      if (matchSpan) matchSpan.remove();
+    }
+  } finally {
+    matchingInProgress = false;
+  }
+}
+
+// ─── Load similar relations from Neo4j ────────────────────────────────────────
+// For every RNEF edge in the current pathway that has no RelationID, queries
+// Neo4j for similar relations using a 3-tier matching hierarchy and adds the
+// found Neo4j relations to the graph as new edges.
+async function loadSimilarRelations() {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+  if (matchingInProgress) { alert('Relation matching is still in progress. Please wait for it to finish before loading similar relations.'); return; }
+
+  // Capture which tab started this search NOW (synchronously).
+  // After the async API call returns the user may have switched to another tab;
+  // this index lets us route writes to the correct graphData snapshot.
+  var simTabIdx = activeTabIdx;
+
+  var NONDIRECTIONAL = new Set(['Binding','CellExpression','FunctionalAssociation','Metabolization','Paralog']);
+
+  // Build both maps directly from live cy nodes — more reliable than graphData
+  // after enrichNodesFromNeo4j may have transformed node properties.
+  var nodeUrnById = {};   // cyNodeId  → URN
+  var urnToCyIds  = {};   // URN       → [cyNodeId, ...]
+  // URN → graphData node ID (Neo4j integer after enrichment, URN before).
+  // Used when pushing new edges to graphData so their startNodeId/endNodeId
+  // match graphData.nodes[i].id — otherwise renderGraph skips them on tab restore.
+  var urnToGdId = {};
+  graphData.nodes.forEach(function(n) {
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (urn && !n.isClone) urnToGdId[urn] = n.id;
+  });
+  cy.nodes().forEach(function(n) {
+    var urn = n.data('URN');
+    if (!urn) {
+      // Clones may carry cloneOf; resolve to original's URN
+      var orig = n.data('cloneOf');
+      if (orig) urn = nodeUrnById[orig];  // orig already processed if it appeared first
+    }
+    if (!urn) return;
+    nodeUrnById[n.id()] = String(urn);
+    (urnToCyIds[urn] = urnToCyIds[urn] || []).push(n.id());
+  });
+  // Second pass for clones whose original hadn't been processed yet
+  cy.nodes().forEach(function(n) {
+    if (nodeUrnById[n.id()]) return;
+    var orig = n.data('cloneOf');
+    if (orig && nodeUrnById[orig]) {
+      var urn = nodeUrnById[orig];
+      nodeUrnById[n.id()] = urn;
+      (urnToCyIds[urn] = urnToCyIds[urn] || []).push(n.id());
+    }
+  });
+
+  // Collect RNEF edges without RelationID
+  var unmatchedEdges = cy.edges().filter(function(e) {
+    return e.data('edgeURN') && !e.data('relId');
+  });
+  if (!unmatchedEdges.length) {
+    alert('All relations in this pathway already have a RelationID.');
+    return;
+  }
+
+  // Build batch
+  var batch = [];
+  unmatchedEdges.forEach(function(e, idx) {
+    var rURN = nodeUrnById[e.data('source')];
+    var tURN = nodeUrnById[e.data('target')];
+    if (rURN && tURN) {
+      batch.push({
+        idx:       idx,
+        rURN:      rURN,
+        tURN:      tURN,
+        relType:   e.data('relType') || '',
+        effect:    e.data('effect')  || '',
+        mechanism: e.data('mechanism') || ''
+      });
+    }
+  });
+  if (!batch.length) {
+    var diag = 'Could not resolve node URNs for any unmatched relation.\n\n'
+      + 'Unmatched edges: ' + unmatchedEdges.length + '\n'
+      + 'Nodes with URN: ' + Object.keys(nodeUrnById).length + '\n'
+      + 'Sample source IDs: ' + unmatchedEdges.slice(0,3).map(function(e){ return e.data('source'); }).join(', ');
+    alert(diag);
+    return;
+  }
+
+  // Show progress in stats bar
+  var statsEl = document.getElementById('graph-stats');
+  var simSpan = document.createElement('span');
+  simSpan.id = 'sim-rel-status';
+  simSpan.style.cssText = 'color:#7a8099;font-size:11px';
+  simSpan.textContent = ' · Searching for similar relations…';
+  if (statsEl) statsEl.appendChild(simSpan);
+
+  try {
+    var response = await api('/api/relations/find-similar', { relations: batch });
+    var results  = response.results || [];
+
+    // ── Re-establish targets after the async gap ──────────────────────────────
+    // If the user opened a new tab while the search was running, cy and graphData
+    // now belong to that OTHER tab.  We must never touch the wrong cy (which would
+    // corrupt tab 2) or the wrong graphData.  Instead we route all writes to the
+    // snapshot of the originating tab; renderGraph will apply them when the user
+    // switches back.
+    var isCurrentTab = (activeTabIdx === simTabIdx);
+    var targetGD = isCurrentTab
+      ? graphData
+      : (tabs[simTabIdx] && tabs[simTabIdx].snapshot && tabs[simTabIdx].snapshot.graphData);
+
+    if (!targetGD) {
+      // The originating tab was closed while the search was in flight
+      if (simSpan.parentNode) simSpan.remove();
+      return;
+    }
+
+    // Rebuild urnToGdId from the chosen targetGD — enrichNodesFromNeo4j may have
+    // updated node IDs after the batch request was sent.
+    var targetUrnToGdId = {};
+    targetGD.nodes.forEach(function(n) {
+      var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+      if (urn && !n.isClone) targetUrnToGdId[urn] = n.id;
+    });
+
+    // Build existingRelIds from the correct data source
+    var existingRelIds = new Set();
+    if (isCurrentTab) {
+      cy.edges().forEach(function(e) {
+        var rid = e.data('relId'); if (rid) existingRelIds.add(rid);
+        var rids = e.data('relIds'); if (rids) rids.forEach(function(id) { existingRelIds.add(id); });
+      });
+    } else {
+      targetGD.edges.forEach(function(e) {
+        var rid = e.properties && e.properties.RelationID;
+        if (rid) existingRelIds.add(String(rid));
+        var rids = e.properties && e.properties.RelationIDs;
+        if (Array.isArray(rids)) rids.forEach(function(id) { existingRelIds.add(String(id)); });
+      });
+    }
+    var preMatchedCount = existingRelIds.size;
+
+    // Snapshot for undo — only meaningful when still on the originating tab
+    if (isCurrentTab) pushUndo();
+
+    // Counters for summary
+    var exactCount   = 0;   // idx matched at Check 1
+    var similarIdxs  = new Set();  // original idx matched at Check 2 or 3
+    var addedEdges   = 0;   // new edges pushed to targetGD (and cy when current tab)
+
+    results.forEach(function(entry) {
+      if (entry.check === 1) exactCount++;
+      else similarIdxs.add(entry.idx);
+
+      // The original unmatchedEdges cy element references retain their .data()
+      // even after the element is removed from cy on a tab switch — safe to read.
+      var origEdge = unmatchedEdges[entry.idx];
+      var edgeURN  = origEdge ? String(origEdge.data('edgeURN') || '') : '';
+
+      // For Check 1 exact matches, annotate the existing RNEF edge in graphData
+      // and (if still on same tab) in the live cy graph.
+      if (entry.check === 1 && entry.relations.length > 0) {
+        var firstRel = entry.relations[0];
+        if (firstRel.relationID && firstRel.relationID !== 'null') {
+          var gEdge = edgeURN ? targetGD.edges.find(function(e) {
+            return e.properties && String(e.properties.URN) === edgeURN;
+          }) : null;
+          if (gEdge) gEdge.properties.RelationID = firstRel.relationID;
+          if (isCurrentTab && edgeURN) {
+            cy.edges().forEach(function(cyE) {
+              if (String(cyE.data('edgeURN')) === edgeURN) cyE.data('relId', firstRel.relationID);
+            });
+          }
+        }
+      }
+
+      // Add each found Neo4j relation as a new edge (dedup by RelationID)
+      entry.relations.forEach(function(rel) {
+        if (!rel.relationID || rel.relationID === 'null') return;
+        if (existingRelIds.has(rel.relationID)) return;
+        existingRelIds.add(rel.relationID);
+
+        var undirected = NONDIRECTIONAL.has(rel.relType);
+        var numRefs    = typeof rel.numRefs === 'number' ? rel.numRefs : 0;
+        var edgeId     = 'sim-' + rel.relationID;
+
+        // Resolve graphData node IDs (rebuilt after potential enrichment)
+        var srcGdId = targetUrnToGdId[rel.rURN] !== undefined ? targetUrnToGdId[rel.rURN] : rel.rURN;
+        var tgtGdId = targetUrnToGdId[rel.tURN] !== undefined ? targetUrnToGdId[rel.tURN] : rel.tURN;
+
+        if (isCurrentTab) {
+          // ── Current tab: need valid cy node IDs; skip edge if nodes absent ──
+          var srcCyIds = urnToCyIds[rel.rURN] || [];
+          var tgtCyIds = urnToCyIds[rel.tURN] || [];
+          if (!srcCyIds.length || !tgtCyIds.length) return;
+
+          var srcCyId = (origEdge && srcCyIds.indexOf(origEdge.data('source')) >= 0)
+            ? origEdge.data('source') : srcCyIds[0];
+          var tgtCyId = (origEdge && tgtCyIds.indexOf(origEdge.data('target')) >= 0)
+            ? origEdge.data('target') : tgtCyIds[0];
+
+          var _simEdge = {
+            id: edgeId, elementId: edgeId, type: rel.relType,
+            startNodeId: srcGdId, endNodeId: tgtGdId,
+            properties: {
+              RelationID: rel.relationID, Effect: rel.effect, Mechanism: rel.mechanism,
+              RelationNumberOfReferences: numRefs, directed: !undirected, sourceType: 'similar'
+            }
+          };
+          targetGD.edges.push(_simEdge);
+          cy.add({
+            group: 'edges',
+            classes: undirected ? 'undirected' : '',
+            data: _buildCyEdgeData(_simEdge, srcCyId, tgtCyId)
+          });
+
+        } else {
+          // ── Background tab: write only to snapshot graphData ─────────────────
+          // cy will render these edges when the user switches back and
+          // applyTabState → renderGraph reads them from the snapshot.
+          targetGD.edges.push({
+            id: edgeId, elementId: edgeId, type: rel.relType,
+            startNodeId: srcGdId, endNodeId: tgtGdId,
+            properties: {
+              RelationID: rel.relationID, Effect: rel.effect, Mechanism: rel.mechanism,
+              RelationNumberOfReferences: numRefs, directed: !undirected, sourceType: 'similar'
+            }
+          });
+        }
+        addedEdges++;
+      });
+    });
+
+    // Update status
+    if (simSpan.parentNode) {
+      if (addedEdges > 0) {
+        simSpan.style.color = '#4caf50';
+        simSpan.textContent = ' · ' + addedEdges + ' similar relation(s) added';
+        setTimeout(function() { if (simSpan.parentNode) simSpan.remove(); }, 5000);
+      } else {
+        simSpan.remove();
+      }
+    }
+
+    // Summary message
+    var msg = 'Load similar relations complete:\n\n'
+      + '  Relations with RelationID before this search: ' + preMatchedCount + '\n'
+      + '  New exact matches found (RelationID assigned): ' + exactCount + '\n'
+      + '  Original pathway relations that have similar relations in the database: ' + similarIdxs.size + '\n'
+      + '  Similar relations loaded from Neo4j: ' + addedEdges;
+    alert(msg);
+
+  } catch (err) {
+    if (simSpan.parentNode) simSpan.remove();
+    alert('Load similar relations failed: ' + err.message);
+  }
+}
+
+// ─── Merge Similar Relations ──────────────────────────────────────────────────
+// Groups edges in the current graph that connect the same two nodes and share
+// equivalent relation types (per FRD 3.2 + server TYPE3_EQUIV), then collapses
+// each group into a single anchor edge: merging references and resolving effect.
+// Extract direction token from an RNEF edge URN, e.g. 'out', 'in-out', 'in'.
+function edgeDirectionToken(ei) {
+  if (!ei || !ei.edgeURN) return null;
+  var m = ei.edgeURN.match(/^urn:agi-[^:]+:([^:]+):/);
+  return m ? m[1] : null;
+}
+
+// ─── Find relations between selected and unselected nodes ────────────────────
+// filterType: 'all' | 'direct' | 'biomarker' | 'indirect'
+async function findRelationsBetweenGroups(filterType) {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+
+  // Collect selected node URNs
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selectedNodes.length === 0) {
+    alert('Please select at least one node to find relations.');
+    return;
+  }
+
+  var selectedURNs   = [];
+  var selectedCyIds  = new Set();
+  selectedNodes.forEach(function(n) {
+    var urn = n.data('urn') || n.data('URN') || '';
+    if (urn) { selectedURNs.push(urn); selectedCyIds.add(n.id()); }
+  });
+
+  // All node URNs in pathway (originals only, no clones)
+  var allURNs = [];
+  cy.nodes().not('[?isClone]').forEach(function(n) {
+    var urn = n.data('urn') || n.data('URN') || '';
+    if (urn) allURNs.push(urn);
+  });
+
+  if (selectedURNs.length === 0) {
+    alert('Selected nodes have no URNs — cannot query database.');
+    return;
+  }
+
+  // Build URN → cy node ID map (mirrors loadSimilarRelations, avoids clone IDs)
+  var nodeUrnById = {};  // cyNodeId → URN
+  var urnToCyIdsLocal = {};  // URN → [cyNodeId, ...]
+  cy.nodes().forEach(function(n) {
+    var urn = n.data('URN');
+    if (!urn) {
+      var orig = n.data('cloneOf');
+      if (orig) urn = nodeUrnById[orig];
+    }
+    if (!urn) return;
+    nodeUrnById[n.id()] = String(urn);
+    (urnToCyIdsLocal[urn] = urnToCyIdsLocal[urn] || []).push(n.id());
+  });
+  // Prefer non-clone cy ID for each URN
+  var urnToCyId = {};
+  Object.keys(urnToCyIdsLocal).forEach(function(urn) {
+    var ids = urnToCyIdsLocal[urn];
+    for (var i = 0; i < ids.length; i++) {
+      if (!cy.$id(ids[i]).data('isClone')) { urnToCyId[urn] = ids[i]; break; }
+    }
+    if (!urnToCyId[urn]) urnToCyId[urn] = ids[0];
+  });
+
+  // Build URN → graphData node ID map
+  var urnToGdId = {};
+  graphData.nodes.forEach(function(n) {
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (urn && urnToGdId[urn] === undefined) urnToGdId[urn] = n.id;
+  });
+
+  // Collect already-present RelationIDs to avoid duplicates
+  var existingRelIds = new Set();
+  cy.edges().forEach(function(e) {
+    var rid = e.data('relId'); if (rid) existingRelIds.add(String(rid));
+  });
+
+  var filterLabel = { all: 'All', direct: 'Direct physical interactions',
+                      biomarker: 'Biomarker', indirect: 'Indirect' }[filterType] || filterType;
+
+  var resp;
+  try {
+    resp = await api('/api/relations/find-between', {
+      selectedURNs: selectedURNs,
+      allURNs:      allURNs,
+      filterType:   filterType,
+    });
+  } catch (err) {
+    alert('Query failed: ' + err.message);
+    return;
+  }
+
+  var relations = (resp && resp.relations) || [];
+
+  // Filter out already-present edges
+  var newRelations = relations.filter(function(r) {
+    return r.relationID && !existingRelIds.has(String(r.relationID));
+  });
+
+  // Build breakdown by relation type for the confirmation dialog
+  var byType = {};
+  newRelations.forEach(function(r) {
+    byType[r.relType] = (byType[r.relType] || 0) + 1;
+  });
+  var breakdown = Object.keys(byType).sort()
+    .map(function(t) { return '  ' + t + ': ' + byType[t]; }).join('\n');
+
+  var msg = 'Filter: ' + filterLabel + '\n' +
+            'Will add ' + newRelations.length + ' relation(s)' +
+            (newRelations.length > 0 ? ':\n' + breakdown : '.') +
+            '\n\nClick OK to add them to the pathway.';
+
+  if (!confirm(msg)) return;
+  if (newRelations.length === 0) return;
+
+  pushUndo();
+
+  // Add edges to graph
+  var NONDIRECTIONAL = new Set(['Binding','CellExpression','FunctionalAssociation','Metabolization','Paralog']);
+  var added = 0;
+  newRelations.forEach(function(rel) {
+    var srcCyId = urnToCyId[rel.rURN];
+    var tgtCyId = urnToCyId[rel.tURN];
+    if (!srcCyId || !tgtCyId) return;  // skip if a node isn't in this pathway
+
+    var undirected = NONDIRECTIONAL.has(rel.relType);
+    var numRefs    = typeof rel.numRefs === 'number' ? rel.numRefs : 0;
+    var edgeId     = 'sim-' + rel.relationID;
+
+    // graphData node IDs
+    var srcGdId = urnToGdId[rel.rURN] !== undefined ? urnToGdId[rel.rURN] : rel.rURN;
+    var tgtGdId = urnToGdId[rel.tURN] !== undefined ? urnToGdId[rel.tURN] : rel.tURN;
+
+    var _betweenEdge = {
+      id: edgeId, elementId: edgeId, type: rel.relType,
+      startNodeId: srcGdId, endNodeId: tgtGdId,
+      properties: {
+        RelationID: rel.relationID, Effect: rel.effect, Mechanism: rel.mechanism,
+        RelationNumberOfReferences: numRefs, directed: !undirected, sourceType: 'between'
+      }
+    };
+    graphData.edges.push(_betweenEdge);
+    cy.add({
+      group: 'edges',
+      classes: undirected ? 'undirected' : '',
+      data: _buildCyEdgeData(_betweenEdge, srcCyId, tgtCyId)
+    });
+    added++;
+  });
+
+  updateStats();
+  if (document.getElementById('table-view').style.display !== 'none') {
+    if (tableViewMode === 'relation') loadRelationData();
+    else { tableRows = []; loadTableData(); }
+  }
+  if (added === 0) alert('No new edges could be placed (nodes not found in pathway).');
+}
+
+
+async function mergeSimilarRelations() {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+  if (matchingInProgress) { alert('Relation matching is still in progress. Please wait for it to finish before merging.'); return; }
+
+  // ── Type equivalence (symmetric, from FRD 3.2 + server TYPE3_EQUIV) ─────────
+  var MERGE_EQUIV = {
+    'DirectRegulation': new Set(['Binding','ProtModification','Regulation','FunctionalAssociation']),
+    'Binding':          new Set(['DirectRegulation','ProtModification','Regulation']),
+    'ProtModification': new Set(['DirectRegulation','Binding','Regulation','FunctionalAssociation']),
+    'Biomarker':        new Set(['QuantitativeChange','StateChange','FunctionalAssociation']),
+    'QuantitativeChange': new Set(['Biomarker']),
+    'StateChange':      new Set(['Biomarker']),
+    'FunctionalAssociation': new Set(['Biomarker','Regulation','DirectRegulation','ProtModification','MolTransport','MolSynthesis']),
+    'MolSynthesis':     new Set(['Regulation','FunctionalAssociation']),
+    'MolTransport':     new Set(['Regulation','FunctionalAssociation']),
+    'PromoterBinding':  new Set(['Expression','Regulation']),
+    'Expression':       new Set(['PromoterBinding']),
+    'Regulation':       new Set(['DirectRegulation','FunctionalAssociation','PromoterBinding','MolSynthesis','MolTransport','ProtModification']),
+  };
+
+  // ── Anchor class precedence (FRD 3.2): higher = preferred anchor ─────────────
+  var CLASS_SCORE = {
+    'DirectRegulation': 6, 'ProtModification': 5, 'Biomarker': 4,
+    'MolTransport': 3,  'MolSynthesis': 3,  'Regulation': 2,
+    'Binding': 1, 'PromoterBinding': 1, 'Expression': 1,
+    'QuantitativeChange': 0, 'StateChange': 0, 'FunctionalAssociation': 0,
+  };
+
+  function normEff(v) {
+    if (!v) return '';
+    var s = String(v);
+    return (s === '_' || s.toLowerCase() === 'unknown') ? '' : s;
+  }
+
+  // Strip ID{...} markup from the first 100 chars, then take first 30 as key fragment
+  function refSentenceKey(msrc) {
+    if (!msrc) return '';
+    return msrc.slice(0, 100).replace(/ID\{[^}]*\}/g, '').slice(0, 30);
+  }
+
+  function refKey(ref) {
+    // Keys are assertion-level: same paper can produce multiple assertions.
+    // Combine a paper identifier with the sentence fragment so two assertions
+    // from the same paper are kept distinct, but the exact same assertion
+    // appearing in multiple source edges is deduplicated.
+    var sentence = refSentenceKey(ref.msrc || '');
+    if (ref.doi)  return 'doi:'  + String(ref.doi).toLowerCase().trim()  + '\x00' + sentence;
+    if (ref.pmid) return 'pmid:' + String(ref.pmid).trim()               + '\x00' + sentence;
+    // Fall back to year+journal+sentence when no identifier is available
+    return 'cnt:' + (ref.pubyear || '') + '\x00' + (ref.journal || '') + '\x00' + sentence;
+  }
+
+  // ── Node URN lookup ───────────────────────────────────────────────────────────
+  var nodeUrnById = {};
+  cy.nodes().forEach(function(n) {
+    var urn = n.data('URN');
+    if (!urn) { var orig = n.data('cloneOf'); if (orig) urn = nodeUrnById[orig]; }
+    if (urn) nodeUrnById[n.id()] = String(urn);
+  });
+  // Second pass for clones whose original hadn't been processed yet
+  cy.nodes().forEach(function(n) {
+    if (nodeUrnById[n.id()]) return;
+    var orig = n.data('cloneOf');
+    if (orig && nodeUrnById[orig]) nodeUrnById[n.id()] = nodeUrnById[orig];
+  });
+
+  // ── Collect edge data ─────────────────────────────────────────────────────────
+  var SKIP_TYPES = new Set(['Substrate', 'Product']);
+  // Types where A→B and B→A are the same relation (no directionality).
+  // All other types are directional: opposite-direction edges must not merge.
+  var NONDIRECTIONAL_MERGE = new Set(['Binding','CellExpression','FunctionalAssociation','Metabolization','Paralog']);
+  var edgeInfos = [];
+
+  cy.edges().forEach(function(e) {
+    var relType = e.data('relType') || '';
+    if (!relType || SKIP_TYPES.has(relType)) return;
+    var srcURN = nodeUrnById[e.data('source')];
+    var tgtURN = nodeUrnById[e.data('target')];
+    if (!srcURN || !tgtURN) return;
+
+    // Undirected types (Binding, FunctionalAssociation, etc.): sort the pair so
+    // A→B and B→A share one key — direction is meaningless for these types.
+    // Directional types (Regulation, MolTransport, etc.): preserve direction.
+    // An edge A→B and an edge B→A are distinct biological statements and must
+    // NOT be merged just because they share the same two endpoints.
+    var pairKey = NONDIRECTIONAL_MERGE.has(relType)
+      ? (srcURN < tgtURN ? srcURN + '\x00' + tgtURN : tgtURN + '\x00' + srcURN)
+      : srcURN + '\x00' + tgtURN;
+
+    // Collect references from inline graphData OR refsCache
+    var refs = [];
+    var relId  = e.data('relId')   || null;
+    var edgeURN = e.data('edgeURN') || null;
+    if (relId && refsCache[relId]) {
+      refs = refsCache[relId].slice();
+    } else {
+      var gEdge = edgeURN
+        ? graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.URN) === edgeURN; })
+        : (relId ? graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.RelationID) === relId; }) : null);
+      if (!gEdge) gEdge = graphData.edges.find(function(ge) { return ge.id === e.id(); });
+      if (gEdge && gEdge.properties && Array.isArray(gEdge.properties.references)) {
+        refs = gEdge.properties.references.slice();
+      }
+    }
+
+    edgeInfos.push({
+      cyEdge:   e,
+      id:       e.id(),
+      relType:  relType,
+      srcURN:   srcURN,
+      tgtURN:   tgtURN,
+      pairKey:  pairKey,
+      effect:   normEff(e.data('effect') || ''),
+      mechanism: normEff(e.data('mechanism') || ''),
+      numRefs:  refs.length || (parseInt(e.data('numRefs')) || 0),
+      refs:     refs,
+      relId:    relId,
+      edgeURN:  edgeURN,
+    });
+  });
+
+  // ── Fetch missing reference objects for sim edges ────────────────────────────
+  // loadSimilarRelations stores only numRefs (a count); the actual ref objects
+  // needed for dedup/merge are fetched here on demand.
+  var missingRelIds = edgeInfos
+    .filter(function(ei) { return ei.relId && !ei.edgeURN && ei.refs.length === 0 && ei.numRefs > 0; })
+    .map(function(ei) { return ei.relId; });
+  if (missingRelIds.length > 0) {
+    try {
+      var fetchedRefs = await api('/api/references/batch', { relationIds: missingRelIds, scopusColumns: [] });
+      edgeInfos.forEach(function(ei) {
+        if (!ei.relId || ei.edgeURN || ei.refs.length > 0) return;
+        var refs = (fetchedRefs[ei.relId]) || [];
+        if (refs.length > 0) {
+          refsCache[ei.relId] = refs;
+          ei.refs    = refs;
+          ei.numRefs = calcRefCount(refs) || ei.numRefs;
+        }
+      });
+    } catch (fetchErr) {
+      console.warn('[MERGE-DEBUG] Failed to fetch sim refs for merge:', fetchErr.message);
+    }
+  }
+
+  // ── Union-Find grouping ───────────────────────────────────────────────────────
+  console.log('[MERGE-DEBUG] edgeInfos collected:', edgeInfos.length,
+    '(cy.edges total:', cy.edges().length, ', SKIP/no-URN excluded)');
+  edgeInfos.forEach(function(ei) {
+    var srcN = cy.$id(ei.cyEdge.data('source')); var tgtN = cy.$id(ei.cyEdge.data('target'));
+    var srcClone = srcN.data('isClone') ? '[clone]' : '';
+    var tgtClone = tgtN.data('isClone') ? '[clone]' : '';
+    console.log('[MERGE-DEBUG]  edge:', ei.id.slice(0,60),
+      '| type:', ei.relType,
+      '| src:', (ei.srcURN||'').split(':').pop() + srcClone,
+      '-> tgt:', (ei.tgtURN||'').split(':').pop() + tgtClone,
+      '| rnef:', !!ei.edgeURN, '| relId:', ei.relId,
+      '| refs:', ei.numRefs, '| effect:', ei.effect || '(none)');
+  });
+  var uf = {};
+  edgeInfos.forEach(function(e) { uf[e.id] = e.id; });
+
+  function ufFind(x) {
+    while (uf[x] !== x) { uf[x] = uf[uf[x]]; x = uf[x]; }
+    return x;
+  }
+  function ufUnion(x, y) {
+    var px = ufFind(x), py = ufFind(y);
+    if (px !== py) uf[px] = py;
+  }
+
+  for (var i = 0; i < edgeInfos.length; i++) {
+    for (var j = i + 1; j < edgeInfos.length; j++) {
+      var e1 = edgeInfos[i], e2 = edgeInfos[j];
+      if (e1.pairKey !== e2.pairKey) continue;
+      var t1 = e1.relType, t2 = e2.relType;
+      if (t1 === t2 || (MERGE_EQUIV[t1] && MERGE_EQUIV[t1].has(t2))) {
+        ufUnion(e1.id, e2.id);
+      }
+    }
+  }
+
+  // Build groups (only those with >1 edge need merging)
+  var groups = {};
+  edgeInfos.forEach(function(e) {
+    var root = ufFind(e.id);
+    (groups[root] = groups[root] || []).push(e);
+  });
+
+  // ── Process each merge group ──────────────────────────────────────────────────
+  var multiGroups = Object.values(groups).filter(function(g){ return g.length > 1; });
+  console.log('[MERGE-DEBUG] groups total:', Object.keys(groups).length,
+    '| groups needing merge:', multiGroups.length);
+  multiGroups.forEach(function(g, gi) {
+    console.log('[MERGE-DEBUG]  group', gi, '(' + g.length + ' edges):');
+    g.forEach(function(ei) {
+      var srcN = cy.$id(ei.cyEdge.data('source')); var tgtN = cy.$id(ei.cyEdge.data('target'));
+      console.log('[MERGE-DEBUG]    -', ei.relType,
+        (ei.srcURN||'').split(':').pop() + (srcN.data('isClone') ? '[clone]':''),
+        '->', (ei.tgtURN||'').split(':').pop() + (tgtN.data('isClone') ? '[clone]':''),
+        '| rnef:', !!ei.edgeURN, '| relId:', ei.relId,
+        '| tier:', (ei.effect?1:0)+(ei.mechanism?1:0),
+        '| class:', ei.relType, '| refs:', ei.numRefs);
+    });
+  });
+  // Check whether any groups actually need merging before touching the graph
+  var hasWork = Object.values(groups).some(function(g) { return g.length > 1; });
+  if (!hasWork) {
+    alert('No similar relations found to merge in this pathway.');
+    return;
+  }
+
+  // Snapshot before modifications so the operation is undoable
+  pushUndo();
+
+  var mergedGroupCount = 0, removedEdgeCount = 0;
+
+  function findGEdge(info) {
+    if (info.edgeURN) {
+      var e = graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.URN) === info.edgeURN; });
+      if (e) return e;
+    }
+    if (info.relId) {
+      var e = graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.RelationID) === info.relId; });
+      if (e) return e;
+    }
+    return graphData.edges.find(function(ge) { return ge.id === info.id; });
+  }
+
+  Object.values(groups).forEach(function(group) {
+    if (group.length < 2) return;
+
+    // Completeness tier: 2 = effect+mechanism, 1 = effect only, 0 = neither
+    function tier(e) { return (e.effect ? 1 : 0) + (e.mechanism ? 1 : 0); }
+
+    // Number of clone-node endpoints on an edge (0, 1 or 2).
+    // Edges connecting to original (non-clone) nodes are preferred as anchors so
+    // that the remaining edge stays visually attached to the canonical node,
+    // rather than to a clone copy that may float at a different position.
+    function cloneEndpointCount(e) {
+      var srcClone = cy.$id(e.cyEdge.data('source')).data('isClone') ? 1 : 0;
+      var tgtClone = cy.$id(e.cyEdge.data('target')).data('isClone') ? 1 : 0;
+      return srcClone + tgtClone;
+    }
+
+    // Sort: completeness desc → class score desc → RNEF before sim → numRefs desc → clone endpoints asc
+    //
+    // RNEF edges (edgeURN set) carry the original pathway layout: clone nodes are
+    // intentionally positioned near their logical neighbours.  Sim edges (no edgeURN)
+    // connect to the canonical/original node which may be far away in the layout.
+    // Always prefer an RNEF edge as anchor so the merged result stays attached to the
+    // clone that is already visually correct in the pathway.
+    // Clone-endpoint count is a secondary tiebreaker: when two RNEF edges have equal
+    // quality, prefer the one connecting to the original (non-clone) node.
+    group.sort(function(a, b) {
+      // CLASS_SCORE is primary: a sim with higher biological specificity
+      // (e.g. DirectRegulation=6) beats an RNEF with lower specificity
+      // (e.g. Binding=1). Within the same class score, RNEF wins.
+      var ds = (CLASS_SCORE[b.relType] || 0) - (CLASS_SCORE[a.relType] || 0); if (ds) return ds;
+      var da = (a.edgeURN ? 0 : 1) - (b.edgeURN ? 0 : 1); if (da) return da;
+      var dt = tier(b) - tier(a);           if (dt) return dt;
+      var dr = b.numRefs - a.numRefs;       if (dr) return dr;
+      // In RNEF pathways clone nodes are placed next to their gene by design;
+      // the clone connection IS the intended local visual connection, so prefer
+      // edges that connect to clone endpoints (descending clone count).
+      return cloneEndpointCount(b) - cloneEndpointCount(a); // more clone endpoints = better anchor
+    });
+
+    var anchor = group[0];
+    var others  = group.slice(1);
+    (function(){
+      var srcN = cy.$id(anchor.cyEdge.data('source')); var tgtN = cy.$id(anchor.cyEdge.data('target'));
+      console.log('[MERGE-DEBUG] ANCHOR ->', anchor.relType,
+        (anchor.srcURN||'').split(':').pop() + (srcN.data('isClone')?'[clone]':''),
+        '->', (anchor.tgtURN||'').split(':').pop() + (tgtN.data('isClone')?'[clone]':''),
+        '| rnef:', !!anchor.edgeURN, '| id:', anchor.id.slice(0,60));
+      others.forEach(function(oi){
+        var sN = cy.$id(oi.cyEdge.data('source')); var tN = cy.$id(oi.cyEdge.data('target'));
+        console.log('[MERGE-DEBUG] REMOVE ->', oi.relType,
+          (oi.srcURN||'').split(':').pop() + (sN.data('isClone')?'[clone]':''),
+          '->', (oi.tgtURN||'').split(':').pop() + (tN.data('isClone')?'[clone]':''),
+          '| rnef:', !!oi.edgeURN, '| id:', oi.id.slice(0,60));
+      });
+    })();
+
+    // FRD 4.1: if anchor has no effect, take from the non-anchor with most refs
+    var resolvedEffect = anchor.effect;
+    if (!resolvedEffect) {
+      var withEff = others.filter(function(e) { return e.effect; });
+      if (withEff.length) {
+        withEff.sort(function(a, b) { return b.numRefs - a.numRefs; });
+        resolvedEffect = withEff[0].effect;
+      }
+    }
+
+    // FRD 5: merge + deduplicate references by (year, journal, first-30-of-sentence)
+    var allRefs = anchor.refs.slice();
+    others.forEach(function(e) { allRefs = allRefs.concat(e.refs); });
+    var seenKeys = new Set();
+    var dedupedRefs = allRefs.filter(function(ref) {
+      var k = refKey(ref);
+      if (seenKeys.has(k)) return false;
+      seenKeys.add(k);
+      return true;
+    });
+
+    // Collect all RelationIDs from every edge in this group (including already-merged ones)
+    var allGroupRelIds = [];
+    group.forEach(function(ei) {
+      var rids = ei.cyEdge.data('relIds') || (ei.relId ? [ei.relId] : []);
+      rids.forEach(function(id) { if (id) allGroupRelIds.push(id); });
+    });
+    var uniqueGroupRelIds = Array.from(new Set(allGroupRelIds));
+
+    // Reference count = unique papers by DOI/EMBASE/PII/PUI/NCT_ID (shared helper).
+    var refCount = calcRefCount(dedupedRefs);
+
+    // Update anchor cy edge
+    if (resolvedEffect !== anchor.effect) {
+      anchor.cyEdge.data('effect', normEffectDisplay(resolvedEffect));
+    }
+    anchor.cyEdge.data('numRefs',      refCount);
+    anchor.cyEdge.data('numSentences', dedupedRefs.length);
+    anchor.cyEdge.data('thickness',    getEdgeThickness(refCount));
+    if (uniqueGroupRelIds.length > 1) {
+      anchor.cyEdge.data('relIds', uniqueGroupRelIds);
+    }
+
+    // Update anchor graphData edge
+    var anchorGEdge = findGEdge(anchor);
+    if (anchorGEdge) {
+      if (resolvedEffect !== anchor.effect) {
+        anchorGEdge.properties.Effect  = normEffectDisplay(resolvedEffect);
+        anchorGEdge.properties.effect  = normEffectDisplay(resolvedEffect);
+      }
+      anchorGEdge.properties.references = dedupedRefs;
+      anchorGEdge.properties.NumRefs = refCount;
+      anchorGEdge.properties.RelationNumberOfReferences  = refCount;
+      anchorGEdge.properties.RelationNumberOfSentences   = dedupedRefs.length;
+      if (uniqueGroupRelIds.length > 1) {
+        anchorGEdge.properties.RelationIDs = uniqueGroupRelIds;
+      }
+    }
+
+    // Update refsCache under all RelationIDs so tooltip shows merged refs immediately
+    uniqueGroupRelIds.forEach(function(id) { refsCache[id] = dedupedRefs; });
+
+    // Remove non-anchor edges from cy and graphData.
+    // Exception: when BOTH the anchor and the candidate are RNEF edges (have edgeURN)
+    // but one connects to all-original endpoints while the other has a clone endpoint,
+    // they represent the same biological relation with DIFFERENT visual anchors — the
+    // RNEF pathway intentionally places clones next to genes for readability while
+    // also keeping a direct connection to the canonical node.  Removing either would
+    // make a visible connection disappear, so we skip removal in that case.
+    others.forEach(function(e) {
+      if (e.edgeURN && anchor.edgeURN) {
+        // Both are RNEF: if their URN direction tokens differ (e.g. 'out' vs 'in-out'),
+        // they represent DIFFERENT biological relations (unidirectional vs bidirectional
+        // transport) and must never be merged.
+        var aDir = edgeDirectionToken(anchor);
+        var eDir = edgeDirectionToken(e);
+        if (aDir && eDir && aDir !== eDir) {
+          console.log('[MERGE-DEBUG] KEEP (direction mismatch ' + aDir + ' vs ' + eDir + '): skipping removal of', e.id.slice(0,60));
+          return;
+        }
+      }
+      if (e.edgeURN && anchor.edgeURN) {
+        // Both are RNEF: if one connects to a clone endpoint and the other to an
+        // original endpoint, they are different visual anchors for the same relation
+        // — keep both so neither the clone nor the original node loses its connection.
+        var anchorHasClone = cloneEndpointCount(anchor) > 0;
+        var eHasClone      = cloneEndpointCount(e)      > 0;
+        if (anchorHasClone !== eHasClone) {
+          console.log('[MERGE-DEBUG] KEEP (clone vs original split): skipping removal of', e.id.slice(0,60));
+          return; // keep this RNEF edge — different endpoint type than anchor
+        }
+      }
+      var idx = graphData.edges.findIndex(function(ge) {
+        if (e.edgeURN && ge.properties && String(ge.properties.URN) === e.edgeURN) return true;
+        if (e.relId  && ge.properties && String(ge.properties.RelationID) === e.relId) return true;
+        return ge.id === e.id;
+      });
+      if (idx >= 0) { graphData.edges.splice(idx, 1); }
+      else { console.warn('[MERGE-DEBUG] graphData edge NOT FOUND for removal:', e.id, '| edgeURN:', e.edgeURN, '| relId:', e.relId); }
+      // Capture clone endpoints before removing the edge
+      var eSrc = e.cyEdge.data('source');
+      var eTgt = e.cyEdge.data('target');
+      e.cyEdge.remove();
+      removedEdgeCount++;
+      // If a clone endpoint is now orphaned (no remaining edges), remove it too
+      [eSrc, eTgt].forEach(function(nid) {
+        var n = cy.$id(nid);
+        if (!n.empty() && n.data('isClone') && n.connectedEdges().length === 0) {
+          console.log('[MERGE-DEBUG] removing orphaned clone node:', nid);
+          var ni = graphData.nodes.findIndex(function(gn) { return String(gn.id) === String(nid); });
+          if (ni >= 0) { graphData.nodes.splice(ni, 1); }
+          n.remove();
+        }
+      });
+    });
+
+    mergedGroupCount++;
+  });
+
+  alert('Merge complete:\n  ' + mergedGroupCount + ' group(s) merged\n  ' + removedEdgeCount + ' duplicate relation(s) removed');
+  updateStats();
+  if (document.getElementById('table-view').style.display !== 'none') {
+    if (tableViewMode === 'relation') { loadRelationData(); }
+    else { tableRows = []; loadTableData(); }
+  }
+
+  // Re-render open tooltip so its reference count reflects the merged result.
+  if (tooltipVisible && tooltipCurrentEdge) {
+    var _tipRelId  = tooltipCurrentEdge.data('relId');
+    var _tipRelIds = tooltipCurrentEdge.data('relIds') || (_tipRelId ? [_tipRelId] : []);
+    var _tipRefs   = null;
+    for (var _i = 0; _i < _tipRelIds.length; _i++) {
+      if (refsCache[_tipRelIds[_i]] !== undefined) { _tipRefs = refsCache[_tipRelIds[_i]]; break; }
+    }
+    if (_tipRefs !== null) renderTooltip(tooltipCurrentEdge, _tipRefs);
+  }
+}
+
+// ─── Expand Selected Nodes ────────────────────────────────────────────────────
+// Pending expansion data — set before showing confirm modal, consumed on commit.
+var _expandPending = null;   // { nodes, edges }
+
+async function expandSelectedNodes(mode) {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selectedNodes.length === 0) {
+    showAlignToast('Please select at least one node to perform an expansion.');
+    return;
+  }
+
+  var urns = [];
+  selectedNodes.forEach(function(n) {
+    var urn = n.data('URN') || n.data('urn') || '';
+    if (urn) urns.push(urn);
+  });
+  if (!urns.length) {
+    showAlignToast('Selected nodes have no URN — cannot expand.');
+    return;
+  }
+
+  if (mode === 'to') {
+    showExpandToDialog();
+    return;
+  }
+
+  await _doExpand(mode, null, urns);
+}
+
+// Show "Expand To..." label picker dialog
+function showExpandToDialog() {
+  _loadSchema().then(function(schema) {
+    var labels = (schema && schema.labels) ? schema.labels.slice().sort() : [];
+    var list = document.getElementById('expand-to-label-list');
+    list.innerHTML = '';
+    if (!labels.length) {
+      list.innerHTML = '<span style="color:#7a8099;font-size:12px">No labels found in schema.</span>';
+    }
+    labels.forEach(function(lbl) {
+      var row = document.createElement('label');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:13px;color:#c0c4d4;cursor:pointer;padding:3px 0';
+      row.innerHTML = '<input type="checkbox" value="' + lbl + '" style="accent-color:#4f8ef7;width:14px;height:14px"> ' + lbl;
+      list.appendChild(row);
+    });
+    document.getElementById('expand-to-modal').style.display = 'flex';
+  });
+}
+
+// Called by the Expand button in the "Expand To..." dialog
+async function expandToConfirm() {
+  var checked = Array.from(
+    document.querySelectorAll('#expand-to-label-list input[type=checkbox]:checked')
+  ).map(function(cb) { return cb.value; });
+
+  if (!checked.length) {
+    alert('Please select at least one node type.');
+    return;
+  }
+  document.getElementById('expand-to-modal').style.display = 'none';
+
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var urns = [];
+  selectedNodes.forEach(function(n) {
+    var urn = n.data('URN') || n.data('urn') || '';
+    if (urn) urns.push(urn);
+  });
+
+  await _doExpand('to', checked, urns);
+}
+
+// Core expansion: fetch from server, tally results, show confirm modal.
+async function _doExpand(mode, targetLabels, urns) {
+  setProgressMsg('⏳ Expanding graph…');
+  try {
+    var body = { urns: urns, mode: mode };
+    if (targetLabels) body.targetLabels = targetLabels;
+
+    var result = await api('/api/graph/expand', body);
+    setProgressMsg(null);
+
+    if (result.error) { alert('Expansion error: ' + result.error); return; }
+
+    var newNodes = result.nodes || [];
+    var newEdges = result.edges || [];
+
+    if (!newEdges.length) {
+      alert('No new relations found for the selected nodes.');
+      return;
+    }
+
+    // Build count-by-type summary
+    var typeCounts = {};
+    newEdges.forEach(function(e) {
+      var t = e.type || 'Unknown';
+      typeCounts[t] = (typeCounts[t] || 0) + 1;
+    });
+    var total = newEdges.length;
+    var lines = ['Will add ' + total + ' relation' + (total === 1 ? '' : 's') + ':'];
+    Object.keys(typeCounts).sort().forEach(function(t) {
+      lines.push('  • ' + t + ': ' + typeCounts[t]);
+    });
+
+    // Store pending data and show confirmation
+    _expandPending = { nodes: newNodes, edges: newEdges };
+    document.getElementById('expand-confirm-msg').textContent = lines.join('\n');
+    document.getElementById('expand-confirm-modal').style.display = 'flex';
+
+  } catch(err) {
+    setProgressMsg(null);
+    alert('Expansion failed: ' + (err.message || err));
+  }
+}
+
+function _expandCancel() {
+  _expandPending = null;
+  document.getElementById('expand-confirm-modal').style.display = 'none';
+}
+
+function _expandCommit() {
+  document.getElementById('expand-confirm-modal').style.display = 'none';
+  if (!_expandPending) return;
+  var pending = _expandPending;
+  _expandPending = null;
+
+  var result = mergeGraphData(pending);
+  console.log('[expand] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
+
+  pushUndoSnapshot('expand');
+  updateStats();
+}
+
 
 function toggleAllRnefCheckboxes(masterCb) {
   var cbs = document.querySelectorAll('.rnef-pw-cb');
@@ -3079,6 +5931,14 @@ function enrichNodesFromNeo4j(jsonNodes) {
                 if (e.endNodeId   === oldId) e.endNodeId   = neo.id;
               });
             }
+            // Propagate enriched properties to RNEF clones in graphData so they
+            // survive tab switches (cy nodes are already updated by the cy.nodes() loop above).
+            targetGD.nodes.forEach(function(cloneNode) {
+              if (!cloneNode.isClone || !cloneNode.properties || cloneNode.properties.URN !== urn) return;
+              Object.assign(cloneNode.properties, safeProps);
+              cloneNode.properties.URN = urn;
+              cloneNode.labels = neo.labels.slice();
+            });
           }
         });
       } else {
@@ -3106,7 +5966,29 @@ function enrichNodesFromNeo4j(jsonNodes) {
               if (e.startNodeId === oldId) e.startNodeId = neo.id;
               if (e.endNodeId   === oldId) e.endNodeId   = neo.id;
             });
+            // Remap the saved-positions key so renderGraph can find coordinates
+            // after the tab is restored.  The key is whichever identifier was
+            // used at captureTabState time — either the old neo4j int or the
+            // original URN string (when capture ran before enrichment completed).
+            var _snap = tabs[enrichTabIdx] && tabs[enrichTabIdx].snapshot;
+            if (_snap && _snap.positions) {
+              if (_snap.positions[oldId] !== undefined) {
+                _snap.positions[neo.id] = _snap.positions[oldId];
+                delete _snap.positions[oldId];
+              } else if (_snap.positions[urn] !== undefined) {
+                // positions was keyed by URN (pre-enrichment capture)
+                _snap.positions[neo.id] = _snap.positions[urn];
+                delete _snap.positions[urn];
+              }
+            }
           }
+          // Propagate to clones in background snapshot as well.
+          targetGD.nodes.forEach(function(cloneNode) {
+            if (!cloneNode.isClone || !cloneNode.properties || cloneNode.properties.URN !== urn) return;
+            Object.assign(cloneNode.properties, safeProps);
+            cloneNode.properties.URN = urn;
+            cloneNode.labels = neo.labels.slice();
+          });
         });
       }
 
@@ -3122,8 +6004,11 @@ function enrichNodesFromNeo4j(jsonNodes) {
           var statsEl = document.getElementById('graph-stats');
           if (statsEl) {
             var orig = statsEl.innerHTML;
-            statsEl.innerHTML = orig + ' <span style="color:#4caf50;font-size:11px">(+' + matched + ' enriched from Neo4j)</span>';
-            setTimeout(function() { updateStats(); }, 3000);
+            statsEl.innerHTML = orig + ' <span id="enrich-result-status" style="color:#4caf50;font-size:11px">(' + matched + ' nodes were enriched from Neo4j)</span>';
+            setTimeout(function() {
+              var s = document.getElementById('enrich-result-status');
+              if (s) s.remove();
+            }, 5000);
           }
         }
 
@@ -3218,6 +6103,7 @@ async function saveNeo4jSettings() {
     okEl.textContent = 'Saved! Neo4j reconnected successfully.';
     okEl.style.display = 'block';
     setTimeout(function() { document.getElementById('neo4j-settings-modal').style.display = 'none'; }, 1500);
+    _invalidateSchemaCache(); // reset schema autocomplete for new connection
   } catch(err) {
     errEl.textContent = err.message;
     errEl.style.display = 'block';
@@ -3913,12 +6799,19 @@ document.addEventListener('click', function(e) {
 function pushUndo() {
   var snapshot = captureTabState();
   undoStack.push({ graphData: snapshot.graphData, positions: snapshot.positions });
+  // Any new operation clears the redo history
+  redoStack = [];
   var btn = document.getElementById('undo-btn');
   if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+  var rbtn = document.getElementById('redo-btn');
+  if (rbtn) { rbtn.disabled = true; rbtn.style.opacity = '0.4'; }
 }
 
 function undoGraphOperation() {
   if (undoStack.length === 0) return;
+  // Save current state to redo stack before reverting
+  var cur = captureTabState();
+  redoStack.push({ graphData: cur.graphData, positions: cur.positions });
   var prev = undoStack.pop();
   graphData = JSON.parse(JSON.stringify(prev.graphData));
   renderGraph(graphData, prev.positions);
@@ -3931,6 +6824,30 @@ function undoGraphOperation() {
   if (btn) {
     btn.disabled = undoStack.length === 0;
     btn.style.opacity = undoStack.length === 0 ? '0.4' : '1';
+  }
+  var rbtn = document.getElementById('redo-btn');
+  if (rbtn) { rbtn.disabled = false; rbtn.style.opacity = '1'; }
+}
+
+function redoGraphOperation() {
+  if (redoStack.length === 0) return;
+  // Save current state to undo stack before re-applying
+  var cur = captureTabState();
+  undoStack.push({ graphData: cur.graphData, positions: cur.positions });
+  var next = redoStack.pop();
+  graphData = JSON.parse(JSON.stringify(next.graphData));
+  renderGraph(graphData, next.positions);
+  applyStyle(currentStyle);
+  // Keep active tab snapshot in sync
+  if (tabs && tabs[activeTabIdx]) {
+    tabs[activeTabIdx].snapshot = captureTabState();
+  }
+  var btn = document.getElementById('undo-btn');
+  if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+  var rbtn = document.getElementById('redo-btn');
+  if (rbtn) {
+    rbtn.disabled = redoStack.length === 0;
+    rbtn.style.opacity = redoStack.length === 0 ? '0.4' : '1';
   }
 }
 
@@ -4035,12 +6952,16 @@ function mergeSelectedClonesFromContext() {
 
   if (selectedClones.length < 2) return;
 
-  // Group by cloneOf so we merge only clones of the same original together
+  // Group by URN (canonical biological identifier, stable across enrichment).
+  // Fallback to cloneOf if URN is absent.
+  // This handles the case where some clones were created pre-enrichment
+  // (cloneOf = URN string) and others post-enrichment (cloneOf = Neo4j integer ID),
+  // but all share the same URN on the node itself.
   var groups = {};
   selectedClones.forEach(function(n) {
-    var cloneOf = n.data('cloneOf');
-    if (!groups[cloneOf]) groups[cloneOf] = [];
-    groups[cloneOf].push(n);
+    var groupKey = n.data('URN') || n.data('cloneOf');
+    if (!groups[groupKey]) groups[groupKey] = [];
+    groups[groupKey].push(n);
   });
 
   Object.keys(groups).forEach(function(cloneOf) {
@@ -4285,6 +7206,9 @@ function emptyTabSnapshot() {
     currentQuery:         '',
     positions:            {},
     tableViewMode:        'reference',
+    activeView:           'graph',
+    tableSortCol:         null,
+    tableSortAsc:         true,
     loadedPropertyNames:  []
   };
 }
@@ -4292,26 +7216,36 @@ function emptyTabSnapshot() {
 function captureTabState() {
   var positions = {};
   if (cy) {
-    // Build a cy-node-id → graphData-node-id map.
-    // After enrichNodesFromNeo4j, cy node IDs are the original URNs (immutable) but
-    // graphData.nodes[i].id has been updated to the Neo4j integer ID.
-    // We always key positions by graphData ID so renderGraph can look them up by n.id.
-    // IMPORTANT: only map URN → graphData ID for the original (non-clone) node.
-    // Clone nodes share the same URN as their original; if we mapped all of them
-    // the last clone processed would overwrite the original's URN entry, causing the
-    // original to lose its position on the next tab switch.
-    var cyIdToGraphId = {};
-    graphData.nodes.forEach(function(n) {
-      cyIdToGraphId[n.id] = n.id;
-      if (!n.isClone && n.properties && n.properties.URN) {
-        cyIdToGraphId[n.properties.URN] = n.id;
-      }
-    });
+    // Key positions by URN for normal nodes and by cy-ID for clones.
+    //
+    // Why URN?  The cy node ID is whatever was in graphData.nodes[i].id when
+    // renderGraph last ran — it may be a legacy Neo4j integer from an older saved
+    // file, or a freshly-enriched integer that differs from the one in a snapshot
+    // that was written earlier.  Either way, background enrichNodesFromNeo4j can
+    // change graphData node IDs in the snapshot AFTER captureTabState captures
+    // positions, making numeric keys stale.
+    //
+    // URN strings are written by the RNEF author and are never mutated by
+    // enrichment, so they form a stable key that survives any number of
+    // background ID updates.  renderGraph has a URN fallback in both the
+    // cyNodes position field and the belt-and-suspenders loop.
+    //
+    // Clone nodes share URN with their original, so they use their unique cy ID
+    // (e.g. "clone-…") as the key instead; their first-lookup path in renderGraph
+    // already handles this.
     cy.nodes().forEach(function(n) {
-      var gid = cyIdToGraphId[n.id()] !== undefined ? cyIdToGraphId[n.id()] : n.id();
-      positions[gid] = { x: n.position('x'), y: n.position('y') };
+      var urn = !n.data('isClone') && n.data('URN');
+      positions[urn || n.id()] = { x: n.position('x'), y: n.position('y') };
     });
   }
+  var tableEl = document.getElementById('table-view');
+  var activeView = (tableEl && tableEl.style.display !== 'none') ? 'table' : 'graph';
+  var _posKeys = Object.keys(positions);
+  var _posVals = _posKeys.slice(0,3).map(function(k) {
+    var p = positions[k];
+    return k + ':(' + Math.round(p.x) + ',' + Math.round(p.y) + ')';
+  }).join(' | ');
+  console.log('[TAB-DEBUG][' + Date.now() + '] captureTabState: tab=' + activeTabIdx + ' posCount=' + _posKeys.length + ' vals=' + _posVals);
   return {
     graphData:           JSON.parse(JSON.stringify(graphData)),
     refsCache:           Object.assign({}, refsCache),
@@ -4320,9 +7254,12 @@ function captureTabState() {
     currentSubgraphName: currentSubgraphName,
     currentLayout:       currentLayout,
     currentStyle:        currentStyle,
-    currentQuery:        (document.getElementById('cypher-input') || {}).value || currentQuery,
+    currentQuery:        getCypherQuery() || currentQuery,
     positions:           positions,
     tableViewMode:       tableViewMode,
+    activeView:          activeView,
+    tableSortCol:        tableSortCol,
+    tableSortAsc:        tableSortAsc,
     loadedPropertyNames: Array.from(_loadedPropertyNames)
   };
 }
@@ -4343,8 +7280,7 @@ function applyTabState(snapshot) {
   currentQuery        = s.currentQuery || '';
   _loadedPropertyNames = new Set(Array.isArray(s.loadedPropertyNames) ? s.loadedPropertyNames : []);
 
-  var qEl = document.getElementById('cypher-input');
-  if (qEl) qEl.value = currentQuery;
+  setCypherQuery(currentQuery);
 
   updateLayoutMenu(currentLayout);
   updateStyleMenu(currentStyle);
@@ -4359,6 +7295,12 @@ function applyTabState(snapshot) {
     tableRows  = [];
   } else {
     var hasPos = s.positions && Object.keys(s.positions).length > 0;
+    var _sPosKeys = Object.keys(s.positions || {});
+    var _sPosVals = _sPosKeys.slice(0,3).map(function(k) {
+      var p = s.positions[k];
+      return k + ':(' + Math.round(p.x) + ',' + Math.round(p.y) + ')';
+    }).join(' | ');
+    console.log('[TAB-DEBUG][' + Date.now() + '] applyTabState: tab=' + activeTabIdx + ' hasPos=' + hasPos + ' posCount=' + _sPosKeys.length + ' vals=' + _sPosVals);
     renderGraph(graphData, hasPos ? s.positions : null);
     applyStyle(currentStyle);
     // renderGraph resets refsCache/medScanMap — restore saved values
@@ -4371,9 +7313,44 @@ function applyTabState(snapshot) {
   }
   columnWidths = s.columnWidths ? Object.assign({}, s.columnWidths) : null;
   tableViewMode = s.tableViewMode || 'reference';
+  tableSortCol  = s.tableSortCol  || null;
+  tableSortAsc  = s.tableSortAsc  !== undefined ? s.tableSortAsc : true;
   syncTableModeIndicator(tableViewMode);
-  updateViewMenu('graph');  // always land on Graph view; must run after syncTableModeIndicator
   updateSelectionInfo();
+
+  // Restore the view the user was on when they left this tab.
+  // Graph view was already set above (required for cy to render correctly);
+  // switch to table now if that's where the user was.
+  var restoredView = s.activeView || 'graph';
+  if (restoredView === 'table' && graphData.edges.length > 0) {
+    switchView('table');
+  } else {
+    updateViewMenu('graph');
+  }
+
+  // Apply results that arrived while this tab was in the background
+  if (s.pendingGraphData) {
+    var pd = s.pendingGraphData;
+    delete s.pendingGraphData;
+    if (pd.table && pd.nodes.length === 0 && pd.edges.length === 0) {
+      showQueryResultTable(pd.table);
+    } else {
+      hideQueryResultTable();
+      renderGraph(pd);
+    }
+  }
+  if (s.pendingQueryError) {
+    var pe = s.pendingQueryError;
+    delete s.pendingQueryError;
+    alert('Query error: ' + pe);
+  }
+
+  // If this tab still has a query running, restore the loading state
+  var tab = tabs[activeTabIdx];
+  if (tab && tab.running) {
+    document.getElementById('graph-loading').style.display = 'flex';
+    document.getElementById('run-btn').disabled = true;
+  }
 }
 
 function createNewTab(name) {
@@ -4395,6 +7372,9 @@ function switchTab(idx) {
   if (idx === activeTabIdx || idx < 0 || idx >= tabs.length) return;
   tooltipVisible = false;
   document.getElementById('tooltip').style.display = 'none';
+  // Always clear loading overlay before switching — destination tab may not be running a query
+  document.getElementById('graph-loading').style.display = 'none';
+  document.getElementById('run-btn').disabled = false;
   tabs[activeTabIdx].snapshot = captureTabState();
   activeTabIdx = idx;
   renderTabBar();
@@ -4418,17 +7398,77 @@ function renderTabBar() {
   tabs.forEach(function(tab, idx) {
     var div = document.createElement('div');
     div.className = 'tab-item' + (idx === activeTabIdx ? ' active' : '');
+    div.draggable = true;
     var closeHtml = tabs.length > 1
       ? '<span class="tab-close" title="Close tab">\xd7</span>'
       : '';
+    var runningHtml = tab.running ? '<span class="tab-running-dot" title="Query running…"></span>' : '';
     div.innerHTML = '<span class="tab-name" title="' + escHtml(tab.name) + '">'
-      + escHtml(tab.name) + '</span>' + closeHtml;
+      + escHtml(tab.name) + '</span>' + runningHtml + closeHtml;
+
     div.addEventListener('click', (function(i) {
       return function(e) {
         if (e.target.classList.contains('tab-close')) closeTab(i, e);
         else switchTab(i);
       };
     })(idx));
+
+    // ── drag-to-reorder ──────────────────────────────────────────────────────
+    div.addEventListener('dragstart', (function(i, el) {
+      return function(e) {
+        tabDragSrcIdx = i;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(i));
+        setTimeout(function() { el.classList.add('tab-dragging'); }, 0);
+      };
+    })(idx, div));
+
+    div.addEventListener('dragend', (function(el) {
+      return function() {
+        el.classList.remove('tab-dragging');
+        list.querySelectorAll('.tab-item').forEach(function(t) {
+          t.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+        });
+        tabDragSrcIdx = -1;
+      };
+    })(div));
+
+    div.addEventListener('dragover', (function(i, el) {
+      return function(e) {
+        if (tabDragSrcIdx < 0 || tabDragSrcIdx === i) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        el.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+        var mid = el.getBoundingClientRect().left + el.getBoundingClientRect().width / 2;
+        el.classList.add(e.clientX < mid ? 'tab-drag-over-left' : 'tab-drag-over-right');
+      };
+    })(idx, div));
+
+    div.addEventListener('dragleave', (function(el) {
+      return function() {
+        el.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+      };
+    })(div));
+
+    div.addEventListener('drop', (function(i, el) {
+      return function(e) {
+        e.preventDefault();
+        el.classList.remove('tab-drag-over-left', 'tab-drag-over-right');
+        var src = tabDragSrcIdx;
+        if (src < 0 || src === i) return;
+        var rect = el.getBoundingClientRect();
+        var insertBefore = e.clientX < rect.left + rect.width / 2;
+        var dest = insertBefore ? i : i + 1;
+        var activeId = tabs[activeTabIdx].id;
+        var moved = tabs.splice(src, 1)[0];
+        if (src < dest) dest--;
+        tabs.splice(dest, 0, moved);
+        activeTabIdx = tabs.findIndex(function(t) { return t.id === activeId; });
+        tabDragSrcIdx = -1;
+        renderTabBar();
+      };
+    })(idx, div));
+
     list.appendChild(div);
   });
 }
@@ -4498,11 +7538,58 @@ function invertSelection() {
   updateSelectionInfo();
 }
 
+// ─── Selection clipboard (cross-tab, URN-based) ───────────────────────────────
+// Stores URNs of selected nodes/edges so the user can select the intersection
+// of that set in a different pathway.
+var selectionClipboard = { nodeUrns: new Set(), edgeUrns: new Set() };
+
+function copySelectionToClipboard() {
+  if (!cy) return;
+  var nodeUrns = new Set();
+  var edgeUrns = new Set();
+  cy.nodes(':selected').forEach(function(n) {
+    var urn = n.data('URN');
+    if (urn) nodeUrns.add(String(urn));
+  });
+  cy.edges(':selected').forEach(function(e) {
+    var urn = e.data('edgeURN');
+    if (urn) edgeUrns.add(String(urn));
+  });
+  selectionClipboard = { nodeUrns: nodeUrns, edgeUrns: edgeUrns };
+  var total = nodeUrns.size + edgeUrns.size;
+  // Enable the menu item and update its label to show what was copied
+  var mi = document.getElementById('mi-select-from-clipboard');
+  if (mi) {
+    mi.style.color = '';
+    mi.textContent = 'Select from clipboard (' + total + ')';
+  }
+  updateSelectionInfo();
+}
+
+function selectFromClipboard() {
+  if (!cy) return;
+  var nodeUrns = selectionClipboard.nodeUrns;
+  var edgeUrns = selectionClipboard.edgeUrns;
+  if (!nodeUrns.size && !edgeUrns.size) return;
+  cy.elements().unselect();
+  cy.nodes().forEach(function(n) {
+    var urn = n.data('URN');
+    if (urn && nodeUrns.has(String(urn))) n.select();
+  });
+  cy.edges().forEach(function(e) {
+    var urn = e.data('edgeURN');
+    if (urn && edgeUrns.has(String(urn))) e.select();
+  });
+  updateSelectionInfo();
+}
+
 function copySelection() {
   if (!cy) return;
   var selNodes = cy.nodes(':selected');
   var selEdges = cy.edges(':selected');
   if (selNodes.length === 0 && selEdges.length === 0) return;
+  // Also update the URN-based selection clipboard for cross-tab "Select from clipboard"
+  copySelectionToClipboard();
 
   // When edges are selected, also pull in their endpoint nodes
   var nodeMap = {};
