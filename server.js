@@ -72,7 +72,7 @@ function saveAppSettings(s) {
   // codeql[js/network-data-written-to-file] - `s` is always the validated and
   // live-tested appSettings object (credentials verified against the real DB
   // before reaching this call); no raw network data is written.
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)); // codeql[js/network-data-written-to-file]
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
 }
 
 let appSettings = loadAppSettings();
@@ -200,7 +200,7 @@ function saveUsers(users) {
   // codeql[js/network-data-written-to-file] - `safe` contains only regex match[0]
   // values (NAME_RE / BCRYPT_RE) and hardcoded role literals; no raw network
   // data reaches this write.
-  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2)); // codeql[js/network-data-written-to-file]
+  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
 }
 
 function adminMiddleware(req, res, next) {
@@ -1254,7 +1254,8 @@ app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '500mb', type: 't
   const inputPath = path.join(tmpDir, 'input.rnef');
   const outDir    = path.join(tmpDir, 'out');
   fs.mkdirSync(outDir);
-  fs.writeFileSync(inputPath, content, 'utf8'); // codeql[js/network-data-written-to-file] - content is RNEF XML written to a server-controlled tmpdir path; not served back to clients
+  // codeql[js/network-data-written-to-file] - content is RNEF XML from an authenticated request; path is server-controlled tmpdir, never served back to clients
+  fs.writeFileSync(inputPath, content, 'utf8');
 
   try {
     await new Promise((resolve, reject) => {
