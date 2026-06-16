@@ -941,6 +941,7 @@ app.post('/api/relations/match-rnef', dbLimiter, authMiddleware, async (req, res
     if (batch.length > 0) {
       const byType = Object.create(null); // null prototype prevents remote property injection
       batch.forEach(row => {
+        if (typeof row.relType !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(row.relType)) return;
         (byType[row.relType] = byType[row.relType] || []).push(row);
       });
 
@@ -1062,6 +1063,7 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
       if (!relId) return;
       out[relId] = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
       safeProps.forEach(p => {
+        if (typeof p !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(p)) return;
         const val = rec.get(p);
         out[relId][p] = (val != null && typeof val === 'object' && val.toNumber)
           ? val.toNumber()
@@ -1171,7 +1173,10 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
 
     function groupByType(rows) {
       const g = Object.create(null); // null prototype prevents remote property injection (no __proto__ pollution)
-      rows.forEach(r => { (g[r.relType] = g[r.relType] || []).push(r); });
+      rows.forEach(r => {
+        if (typeof r.relType !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(r.relType)) return;
+        (g[r.relType] = g[r.relType] || []).push(r);
+      });
       return g;
     }
 
