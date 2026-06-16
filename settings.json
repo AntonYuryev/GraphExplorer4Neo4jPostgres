@@ -12,5 +12,6 @@
     "schema": "resnet18",
     "username": "YOUR_PG_USER",
     "password": "YOUR_PG_PASSWORD"
-  }
+  },
+  "jwtSecret": "918b94c8c1cf439880e783b9028600fedda4a56a089ea4b449bc0199e935296c"
 }
