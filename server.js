@@ -69,10 +69,10 @@ function loadAppSettings() {
 }
 
 function saveAppSettings(s) {
-  // lgtm[js/network-data-written-to-file] - `s` is always the validated and
+  // codeql[js/network-data-written-to-file] - `s` is always the validated and
   // live-tested appSettings object (credentials verified against the real DB
   // before reaching this call); no raw network data is written.
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)); // lgtm[js/network-data-written-to-file]
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2)); // codeql[js/network-data-written-to-file]
 }
 
 let appSettings = loadAppSettings();
@@ -132,17 +132,21 @@ function sanitizeSchemaName(name) {
 let PG_SCHEMA = sanitizeSchemaName(appSettings.postgres.schema);
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-// JWT_SECRET must be set in the environment for production.
-// If not set, a random secret is generated at startup — sessions will NOT survive
-// server restarts.  Set JWT_SECRET to a long random string for production use.
-const JWT_SECRET = process.env.JWT_SECRET || (() => {
+// JWT_SECRET resolution order:
+//   1. JWT_SECRET environment variable (recommended for production)
+//   2. jwtSecret field persisted in settings.json (auto-generated on first run)
+// This ensures sessions survive server restarts without any manual configuration.
+function resolveJwtSecret() {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (appSettings.jwtSecret) return appSettings.jwtSecret;
   const crypto = require('crypto');
   const generated = crypto.randomBytes(32).toString('hex');
-  console.warn('\n[WARNING] JWT_SECRET env var is not set.');
-  console.warn('[WARNING] Sessions will not survive server restarts.');
-  console.warn('[WARNING] Set JWT_SECRET in your environment for production.\n');
+  appSettings.jwtSecret = generated;
+  saveAppSettings(appSettings);
+  console.log('[INFO] Generated and saved JWT_SECRET to settings.json.');
   return generated;
-})();
+}
+const JWT_SECRET = resolveJwtSecret();
 const USERS_FILE = path.join(__dirname, 'users.json');
 
 function loadUsers() {
@@ -193,10 +197,10 @@ function saveUsers(users) {
       safe.push({ username: nameMatch[0], password: hashMatch[0], role });
     }
   }
-  // lgtm[js/network-data-written-to-file] - `safe` contains only regex match[0]
+  // codeql[js/network-data-written-to-file] - `safe` contains only regex match[0]
   // values (NAME_RE / BCRYPT_RE) and hardcoded role literals; no raw network
   // data reaches this write.
-  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2)); // lgtm[js/network-data-written-to-file]
+  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2)); // codeql[js/network-data-written-to-file]
 }
 
 function adminMiddleware(req, res, next) {
@@ -227,7 +231,7 @@ function toPlain(val) {
   }
   if (Array.isArray(val)) return val.map(toPlain);
   if (typeof val === 'object' && val !== null) {
-    const out = {};
+    const out = Object.create(null); // null prototype prevents remote property injection
     for (const [k, v] of Object.entries(val)) {
       if (v === '_') continue;  // skip empty-marker properties
       out[k] = toPlain(v);
@@ -735,6 +739,38 @@ app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, re
   res.json({ byNodeId, byUrn });
 });
 
+// ─── Node connectivity (total edge count in Neo4j) ────────────────────────────
+// POST /api/nodes/connectivity
+// Body: { urns: [...] }
+// Returns { [urn]: count, ... }
+app.post('/api/nodes/connectivity', dbLimiter, authMiddleware, async (req, res) => {
+  const { urns = [] } = req.body || {};
+  const safeUrns = urns.map(String).filter(u => u.length > 0 && u.length < 500);
+  if (!safeUrns.length) return res.json({});
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(
+      `UNWIND $urns AS urn
+       MATCH (n {URN: urn})-[r]-(neighbor)
+       RETURN urn, count(r) AS degree, count(DISTINCT neighbor) AS neighborCount`,
+      { urns: safeUrns }
+    );
+    const out = Object.create(null); // null prototype prevents remote property injection
+    result.records.forEach(rec => {
+      const urn = rec.get('urn');
+      const toN = v => v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v);
+      out[urn] = { degree: toN(rec.get('degree')), neighborCount: toN(rec.get('neighborCount')) };
+    });
+    res.json(out);
+  } catch (err) {
+    console.error('connectivity error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── PostgreSQL reference update (curation) ───────────────────────────────────
 app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) => {
   const { id, msrc } = req.body || {};
@@ -847,7 +883,7 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     // validated above to be a read-only SELECT/WITH query with no stacked
     // statements or comment injection.  Parameterised queries cannot be used
     // here because the entire query text is the user-supplied value.
-    const result = await pgPool.query(sql); // lgtm[js/sql-injection]
+    const result = await pgPool.query(sql); // codeql[js/sql-injection]
     res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -903,7 +939,7 @@ app.post('/api/relations/match-rnef', dbLimiter, authMiddleware, async (req, res
     ]);
 
     if (batch.length > 0) {
-      const byType = {};
+      const byType = Object.create(null); // null prototype prevents remote property injection
       batch.forEach(row => {
         (byType[row.relType] = byType[row.relType] || []).push(row);
       });
@@ -1020,7 +1056,7 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
        RETURN DISTINCT relId, ${propReturn}`,
       { ids: validIds }
     );
-    const out = {};
+    const out = Object.create(null); // null prototype prevents remote property injection
     result.records.forEach(rec => {
       const relId = rec.get('relId');
       if (!relId) return;
@@ -1134,7 +1170,7 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
     }
 
     function groupByType(rows) {
-      const g = {};
+      const g = Object.create(null); // null prototype prevents remote property injection (no __proto__ pollution)
       rows.forEach(r => { (g[r.relType] = g[r.relType] || []).push(r); });
       return g;
     }
@@ -1213,7 +1249,7 @@ app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '500mb', type: 't
   const inputPath = path.join(tmpDir, 'input.rnef');
   const outDir    = path.join(tmpDir, 'out');
   fs.mkdirSync(outDir);
-  fs.writeFileSync(inputPath, content, 'utf8'); // lgtm[js/network-data-written-to-file] - content is RNEF XML written to a server-controlled tmpdir path; not served back to clients
+  fs.writeFileSync(inputPath, content, 'utf8'); // codeql[js/network-data-written-to-file] - content is RNEF XML written to a server-controlled tmpdir path; not served back to clients
 
   try {
     await new Promise((resolve, reject) => {
@@ -1346,6 +1382,89 @@ RETURN
 });
 
 
+// ─── Connect selected nodes (closed-loop inner edges) ────────────────────────
+// POST /api/relations/connect-selected
+// Body: { selectedURNs: [...], filterType: 'all'|'direct'|'biomarker'|'indirect' }
+// Returns edges where BOTH endpoints are in selectedURNs (closed-loop query).
+app.post('/api/relations/connect-selected', dbLimiter, authMiddleware, async (req, res) => {
+  const { selectedURNs = [], filterType = 'all' } = req.body || {};
+  if (selectedURNs.length < 2) return res.json({ relations: [] });
+
+  const DIRECT_TYPES    = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
+  const BIOMARKER_TYPES = ['Biomarker','QuantitativeChange','StateChange','GeneticChange'];
+
+  let typeFilter = '';
+  if (filterType === 'direct')   typeFilter = 'AND type(r) IN $typeList ';
+  else if (filterType === 'biomarker') typeFilter = 'AND type(r) IN $typeList ';
+  else if (filterType === 'indirect')  typeFilter = 'AND NOT type(r) IN $typeList ';
+
+  const typeList = filterType === 'direct'    ? DIRECT_TYPES
+                 : filterType === 'biomarker' ? BIOMARKER_TYPES
+                 : filterType === 'indirect'  ? DIRECT_TYPES
+                 : [];
+
+  function normDisplayEff(v) {
+    if (v == null) return '';
+    const s = String(v);
+    if (s === '' || s === '_' || s.toLowerCase() === 'unknown') return '';
+    if (s.toLowerCase() === 'positive') return 'Positive';
+    if (s.toLowerCase() === 'negative') return 'Negative';
+    return s;
+  }
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    // Closed-loop: both endpoints must be in selectedURNs.
+    // Bidirectional match covers both directions; dedup by RelationID.
+    const cypher = `
+UNWIND $selectedURNs AS sURN
+MATCH (a {URN: sURN})-[r]-(b)
+WHERE b.URN IN $selectedURNs AND b.URN <> sURN
+  ${typeFilter}
+RETURN
+  r.RelationID                              AS relationID,
+  type(r)                                   AS relType,
+  coalesce(r.Effect,    '')                 AS effect,
+  coalesce(r.Mechanism, '')                 AS mechanism,
+  coalesce(r.RelationNumberOfReferences, 0) AS numRefs,
+  a.URN AS aURN, coalesce(a.Name,'') AS aName,
+  b.URN AS bURN, coalesce(b.Name,'') AS bName,
+  startNode(r).URN = a.URN AS aIsStart`;
+
+    const result = await session.run(cypher, { selectedURNs, typeList });
+
+    const seen = new Set();
+    const relations = [];
+    for (const rec of result.records) {
+      const rid = String(toPlain(rec.get('relationID')));
+      if (seen.has(rid)) continue;
+      seen.add(rid);
+
+      const aIsStart = rec.get('aIsStart');
+      const aURN = rec.get('aURN'), bURN = rec.get('bURN');
+      const rURN = aIsStart ? aURN : bURN;
+      const tURN = aIsStart ? bURN : aURN;
+      const rName = aIsStart ? rec.get('aName') : rec.get('bName');
+      const tName = aIsStart ? rec.get('bName') : rec.get('aName');
+
+      relations.push({
+        relationID: rid,
+        relType:    rec.get('relType'),
+        effect:     normDisplayEff(rec.get('effect')),
+        mechanism:  normDisplayEff(rec.get('mechanism')),
+        numRefs:    toPlain(rec.get('numRefs')),
+        rURN, rName, tURN, tName,
+      });
+    }
+    res.json({ relations });
+  } catch (err) {
+    console.error('connect-selected error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── Pre-execution edge count check ──────────────────────────────────────────
 // POST /api/graph/count-query
 // Body: { query }  →  { edgeCount: N }
@@ -1391,7 +1510,7 @@ app.listen(PORT, () => {
 // ─── Neo4j schema introspection ───────────────────────────────────────────────
 // GET /api/graph/schema
 // Returns { labels: [...], relTypes: [...], propKeys: [...] }
-app.get('/api/graph/schema', authMiddleware, async (req, res) => {
+app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
   // Use three separate sessions — Neo4j forbids concurrent queries on one session
   const s1 = neo4jDriver.session({ database: NEO4J_DB });
   const s2 = neo4jDriver.session({ database: NEO4J_DB });
