@@ -18,7 +18,7 @@ graph-explorer/
   settings.json                   DB credentials (not committed to source control)
   public/
     index.html                    App HTML & modals
-    app.js                        All frontend logic (~4 000 lines)
+    app.js                        All frontend logic (~8 000 lines)
     app.css                       Styles
   Graph_Explorer_User_Manual.docx End-user guide
   Graph_Explorer_FRD.docx         Functional requirements document
@@ -33,10 +33,8 @@ graph-explorer/
 **Python 3** — required for RNEF file conversion. Usually pre-installed on Mac/Linux; download from https://python.org on Windows.
 
 The machine also needs network access to:
-- Neo4j at your configured host (default `neo4j.lifesciencepsg.com:7687`)
-- PostgreSQL at your configured host (default `postgres.cldbkt9huzvb.us-east-2.rds.amazonaws.com:5432`)
-
-(VPN may be required off-site.)
+- Neo4j at your configured host
+- PostgreSQL at your configured host
 
 ---
 
@@ -123,11 +121,18 @@ Change this password immediately after first login via **⚙ Settings ▾ → Ad
 | **File I/O** | Open/Save JSON subgraphs (Save dialog pre-fills current tab name); open RNEF pathway files (single or multi-pathway with tab per pathway) |
 | **Header toolbar** | Undo (Ctrl+Z), zoom controls, Align H/V, Highlight, Node Color, Find (Ctrl+F), Resize nodes ⊕/⊖ |
 | **Focus node** | Click a node to set it as the alignment anchor; Align H/V aligns all selected nodes to the focus node's axis |
+| **Undo** | Ctrl+Z undoes graph modifications including node moves, added relations, and expand operations; each drag is independently undoable |
+| **Cypher autocomplete** | Schema-aware dropdown in the query bar: node labels, relationship types, and property keys fetched from Neo4j and suggested as you type |
+| **Cypher lint** | Structural and semantic checks run before and after EXPLAIN; catches space-after-dot, bare property used as boolean, and other common mistakes |
+| **Query row-count guard** | Queries returning > 20 000 rows show a confirmation dialog before loading; warns that sentence coloring will be disabled |
 | **Table view** | References mode (one row/reference) and Relations mode (one row/edge) |
 | **Columns** | Add/remove/reorder/resize columns; Graph, Neo4j, Reference, Scopus, and Node Property columns; Reset to defaults button |
 | **Load node properties** | Database → Load node properties fetches additional Neo4j properties for current graph nodes; properties appear in tooltips and table |
 | **Sentence coloring** | MedScan entity markup highlighted red (regulator) and green (target) |
-| **Export** | CSV and Excel (.xlsx) with rich-text sentence coloring and hyperlinked PMIDs/DOIs |
+| **Export** | CSV and Excel (.xlsx) with rich-text sentence coloring and hyperlinked PMIDs/DOIs; also export references or relations for the current query directly |
+| **Find relations** | Database → Find relations between groups — queries Neo4j for relations connecting selected vs. unselected nodes; filter by All / Direct / Biomarker / Indirect |
+| **Load similar relations** | Database → Load similar relations — matches RNEF pathway edges to Neo4j relations and pulls in additional similar edges with RelationIDs |
+| **Expand selected nodes** | Database → Expand → five modes (Expand All, Expand To…, Find relations between selected and unselected, Expand similar, Expand direct); previews before committing |
 | **Selection** | Click, box-select, select all, invert; Move mode vs. box-select mode |
 | **Clipboard** | Copy/paste nodes and edges across tabs; paste merges nodes with the same URN and skips duplicate edges (by RelationID or structure) |
 | **Curation** | Right-click any node or edge → Edit Properties → saves directly to Neo4j |
@@ -196,6 +201,8 @@ Colleagues connect at: `http://<server-ip>:3000`
 | Session expired after 12 hours | Log in again; save your work with File → Save Subgraph before long breaks |
 | Node labels unreadable on light nodes | Update to latest app.js — white text halo fix is included |
 | Tooltip blocks node drag | Update to latest app.js — tooltip hides on node grab |
+| Undo skips node moves | Update to latest app.js — node drag now pushes its own undo snapshot |
+| Autocomplete not appearing | Schema is fetched on login; ensure Neo4j connection is configured in Settings |
 
 ---
 
