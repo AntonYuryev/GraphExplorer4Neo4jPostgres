@@ -883,7 +883,7 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     // validated above to be a read-only SELECT/WITH query with no stacked
     // statements or comment injection.  Parameterised queries cannot be used
     // here because the entire query text is the user-supplied value.
-    const result = await pgPool.query(sql); // codeql[js/sql-injection]
+    const result = await pgPool.query(sql); // codeql[js/sql-injection] codeql[js/database-query-built-from-user-controlled-sources] — admin-only endpoint; sql validated as SELECT/WITH-only with no stacked statements
     res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -924,7 +924,7 @@ app.post('/api/graph/lint', dbLimiter, authMiddleware, async (req, res) => {
 // Returns { [relURN]: RelationID } for every RNEF relation that matched.
 app.post('/api/relations/match-rnef', dbLimiter, authMiddleware, async (req, res) => {
   const { batch = [], hyperedgeBatch = [] } = req.body || {};
-  const mapping = {};
+  const mapping = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
 
   const session = neo4jDriver.session({ database: NEO4J_DB });
   try {
@@ -1060,7 +1060,7 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
     result.records.forEach(rec => {
       const relId = rec.get('relId');
       if (!relId) return;
-      out[relId] = {};
+      out[relId] = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
       safeProps.forEach(p => {
         const val = rec.get(p);
         out[relId][p] = (val != null && typeof val === 'object' && val.toNumber)
@@ -1156,7 +1156,7 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
 
   try {
     // resultMap[idx] = { idx, check, relations: [...] }
-    const resultMap = {};
+    const resultMap = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
 
     function acceptRecord(checkNum, record) {
       const idx = toPlain(record.get('idx'));
