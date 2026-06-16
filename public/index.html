@@ -115,6 +115,14 @@
             <div class="menu-item" onclick="findRelationsBetweenGroups('indirect');closeMenus()">Indirect relations</div>
           </div>
         </div>
+        <div class="menu-item has-sub">Connect Selected Nodes
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="connectSelectedNodes('all');closeMenus()">All relations</div>
+            <div class="menu-item" onclick="connectSelectedNodes('direct');closeMenus()">Direct physical interactions</div>
+            <div class="menu-item" onclick="connectSelectedNodes('biomarker');closeMenus()">Biomarker relations</div>
+            <div class="menu-item" onclick="connectSelectedNodes('indirect');closeMenus()">Indirect relations</div>
+          </div>
+        </div>
         <div class="menu-item has-sub">Expand Selected Nodes
           <div class="menu-submenu">
             <div class="menu-item" onclick="expandSelectedNodes('all');closeMenus()">Expand to all neighbors</div>
@@ -484,6 +492,19 @@
     <div style="display:flex;gap:8px;margin-bottom:10px">
       <button class="btn-ghost" style="font-size:11px;padding:3px 10px" onclick="loadPropsSelectAll(true)">Select all</button>
       <button class="btn-ghost" style="font-size:11px;padding:3px 10px" onclick="loadPropsSelectAll(false)">Deselect all</button>
+    </div>
+    <div style="border-bottom:1px solid #e8ecf3;padding-bottom:8px;margin-bottom:8px">
+      <div style="font-size:11px;color:#7a8099;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px">Computed</div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px 16px;">
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap;cursor:pointer">
+          <input type="checkbox" id="load-props-degree">
+          Degree <span style="color:#7a8099;font-size:11px">(total edge count in Neo4j)</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap;cursor:pointer">
+          <input type="checkbox" id="load-props-neighbor-count">
+          Neighbor Count <span style="color:#7a8099;font-size:11px">(distinct nodes directly linked)</span>
+        </label>
+      </div>
     </div>
     <div id="load-props-list" style="overflow-y:auto;flex:1;display:flex;flex-wrap:wrap;gap:4px 16px;align-content:flex-start;min-height:80px">
       <span style="color:#7a8099;font-size:12px">Loading…</span>
