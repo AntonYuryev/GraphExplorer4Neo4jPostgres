@@ -37,6 +37,7 @@ let currentSubgraphName = '';   // name from loaded JSON file
 let contextTarget = null;   // element targeted by right-click
 let curationTarget = null;  // element open in curation modal
 let undoStack = [];          // stack of {graphData, positions} snapshots for undo
+let _dragUndoPushed = false; // guard: push only one undo snapshot per drag gesture
 let redoStack = [];          // stack of {graphData, positions} snapshots for redo
 let focusNodeId = null;      // reference node for alignment operations
 let _loadedPropertyNames = new Set();  // property names loaded via "Load node properties" dialog
@@ -566,10 +567,17 @@ function initCytoscape() {
     tooltipVisible = false;
     document.getElementById('tooltip').style.display = 'none';
     if (_rhNode && evt.target.id() === _rhNode.id()) hideResizeHandles();
-    // Snapshot before drag so each node move is independently undoable
-    pushUndo();
+    // Snapshot before drag so each node move is independently undoable.
+    // Guard with _dragUndoPushed: when multiple nodes are selected and dragged
+    // together, Cytoscape fires 'grab' on every node in the selection — without
+    // the guard this pushes N identical snapshots onto the undo stack.
+    if (!_dragUndoPushed) {
+      _dragUndoPushed = true;
+      pushUndo();
+    }
   });
   cy.on('dragfree', 'node', function(evt) {
+    _dragUndoPushed = false;  // reset so the next drag gets its own snapshot
     currentLayout = 'manual';
     // Re-show handles if this was the focused node
     if (focusNodeId && evt.target.id() === focusNodeId) showResizeHandles(evt.target);
@@ -1195,6 +1203,10 @@ function closeLoadPropsModal(e) {
 function loadPropsSelectAll(checked) {
   document.querySelectorAll('#load-props-list input[type=checkbox]')
     .forEach(function(cb) { cb.checked = checked; });
+  ['load-props-degree', 'load-props-neighbor-count'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.checked = checked;
+  });
 }
 
 async function executeLoadNodeProperties() {
@@ -1203,7 +1215,6 @@ async function executeLoadNodeProperties() {
 
   var selected = Array.from(document.querySelectorAll('#load-props-list input[type=checkbox]:checked'))
     .map(function(cb) { return cb.getAttribute('data-prop'); });
-  if (!selected.length) { status.textContent = 'Select at least one property.'; return; }
 
   if (!cy || !graphData) { status.textContent = 'No pathway loaded.'; return; }
 
@@ -1221,10 +1232,19 @@ async function executeLoadNodeProperties() {
     return;
   }
 
+  var loadDegree        = !!(document.getElementById('load-props-degree') &&
+                              document.getElementById('load-props-degree').checked);
+  var loadNeighborCount = !!(document.getElementById('load-props-neighbor-count') &&
+                              document.getElementById('load-props-neighbor-count').checked);
+
+  if (!selected.length && !loadDegree && !loadNeighborCount) { status.textContent = 'Select at least one property.'; return; }
+
   btn.disabled = true;
   status.textContent = 'Loading…';
   try {
-    var result = await api('/api/nodes/load-properties', { nodeIds: nodeIds, urns: urns, properties: selected });
+    var result = selected.length
+      ? await api('/api/nodes/load-properties', { nodeIds: nodeIds, urns: urns, properties: selected })
+      : { byNodeId: {}, byUrn: {} };
     var byNodeId = result.byNodeId || {};
     var byUrn    = result.byUrn    || {};
 
@@ -1270,6 +1290,41 @@ async function executeLoadNodeProperties() {
         }
       }
     });
+
+    // ── Degree / Neighbor Count ───────────────────────────────────────────────
+    if (loadDegree || loadNeighborCount) {
+      status.textContent = 'Loading graph metrics…';
+      var metricUrns = [];
+      cy.nodes().forEach(function(cyNode) {
+        var urn = cyNode.data('URN');
+        if (urn) metricUrns.push(String(urn));
+      });
+      if (metricUrns.length) {
+        var metricsResult = await api('/api/nodes/connectivity', { urns: metricUrns });
+        cy.nodes().forEach(function(cyNode) {
+          var urn = cyNode.data('URN');
+          if (!urn) return;
+          var metrics = metricsResult[String(urn)] || { degree: 0, neighborCount: 0 };
+          if (loadDegree) {
+            cyNode.data('Degree', metrics.degree);
+            var gNodeD = graphData.nodes.find(function(n) {
+              return n.properties && String(n.properties.URN) === String(urn);
+            });
+            if (gNodeD) gNodeD.properties.Degree = metrics.degree;
+          }
+          if (loadNeighborCount) {
+            cyNode.data('NeighborCount', metrics.neighborCount);
+            var gNodeN = graphData.nodes.find(function(n) {
+              return n.properties && String(n.properties.URN) === String(urn);
+            });
+            if (gNodeN) gNodeN.properties.NeighborCount = metrics.neighborCount;
+          }
+          annotated++;
+        });
+        if (loadDegree)        _loadedPropertyNames.add('Degree');
+        if (loadNeighborCount) _loadedPropertyNames.add('NeighborCount');
+      }
+    }
 
     if (annotated > 0) {
       // Track which property names were loaded so the tooltip can show them first
@@ -5247,6 +5302,137 @@ async function findRelationsBetweenGroups(filterType) {
 }
 
 
+// ─── Connect Selected Nodes ───────────────────────────────────────────────────
+// Finds edges whose BOTH endpoints are among the currently selected nodes
+// (closed-loop / inner-connections query).
+// filterType: 'all' | 'direct' | 'biomarker' | 'indirect'
+async function connectSelectedNodes(filterType) {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selectedNodes.length < 2) {
+    alert('Please select at least two nodes to find connections between them.');
+    return;
+  }
+
+  var selectedURNs = [];
+  var selectedCyIds = new Set();
+  selectedNodes.forEach(function(n) {
+    var urn = n.data('URN') || n.data('urn') || '';
+    if (urn) { selectedURNs.push(urn); selectedCyIds.add(n.id()); }
+  });
+
+  if (selectedURNs.length < 2) {
+    alert('Selected nodes have no URNs — cannot query database.');
+    return;
+  }
+
+  // Build URN → cy node ID map (non-clone preferred)
+  var urnToCyIdsLocal = {};
+  cy.nodes().forEach(function(n) {
+    var urn = n.data('URN');
+    if (!urn) return;
+    (urnToCyIdsLocal[urn] = urnToCyIdsLocal[urn] || []).push(n.id());
+  });
+  var urnToCyId = {};
+  Object.keys(urnToCyIdsLocal).forEach(function(urn) {
+    var ids = urnToCyIdsLocal[urn];
+    for (var i = 0; i < ids.length; i++) {
+      if (!cy.$id(ids[i]).data('isClone')) { urnToCyId[urn] = ids[i]; break; }
+    }
+    if (!urnToCyId[urn]) urnToCyId[urn] = ids[0];
+  });
+
+  // Build URN → graphData node ID map
+  var urnToGdId = {};
+  graphData.nodes.forEach(function(n) {
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+    if (urn && urnToGdId[urn] === undefined) urnToGdId[urn] = n.id;
+  });
+
+  // Collect already-present RelationIDs to avoid duplicates
+  var existingRelIds = new Set();
+  cy.edges().forEach(function(e) {
+    var rid = e.data('relId'); if (rid) existingRelIds.add(String(rid));
+  });
+
+  var filterLabel = { all: 'All', direct: 'Direct physical interactions',
+                      biomarker: 'Biomarker', indirect: 'Indirect' }[filterType] || filterType;
+
+  var resp;
+  try {
+    resp = await api('/api/relations/connect-selected', {
+      selectedURNs: selectedURNs,
+      filterType:   filterType,
+    });
+  } catch (err) {
+    alert('Query failed: ' + err.message);
+    return;
+  }
+
+  var relations = (resp && resp.relations) || [];
+  var newRelations = relations.filter(function(r) {
+    return r.relationID && !existingRelIds.has(String(r.relationID));
+  });
+
+  // Build breakdown by relation type
+  var byType = {};
+  newRelations.forEach(function(r) {
+    byType[r.relType] = (byType[r.relType] || 0) + 1;
+  });
+  var breakdown = Object.keys(byType).sort()
+    .map(function(t) { return '  ' + t + ': ' + byType[t]; }).join('\n');
+
+  var msg = 'Filter: ' + filterLabel + '\n' +
+            'Will add ' + newRelations.length + ' relation(s)' +
+            (newRelations.length > 0 ? ':\n' + breakdown : '.') +
+            '\n\nClick OK to add them to the pathway.';
+
+  if (!confirm(msg)) return;
+  if (newRelations.length === 0) return;
+
+  pushUndo();
+
+  var NONDIRECTIONAL = new Set(['Binding','CellExpression','FunctionalAssociation','Metabolization','Paralog']);
+  var added = 0;
+  newRelations.forEach(function(rel) {
+    var srcCyId = urnToCyId[rel.rURN];
+    var tgtCyId = urnToCyId[rel.tURN];
+    if (!srcCyId || !tgtCyId) return;
+
+    var undirected = NONDIRECTIONAL.has(rel.relType);
+    var numRefs    = typeof rel.numRefs === 'number' ? rel.numRefs : 0;
+    var edgeId     = 'sim-' + rel.relationID;
+
+    var srcGdId = urnToGdId[rel.rURN] !== undefined ? urnToGdId[rel.rURN] : rel.rURN;
+    var tgtGdId = urnToGdId[rel.tURN] !== undefined ? urnToGdId[rel.tURN] : rel.tURN;
+
+    var _connEdge = {
+      id: edgeId, elementId: edgeId, type: rel.relType,
+      startNodeId: srcGdId, endNodeId: tgtGdId,
+      properties: {
+        RelationID: rel.relationID, Effect: rel.effect, Mechanism: rel.mechanism,
+        RelationNumberOfReferences: numRefs, directed: !undirected, sourceType: 'connect-selected'
+      }
+    };
+    graphData.edges.push(_connEdge);
+    cy.add({
+      group: 'edges',
+      classes: undirected ? 'undirected' : '',
+      data: _buildCyEdgeData(_connEdge, srcCyId, tgtCyId)
+    });
+    added++;
+  });
+
+  updateStats();
+  if (document.getElementById('table-view').style.display !== 'none') {
+    if (tableViewMode === 'relation') loadRelationData();
+    else { tableRows = []; loadTableData(); }
+  }
+  if (added === 0) alert('No new edges could be placed (nodes not found in pathway).');
+}
+
+
 async function mergeSimilarRelations() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
   if (matchingInProgress) { alert('Relation matching is still in progress. Please wait for it to finish before merging.'); return; }
@@ -5417,10 +5603,20 @@ async function mergeSimilarRelations() {
     if (px !== py) uf[px] = py;
   }
 
+  // Two edges connect the "same" node pair when:
+  //   - forward direction matches (srcURN===srcURN, tgtURN===tgtURN), OR
+  //   - reverse direction AND at least one of the types is nondirectional
+  //     (e.g. Binding A-B should group with DirectRegulation A→B)
+  function sameNodePair(e1, e2) {
+    if (e1.srcURN === e2.srcURN && e1.tgtURN === e2.tgtURN) return true;
+    var rev = e1.srcURN === e2.tgtURN && e1.tgtURN === e2.srcURN;
+    return rev && (NONDIRECTIONAL_MERGE.has(e1.relType) || NONDIRECTIONAL_MERGE.has(e2.relType));
+  }
+
   for (var i = 0; i < edgeInfos.length; i++) {
     for (var j = i + 1; j < edgeInfos.length; j++) {
       var e1 = edgeInfos[i], e2 = edgeInfos[j];
-      if (e1.pairKey !== e2.pairKey) continue;
+      if (!sameNodePair(e1, e2)) continue;
       var t1 = e1.relType, t2 = e2.relType;
       if (t1 === t2 || (MERGE_EQUIV[t1] && MERGE_EQUIV[t1].has(t2))) {
         ufUnion(e1.id, e2.id);
@@ -5795,10 +5991,10 @@ function _expandCommit() {
   var pending = _expandPending;
   _expandPending = null;
 
+  pushUndo();  // snapshot BEFORE merge so Undo restores pre-expand state
   var result = mergeGraphData(pending);
   console.log('[expand] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
 
-  pushUndoSnapshot('expand');
   updateStats();
 }
 
