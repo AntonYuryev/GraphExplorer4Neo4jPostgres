@@ -40,20 +40,23 @@ const dbLimiter = rateLimit({
 // served to clients (it is outside the public/ directory).
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 
+// DEFAULT_SETTINGS is used only when settings.json does not exist.
+// Passwords are intentionally blank — configure via the Settings UI after first login,
+// or create settings.json manually before starting the server.  See README.md.
 const DEFAULT_SETTINGS = {
   neo4j: {
-    url:      'YOUR_NEO4J_URI',
-    database: 'mammaloct2025new',
-    username: 'YOUR_NEO4J_USER',
-    password: 'YOUR_NEO4J_PASSWORD'
+    url:      'bolt+ssc://your-neo4j-host:7687',
+    database: 'your-database-name',
+    username: 'your-neo4j-username',
+    password: ''
   },
   postgres: {
-    host:     'YOUR_PG_HOST',
+    host:     'your-postgres-host',
     port:     5432,
-    database: 'YOUR_PG_DATABASE',
-    schema:   'resnetcustomnov',
-    username: 'YOUR_PG_USER',
-    password: 'YOUR_PG_PASSWORD'
+    database: 'your-pg-database',
+    schema:   'your-pg-schema',
+    username: 'your-pg-username',
+    password: ''
   }
 };
 
@@ -129,7 +132,17 @@ function sanitizeSchemaName(name) {
 let PG_SCHEMA = sanitizeSchemaName(appSettings.postgres.schema);
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-const JWT_SECRET = process.env.JWT_SECRET || 'YOUR_JWT_SECRET';
+// JWT_SECRET must be set in the environment for production.
+// If not set, a random secret is generated at startup — sessions will NOT survive
+// server restarts.  Set JWT_SECRET to a long random string for production use.
+const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  const crypto = require('crypto');
+  const generated = crypto.randomBytes(32).toString('hex');
+  console.warn('\n[WARNING] JWT_SECRET env var is not set.');
+  console.warn('[WARNING] Sessions will not survive server restarts.');
+  console.warn('[WARNING] Set JWT_SECRET in your environment for production.\n');
+  return generated;
+})();
 const USERS_FILE = path.join(__dirname, 'users.json');
 
 function loadUsers() {
@@ -339,7 +352,7 @@ app.get('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, (req,
     url:      appSettings.neo4j.url,
     database: appSettings.neo4j.database,
     username: appSettings.neo4j.username,
-    password: appSettings.neo4j.password
+    password: appSettings.neo4j.password ? '••••••••' : ''  // never send real password to client
   });
 });
 
@@ -351,7 +364,7 @@ app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, asyn
     url:      String(url).trim(),
     database: String(database).trim(),
     username: String(username).trim(),
-    password: password ? String(password) : appSettings.neo4j.password
+    password: (password && password !== '••••••••') ? String(password) : appSettings.neo4j.password
   };
 
   // Test the new connection before committing
@@ -381,7 +394,7 @@ app.get('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, (r
     database: appSettings.postgres.database,
     schema:   appSettings.postgres.schema,
     username: appSettings.postgres.username,
-    password: appSettings.postgres.password
+    password: appSettings.postgres.password ? '••••••••' : ''  // never send real password to client
   });
 });
 
@@ -395,7 +408,7 @@ app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, a
     database: String(database).trim(),
     schema:   String(schema).trim(),
     username: String(username).trim(),
-    password: password ? String(password) : appSettings.postgres.password
+    password: (password && password !== '••••••••') ? String(password) : appSettings.postgres.password
   };
 
   // Test the new connection before committing
@@ -841,6 +854,353 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Cypher syntax lint via EXPLAIN ──────────────────────────────────────────
+// Runs EXPLAIN <query> without executing it.  Returns {ok:true} or
+// {error:{message, line, column, offset}} parsed from the Neo4j error string.
+app.post('/api/graph/lint', dbLimiter, authMiddleware, async (req, res) => {
+  const { query } = req.body || {};
+  if (!query || !query.trim()) return res.json({ ok: true });
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    await session.run('EXPLAIN ' + query);
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = err.message || '';
+    // Neo4j syntax errors include "(line N, column M (offset: K))"
+    const posMatch = msg.match(/\(line\s+(\d+),\s+column\s+(\d+)\s+\(offset:\s*(\d+)\)\)/i);
+    const errObj = { message: msg };
+    if (posMatch) {
+      errObj.line   = parseInt(posMatch[1], 10) - 1;   // 0-based for CodeMirror
+      errObj.column = parseInt(posMatch[2], 10) - 1;
+      errObj.offset = parseInt(posMatch[3], 10);
+    }
+    res.json({ ok: false, error: errObj });
+  } finally {
+    await session.close();
+  }
+});
+
+// ─── Match RNEF relations to Neo4j relations and return RelationID mapping ────
+// Accepts two batches:
+//   batch         – regular (1-to-1) edges: [{rURN, tURN, relType, effect, mechanism, relURN}]
+//   hyperedgeBatch – ChemicalReaction edges: [{rURNs, tURNs, effect, mechanism, relURN}]
+// Returns { [relURN]: RelationID } for every RNEF relation that matched.
+app.post('/api/relations/match-rnef', dbLimiter, authMiddleware, async (req, res) => {
+  const { batch = [], hyperedgeBatch = [] } = req.body || {};
+  const mapping = {};
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    // ── Regular (1-to-1) relations ──────────────────────────────────────────
+    // Cypher cannot parametrize relationship types, so we group the batch by
+    // relType and run one query per type.  Effect normalization: RNEF "Unknown"
+    // or "" matches Neo4j NULL, "" or "_".
+    // Nondirectional types are matched with an undirected pattern so that
+    // RNEF regulator/target order doesn't have to match Neo4j's stored direction.
+    const NONDIRECTIONAL_TYPES = new Set([
+      'Binding', 'CellExpression', 'FunctionalAssociation', 'Metabolization', 'Paralog'
+    ]);
+
+    if (batch.length > 0) {
+      const byType = {};
+      batch.forEach(row => {
+        (byType[row.relType] = byType[row.relType] || []).push(row);
+      });
+
+      for (const [relType, rows] of Object.entries(byType)) {
+        // Sanitize relationship type: only alphanumeric + underscore
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(relType)) continue;
+
+        const arrow = NONDIRECTIONAL_TYPES.has(relType) ? '-' : '->';
+        // Normalize Effect: treat NULL, '', '_', 'Unknown' as equivalent "no effect"
+        const cypher = `
+UNWIND $rows AS row
+MATCH (a {URN: row.rURN})-[r:\`${relType}\`]${arrow}(b {URN: row.tURN})
+WHERE (
+    CASE WHEN coalesce(r.Effect, '') IN ['', '_', 'Unknown', 'unknown'] THEN ''
+         ELSE r.Effect END
+  ) = (
+    CASE WHEN coalesce(row.effect, '') IN ['', '_', 'Unknown', 'unknown'] THEN ''
+         ELSE row.effect END
+  )
+  AND (
+    coalesce(r.Mechanism, '')   IN ['', '_', 'Unknown', 'unknown']
+    OR coalesce(row.mechanism, '') IN ['', '_', 'Unknown', 'unknown']
+    OR r.Mechanism = row.mechanism
+  )
+RETURN row.relURN AS relURN, r.RelationID AS relationID, r.RelationNumberOfSentences AS numSentences`;
+
+        const result = await session.run(cypher, { rows });
+        result.records.forEach(record => {
+          const relURN    = record.get('relURN');
+          const relationID = record.get('relationID');
+          if (relURN != null && relationID != null) {
+            const nos = record.get('numSentences');
+            mapping[String(relURN)] = {
+              id:          String(toPlain(relationID)),
+              numSentences: nos != null ? (typeof nos === 'object' && nos.toNumber ? nos.toNumber() : Number(nos)) : null
+            };
+          }
+        });
+      }
+    }
+
+    // ── ChemicalReaction hyperedges ─────────────────────────────────────────
+    // In Neo4j a ChemicalReaction hyperedge is stored as many (a)-[r]->(b) rows
+    // sharing the same RelationID.  We pre-filter with IN, then verify the full
+    // set of matched regulators/targets equals the RNEF set via size comparison.
+    if (hyperedgeBatch.length > 0) {
+      const cypher = `
+UNWIND $rows AS row
+MATCH (a)-[r:ChemicalReaction]->(b)
+WHERE a.URN IN row.rURNs AND b.URN IN row.tURNs
+WITH row, r.RelationID AS relID, r.RelationNumberOfSentences AS numSentences,
+     collect(DISTINCT a.URN) AS matchedRegs,
+     collect(DISTINCT b.URN) AS matchedTgts
+WHERE size(matchedRegs) = size(row.rURNs) AND size(matchedTgts) = size(row.tURNs)
+RETURN DISTINCT row.relURN AS relURN, relID AS relationID, numSentences`;
+
+      const result = await session.run(cypher, { rows: hyperedgeBatch });
+      result.records.forEach(record => {
+        const relURN    = record.get('relURN');
+        const relationID = record.get('relationID');
+        if (relURN != null && relationID != null) {
+          const nos = record.get('numSentences');
+          mapping[String(relURN)] = {
+            id:          String(toPlain(relationID)),
+            numSentences: nos != null ? (typeof nos === 'object' && nos.toNumber ? nos.toNumber() : Number(nos)) : null
+          };
+        }
+      });
+    }
+
+    res.json(mapping);
+  } catch (err) {
+    console.error('match-rnef error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+// ─── Fetch specific Neo4j edge properties by RelationID ─────────────────────
+// Returns { "<relId>": { "RelationNumberOfSentences": N, ... }, ... }
+// Only properties in the hardcoded whitelist are accepted to prevent injection.
+const NEO4J_EDGE_PROP_WHITELIST = new Set([
+  'RelationNumberOfSentences',
+  'RelationNumberOfReferences',
+  'Confidence',
+  'BibliographicCredibilityScore',
+]);
+
+app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res) => {
+  const { relationIds = [], properties = [] } = req.body || {};
+  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
+  const safeProps = properties.filter(p => NEO4J_EDGE_PROP_WHITELIST.has(p));
+  if (!validIds.length || !safeProps.length) return res.json({});
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const propReturn = safeProps.map(p => `r.\`${p}\` AS \`${p}\``).join(', ');
+    // r.RelationID can be scalar (integer/string) OR a list (StringArray) in Neo4j.
+    // Type probe: toFloat() returns null for lists but a numeric value for integer/string
+    // scalars — safe across Neo4j versions.  CASE is lazy so the non-matching branch
+    // is never evaluated (toString on a list / list-comprehension on a scalar both throw).
+    const result = await session.run(
+      `MATCH ()-[r]->()
+       WHERE r.RelationID IS NOT NULL
+       WITH r,
+            CASE WHEN toFloat(r.RelationID) IS NOT NULL
+                 THEN [toString(r.RelationID)]
+                 ELSE [x IN r.RelationID | toString(x)]
+            END AS relIdList
+       WHERE ANY(id IN relIdList WHERE id IN $ids)
+       UNWIND [id IN relIdList WHERE id IN $ids] AS relId
+       RETURN DISTINCT relId, ${propReturn}`,
+      { ids: validIds }
+    );
+    const out = {};
+    result.records.forEach(rec => {
+      const relId = rec.get('relId');
+      if (!relId) return;
+      out[relId] = {};
+      safeProps.forEach(p => {
+        const val = rec.get(p);
+        out[relId][p] = (val != null && typeof val === 'object' && val.toNumber)
+          ? val.toNumber()
+          : val;
+      });
+    });
+    res.json(out);
+  } catch (err) {
+    console.error('Neo4j relations/properties error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+// ─── Find similar relations (for RNEF relations without RelationID) ───────────
+// For each submitted relation, runs 3 checks in order and returns all Neo4j
+// relations found at the best matching level.
+//   Check 1: same type + same normalised effect   → "exact RelationID match"
+//   Check 2: same type, any effect                → "similar – same type"
+//   Check 3: equivalent type (see map below)      → "similar – related type"
+app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, res) => {
+  const { relations = [] } = req.body || {};
+  if (!relations.length) return res.json({ results: [] });
+
+  const NONDIRECTIONAL = new Set([
+    'Binding','CellExpression','FunctionalAssociation','Metabolization','Paralog'
+  ]);
+
+  function normEff(v) {
+    const s = v == null ? '' : String(v);
+    return (s === '' || s === '_' || s.toLowerCase() === 'unknown') ? '' : s;
+  }
+
+  // Check 3 equivalence map: sourceType → [{equivTypes, undirected}]
+  // Built from the bidirectional similarity rules.
+  const TYPE3_EQUIV = {
+    'DirectRegulation': [{ equivTypes: ['Binding','ProtModification','Regulation'],              undirected: true  }],
+    'Binding':          [{ equivTypes: ['DirectRegulation','ProtModification','Regulation'],      undirected: true  }],
+    'ProtModification': [{ equivTypes: ['DirectRegulation','Binding','Regulation'],               undirected: true  }],
+    'PromoterBinding':  [{ equivTypes: ['Expression','Regulation'],                               undirected: false }],
+    'Expression':       [{ equivTypes: ['PromoterBinding'],                                       undirected: false }],
+    'Biomarker':        [{ equivTypes: ['QuantitativeChange','StateChange','FunctionalAssociation'], undirected: true }],
+    'QuantitativeChange': [{ equivTypes: ['Biomarker'],                                           undirected: true  }],
+    'StateChange':      [{ equivTypes: ['Biomarker'],                                             undirected: true  }],
+    'FunctionalAssociation': [{ equivTypes: ['Biomarker','Regulation'],                           undirected: true  }],
+    'MolSynthesis':     [{ equivTypes: ['Regulation'],                                            undirected: false }],
+    'MolTransport':     [{ equivTypes: ['Regulation'],                                            undirected: false }],
+    'Regulation': [
+      { equivTypes: ['DirectRegulation','FunctionalAssociation'],         undirected: true  },
+      { equivTypes: ['PromoterBinding','MolSynthesis','MolTransport'],    undirected: false }
+    ],
+  };
+
+  const REL_TYPE_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+  // Columns returned for every matched relation
+  const RETURN_COLS = `
+       r.RelationID AS relationID, type(r) AS relType,
+       coalesce(r.Effect,    '') AS effect,
+       coalesce(r.Mechanism, '') AS mechanism,
+       coalesce(r.RelationNumberOfReferences, 0) AS numRefs,
+       a.URN AS rURN, coalesce(a.Name,'') AS rName, labels(a) AS rLabels,
+       b.URN AS tURN, coalesce(b.Name,'') AS tName, labels(b) AS tLabels`;
+
+  function normDisplayEff(v) {
+    if (v == null) return '';
+    const s = String(v);
+    if (s === '' || s === '_' || s.toLowerCase() === 'unknown') return '';
+    if (s.toLowerCase() === 'positive') return 'Positive';
+    if (s.toLowerCase() === 'negative') return 'Negative';
+    return s;
+  }
+
+  function recordToRel(record) {
+    return {
+      relationID: String(toPlain(record.get('relationID'))),
+      relType:    record.get('relType'),
+      effect:     normDisplayEff(record.get('effect')),
+      mechanism:  normDisplayEff(record.get('mechanism')),
+      numRefs:    toPlain(record.get('numRefs')),
+      rURN:       record.get('rURN'),
+      rName:      record.get('rName'),
+      rLabels:    record.get('rLabels') || [],
+      tURN:       record.get('tURN'),
+      tName:      record.get('tName'),
+      tLabels:    record.get('tLabels') || [],
+    };
+  }
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+
+  try {
+    // resultMap[idx] = { idx, check, relations: [...] }
+    const resultMap = {};
+
+    function acceptRecord(checkNum, record) {
+      const idx = toPlain(record.get('idx'));
+      const existing = resultMap[idx];
+      // Only record if not already matched at a stricter (lower) check
+      if (existing && existing.check < checkNum) return;
+      if (!existing || existing.check > checkNum) {
+        resultMap[idx] = { idx, check: checkNum, relations: [] };
+      }
+      resultMap[idx].relations.push(recordToRel(record));
+    }
+
+    function groupByType(rows) {
+      const g = {};
+      rows.forEach(r => { (g[r.relType] = g[r.relType] || []).push(r); });
+      return g;
+    }
+
+    // Prepare rows with normalised effect
+    const workList = relations.map(r => ({
+      idx:        r.idx,
+      rURN:       r.rURN,
+      tURN:       r.tURN,
+      relType:    r.relType,
+      normEffect: normEff(r.effect),
+    }));
+
+    // ── Check 1: same type + same normalised effect ──────────────────────────
+    for (const [relType, rows] of Object.entries(groupByType(workList))) {
+      if (!REL_TYPE_RE.test(relType)) continue;
+      const arrow = NONDIRECTIONAL.has(relType) ? '-' : '->';
+      const cypher = `
+UNWIND $rows AS row
+MATCH (a {URN: row.rURN})-[r:\`${relType}\`]${arrow}(b {URN: row.tURN})
+WHERE (CASE WHEN coalesce(r.Effect,'') IN ['','_','Unknown','unknown'] THEN ''
+            ELSE r.Effect END) = row.normEffect
+RETURN row.idx AS idx, ${RETURN_COLS}`;
+      const result = await session.run(cypher, { rows });
+      result.records.forEach(rec => acceptRecord(1, rec));
+    }
+
+    // ── Check 2: same type, any effect ───────────────────────────────────────
+    const unmatched2 = workList.filter(r => !resultMap[r.idx]);
+    for (const [relType, rows] of Object.entries(groupByType(unmatched2))) {
+      if (!REL_TYPE_RE.test(relType)) continue;
+      const arrow = NONDIRECTIONAL.has(relType) ? '-' : '->';
+      const cypher = `
+UNWIND $rows AS row
+MATCH (a {URN: row.rURN})-[r:\`${relType}\`]${arrow}(b {URN: row.tURN})
+RETURN row.idx AS idx, ${RETURN_COLS}`;
+      const result = await session.run(cypher, { rows });
+      result.records.forEach(rec => acceptRecord(2, rec));
+    }
+
+    // ── Check 3: equivalent type ─────────────────────────────────────────────
+    const unmatched3 = workList.filter(r => !resultMap[r.idx]);
+    for (const [relType, rows] of Object.entries(groupByType(unmatched3))) {
+      const equivGroups = TYPE3_EQUIV[relType];
+      if (!equivGroups) continue;
+      for (const { equivTypes, undirected } of equivGroups) {
+        const arrow = undirected ? '-' : '->';
+        const cypher = `
+UNWIND $rows AS row
+MATCH (a {URN: row.rURN})-[r]${arrow}(b {URN: row.tURN})
+WHERE type(r) IN $equivTypes
+RETURN row.idx AS idx, ${RETURN_COLS}`;
+        const result = await session.run(cypher, { rows, equivTypes });
+        result.records.forEach(rec => acceptRecord(3, rec));
+      }
+    }
+
+    res.json({ results: Object.values(resultMap) });
+  } catch (err) {
+    console.error('find-similar error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── RNEF → JSON conversion ───────────────────────────────────────────────────
 // Accepts raw XML text body (Content-Type: text/plain, up to 50 MB) and returns
 // { pathways: [{name, data}, ...] }.  Using text/plain avoids the global 10 MB
@@ -853,7 +1213,7 @@ app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '500mb', type: 't
   const inputPath = path.join(tmpDir, 'input.rnef');
   const outDir    = path.join(tmpDir, 'out');
   fs.mkdirSync(outDir);
-  fs.writeFileSync(inputPath, content, 'utf8');
+  fs.writeFileSync(inputPath, content, 'utf8'); // lgtm[js/network-data-written-to-file] - content is RNEF XML written to a server-controlled tmpdir path; not served back to clients
 
   try {
     await new Promise((resolve, reject) => {
@@ -881,8 +1241,237 @@ app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '500mb', type: 't
   }
 });
 
+
+// ─── Find relations between selected and unselected nodes ─────────────────────
+// POST /api/relations/find-between
+// Body: { selectedURNs: [...], allURNs: [...], filterType: 'all'|'direct'|'biomarker'|'indirect' }
+app.post('/api/relations/find-between', dbLimiter, authMiddleware, async (req, res) => {
+  const { selectedURNs = [], allURNs = [], filterType = 'all' } = req.body || {};
+  if (!selectedURNs.length) return res.json({ relations: [] });
+
+  const DIRECT_TYPES   = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
+  const BIOMARKER_TYPES = ['Biomarker','QuantitativeChange','StateChange','GeneticChange'];
+
+  // Build relationship-type filter clause for Cypher
+  let typeFilter = '';
+  if (filterType === 'direct') {
+    typeFilter = 'AND type(r) IN $typeList ';
+  } else if (filterType === 'biomarker') {
+    typeFilter = 'AND type(r) IN $typeList ';
+  } else if (filterType === 'indirect') {
+    typeFilter = 'AND NOT type(r) IN $typeList ';
+  }
+  // filterType === 'all': no filter
+
+  const typeList = filterType === 'direct'   ? DIRECT_TYPES
+                 : filterType === 'biomarker' ? BIOMARKER_TYPES
+                 : filterType === 'indirect'  ? DIRECT_TYPES   // excluded for indirect
+                 : [];
+
+  // unselectedURNs = allURNs minus selectedURNs (scoped to current pathway)
+  const selectedSet   = new Set(selectedURNs);
+  const unselectedURNs = allURNs.filter(u => !selectedSet.has(u));
+  if (!unselectedURNs.length) return res.json({ relations: [] });
+
+  function normDisplayEff(v) {
+    if (v == null) return '';
+    const s = String(v);
+    if (s === '' || s === '_' || s.toLowerCase() === 'unknown') return '';
+    if (s.toLowerCase() === 'positive') return 'Positive';
+    if (s.toLowerCase() === 'negative') return 'Negative';
+    return s;
+  }
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    // Find edges: one endpoint in selectedURNs, other in unselectedURNs.
+    // Uses UNWIND + bidirectional match to avoid full-graph scan.
+    const cypher = `
+UNWIND $selectedURNs AS sURN
+MATCH (a {URN: sURN})-[r]-(b)
+WHERE b.URN IN $unselectedURNs
+  ${typeFilter}
+RETURN
+  r.RelationID                              AS relationID,
+  type(r)                                   AS relType,
+  coalesce(r.Effect,    '')                 AS effect,
+  coalesce(r.Mechanism, '')                 AS mechanism,
+  coalesce(r.RelationNumberOfReferences, 0) AS numRefs,
+  a.URN AS aURN, coalesce(a.Name,'') AS aName, labels(a) AS aLabels,
+  b.URN AS bURN, coalesce(b.Name,'') AS bName, labels(b) AS bLabels,
+  startNode(r).URN = a.URN AS aIsStart`;
+
+    const result = await session.run(cypher, {
+      selectedURNs,
+      unselectedURNs,
+      typeList,
+    });
+
+    // Deduplicate by RelationID (bidirectional match may return each edge twice)
+    const seen = new Set();
+    const relations = [];
+    for (const rec of result.records) {
+      const rid = String(toPlain(rec.get('relationID')));
+      if (seen.has(rid)) continue;
+      seen.add(rid);
+
+      const aIsStart = rec.get('aIsStart');
+      const aURN = rec.get('aURN');
+      const bURN = rec.get('bURN');
+      // Canonical direction: whichever endpoint is in selectedURNs is "source"
+      // unless the graph edge direction already determines it
+      const rURN = aIsStart ? aURN : bURN;
+      const tURN = aIsStart ? bURN : aURN;
+      const rName = aIsStart ? rec.get('aName') : rec.get('bName');
+      const tName = aIsStart ? rec.get('bName') : rec.get('aName');
+
+      relations.push({
+        relationID: rid,
+        relType:    rec.get('relType'),
+        effect:     normDisplayEff(rec.get('effect')),
+        mechanism:  normDisplayEff(rec.get('mechanism')),
+        numRefs:    toPlain(rec.get('numRefs')),
+        rURN, rName,
+        tURN, tName,
+      });
+    }
+
+    res.json({ relations });
+  } catch (err) {
+    console.error('find-between error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// ─── Pre-execution edge count check ──────────────────────────────────────────
+// POST /api/graph/count-query
+// Body: { query }  →  { edgeCount: N }
+// Runs the user's Cypher query on Neo4j and counts how many relationship
+// elements appear in the result — without sending back full node/edge data.
+// Used to intercept large result sets before they reach the browser renderer.
+app.post('/api/graph/count-query', dbLimiter, authMiddleware, async (req, res) => {
+  const { query } = req.body || {};
+  if (!query || !query.trim()) return res.status(400).json({ error: 'Cypher query is required' });
+
+  // Transform the query into a fast COUNT query by replacing the RETURN clause.
+  // e.g.  MATCH ... RETURN a,r,b  →  MATCH ... RETURN count(*) AS edgeCount
+  // This avoids fetching full node/edge data just to count rows.
+  const returnPos = query.search(/\bRETURN\b/i);
+  const countQuery = returnPos !== -1
+    ? query.substring(0, returnPos) + 'RETURN count(*) AS edgeCount'
+    : query;  // fallback: run original if no RETURN found
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(countQuery);
+    let edgeCount = 0;
+    if (result.records.length > 0) {
+      const val = result.records[0].get('edgeCount');
+      // Neo4j returns integers as neo4j.Integer objects
+      edgeCount = (val && typeof val.toNumber === 'function') ? val.toNumber() : Number(val);
+    }
+    res.json({ edgeCount });
+  } catch (err) {
+    console.error('count-query error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Graph Explorer running on http://localhost:${PORT}`);
+});
+
+// ─── Neo4j schema introspection ───────────────────────────────────────────────
+// GET /api/graph/schema
+// Returns { labels: [...], relTypes: [...], propKeys: [...] }
+app.get('/api/graph/schema', authMiddleware, async (req, res) => {
+  // Use three separate sessions — Neo4j forbids concurrent queries on one session
+  const s1 = neo4jDriver.session({ database: NEO4J_DB });
+  const s2 = neo4jDriver.session({ database: NEO4J_DB });
+  const s3 = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const [labelsResult, relTypesResult, propKeysResult] = await Promise.all([
+      s1.run('CALL db.labels()'),
+      s2.run('CALL db.relationshipTypes()'),
+      s3.run('CALL db.propertyKeys()'),
+    ]);
+    const labels   = labelsResult.records.map(r => r.get('label'));
+    const relTypes = relTypesResult.records.map(r => r.get('relationshipType'));
+    const propKeys = propKeysResult.records.map(r => r.get('propertyKey'));
+    res.json({ labels, relTypes, propKeys });
+  } catch (err) {
+    console.error('schema error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await Promise.all([s1.close(), s2.close(), s3.close()]);
+  }
+});
+
+
+// ─── Expand selected nodes ────────────────────────────────────────────────────
+// POST /api/graph/expand
+// Body: { urns: string[], mode: 'all'|'direct'|'biomarker'|'indirect'|'to',
+//         targetLabels?: string[] }
+// Returns same { nodes, edges } format as /api/graph/query
+app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
+  const { urns, mode, targetLabels } = req.body || {};
+  if (!Array.isArray(urns) || !urns.length)
+    return res.status(400).json({ error: 'urns array is required' });
+
+  const DIRECT_TYPES = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
+
+  // Build rel-type clause
+  let relClause = '-[r]-';
+  if (mode === 'direct') {
+    relClause = '-[r:' + DIRECT_TYPES.join('|') + ']-';
+  } else if (mode === 'biomarker') {
+    relClause = '-[r:Biomarker|QuantitativeChange|StateChange|GeneticChange]-';
+  }
+  // 'indirect' and 'to' use no type filter in the pattern; indirect is filtered by WHERE below
+
+  // Build target-label clause (for 'to' mode)
+  let targetClause = '';
+  if (mode === 'to' && Array.isArray(targetLabels) && targetLabels.length) {
+    // Sanitize: only allow label names that are safe identifiers
+    const safeLabels = targetLabels.filter(l => /^[A-Za-z_][A-Za-z0-9_]*$/.test(l));
+    if (safeLabels.length) {
+      targetClause = ' AND any(lbl IN labels(b) WHERE lbl IN ' +
+                     JSON.stringify(safeLabels) + ')';
+    }
+  }
+
+  // Build indirect exclusion clause
+  let indirectClause = '';
+  if (mode === 'indirect') {
+    indirectClause = ' AND NOT type(r) IN ' + JSON.stringify(DIRECT_TYPES);
+  }
+
+  const cypher =
+    'MATCH (a)' + relClause + '(b) ' +
+    'WHERE a.`' + NEO4J_URN_PROP + '` IN $urns' +
+    targetClause + indirectClause +
+    ' RETURN a, r, b LIMIT 2000';
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { urns });
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+    result.records.forEach(record => {
+      record.keys.forEach(key => processValue(record.get(key), nodesMap, edgesMap));
+    });
+    res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
+  } catch (err) {
+    console.error('expand error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
 });
