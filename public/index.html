@@ -107,6 +107,8 @@
         <div class="menu-item" onclick="loadSimilarRelations();closeMenus()">Load similar relations</div>
         <div class="menu-item" onclick="mergeSimilarRelations();closeMenus()">Merge similar relations</div>
         <div class="menu-separator"></div>
+        <div class="menu-item" onclick="findOntologyChildren();closeMenus()">Find ontology children</div>
+        <div class="menu-item" onclick="findOntologyParents();closeMenus()">Find ontology parents</div>
         <div class="menu-item has-sub">Find relations between Selected and Unselected
           <div class="menu-submenu">
             <div class="menu-item" onclick="findRelationsBetweenGroups('all');closeMenus()">All relations</div>
@@ -169,6 +171,13 @@
               <div class="menu-item" onclick="menuApplyLayout('circle');closeMenus()"><span class="menu-check" id="mc-circle"></span>Circular</div>
               <div class="menu-item" onclick="menuApplyLayout('concentric');closeMenus()"><span class="menu-check" id="mc-concentric"></span>Concentric</div>
               <div class="menu-item" onclick="menuApplyLayout('klay');closeMenus()"><span class="menu-check" id="mc-klay"></span>Orthogonal</div>
+            </div>
+          </div>
+          <div class="menu-item has-sub">Rotate
+            <div class="menu-submenu">
+              <div class="menu-item" onclick="rotateGraph(90);closeMenus()">90° Clockwise</div>
+              <div class="menu-item" onclick="rotateGraph(-90);closeMenus()">90° Counter-clockwise</div>
+              <div class="menu-item" onclick="rotateGraph(180);closeMenus()">180°</div>
             </div>
           </div>
           <div class="menu-separator"></div>
@@ -330,13 +339,41 @@
 
 <!-- Large query intercept modal -->
 <div id="large-query-modal" class="modal-backdrop" style="display:none">
-  <div class="modal-box" style="max-width:460px">
+  <div class="modal-box" style="max-width:480px">
     <h3>Query Result Too Large</h3>
     <p id="large-query-msg" style="margin:10px 0 18px;font-size:13px;color:#c0c4d8;line-height:1.5"></p>
+    <div style="display:flex;gap:12px;margin-bottom:16px">
+      <div style="flex:1">
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Data Scope</label>
+        <select id="lq-scope-sel" style="width:100%;padding:6px 8px;background:#1e2235;color:#c0c4d8;border:1px solid #3a3f55;border-radius:4px;font-size:13px">
+          <option value="references">References</option>
+          <option value="relations">Relations</option>
+        </select>
+      </div>
+      <div style="flex:1">
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Format</label>
+        <select id="lq-format-sel" style="width:100%;padding:6px 8px;background:#1e2235;color:#c0c4d8;border:1px solid #3a3f55;border-radius:4px;font-size:13px">
+          <option value="excel">Excel</option>
+          <option value="csv">CSV</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-actions" style="gap:8px">
+      <button onclick="largeQueryExport()" style="flex:1;padding:7px 12px;background:#3a6fad;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">Export</button>
+      <button onclick="closeLargeQueryModal()" style="min-width:80px;padding:7px 12px;background:transparent;color:#7a8099;border:1px solid #3a3f55;border-radius:5px;cursor:pointer;font-size:13px">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Large export warning modal (Excel export exceeds 20 000 rows) -->
+<div id="large-export-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-box" style="max-width:500px">
+    <h3>Large Export Warning</h3>
+    <p id="large-export-msg" style="margin:10px 0 18px;font-size:13px;color:#c0c4d8;line-height:1.5"></p>
     <div class="modal-actions" style="gap:8px;flex-wrap:wrap">
-      <button onclick="largeQueryExport('references')" style="flex:1;min-width:130px;padding:7px 12px;background:#3a6fad;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">Export References</button>
-      <button onclick="largeQueryExport('relations')"  style="flex:1;min-width:130px;padding:7px 12px;background:#3a6fad;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">Export Relations</button>
-      <button onclick="closeLargeQueryModal()"         style="flex:1;min-width:80px;padding:7px 12px;background:transparent;color:#7a8099;border:1px solid #3a3f55;border-radius:5px;cursor:pointer;font-size:13px">Cancel</button>
+      <button onclick="confirmLargeExportSplit()" style="flex:1;min-width:180px;padding:7px 12px;background:#3a6fad;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">Split into Excel Files</button>
+      <button onclick="confirmLargeExportCSV()"   style="flex:1;min-width:140px;padding:7px 12px;background:#2e7d5a;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">Convert to CSV</button>
+      <button onclick="closeLargeExportModal()"   style="min-width:80px;padding:7px 12px;background:transparent;color:#7a8099;border:1px solid #3a3f55;border-radius:5px;cursor:pointer;font-size:13px">Cancel</button>
     </div>
   </div>
 </div>
