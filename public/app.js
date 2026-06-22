@@ -2097,19 +2097,53 @@ function zoomFit() {
   updateZoomLabel();
 }
 
+// ─── Rotate graph ─────────────────────────────────────────────────────────────
+// Rotates all node positions by `degrees` (positive = clockwise) around the
+// bounding-box centroid.  Saves an undo snapshot before moving anything.
+function rotateGraph(degrees) {
+  if (!cy) return;
+  var nodes = cy.nodes().not('[?isClone]');
+  if (nodes.length === 0) return;
+
+  pushUndo();
+
+  var rad = degrees * Math.PI / 180;
+  var cosA = Math.cos(rad);
+  var sinA = Math.sin(rad);
+
+  // Centroid of all node positions
+  var cx = 0, cy_ = 0;
+  nodes.forEach(function(n) { var p = n.position(); cx += p.x; cy_ += p.y; });
+  cx /= nodes.length;
+  cy_ /= nodes.length;
+
+  // Rotate each node around the centroid
+  cy.startBatch();
+  nodes.forEach(function(n) {
+    var p  = n.position();
+    var dx = p.x - cx;
+    var dy = p.y - cy_;
+    n.position({ x: cx + dx * cosA - dy * sinA,
+                 y: cy_ + dx * sinA + dy * cosA });
+  });
+  cy.endBatch();
+}
+
 // ─── Run query ────────────────────────────────────────────────────────────────
 // ─── In-memory large-query exports (FR-2 / FR-3 / FR-4) ─────────────────────
 // Shared Excel writer — accepts pre-built rows + isRelMode flag + filename.
 // Mirrors exportTableExcel() but operates on caller-supplied rows so it can be
 // used without touching tableRows / relationRows global state.
-async // Build an ExcelJS buffer from rows without triggering a download.
-// Separated so callers can build multiple buffers in parallel then download in order.
+// Build an ExcelJS buffer from rows without triggering a download.
+// Separated so callers can build multiple buffers sequentially then download in order.
 async function buildExcelBuffer(rows, isRelMode, plainText) {
-  var visCols = columnDefs.filter(function(c) {
-    if (!c.visible) return false;
+  function _matchSource(c) {
     if (isRelMode) return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
     return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
-  });
+  }
+  var visCols = columnDefs.filter(function(c) { return c.visible && _matchSource(c); });
+  // Fallback: if all matching columns are hidden, include them all (prevents empty export)
+  if (visCols.length === 0) visCols = columnDefs.filter(_matchSource);
 
   var wb    = new ExcelJS.Workbook();
   var sheet = wb.addWorksheet('Graph Data');
@@ -2182,10 +2216,18 @@ async function buildExcelBuffer(rows, isRelMode, plainText) {
 }
 
 function downloadBuffer(buffer, filename) {
-  var blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  var mimeType = /\.zip$/i.test(filename) ? 'application/zip'
+               : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  var blob = new Blob([buffer], { type: mimeType });
   var url  = URL.createObjectURL(blob);
-  var a    = document.createElement('a'); a.href = url; a.download = filename; a.click();
-  URL.revokeObjectURL(url);
+  var a    = document.createElement('a');
+  a.style.display = 'none'; a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoke after a generous delay — revoking synchronously can abort large downloads
+  // before the browser has finished reading the Blob.
+  setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
 }
 
 async function writeRowsToExcel(rows, isRelMode, filename, plainText) {
@@ -2196,6 +2238,380 @@ async function writeRowsToExcel(rows, isRelMode, filename, plainText) {
     var buffer = await buildExcelBuffer(rows, isRelMode, plainText);
     downloadBuffer(buffer, filename);
   } catch (err) { alert('Excel export failed: ' + err.message); }
+}
+
+// ─── CSV export engine ────────────────────────────────────────────────────────
+// Max rows per CSV file before splitting into a zip archive.
+var MAX_CSV_ROWS = 1000000;
+
+// Builds one comma-separated line from a row object (RFC 4180).
+// Values containing commas, newlines, or double-quotes are wrapped in double-quotes
+// with inner double-quotes escaped by doubling them.
+// Sentence (msrc) values are kept exactly as they exist in PostgreSQL — the
+// ID{…} markup is NOT stripped, per spec.
+function buildCsvLine(row, visCols) {
+  return visCols.map(function(col) {
+    var val = row[col.key];
+    var s   = val != null ? String(val) : '';
+    // Always quote every field so Excel treats all values as strings (no
+    // auto-conversion of IDs, years, or numeric-looking text to numbers).
+    return '"' + s.replace(/"/g, '""') + '"';
+  }).join(',');
+}
+
+// Triggers a plain-text download of a string.
+function downloadTextFile(text, filename) {
+  var blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+  var url  = URL.createObjectURL(blob);
+  var a    = document.createElement('a');
+  a.style.display = 'none'; a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
+}
+
+// Writes an array of row objects as comma-separated CSV (RFC 4180).
+// Splits into multiple files at maxRows (default MAX_CSV_ROWS) and zips them
+// using the JSZip library that is already loaded on the page.
+async function writeRowsToCSV(rows, isRelMode, baseName, maxRows) {
+  maxRows = maxRows || MAX_CSV_ROWS;
+
+  function _csvMatchSource(c) {
+    if (isRelMode) return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    return c.source === 'graph' || c.source === 'reference' ||
+           c.source === 'scopus_data' || c.source === 'node_prop';
+  }
+  var visCols = columnDefs.filter(function(c) { return c.visible && _csvMatchSource(c); });
+  // Fallback: if all matching columns are hidden, include them all (prevents silent empty export)
+  if (visCols.length === 0) visCols = columnDefs.filter(_csvMatchSource);
+
+  var headerLine = visCols.map(function(c) { return '"' + c.label.replace(/"/g, '""') + '"'; }).join(',');
+  var _parts = Math.max(1, Math.ceil(rows.length / maxRows));
+
+  if (_parts === 1) {
+    setProgressMsg('⏳ Building CSV… (' + rows.length.toLocaleString() + ' rows)');
+    await yieldToUI();
+    var lines = [headerLine];
+    rows.forEach(function(row) { lines.push(buildCsvLine(row, visCols)); });
+    downloadTextFile(lines.join('\n'), baseName + '.csv');
+
+  } else {
+    if (typeof JSZip === 'undefined') {
+      alert('JSZip library not loaded. Cannot create multi-file archive.');
+      setProgressMsg(null); return;
+    }
+    var zip = new JSZip();
+    for (var _pi = 0; _pi < _parts; _pi++) {
+      setProgressMsg('⏳ Building CSV part ' + (_pi + 1) + ' of ' + _parts + '…');
+      await yieldToUI();
+      var _slice = rows.slice(_pi * maxRows, (_pi + 1) * maxRows);
+      var lines  = [headerLine];
+      _slice.forEach(function(row) { lines.push(buildCsvLine(row, visCols)); });
+      zip.file(baseName + '-part' + (_pi + 1) + '.csv', lines.join('\n'));
+    }
+    setProgressMsg('⏳ Compressing ' + _parts + ' CSV files…');
+    await yieldToUI();
+    var _zipBuf = await zip.generateAsync({
+      type: 'arraybuffer', compression: 'DEFLATE', compressionOptions: { level: 1 }
+    });
+    var blob = new Blob([_zipBuf], { type: 'application/zip' });
+    var url  = URL.createObjectURL(blob);
+    var a    = document.createElement('a'); a.href = url; a.download = baseName + '.zip'; a.click();
+    URL.revokeObjectURL(url);
+  }
+  setProgressMsg(null);
+}
+
+// ─── CSV export — References mode ─────────────────────────────────────────────
+// Uses /api/export/csv-query (Neo4j fetchSize 50 000) and 10 parallel PG workers.
+// Processes edges in batches of EDGE_BATCH to keep browser memory bounded:
+// refs are fetched and converted to CSV lines per-batch, then discarded.
+// Splits output at MAX_CSV_ROWS rows per file; downloads a zip when > 1 file.
+async function exportQueryCSVReferences(query) {
+  setProgressMsg('⏳ Fetching relations from database…');
+  var qData;
+  try { qData = await api('/api/export/csv-query', { query }); }
+  catch (err) { setProgressMsg(null); alert('Query error: ' + err.message); return; }
+
+  var qNodes = qData.nodes || [];
+  var qEdges = qData.edges || [];
+
+  var nodeById = {};
+  qNodes.forEach(function(n) {
+    nodeById[n.id] = n;
+    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+  });
+
+  // MedScan IDs
+  var medScan = {};
+  var nodeIds = qNodes
+    .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
+    .filter(Boolean);
+  if (nodeIds.length > 0) {
+    try { Object.assign(medScan, await api('/api/nodes/medscan', { nodeIds })); }
+    catch(e) { console.warn('MedScan lookup failed:', e.message); }
+  }
+
+  function nodeLabel(node)   { return node ? getNodeLabel(node) : '?'; }
+  function nodeMedScan(node) {
+    if (!node || !node.properties) return '';
+    var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
+    return (nid && medScan[nid]) ? medScan[nid] : '';
+  }
+
+  // Column definitions — same filter as writeRowsToCSV(isRelMode=false)
+  function _refMatchSource(c) {
+    return c.source === 'graph' || c.source === 'reference' ||
+           c.source === 'scopus_data' || c.source === 'node_prop';
+  }
+  var visCols = columnDefs.filter(function(c) { return c.visible && _refMatchSource(c); });
+  if (visCols.length === 0) visCols = columnDefs.filter(_refMatchSource);
+  var scopusCols = columnDefs.filter(function(c) { return c.source === 'scopus_data' && c.visible; })
+                             .map(function(c) { return c.dbField; });
+  var headerLine = visCols.map(function(c) { return '"' + c.label.replace(/"/g, '""') + '"'; }).join(',');
+
+  // Streaming CSV accumulation — bounded memory via edge batching
+  var EDGE_BATCH  = 5000;   // edges processed per round
+  var REF_CHUNK   = 200;    // relIds per PostgreSQL batch request
+  var CONCURRENCY = 10;     // parallel PG workers per edge batch
+
+  // fileSegments holds one complete CSV string per output file.
+  // Flushed at MAX_CSV_ROWS rows so no single file exceeds Excel's row limit.
+  var fileSegments = [];
+  var currentLines = [headerLine];
+  var currentCount = 0;
+  var totalRows    = 0;
+  var _startTime   = Date.now();
+
+  function flushSegment() {
+    fileSegments.push(currentLines.join('\n'));
+    currentLines = [headerLine];
+    currentCount = 0;
+  }
+
+  function buildRefRow(base, ref) {
+    var row = Object.assign({}, base);
+    if (ref) {
+      Object.keys(ref).forEach(function(k) {
+        row[k.startsWith('sd_') ? k : ('_ref_' + k)] = ref[k];
+      });
+      columnDefs.forEach(function(col) {
+        if (col.source === 'reference') {
+          if      (col.key === 'year')     row.year     = getRefYear(ref);
+          else if (col.key === 'sentence') row.sentence = ref.msrc || '';
+          else                             row[col.key] = ref[col.dbField] != null ? String(ref[col.dbField]) : '';
+        } else if (col.source === 'scopus_data') {
+          row[col.key] = ref['sd_' + col.dbField] != null ? String(ref['sd_' + col.dbField]) : '';
+        }
+      });
+    } else {
+      columnDefs.forEach(function(col) {
+        if (col.source === 'reference' || col.source === 'scopus_data') row[col.key] = '';
+      });
+    }
+    return row;
+  }
+
+  // Main loop: one edge batch at a time
+  for (var batchStart = 0; batchStart < qEdges.length; batchStart += EDGE_BATCH) {
+    var batchEdges = qEdges.slice(batchStart, batchStart + EDGE_BATCH);
+    var doneEdges  = Math.min(batchStart + EDGE_BATCH, qEdges.length);
+    var _elapsed   = (Date.now() - _startTime) / 1000;
+    var _eta       = batchStart > 0 ? formatEta(_elapsed / doneEdges * (qEdges.length - doneEdges)) : '';
+
+    // Collect relIds for this batch only
+    var batchRelIds = [];
+    batchEdges.forEach(function(e) {
+      if (Array.isArray(e.properties.RelationIDs))
+        e.properties.RelationIDs.forEach(function(id) { if (id != null) batchRelIds.push(String(id)); });
+      else if (e.properties.RelationID != null)
+        batchRelIds.push(String(e.properties.RelationID));
+    });
+
+    setProgressMsg('⏳ Fetching references… (' + (batchStart + 1).toLocaleString() + '–' + doneEdges.toLocaleString() +
+                   ' / ' + qEdges.length.toLocaleString() + ' relations' + (_eta ? '  ·  ~' + _eta + ' left' : '') + ')');
+    await yieldToUI();
+
+    // Fetch refs for this batch — 10 parallel PG workers
+    var refsGrouped = {};
+    if (batchRelIds.length > 0) {
+      var batchChunks = [];
+      for (var _ci = 0; _ci < batchRelIds.length; _ci += REF_CHUNK)
+        batchChunks.push(batchRelIds.slice(_ci, _ci + REF_CHUNK));
+
+      var _qIdx = 0;
+      var _batchWorker = async function() {
+        while (_qIdx < batchChunks.length) {
+          var _i = _qIdx++;
+          try {
+            var _part = await api('/api/references/batch', { relationIds: batchChunks[_i], scopusColumns: scopusCols });
+            Object.assign(refsGrouped, _part);
+          } catch(e) {
+            if (scopusCols.length > 0) {
+              try {
+                var _p2 = await api('/api/references/batch', { relationIds: batchChunks[_i], scopusColumns: [] });
+                Object.assign(refsGrouped, _p2);
+              } catch(e2) {}
+            }
+          }
+        }
+      };
+      var _workers = [];
+      for (var _w = 0; _w < Math.min(CONCURRENCY, batchChunks.length); _w++) _workers.push(_batchWorker());
+      await Promise.all(_workers);
+    }
+
+    // Convert this batch's edges directly to CSV lines — no intermediate rows array
+    batchEdges.forEach(function(edge) {
+      var srcNode   = nodeById[edge.startNodeId];
+      var tgtNode   = nodeById[edge.endNodeId];
+      var relId     = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+      var relIdsArr = Array.isArray(edge.properties.RelationIDs)
+                    ? edge.properties.RelationIDs : (relId ? [relId] : []);
+
+      var refs = [];
+      for (var ri = 0; ri < relIdsArr.length; ri++) {
+        var _r = refsGrouped[String(relIdsArr[ri])];
+        if (_r && _r.length) { refs = _r; break; }
+      }
+
+      var base = {
+        edgeId: edge.id, elementId: edge.elementId || edge.id,
+        relId:         relIdsArr.join(', ') || relId,
+        regulator:     nodeLabel(srcNode),    regulatorMedScan: nodeMedScan(srcNode),
+        regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+        target:        nodeLabel(tgtNode),    targetMedScan:    nodeMedScan(tgtNode),
+        targetType:    (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+        relationType:  edge.type,
+        effect:        normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
+        numRefs:       edge.properties.RelationNumberOfReferences  || 0,
+        numSentences:  edge.properties.RelationNumberOfSentences   || 0,
+      };
+
+      function writeEdge(ref) {
+        currentLines.push(buildCsvLine(buildRefRow(base, ref), visCols));
+        currentCount++;
+        totalRows++;
+        if (currentCount >= MAX_CSV_ROWS) flushSegment();
+      }
+
+      if (refs.length === 0) writeEdge(null);
+      else refs.forEach(function(ref) { writeEdge(ref); });
+    });
+
+    // Discard this batch's refs — frees memory before next batch
+    refsGrouped = null;
+  }
+
+  // Flush any remaining lines into the last file segment
+  if (currentLines.length > 1 || fileSegments.length === 0) flushSegment();
+
+  setProgressMsg('⏳ Generating download… (' + totalRows.toLocaleString() + ' rows' +
+                 (fileSegments.length > 1 ? ', ' + fileSegments.length + ' files' : '') + ')');
+  await yieldToUI();
+
+  if (fileSegments.length === 1) {
+    // Single file — download directly as CSV, no zip overhead
+    downloadTextFile(fileSegments[0], 'query-references.csv');
+  } else {
+    // Multiple files — zip them
+    if (typeof JSZip === 'undefined') {
+      alert('JSZip library not loaded. Cannot create multi-file archive.');
+      setProgressMsg(null);
+      return;
+    }
+    var zip = new JSZip();
+    fileSegments.forEach(function(seg, idx) {
+      zip.file('query-references-part' + (idx + 1) + '.csv', seg);
+    });
+    setProgressMsg('⏳ Compressing ' + fileSegments.length + ' files…');
+    await yieldToUI();
+    var zipBuf = await zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE', compressionOptions: { level: 1 } });
+    downloadBuffer(zipBuf, 'query-references.zip');
+  }
+
+  setProgressMsg(null);
+}
+
+// ─── CSV export — Relations mode ──────────────────────────────────────────────
+// Uses /api/export/csv-query (Neo4j fetchSize 50 000). No PG calls needed —
+// all relation data comes directly from Neo4j edge properties.
+async function exportQueryCSVRelations(query) {
+  setProgressMsg('⏳ Fetching relations from database…');
+  var qData;
+  try { qData = await api('/api/export/csv-query', { query }); }
+  catch (err) { setProgressMsg(null); alert('Query error: ' + err.message); return; }
+
+  var qNodes = qData.nodes || [];
+  var qEdges = qData.edges || [];
+
+  var nodeById = {};
+  qNodes.forEach(function(n) {
+    nodeById[n.id] = n;
+    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+  });
+
+  var medScan = {};
+  var nodeIds = qNodes
+    .map(function(n) { return n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null; })
+    .filter(Boolean);
+  if (nodeIds.length > 0) {
+    try { Object.assign(medScan, await api('/api/nodes/medscan', { nodeIds })); }
+    catch(e) { console.warn('MedScan lookup failed:', e.message); }
+  }
+
+  function nodeLabel(node)   { return node ? getNodeLabel(node) : '?'; }
+  function nodeMedScan(node) {
+    if (!node || !node.properties) return '';
+    var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
+    return (nid && medScan[nid]) ? medScan[nid] : '';
+  }
+
+  // Ensure NEO4J_PROP_DEFS columns are registered (mirrors exportQueryRelations)
+  var existingNeo4j = {};
+  columnDefs.forEach(function(c) { if (c.source === 'neo4j') existingNeo4j[c.dbField] = c; });
+  NEO4J_PROP_DEFS.forEach(function(def) {
+    if (!existingNeo4j[def.prop]) {
+      var nc = { key: 'neo4j_' + def.prop, label: def.label, visible: false, source: 'neo4j', dbField: def.prop };
+      columnDefs.push(nc); existingNeo4j[def.prop] = nc;
+    }
+  });
+
+  setProgressMsg('⏳ Building rows…');
+  await yieldToUI();
+
+  var rows = qEdges.map(function(edge) {
+    var srcNode   = nodeById[edge.startNodeId];
+    var tgtNode   = nodeById[edge.endNodeId];
+    var relId     = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relIdsArr = Array.isArray(edge.properties.RelationIDs)
+                  ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var row = {
+      edgeId: edge.id, elementId: edge.elementId || edge.id,
+      relId:         relIdsArr.length > 1 ? relIdsArr.join(', ') : relId,
+      regulator:     nodeLabel(srcNode),    regulatorMedScan: nodeMedScan(srcNode),
+      regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      target:        nodeLabel(tgtNode),    targetMedScan:    nodeMedScan(tgtNode),
+      targetType:    (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      relationType:  edge.type,
+      effect:        normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
+      numRefs:       edge.properties.RelationNumberOfReferences  || 0,
+      numSentences:  edge.properties.RelationNumberOfSentences   || '',
+    };
+    columnDefs.forEach(function(col) {
+      if (col.source === 'neo4j') {
+        row[col.key] = edge.properties[col.dbField] != null ? String(edge.properties[col.dbField]) : '';
+      } else if (col.source === 'node_prop') {
+        var npNode = col.nodeRole === 'tgt' ? tgtNode : srcNode;
+        row[col.key] = (npNode && npNode.properties && npNode.properties[col.dbField] != null)
+                     ? String(npNode.properties[col.dbField]) : '';
+      }
+    });
+    return row;
+  });
+
+  await writeRowsToCSV(rows, true, 'query-relations');
 }
 
 // Shared: run query in-memory and build node/edge lookup + MedScan map.
@@ -2248,7 +2664,7 @@ async function exportQueryReferences(query) {
 
   var refsGrouped = {};
   if (relIds.length > 0) {
-    var scopusCols = columnDefs.filter(function(c) { return c.source === 'scopus_data'; }).map(function(c) { return c.dbField; });
+    var scopusCols = columnDefs.filter(function(c) { return c.source === 'scopus_data' && c.visible; }).map(function(c) { return c.dbField; });
     var CHUNK       = 200;
     var CONCURRENCY = 4;   // parallel requests in flight at once
 
@@ -2355,16 +2771,27 @@ async function exportQueryReferences(query) {
     else refs.forEach(function(ref) { rows.push(buildRow(ref)); });
   });
 
-  var MAX_ROWS   = 20000;
-  var _parts     = Math.ceil(rows.length / MAX_ROWS);
+  if (rows.length === 0) {
+    alert('No data to export — the query returned no edges or references.');
+    setProgressMsg(null); return;
+  }
+
+  var EXCEL_MAX  = 20000;
+  var _parts     = Math.max(1, Math.ceil(rows.length / EXCEL_MAX));
   var _plain     = _parts > 1;
+
+  // Entry Point 2: intercept if result exceeds 20 000 rows
   if (_parts > 1) {
     setProgressMsg(null);
-    var _proceed = confirm('Number of exported rows exceeded ' + MAX_ROWS.toLocaleString() + ' limit ' +
-                           '(' + rows.length.toLocaleString() + ' rows). ' +
-                           'Sentence coloring is disabled. The export will be split into ' + _parts + ' files.\n\n' +
-                           'Click OK to continue or Cancel to abort.');
-    if (!_proceed) return;
+    var _choice = await showLargeExportModal(_parts, rows.length);
+    if (!_choice) return;  // Cancel
+
+    if (_choice === 'csv') {
+      // Path B: write all rows as tab-delimited CSV (no markup strip)
+      await writeRowsToCSV(rows, false, 'query-references');
+      return;
+    }
+    // Path A: fall through to split-Excel logic below
   }
 
   if (typeof ExcelJS === 'undefined') {
@@ -2372,61 +2799,63 @@ async function exportQueryReferences(query) {
     setProgressMsg(null); return;
   }
 
-  // Build all buffers in parallel (concurrency 3), download in order as they finish.
-  var GEN_CONCURRENCY = 3;
-  var _slices = [];
+  // Build Excel files one at a time (sequential) and add directly to the zip.
+  // This avoids holding multiple large Excel buffers in memory simultaneously,
+  // which caused silent failures for exports > ~60 k rows on most browsers.
+  var _note  = _plain ? ' · plain text' : '';
   var _fnames = [];
-  for (var _pi = 0; _pi < _parts; _pi++) {
-    _slices.push(rows.slice(_pi * MAX_ROWS, (_pi + 1) * MAX_ROWS));
-    _fnames.push('query-references-part' + (_pi + 1) + '.xlsx');
-  }
+  for (var _fi = 0; _fi < _parts; _fi++)
+    _fnames.push('query-references-part' + (_fi + 1) + '.xlsx');
 
-  var _buffers  = new Array(_parts);
-  var _genDone  = 0;
-  var _genIdx   = 0;
-  var _genStart = Date.now();
-  var _note     = _plain ? ' · plain text' : '';
-
-  function _updateGenProgress() {
-    var _elapsed = (Date.now() - _genStart) / 1000;
-    var _eta     = (_genDone > 1) ? formatEta(_elapsed / _genDone * (_parts - _genDone)) : '';
-    setProgressMsg('⏳ Building Excel parts… (' + _genDone + ' / ' + _parts + _note +
-                   (_eta ? '  ·  ~' + _eta + ' left' : '') + ')');
-  }
-
-  // Worker: pulls from queue, builds buffer, stores at index
-  async function _genWorker() {
-    while (_genIdx < _parts) {
-      var _i       = _genIdx++;
-      _buffers[_i] = await buildExcelBuffer(_slices[_i], false, _plain);
-      _slices[_i]  = null;   // free row data immediately
-      _genDone++;
-      _updateGenProgress();
-    }
-  }
-
-  // Generate all parts in parallel
-  var _workers = [];
-  for (var _w = 0; _w < Math.min(GEN_CONCURRENCY, _parts); _w++) _workers.push(_genWorker());
-  await Promise.all(_workers);
-
-  // Bundle into one ZIP and download — single browser confirmation
   if (_parts === 1) {
-    setProgressMsg('⏳ Downloading…');
+    // Single file — no zip needed.
+    setProgressMsg('⏳ Building Excel… (' + rows.length + ' rows' + _note + ')');
     await yieldToUI();
-    downloadBuffer(_buffers[0], 'query-references.xlsx');
+    try {
+      var _buf = await buildExcelBuffer(rows.slice(0, EXCEL_MAX), false, _plain);
+      setProgressMsg('⏳ Downloading…');
+      await yieldToUI();
+      downloadBuffer(_buf, 'query-references.xlsx');
+    } catch(e) {
+      console.error('[Export] buildExcelBuffer failed:', e);
+      setProgressMsg(null);
+      alert('Excel export failed: ' + e.message + '\n\nTry CSV format — it uses much less memory.');
+      return;
+    }
   } else {
+    var _zip = new JSZip();
+    var _genStart = Date.now();
+    for (var _pi = 0; _pi < _parts; _pi++) {
+      var _elapsed = (Date.now() - _genStart) / 1000;
+      var _eta     = (_pi > 0) ? formatEta(_elapsed / _pi * (_parts - _pi)) : '';
+      setProgressMsg('⏳ Building Excel ' + (_pi + 1) + ' / ' + _parts + _note +
+                     (_eta ? '  ·  ~' + _eta + ' left' : '') + '…');
+      await yieldToUI();
+      try {
+        var _slice = rows.slice(_pi * EXCEL_MAX, (_pi + 1) * EXCEL_MAX);
+        var _buf   = await buildExcelBuffer(_slice, false, _plain);
+        _zip.file(_fnames[_pi], _buf);
+      } catch(e) {
+        console.error('[Export] buildExcelBuffer failed for part', _pi + 1, ':', e);
+        setProgressMsg(null);
+        alert('Excel export failed at part ' + (_pi + 1) + ' of ' + _parts + ': ' + e.message +
+              '\n\nTip: "Convert to CSV" uses much less memory for large exports.');
+        return;
+      }
+    }
     setProgressMsg('⏳ Zipping ' + _parts + ' files…');
     await yieldToUI();
-    var _zip = new JSZip();
-    for (var _zi = 0; _zi < _parts; _zi++) {
-      _zip.file(_fnames[_zi], _buffers[_zi]);
-      _buffers[_zi] = null;   // free memory as we go
+    try {
+      var _zipBuf = await _zip.generateAsync({ type: 'arraybuffer',
+                                               compression: 'DEFLATE',
+                                               compressionOptions: { level: 1 } });
+      downloadBuffer(_zipBuf, 'query-references.zip');
+    } catch(e) {
+      console.error('[Export] zip.generateAsync failed:', e);
+      setProgressMsg(null);
+      alert('Zip generation failed: ' + e.message + '\n\nTry CSV format instead.');
+      return;
     }
-    var _zipBuf = await _zip.generateAsync({ type: 'arraybuffer',
-                                             compression: 'DEFLATE',
-                                             compressionOptions: { level: 1 } });
-    downloadBuffer(_zipBuf, 'query-references.zip');
   }
   setProgressMsg(null);
 }
@@ -2484,18 +2913,78 @@ async function exportQueryRelations(query) {
     return row;
   });
 
-  var MAX_ROWS = 100000;
-  var _parts = Math.ceil(rows.length / MAX_ROWS);
-  for (var _pi = 0; _pi < _parts; _pi++) {
-    var _slice = rows.slice(_pi * MAX_ROWS, (_pi + 1) * MAX_ROWS);
-    var _label = _parts > 1 ? ' (part ' + (_pi + 1) + ' of ' + _parts + ')' : '';
-    setProgressMsg('⏳ Formatting Excel' + _label + '… (' + _slice.length + ' rows)');
-    await yieldToUI();
-    var _fname = _parts > 1 ? 'query-relations-part' + (_pi + 1) + '.xlsx' : 'query-relations.xlsx';
-    var _plain = _parts > 1;
-    await writeRowsToExcel(_slice, true, _fname, _plain);
-    if (_pi < _parts - 1) await new Promise(function(r) {{ setTimeout(r, 800); }});
+  if (rows.length === 0) {
+    alert('No data to export — the query returned no edges.');
+    setProgressMsg(null); return;
   }
+
+  var EXCEL_MAX = 20000;
+
+  // Entry Point 2: intercept if result exceeds 20 000 rows
+  if (rows.length > EXCEL_MAX) {
+    var _warnParts = Math.ceil(rows.length / EXCEL_MAX);
+    setProgressMsg(null);
+    var _choice = await showLargeExportModal(_warnParts, rows.length);
+    if (!_choice) return;  // Cancel
+
+    if (_choice === 'csv') {
+      // Path B: write all rows as tab-delimited CSV
+      await writeRowsToCSV(rows, true, 'query-relations');
+      return;
+    }
+
+    // Path A: split into 20k-row Excel files, bundle into zip (plain text, no colours).
+    // Sequential generation — one file at a time, added directly to zip — avoids
+    // holding multiple large buffers in memory simultaneously.
+    if (typeof ExcelJS === 'undefined') {
+      alert('ExcelJS library not loaded. Please check your internet connection.');
+      setProgressMsg(null); return;
+    }
+
+    var _parts    = _warnParts;
+    var _zip      = new JSZip();
+    var _rStart   = Date.now();
+    for (var _pi = 0; _pi < _parts; _pi++) {
+      var _el  = (Date.now() - _rStart) / 1000;
+      var _eta = (_pi > 0) ? formatEta(_el / _pi * (_parts - _pi)) : '';
+      setProgressMsg('⏳ Building Excel ' + (_pi + 1) + ' / ' + _parts + ' · plain text' +
+                     (_eta ? '  ·  ~' + _eta + ' left' : '') + '…');
+      await yieldToUI();
+      try {
+        var _slice = rows.slice(_pi * EXCEL_MAX, (_pi + 1) * EXCEL_MAX);
+        var _buf   = await buildExcelBuffer(_slice, true, true /* plainText */);
+        console.log('[Export-Relations] Part', _pi + 1, 'built:', (_buf.byteLength || _buf.length), 'bytes');
+        _zip.file('query-relations-part' + (_pi + 1) + '.xlsx', _buf);
+      } catch(e) {
+        console.error('[Export-Relations] buildExcelBuffer failed for part', _pi + 1, ':', e);
+        setProgressMsg(null);
+        alert('Excel export failed at part ' + (_pi + 1) + ' of ' + _parts + ': ' + e.message +
+              '\n\nTip: "Convert to CSV" uses much less memory for large exports.');
+        return;
+      }
+    }
+    setProgressMsg('⏳ Zipping ' + _parts + ' files…');
+    await yieldToUI();
+    try {
+      var _zipBuf = await _zip.generateAsync({ type: 'arraybuffer',
+                                               compression: 'DEFLATE',
+                                               compressionOptions: { level: 1 } });
+      console.log('[Export-Relations] Zip generated:', _zipBuf.byteLength, 'bytes,', _parts, 'files');
+      downloadBuffer(_zipBuf, 'query-relations.zip');
+    } catch(e) {
+      console.error('[Export-Relations] zip.generateAsync failed:', e);
+      setProgressMsg(null);
+      alert('Zip generation failed: ' + e.message + '\n\nTry CSV format instead.');
+      return;
+    }
+    setProgressMsg(null);
+    return;
+  }
+
+  // ≤ 20 000 rows: single Excel file, no warning needed
+  setProgressMsg('⏳ Formatting Excel… (' + rows.length + ' rows)');
+  await yieldToUI();
+  await writeRowsToExcel(rows, true, 'query-relations.xlsx', false);
   setProgressMsg(null);
 }
 
@@ -2508,12 +2997,53 @@ function closeLargeQueryModal() {
   document.getElementById('large-query-modal').style.display = 'none';
 }
 
-async function largeQueryExport(mode) {
-  var query = _largeQueryPending;
+// Reads the two dropdowns and dispatches to the appropriate export function.
+async function largeQueryExport() {
+  var query  = _largeQueryPending;
   closeLargeQueryModal();
   if (!query) return;
-  if (mode === 'references') await exportQueryReferences(query);
-  else                       await exportQueryRelations(query);
+
+  var scope  = (document.getElementById('lq-scope-sel')  || {}).value || 'references';
+  var format = (document.getElementById('lq-format-sel') || {}).value || 'excel';
+
+  if (format === 'csv') {
+    if (scope === 'relations') await exportQueryCSVRelations(query);
+    else                       await exportQueryCSVReferences(query);
+  } else {
+    if (scope === 'relations') await exportQueryRelations(query);
+    else                       await exportQueryReferences(query);
+  }
+}
+
+// ─── Large Export Warning modal ───────────────────────────────────────────────
+// Shown when an Excel export exceeds 20 000 rows (entry point 2 per spec).
+// The modal is driven by a Promise so async export functions can await the choice.
+
+var _largeExportResolve = null; // set while the modal is open
+
+function showLargeExportModal(parts, rowCount) {
+  var msg = 'Row count exceeds the 20,000 limit. Text coloring is disabled due to performance ' +
+    'limits. The export will be split into ' + parts.toLocaleString() + ' file' +
+    (parts > 1 ? 's' : '') + ' (' + rowCount.toLocaleString() + ' rows total). ' +
+    'Choose how you would like to proceed:';
+  document.getElementById('large-export-msg').textContent = msg;
+  document.getElementById('large-export-modal').style.display = 'flex';
+  return new Promise(function(resolve) { _largeExportResolve = resolve; });
+}
+
+function closeLargeExportModal() {
+  document.getElementById('large-export-modal').style.display = 'none';
+  if (_largeExportResolve) { _largeExportResolve(null);    _largeExportResolve = null; }
+}
+
+function confirmLargeExportSplit() {
+  document.getElementById('large-export-modal').style.display = 'none';
+  if (_largeExportResolve) { _largeExportResolve('split'); _largeExportResolve = null; }
+}
+
+function confirmLargeExportCSV() {
+  document.getElementById('large-export-modal').style.display = 'none';
+  if (_largeExportResolve) { _largeExportResolve('csv');   _largeExportResolve = null; }
 }
 
 async function runQuery() {
@@ -5894,6 +6424,112 @@ async function expandSelectedNodes(mode) {
   }
 
   await _doExpand(mode, null, urns);
+}
+
+// ─── Find ontology children (is_a hierarchy) ─────────────────────────────────
+// For each selected node, queries Neo4j for all nodes that reach it via
+// (child)-[:is_a*]->(parent), then merges results into the graph.
+async function findOntologyChildren() {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selectedNodes.length === 0) {
+    showAlignToast('Please select at least one node to find ontology children.');
+    return;
+  }
+
+  var nodeParams = [];
+  selectedNodes.forEach(function(n) {
+    var urn   = n.data('URN') || n.data('urn') || '';
+    var label = n.data('nodeType') || '';
+    if (urn && label) nodeParams.push({ label: label, urn: urn });
+  });
+  if (!nodeParams.length) {
+    showAlignToast('Selected nodes have no URN or label — cannot query ontology children.');
+    return;
+  }
+
+  setProgressMsg('⏳ Finding ontology children…');
+  try {
+    var result = await api('/api/graph/ontology-children', { nodeParams: nodeParams });
+    setProgressMsg(null);
+
+    if (result.error) { alert('Ontology children error: ' + result.error); return; }
+
+    var newNodes = result.nodes || [];
+    var newEdges = result.edges || [];
+
+    if (!newNodes.length && !newEdges.length) {
+      alert('No ontology children found for the selected node' + (nodeParams.length > 1 ? 's' : '') + '.');
+      return;
+    }
+
+    var nodeWord = newNodes.length === 1 ? 'node' : 'nodes';
+    var edgeWord = newEdges.length === 1 ? 'is_a relation' : 'is_a relations';
+    var summary  = 'Will add ' + newNodes.length + ' ' + nodeWord +
+                   ' and ' + newEdges.length + ' ' + edgeWord + '.';
+
+    _expandPending = { nodes: newNodes, edges: newEdges };
+    document.getElementById('expand-confirm-msg').textContent = summary;
+    document.getElementById('expand-confirm-modal').style.display = 'flex';
+
+  } catch(err) {
+    setProgressMsg(null);
+    alert('Ontology children query failed: ' + (err.message || err));
+  }
+}
+
+// ─── Find ontology parents (is_a hierarchy) ──────────────────────────────────
+// For each selected node, queries Neo4j for all nodes reachable via
+// (p)<-[:is_a*]-(parent), then merges results into the graph.
+async function findOntologyParents() {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selectedNodes.length === 0) {
+    showAlignToast('Please select at least one node to find ontology parents.');
+    return;
+  }
+
+  var nodeParams = [];
+  selectedNodes.forEach(function(n) {
+    var urn   = n.data('URN') || n.data('urn') || '';
+    var label = n.data('nodeType') || '';
+    if (urn && label) nodeParams.push({ label: label, urn: urn });
+  });
+  if (!nodeParams.length) {
+    showAlignToast('Selected nodes have no URN or label — cannot query ontology parents.');
+    return;
+  }
+
+  setProgressMsg('⏳ Finding ontology parents…');
+  try {
+    var result = await api('/api/graph/ontology-parents', { nodeParams: nodeParams });
+    setProgressMsg(null);
+
+    if (result.error) { alert('Ontology parents error: ' + result.error); return; }
+
+    var newNodes = result.nodes || [];
+    var newEdges = result.edges || [];
+
+    if (!newNodes.length && !newEdges.length) {
+      alert('No ontology parents found for the selected node' + (nodeParams.length > 1 ? 's' : '') + '.');
+      return;
+    }
+
+    var nodeWord = newNodes.length === 1 ? 'node' : 'nodes';
+    var edgeWord = newEdges.length === 1 ? 'is_a relation' : 'is_a relations';
+    var summary  = 'Will add ' + newNodes.length + ' ' + nodeWord +
+                   ' and ' + newEdges.length + ' ' + edgeWord + '.';
+
+    _expandPending = { nodes: newNodes, edges: newEdges };
+    document.getElementById('expand-confirm-msg').textContent = summary;
+    document.getElementById('expand-confirm-modal').style.display = 'flex';
+
+  } catch(err) {
+    setProgressMsg(null);
+    alert('Ontology parents query failed: ' + (err.message || err));
+  }
 }
 
 // Show "Expand To..." label picker dialog
