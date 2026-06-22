@@ -34,6 +34,18 @@ const dbLimiter = rateLimit({
   message: { error: 'Too many requests. Please slow down and try again shortly.' }
 });
 
+// Higher-limit rate limiter for bulk export batch endpoints.
+// A single export can require hundreds of sequential batch requests from parallel
+// workers — the 200/min cap would silently truncate results.  5000/min still
+// prevents runaway abuse while supporting large exports.
+const exportLimiter = rateLimit({
+  windowMs: 60 * 1000,         // 1 minute
+  max: 5000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Export rate limit exceeded. Please wait a moment and retry.' }
+});
+
 // ─── Persistent settings (settings.json) ─────────────────────────────────────
 // Connection credentials are stored here so admins can update them via the UI
 // without restarting the server.  The file lives next to server.js and is never
@@ -284,6 +296,7 @@ function processValue(val, nodesMap, edgesMap) {
 }
 
 // ─── Auth routes ──────────────────────────────────────────────────────────────
+
 app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -486,6 +499,51 @@ app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
   }
 });
 
+// ─── CSV export query (high-throughput fetchSize for bulk export) ─────────────
+// POST /api/export/csv-query
+// Identical to /api/graph/query but opens the Neo4j session with fetchSize: 50000
+// so the driver streams records in 50 k-record pages, reducing round-trips and
+// memory pressure on very large result sets.
+app.post('/api/export/csv-query', dbLimiter, authMiddleware, async (req, res) => {
+  const { query } = req.body || {};
+  if (!query || !query.trim()) return res.status(400).json({ error: 'Cypher query is required' });
+
+  // Allow up to 10 minutes for large export queries before the socket times out.
+  req.socket.setTimeout(10 * 60 * 1000);
+
+  const session = neo4jDriver.session({ database: NEO4J_DB, fetchSize: 50000 });
+  try {
+    const result = await session.run(query);
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+
+    result.records.forEach(record => {
+      record.keys.forEach(key => {
+        processValue(record.get(key), nodesMap, edgesMap);
+      });
+    });
+
+    edgesMap.forEach(edge => {
+      if (!nodesMap.has(edge.startNodeId)) {
+        nodesMap.set(edge.startNodeId, { id: edge.startNodeId, elementId: edge.startNodeId, labels: [], properties: {} });
+      }
+      if (!nodesMap.has(edge.endNodeId)) {
+        nodesMap.set(edge.endNodeId, { id: edge.endNodeId, elementId: edge.endNodeId, labels: [], properties: {} });
+      }
+    });
+
+    res.json({
+      nodes: Array.from(nodesMap.values()),
+      edges: Array.from(edgesMap.values())
+    });
+  } catch (err) {
+    console.error('csv-query error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── Enrich loaded-subgraph nodes via URN ─────────────────────────────────────
 // Accepts a list of URN strings (from converted pathway JSON files), queries
 // Neo4j for matching nodes, and returns their full property set keyed by URN.
@@ -528,11 +586,13 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
 // ─── PostgreSQL references (tooltip — single edge hover) ──────────────────────
 // RelationID in Neo4j is a string; id in Postgres is bigint.
 // Pass as strings and cast to bigint in SQL to preserve full 64-bit precision.
-app.post('/api/references', dbLimiter, authMiddleware, async (req, res) => {
+app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
   const { relationIds } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json([]);
 
-  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
+  // Keep as strings and use ::bigint[] cast in SQL — preserves full 64-bit precision.
+  // Number() conversion loses digits for IDs > 2^53 (JavaScript safe integer limit).
+  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id.trim()));
   if (!validIds.length) return res.json([]);
 
   try {
@@ -583,11 +643,14 @@ const SCOPUS_COL_SQL = {
   relation_score:                     'sd."relation_score" AS "sd_relation_score"'
 };
 
-app.post('/api/references/batch', dbLimiter, authMiddleware, async (req, res) => {
+app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res) => {
   const { relationIds, scopusColumns } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json({});
 
-  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
+  // Keep as strings and use ::bigint[] cast in SQL — this preserves full 64-bit
+  // precision. JavaScript Number loses precision for integers > 2^53, so converting
+  // to Number first would corrupt large RelationIDs.
+  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id.trim()));
   if (!validIds.length) return res.json({});
 
   // Look up each requested column in the hardcoded map.
@@ -1291,23 +1354,20 @@ app.post('/api/relations/find-between', dbLimiter, authMiddleware, async (req, r
   const { selectedURNs = [], allURNs = [], filterType = 'all' } = req.body || {};
   if (!selectedURNs.length) return res.json({ relations: [] });
 
-  const DIRECT_TYPES   = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
+  const DIRECT_TYPES    = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
   const BIOMARKER_TYPES = ['Biomarker','QuantitativeChange','StateChange','GeneticChange'];
+  const INDIRECT_TYPES  = ['Regulation','Expression','MolTransport','MolSynthesis','Metabolization'];
 
   // Build relationship-type filter clause for Cypher
   let typeFilter = '';
-  if (filterType === 'direct') {
+  if (filterType === 'direct' || filterType === 'biomarker' || filterType === 'indirect') {
     typeFilter = 'AND type(r) IN $typeList ';
-  } else if (filterType === 'biomarker') {
-    typeFilter = 'AND type(r) IN $typeList ';
-  } else if (filterType === 'indirect') {
-    typeFilter = 'AND NOT type(r) IN $typeList ';
   }
   // filterType === 'all': no filter
 
-  const typeList = filterType === 'direct'   ? DIRECT_TYPES
+  const typeList = filterType === 'direct'    ? DIRECT_TYPES
                  : filterType === 'biomarker' ? BIOMARKER_TYPES
-                 : filterType === 'indirect'  ? DIRECT_TYPES   // excluded for indirect
+                 : filterType === 'indirect'  ? INDIRECT_TYPES
                  : [];
 
   // unselectedURNs = allURNs minus selectedURNs (scoped to current pathway)
@@ -1398,15 +1458,16 @@ app.post('/api/relations/connect-selected', dbLimiter, authMiddleware, async (re
 
   const DIRECT_TYPES    = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
   const BIOMARKER_TYPES = ['Biomarker','QuantitativeChange','StateChange','GeneticChange'];
+  const INDIRECT_TYPES  = ['Regulation','Expression','MolTransport','MolSynthesis','Metabolization'];
 
   let typeFilter = '';
-  if (filterType === 'direct')   typeFilter = 'AND type(r) IN $typeList ';
-  else if (filterType === 'biomarker') typeFilter = 'AND type(r) IN $typeList ';
-  else if (filterType === 'indirect')  typeFilter = 'AND NOT type(r) IN $typeList ';
+  if (filterType === 'direct' || filterType === 'biomarker' || filterType === 'indirect') {
+    typeFilter = 'AND type(r) IN $typeList ';
+  }
 
   const typeList = filterType === 'direct'    ? DIRECT_TYPES
                  : filterType === 'biomarker' ? BIOMARKER_TYPES
-                 : filterType === 'indirect'  ? DIRECT_TYPES
+                 : filterType === 'indirect'  ? INDIRECT_TYPES
                  : [];
 
   function normDisplayEff(v) {
@@ -1481,22 +1542,38 @@ app.post('/api/graph/count-query', dbLimiter, authMiddleware, async (req, res) =
   const { query } = req.body || {};
   if (!query || !query.trim()) return res.status(400).json({ error: 'Cypher query is required' });
 
-  // Transform the query into a fast COUNT query by replacing the RETURN clause.
-  // e.g.  MATCH ... RETURN a,r,b  →  MATCH ... RETURN count(*) AS edgeCount
-  // This avoids fetching full node/edge data just to count rows.
-  const returnPos = query.search(/\bRETURN\b/i);
-  const countQuery = returnPos !== -1
-    ? query.substring(0, returnPos) + 'RETURN count(*) AS edgeCount'
-    : query;  // fallback: run original if no RETURN found
+  // Transform the query into a fast COUNT query by replacing each RETURN clause.
+  // For UNION queries every branch is counted separately and the results are summed
+  // (a slight overcount for UNION-with-dedup, but safe for the "too large" gate).
+  // e.g.  MATCH ... RETURN a,r,b UNION MATCH ... RETURN b,r,a
+  //   →   run count(*) on each branch and sum
+
+  function branchToCountQuery(branch) {
+    const pos = branch.search(/\bRETURN\b/i);
+    return pos !== -1
+      ? branch.substring(0, pos) + 'RETURN count(*) AS edgeCount'
+      : null;
+  }
+
+  // Split on UNION ALL first (longer token), then UNION, preserving both variants.
+  // We only split on top-level UNION — subquery UNION (inside CALL {}) would be
+  // indented and is not a concern for the query patterns we expect here.
+  const branches = query.split(/\bUNION\s+ALL\b|\bUNION\b/i).map(b => b.trim()).filter(Boolean);
+  const countQueries = branches.map(branchToCountQuery).filter(Boolean);
+
+  // Fallback: if no RETURN was found anywhere, run the original query.
+  if (countQueries.length === 0) countQueries.push(query);
 
   const session = neo4jDriver.session({ database: NEO4J_DB });
   try {
-    const result = await session.run(countQuery);
     let edgeCount = 0;
-    if (result.records.length > 0) {
-      const val = result.records[0].get('edgeCount');
-      // Neo4j returns integers as neo4j.Integer objects
-      edgeCount = (val && typeof val.toNumber === 'function') ? val.toNumber() : Number(val);
+    for (const cq of countQueries) {
+      const result = await session.run(cq);
+      if (result.records.length > 0) {
+        const val = result.records[0].get('edgeCount');
+        // Neo4j returns integers as neo4j.Integer objects
+        edgeCount += (val && typeof val.toNumber === 'function') ? val.toNumber() : Number(val);
+      }
     }
     res.json({ edgeCount });
   } catch (err) {
@@ -1550,7 +1627,8 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
   if (!Array.isArray(urns) || !urns.length)
     return res.status(400).json({ error: 'urns array is required' });
 
-  const DIRECT_TYPES = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
+  const DIRECT_TYPES   = ['Binding','DirectRegulation','ProtModification','PromoterBinding','ChemicalReaction'];
+  const INDIRECT_TYPES = ['Regulation','Expression','MolTransport','MolSynthesis','Metabolization'];
 
   // Build rel-type clause
   let relClause = '-[r]-';
@@ -1558,8 +1636,10 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
     relClause = '-[r:' + DIRECT_TYPES.join('|') + ']-';
   } else if (mode === 'biomarker') {
     relClause = '-[r:Biomarker|QuantitativeChange|StateChange|GeneticChange]-';
+  } else if (mode === 'indirect') {
+    relClause = '-[r:' + INDIRECT_TYPES.join('|') + ']-';
   }
-  // 'indirect' and 'to' use no type filter in the pattern; indirect is filtered by WHERE below
+  // 'to' uses no type filter in the pattern
 
   // Build target-label clause (for 'to' mode)
   let targetClause = '';
@@ -1572,16 +1652,10 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
     }
   }
 
-  // Build indirect exclusion clause
-  let indirectClause = '';
-  if (mode === 'indirect') {
-    indirectClause = ' AND NOT type(r) IN ' + JSON.stringify(DIRECT_TYPES);
-  }
-
   const cypher =
     'MATCH (a)' + relClause + '(b) ' +
     'WHERE a.`' + NEO4J_URN_PROP + '` IN $urns' +
-    targetClause + indirectClause +
+    targetClause +
     ' RETURN a, r, b LIMIT 2000';
 
   const session = neo4jDriver.session({ database: NEO4J_DB });
@@ -1595,6 +1669,93 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
     res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
   } catch (err) {
     console.error('expand error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// ─── Find ontology parents via is_a hierarchy ────────────────────────────────
+// POST /api/graph/ontology-parents
+// Body: { nodeParams: [{label: string, urn: string}, ...] }
+// Returns { nodes, edges } of the full is_a ancestry chain for each given node.
+app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeParams = [] } = req.body || {};
+  if (!Array.isArray(nodeParams) || !nodeParams.length)
+    return res.status(400).json({ error: 'nodeParams array is required' });
+
+  const safe = nodeParams.filter(np =>
+    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    typeof np.urn === 'string' && np.urn.trim().length > 0
+  );
+  if (!safe.length) return res.json({ nodes: [], edges: [] });
+
+  const cypher = `
+    UNWIND $nodeParams AS np
+    MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
+    WHERE np.label IN labels(p)
+    OPTIONAL MATCH path = (p)-[:is_a*]->(parent)
+    WITH p, collect(DISTINCT path) AS paths
+    RETURN p, paths
+  `;
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { nodeParams: safe });
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+    result.records.forEach(record => {
+      record.keys.forEach(key => processValue(record.get(key), nodesMap, edgesMap));
+    });
+    res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
+  } catch (err) {
+    console.error('ontology-parents error:', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// ─── Find ontology children via is_a hierarchy ───────────────────────────────
+// POST /api/graph/ontology-children
+// Body: { nodeParams: [{label: string, urn: string}, ...] }
+// Returns { nodes, edges } of the full is_a subtree rooted at each given node.
+app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeParams = [] } = req.body || {};
+  if (!Array.isArray(nodeParams) || !nodeParams.length)
+    return res.status(400).json({ error: 'nodeParams array is required' });
+
+  // Validate inputs — label must be a safe Neo4j identifier, urn must be non-empty string
+  const safe = nodeParams.filter(np =>
+    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    typeof np.urn === 'string' && np.urn.trim().length > 0
+  );
+  if (!safe.length) return res.json({ nodes: [], edges: [] });
+
+  // UNWIND the list so all parent nodes are resolved in a single round-trip.
+  // Labels cannot be parameterized in Cypher, so we filter by label using WHERE.
+  const cypher = `
+    UNWIND $nodeParams AS np
+    MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
+    WHERE np.label IN labels(p)
+    OPTIONAL MATCH path = (child)-[:is_a*]->(p)
+    WITH p, collect(DISTINCT path) AS paths
+    RETURN p, paths
+  `;
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { nodeParams: safe });
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+    result.records.forEach(record => {
+      record.keys.forEach(key => processValue(record.get(key), nodesMap, edgesMap));
+    });
+    res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
+  } catch (err) {
+    console.error('ontology-children error:', err.message);
     res.status(500).json({ error: err.message });
   } finally {
     await session.close();
