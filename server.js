@@ -8,8 +8,15 @@ const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
 const rateLimit = require('express-rate-limit');
+const _crypto   = require('crypto');
 
+let helmet;
+try { helmet = require('helmet'); } catch(e) {
+  console.warn('[warn] helmet not installed — run `npm install` to enable security headers');
+}
 const app = express();
+// Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, etc.
+if (helmet) app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled — app loads inline scripts from CDN
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -46,11 +53,22 @@ const exportLimiter = rateLimit({
   message: { error: 'Export rate limit exceeded. Please wait a moment and retry.' }
 });
 
+// ─── Safe error helper ────────────────────────────────────────────────────────
+// Returns a generic message to the client while logging the real error server-side.
+// Prevents internal database schema names, file paths, and stack details from leaking.
+const IS_DEV = process.env.NODE_ENV !== 'production';
+function safeError(err, context) {
+  const detail = (err && err.message) ? err.message : String(err);
+  console.error(`[error] ${context || 'request'}:`, detail);
+  return IS_DEV ? detail : 'Internal server error';
+}
+
 // ─── Persistent settings (settings.json) ─────────────────────────────────────
 // Connection credentials are stored here so admins can update them via the UI
 // without restarting the server.  The file lives next to server.js and is never
 // served to clients (it is outside the public/ directory).
-const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+const SETTINGS_FILE  = path.join(__dirname, 'settings.json');
+const HISTORY_FILE   = path.join(__dirname, 'cypher_history.tsv');
 
 // DEFAULT_SETTINGS is used only when settings.json does not exist.
 // Passwords are intentionally blank — configure via the Settings UI after first login,
@@ -91,7 +109,11 @@ let appSettings = loadAppSettings();
 
 // ─── Neo4j ───────────────────────────────────────────────────────────────────
 // URN property name on Neo4j nodes — change to match your schema (e.g. 'id', '@id', 'URN')
-const NEO4J_URN_PROP = process.env.NEO4J_URN_PROP || 'URN';
+const _rawUrnProp = process.env.NEO4J_URN_PROP || 'URN';
+if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(_rawUrnProp)) {
+  throw new Error(`Unsafe NEO4J_URN_PROP identifier rejected: "${_rawUrnProp}"`);
+}
+const NEO4J_URN_PROP = _rawUrnProp;
 
 function makeNeo4jDriver(cfg) {
   return neo4j.driver(cfg.url, neo4j.auth.basic(cfg.username, cfg.password));
@@ -392,7 +414,8 @@ app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, asyn
     await session.close();
   } catch(e) {
     await testDriver.close();
-    return res.status(400).json({ error: 'Connection test failed: ' + e.message });
+    console.error('[settings/neo4j] Connection test failed:', e.message);
+    return res.status(400).json({ error: 'Connection test failed. Check URL, database name, and credentials.' });
   }
 
   // Commit: close old driver, switch to new
@@ -434,7 +457,8 @@ app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, a
     await testPool.query('SELECT 1');
   } catch(e) {
     await testPool.end();
-    return res.status(400).json({ error: 'Connection test failed: ' + e.message });
+    console.error('[settings/postgres] Connection test failed:', e.message);
+    return res.status(400).json({ error: 'Connection test failed. Check host, port, database, schema, and credentials.' });
   }
 
   // Commit: end old pool, switch to new
@@ -493,7 +517,7 @@ app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
     res.json(response);
   } catch (err) {
     console.error('Neo4j error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -538,7 +562,7 @@ app.post('/api/export/csv-query', dbLimiter, authMiddleware, async (req, res) =>
     });
   } catch (err) {
     console.error('csv-query error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -577,7 +601,7 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
     res.json(enriched);
   } catch (err) {
     console.error('enrich-by-urn error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -612,7 +636,7 @@ app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
       res.json(result2.rows);
     } catch (err2) {
       console.error('PostgreSQL error:', err2.message);
-      res.status(500).json({ error: err2.message });
+      res.status(500).json({ error: safeError(err2) });
     }
   }
 });
@@ -690,7 +714,7 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
     res.json(grouped);
   } catch (err) {
     console.error('PostgreSQL batch error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -717,7 +741,7 @@ app.post('/api/nodes/medscan', dbLimiter, authMiddleware, async (req, res) => {
     res.json(map);
   } catch (err) {
     console.error('MedScan error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -739,7 +763,7 @@ app.post('/api/nodes/property-names', dbLimiter, authMiddleware, async (req, res
     res.json(result.rows.map(r => r.name));
   } catch (err) {
     console.error('property-names error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -828,7 +852,7 @@ app.post('/api/nodes/connectivity', dbLimiter, authMiddleware, async (req, res) 
     res.json(out);
   } catch (err) {
     console.error('connectivity error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -848,7 +872,7 @@ app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) =
     res.json({ ok: true });
   } catch (err) {
     console.error('Reference update error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -867,7 +891,7 @@ app.post('/api/graph/update-node', dbLimiter, authMiddleware, async (req, res) =
     res.json({ ok: true });
   } catch (err) {
     console.error('update-node error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -888,7 +912,7 @@ app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, re
     res.json({ ok: true });
   } catch (err) {
     console.error('update-relation error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -912,7 +936,7 @@ app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('schema/columns error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -1078,7 +1102,7 @@ RETURN DISTINCT row.relURN AS relURN, relID AS relationID, numSentences`;
     res.json(mapping);
   } catch (err) {
     console.error('match-rnef error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -1136,7 +1160,7 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
     res.json(out);
   } catch (err) {
     console.error('Neo4j relations/properties error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -1299,7 +1323,7 @@ RETURN row.idx AS idx, ${RETURN_COLS}`;
     res.json({ results: Object.values(resultMap) });
   } catch (err) {
     console.error('find-similar error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -1340,7 +1364,7 @@ app.post('/api/convert/rnef', dbLimiter, express.text({ limit: '500mb', type: 't
     res.json({ pathways });
   } catch (err) {
     console.error('RNEF conversion error:', err.message);
-    res.status(500).json({ error: 'Conversion failed: ' + err.message });
+    res.status(500).json({ error: safeError(err, 'RNEF conversion') });
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true }); } catch(e) {}
   }
@@ -1441,7 +1465,7 @@ RETURN
     res.json({ relations });
   } catch (err) {
     console.error('find-between error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -1526,7 +1550,7 @@ RETURN
     res.json({ relations });
   } catch (err) {
     console.error('connect-selected error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -1578,9 +1602,43 @@ app.post('/api/graph/count-query', dbLimiter, authMiddleware, async (req, res) =
     res.json({ edgeCount });
   } catch (err) {
     console.error('count-query error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
+  }
+});
+
+// ─── Cypher query history ─────────────────────────────────────────────────────
+// Tab-delimited file: Date \t CypherQuery \t ResultCount
+app.get('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) return res.json({ rows: [] });
+    const content = fs.readFileSync(HISTORY_FILE, 'utf8');
+    const rows = content.trim().split('\n').filter(l => l.trim()).map(line => {
+      const parts = line.split('\t');
+      const date  = parts[0] || '';
+      const query = parts[1] || '';
+      const count = parts.length > 2 ? parseInt(parts[2], 10) : 0;
+      return { date, query, count: isNaN(count) ? 0 : count };
+    });
+    res.json({ rows });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+const HISTORY_QUERY_MAX_CHARS = 10_000; // per-entry limit to prevent disk exhaustion
+app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
+  const { query, count } = req.body || {};
+  if (!query || !query.trim()) return res.status(400).json({ error: 'query required' });
+  const date       = new Date().toISOString();
+  const cleanQuery = String(query).replace(/[\t\r\n]+/g, ' ').trim().slice(0, HISTORY_QUERY_MAX_CHARS);
+  const line       = date + '\t' + cleanQuery + '\t' + (Number.isFinite(Number(count)) ? Number(count) : 0) + '\n';
+  try {
+    fs.appendFileSync(HISTORY_FILE, line, 'utf8');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -1591,31 +1649,101 @@ app.listen(PORT, () => {
 });
 
 // ─── Neo4j schema introspection ───────────────────────────────────────────────
-// GET /api/graph/schema
-// Returns { labels: [...], relTypes: [...], propKeys: [...] }
-app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
-  // Use three separate sessions — Neo4j forbids concurrent queries on one session
+// In-memory cache populated at startup and refreshed every 10 minutes.
+let _schemaServerCache = null;
+let _schemaFetchPromise = null; // in-flight promise guard — concurrent callers share one DB round-trip
+
+async function _fetchSchemaFromNeo4j() {
+  // If a fetch is already in progress, return the same promise so we don't hit Neo4j multiple times
+  if (_schemaFetchPromise) return _schemaFetchPromise;
+  _schemaFetchPromise = _doFetchSchemaFromNeo4j().finally(() => { _schemaFetchPromise = null; });
+  return _schemaFetchPromise;
+}
+
+async function _doFetchSchemaFromNeo4j() {
   const s1 = neo4jDriver.session({ database: NEO4J_DB });
   const s2 = neo4jDriver.session({ database: NEO4J_DB });
   const s3 = neo4jDriver.session({ database: NEO4J_DB });
   try {
-    const [labelsResult, relTypesResult, propKeysResult] = await Promise.all([
+    const [labelsResult, relTypesResult] = await Promise.all([
       s1.run('CALL db.labels()'),
       s2.run('CALL db.relationshipTypes()'),
-      s3.run('CALL db.propertyKeys()'),
     ]);
     const labels   = labelsResult.records.map(r => r.get('label'));
     const relTypes = relTypesResult.records.map(r => r.get('relationshipType'));
-    const propKeys = propKeysResult.records.map(r => r.get('propertyKey'));
-    res.json({ labels, relTypes, propKeys });
+
+    // Relationship-only property keys — schema metadata first (no data scan), fallback to sampling
+    let propKeys = [];
+    try {
+      const pkResult = await s3.run(
+        'CALL db.schema.relTypeProperties() YIELD propertyName RETURN DISTINCT propertyName AS k ORDER BY k'
+      );
+      propKeys = pkResult.records.map(r => r.get('k')).filter(Boolean);
+    } catch (_) {
+      try {
+        const pkResult = await s3.run(
+          'MATCH ()-[r]->() WITH r LIMIT 5000 UNWIND keys(r) AS k RETURN DISTINCT k ORDER BY k'
+        );
+        propKeys = pkResult.records.map(r => r.get('k'));
+      } catch (_2) {}
+    }
+    _schemaServerCache = { labels, relTypes, propKeys };
+    console.log(`Schema cache refreshed: ${labels.length} labels, ${relTypes.length} relTypes, ${propKeys.length} propKeys`);
+    return _schemaServerCache;
   } catch (err) {
-    console.error('schema error:', err.message);
-    res.status(500).json({ error: err.message });
+    console.error('Schema cache fetch error:', err.message);
+    return null;
   } finally {
     await Promise.all([s1.close(), s2.close(), s3.close()]);
   }
+}
+
+// Pre-warm cache 3 s after startup (gives Neo4j time to accept connections)
+setTimeout(function() {
+  _fetchSchemaFromNeo4j().catch(() => {});
+}, 3000);
+// Refresh every 10 minutes so new relation types / property keys appear automatically
+setInterval(function() {
+  _fetchSchemaFromNeo4j().catch(() => {});
+}, 10 * 60 * 1000);
+
+// GET /api/graph/schema — returns { labels, relTypes, propKeys }
+app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
+  try {
+    // Serve from cache (instant); if cache not ready yet, fetch now and cache result
+    const schema = _schemaServerCache || await _fetchSchemaFromNeo4j();
+    if (!schema) return res.status(503).json({ error: 'Schema not available yet' });
+    res.json(schema);
+  } catch (err) {
+    console.error('schema error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
 });
 
+
+// ─── Distinct values for a relation property ──────────────────────────────────
+// GET /api/schema/prop-values?prop=Effect
+// Returns { values: [...] } – distinct non-empty values of the given property
+// across all relationships in Neo4j, sorted alphabetically (max 200).
+app.get('/api/schema/prop-values', dbLimiter, authMiddleware, async (req, res) => {
+  const prop = (req.query.prop || '').trim();
+  if (!prop || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(prop))
+    return res.status(400).json({ error: 'Invalid property name' });
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(
+      `MATCH ()-[r]->() WHERE r[\`${prop}\`] IS NOT NULL AND r[\`${prop}\`] <> ''
+       RETURN DISTINCT toString(r[\`${prop}\`]) AS v ORDER BY v LIMIT 200`
+    );
+    const values = result.records.map(rec => rec.get('v'));
+    res.json({ values });
+  } catch (err) {
+    console.error('prop-values error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
 
 // ─── Expand selected nodes ────────────────────────────────────────────────────
 // POST /api/graph/expand
@@ -1669,7 +1797,7 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
     res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
   } catch (err) {
     console.error('expand error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
@@ -1711,14 +1839,253 @@ app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, r
     res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
   } catch (err) {
     console.error('ontology-parents error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
 });
 
 
-// ─── Find ontology children via is_a hierarchy ───────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RELATION CURATION  ──  Create / Edit relations from the UI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── RelationID hashing (mirrors Python myhash) ─────────────────────────────────
+function _myhash(text) {
+  const buf = Buffer.from(String(text), 'utf8');
+  const d   = _crypto.createHash('md5').update(buf).digest();
+  const high = d.readBigUInt64BE(0);
+  const low  = d.readBigUInt64BE(8);
+  const MASK = BigInt('0x7FFFFFFFFFFFFFFF');
+  let r = high ^ low;
+  if (r > MASK) r = -(r & MASK);
+  return r.toString();
+}
+
+// Reproduce Python's str() representation of a list/string so the hash matches.
+function _pyRepr(val) {
+  if (Array.isArray(val)) {
+    if (!val.length) return '[]';
+    // NodeIDs are integers — output as int literals (no quotes), matching Python str(list[int])
+    return '[' + val.map(v => {
+      const s = String(v);
+      return /^-?\d+$/.test(s) ? s : ("'" + s.replace(/\\/g,'\\\\').replace(/'/g,"\\'") + "'");
+    }).join(', ') + ']';
+  }
+  return "'" + String(val).replace(/\\/g,'\\\\').replace(/'/g,"\\'") + "'";
+}
+
+function calcRelationId({ inref=[], inoutref=[], outref=[], control_type='',
+                          ontology='', relationship='', effect='', mechanism='' }) {
+  // Lists sorted descending (matches Python .sort(reverse=True)) using BigInt for 64-bit NodeIDs
+  const bigSort = (a, b) => { const x = BigInt(String(a)), y = BigInt(String(b)); return x < y ? 1 : x > y ? -1 : 0; };
+  const s = '(' + [
+    _pyRepr([...inref  ].sort(bigSort)),
+    _pyRepr([...inoutref].sort(bigSort)),
+    _pyRepr([...outref ].sort(bigSort)),
+    _pyRepr(control_type), _pyRepr(ontology),
+    _pyRepr(relationship), _pyRepr(effect.toLowerCase()), _pyRepr(mechanism)
+  ].join(', ') + ')';
+  return _myhash(s);
+}
+
+// GET /api/schema/relation-types  — distinct Neo4j relationship types
+app.get('/api/schema/relation-types', dbLimiter, authMiddleware, async (req, res) => {
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const r = await session.run(
+      'CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType'
+    );
+    res.json({ types: r.records.map(rec => rec.get('relationshipType')) });
+  } catch(e) { res.status(500).json({ error: safeError(e) }); }
+  finally { await session.close(); }
+});
+
+// GET /api/schema/relation-properties  — distinct property keys on Neo4j relationships
+app.get('/api/schema/relation-properties', dbLimiter, authMiddleware, async (req, res) => {
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const r = await session.run(
+      'MATCH ()-[rel]->() WITH keys(rel) AS k UNWIND k AS key RETURN DISTINCT key ORDER BY key LIMIT 300'
+    );
+    res.json({ properties: r.records.map(rec => rec.get('key')) });
+  } catch(e) { res.status(500).json({ error: safeError(e) }); }
+  finally { await session.close(); }
+});
+
+// POST /api/curation/calculate-relation-id  — deterministic hash for live preview
+// Also checks Neo4j for an existing relation of the same type between the same nodes,
+// and returns the EXISTING RelationID if found (to avoid creating duplicates of
+// relations that were loaded by the external Python pipeline with a different hash).
+app.post('/api/curation/calculate-relation-id', dbLimiter, authMiddleware, async (req, res) => {
+  const body = req.body || {};
+  const computed = calcRelationId(body);
+
+  // Try to find an existing relation in Neo4j with the same type + same node pair
+  const { inref = [], outref = [], inoutref = [], control_type = '' } = body;
+  const safeType = /^[A-Za-z_][A-Za-z0-9_]*$/.test(control_type) ? control_type : null;
+
+  if (safeType && (inref.length || outref.length || inoutref.length)) {
+    const session = neo4jDriver.session({ database: NEO4J_DB });
+    try {
+      let result;
+      if (inref.length === 1 && outref.length === 1 && !inoutref.length) {
+        // Directional: single source → single target
+        result = await session.run(
+          `MATCH (a {NodeID: $src})-[r:\`${safeType}\`]->(b {NodeID: $tgt})
+           WHERE r.RelationID IS NOT NULL
+           RETURN toString(r.RelationID) AS rid LIMIT 1`,
+          { src: inref[0], tgt: outref[0] }
+        );
+      } else if (!inref.length && !outref.length && inoutref.length >= 2) {
+        // Non-directional: match either direction
+        result = await session.run(
+          `MATCH (a {NodeID: $n1})-[r:\`${safeType}\`]-(b {NodeID: $n2})
+           WHERE r.RelationID IS NOT NULL
+           RETURN toString(r.RelationID) AS rid LIMIT 1`,
+          { n1: inoutref[0], n2: inoutref[1] }
+        );
+      }
+      if (result && result.records.length) {
+        const existing = result.records[0].get('rid');
+        return res.json({ relationId: existing, existingFound: true });
+      }
+    } catch(e) { /* fall through to computed */ }
+    finally { await session.close(); }
+  }
+
+  res.json({ relationId: computed });
+});
+
+// POST /api/curation/write-relation  — MERGE to Neo4j + upsert references in Postgres
+// Requires role === 'user'  (admin cannot curate per spec §1.3)
+app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, res) => {
+  if (req.user.role !== 'user')
+    return res.status(403).json({ error: 'Curation requires User role.' });
+
+  const { sourceNode, targetNode, relationType, properties = {}, relationId, references = [] } = req.body || {};
+  if (!relationType)
+    return res.status(400).json({ error: 'Please add relation type before adding relation to database.' });
+  if (!sourceNode || !targetNode)
+    return res.status(400).json({ error: 'Source (→) and target (←) nodes are required.' });
+
+  // Validate identifiers used in Cypher interpolation
+  const safeId = s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
+  if (!safeId(relationType))       return res.status(400).json({ error: `Unsafe relation type: "${relationType}"` });
+  if (!safeId(sourceNode.nodeLabel)) return res.status(400).json({ error: `Unsafe label: "${sourceNode.nodeLabel}"` });
+  if (!safeId(targetNode.nodeLabel)) return res.status(400).json({ error: `Unsafe label: "${targetNode.nodeLabel}"` });
+
+  const username = req.user.username;
+
+  // Coerce semicolon-separated strings → arrays for list properties
+  const relProps = {};
+  Object.entries(properties).forEach(([k, v]) => {
+    if (v == null || v === '') return;
+    relProps[k] = (typeof v === 'string' && v.includes(';'))
+      ? v.split(';').map(s => s.trim()).filter(Boolean) : v;
+  });
+
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const cypher = `
+      MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
+            (b:${targetNode.nodeLabel} {NodeID: $tgtId})
+      MERGE (a)-[r:${relationType} {RelationID: $relId}]->(b)
+      ON CREATE SET r.createdAt = timestamp(), r.updatedAt = timestamp(),
+                    r.createdBy = $username,   r.updatedBy = $username
+      ON MATCH  SET r.updatedAt = timestamp(), r.updatedBy = $username
+      SET r += $relProps
+      RETURN r,
+             elementId(r) AS eid,
+             id(a) AS aId, elementId(a) AS aEid,
+             id(b) AS bId, elementId(b) AS bEid
+    `;
+    const result = await session.run(cypher, {
+      srcId: sourceNode.nodeId, tgtId: targetNode.nodeId,
+      relId: relationId, username, relProps
+    });
+
+    if (!result.records.length)
+      return res.status(404).json({ error: 'Source or target node not found. Verify NodeID and label.' });
+    const rec = result.records[0];
+
+    // ── Write / delete references in Postgres ──────────────────────────────────
+    if (pgPool && Array.isArray(references) && references.length) {
+      const client = await pgPool.connect();
+      try {
+        await client.query('BEGIN');
+
+        // Fetch valid column names for the reference table once
+        const colRes = await client.query(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_schema = $1 AND table_name = 'reference'
+           ORDER BY ordinal_position`,
+          [PG_SCHEMA]
+        );
+        const validCols = new Set(colRes.rows.map(r => r.column_name));
+
+        for (const ref of references) {
+          if (!ref) continue;
+
+          // Delete
+          if (ref._deleted) {
+            if (ref.unique_id)
+              await client.query(`DELETE FROM ${PG_SCHEMA}.reference WHERE unique_id = $1`, [ref.unique_id]);
+            continue;
+          }
+
+          // Collect writable columns
+          const cols = Object.keys(ref).filter(k =>
+            !k.startsWith('_') && k !== 'unique_id' && validCols.has(k) &&
+            ref[k] != null && ref[k] !== ''
+          );
+          if (!cols.length) continue;
+
+          if (ref.unique_id) {
+            // Update existing row
+            const setParts = cols.map((c, i) => `"${c}" = $${i + 2}`).join(', ');
+            await client.query(
+              `UPDATE ${PG_SCHEMA}.reference SET ${setParts} WHERE unique_id = $1`,
+              [ref.unique_id, ...cols.map(k => ref[k])]
+            );
+          } else {
+            // Insert new row — always set id = RelationID
+            const allCols = ['id', ...cols];
+            const vals    = [BigInt(relationId), ...cols.map(k => ref[k])];
+            const ph      = vals.map((_, i) => `$${i + 1}`).join(', ');
+            await client.query(
+              `INSERT INTO ${PG_SCHEMA}.reference (${allCols.map(c => `"${c}"`).join(', ')})
+               VALUES (${ph})`,
+              vals
+            );
+          }
+        }
+        await client.query('COMMIT');
+      } catch (pgErr) {
+        await client.query('ROLLBACK');
+        console.error('Reference write error:', pgErr.message);
+        // Neo4j write succeeded — don't abort the whole response
+      } finally { client.release(); }
+    }
+
+    res.json({
+      success: true,
+      elementId:             rec.get('eid'),
+      relationId,
+      relationType,
+      sourceNodeInternalId:  rec.get('aId').toString(),
+      targetNodeInternalId:  rec.get('bId').toString(),
+      sourceElementId:       rec.get('aEid'),
+      targetElementId:       rec.get('bEid'),
+      properties:            toPlain(rec.get('r').properties)
+    });
+  } catch (err) {
+    console.error('write-relation error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally { await session.close(); }
+});
+
+
 // POST /api/graph/ontology-children
 // Body: { nodeParams: [{label: string, urn: string}, ...] }
 // Returns { nodes, edges } of the full is_a subtree rooted at each given node.
@@ -1756,7 +2123,153 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
     res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
   } catch (err) {
     console.error('ontology-children error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Ontology Analysis endpoints
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/ontology/roots
+// Returns root SemanticConcept nodes: have is_a children but no is_a/part_of parents
+app.get('/api/ontology/roots', dbLimiter, authMiddleware, async (req, res) => {
+  const cypher = `
+    MATCH (root:SemanticConcept)
+    WHERE (root)<-[:is_a]-()
+    AND NOT (root)-[:is_a|part_of]->()
+    RETURN root
+    ORDER BY root.name
+  `;
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher);
+    const nodes = result.records.map(r => {
+      const n = r.get('root');
+      const p = toPlain(n.properties);
+      return {
+        id: n.identity.toString(),
+        labels: n.labels,
+        name: String(p.name || p.Name || p[NEO4J_URN_PROP] || n.identity.toString()),
+        urn: String(p[NEO4J_URN_PROP] || '')
+      };
+    });
+    res.json({ nodes });
+  } catch (err) {
+    console.error('ontology-roots error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// POST /api/ontology/direct-children
+// Body: { urn: string }
+// Returns the immediate (one-level) children of the given ontology node via is_a|part_of
+app.post('/api/ontology/direct-children', dbLimiter, authMiddleware, async (req, res) => {
+  const { urn } = req.body || {};
+  if (!urn || typeof urn !== 'string' || !urn.trim())
+    return res.status(400).json({ error: 'urn is required' });
+
+  const cypher = `
+    MATCH (parent {\`${NEO4J_URN_PROP}\`: $urn})
+    MATCH (child)-[:is_a|part_of]->(parent)
+    RETURN DISTINCT child
+    ORDER BY child.name
+  `;
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { urn });
+    const nodes = result.records.map(r => {
+      const n = r.get('child');
+      const p = toPlain(n.properties);
+      return {
+        id: n.identity.toString(),
+        labels: n.labels,
+        name: String(p.name || p.Name || p[NEO4J_URN_PROP] || n.identity.toString()),
+        urn: String(p[NEO4J_URN_PROP] || '')
+      };
+    });
+    res.json({ nodes });
+  } catch (err) {
+    console.error('ontology-direct-children error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// POST /api/ontology/batch-counts
+// Body: { urns: string[], graphUrns: string[] }
+// For each ontology URN, counts how many graphUrns are descendants of it.
+// Returns { counts: { [urn]: number } }
+app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, res) => {
+  const { urns = [], graphUrns = [] } = req.body || {};
+  if (!Array.isArray(urns) || !urns.length) return res.json({ counts: {} });
+  if (!Array.isArray(graphUrns) || !graphUrns.length) {
+    const counts = {};
+    urns.forEach(u => { counts[u] = 0; });
+    return res.json({ counts });
+  }
+
+  const cypher = `
+    UNWIND $urns AS parentUrn
+    MATCH (parent {\`${NEO4J_URN_PROP}\`: parentUrn})
+    OPTIONAL MATCH (descendant)-[:is_a|part_of*0..]->(parent)
+    WHERE descendant.\`${NEO4J_URN_PROP}\` IN $graphUrns
+    RETURN parentUrn, count(DISTINCT descendant) AS cnt
+  `;
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { urns, graphUrns });
+    const counts = {};
+    result.records.forEach(r => {
+      const u = r.get('parentUrn');
+      const c = r.get('cnt');
+      counts[u] = neo4j.isInt(c) ? c.toNumber() : (Number(c) || 0);
+    });
+    res.json({ counts });
+  } catch (err) {
+    console.error('ontology-batch-counts error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// POST /api/ontology/descendants
+// Body: { urn: string, graphUrns: string[] }
+// Returns URNs of all descendants of the given ontology node that appear in graphUrns.
+app.post('/api/ontology/descendants', dbLimiter, authMiddleware, async (req, res) => {
+  const { urn, graphUrns = [] } = req.body || {};
+  if (!urn || typeof urn !== 'string' || !urn.trim())
+    return res.status(400).json({ error: 'urn is required' });
+
+  const filterClause = (Array.isArray(graphUrns) && graphUrns.length)
+    ? `WHERE descendant.\`${NEO4J_URN_PROP}\` IN $graphUrns`
+    : '';
+  const cypher = `
+    MATCH (parent {\`${NEO4J_URN_PROP}\`: $urn})
+    MATCH (descendant)-[:is_a|part_of*0..]->(parent)
+    ${filterClause}
+    RETURN DISTINCT descendant.\`${NEO4J_URN_PROP}\` AS urn
+  `;
+  const session = neo4jDriver.session({ database: NEO4J_DB });
+  try {
+    const result = await session.run(cypher, { urn, graphUrns });
+    const urns = result.records
+      .map(r => toPlain(r.get('urn')))
+      .filter(u => u != null && u !== '');
+    res.json({ urns });
+  } catch (err) {
+    console.error('ontology-descendants error:', err.message);
+    res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
   }
