@@ -16,7 +16,21 @@ try { helmet = require('helmet'); } catch(e) {
 }
 const app = express();
 // Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, etc.
-if (helmet) app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled — scripts load from CDN
+if (helmet) app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:  ["'self'"],
+      scriptSrc:     ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // eval() used by ExcelJS/Klay
+      scriptSrcAttr: ["'unsafe-inline'"], // allows onclick= and other inline event handlers in index.html
+      styleSrc:      ["'self'", "'unsafe-inline'"], // extensive inline styles in index.html
+      imgSrc:      ["'self'", 'data:'],           // data: URIs for node color swatches
+      connectSrc:  ["'self'"],                    // all API calls go to same origin
+      fontSrc:     ["'self'"],
+      objectSrc:   ["'none'"],
+      frameSrc:    ["'none'"],
+    },
+  },
+}));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -1649,7 +1663,9 @@ app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
     query: String(query).slice(0, HISTORY_QUERY_MAX_CHARS),
     count: Number.isFinite(Number(count)) ? Number(count) : 0
   };
-  // JSON.stringify escapes all control characters — no log-injection possible
+  // JSON.stringify escapes all control characters — no log-injection possible.
+  // HISTORY_FILE is a hardcoded server-side path — no path-traversal risk.
+  // CodeQL "network-data-written-to-file": intentional design; dismiss in GitHub UI.
   const line = JSON.stringify(entry) + '\n';
   try {
     fs.appendFileSync(HISTORY_FILE, line, 'utf8');
@@ -1659,69 +1675,11 @@ app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
   }
 });
 
-// ─── Vendor library auto-download ────────────────────────────────────────────
-// Downloads third-party JS bundles into public/vendor/ on first run so the
-// browser never needs to reach an external CDN.  Runs in the background after
-// the server starts; missing files are logged but do not crash the server.
-const _vendorDir = path.join(__dirname, 'public', 'vendor');
-const _vendorLibs = [
-  { url: 'https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js',                  file: 'cytoscape.min.js' },
-  { url: 'https://unpkg.com/dagre@0.8.5/dist/dagre.min.js',                           file: 'dagre.min.js' },
-  { url: 'https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js',                file: 'cytoscape-dagre.js' },
-  { url: 'https://unpkg.com/klayjs@0.4.1/klay.js',                                    file: 'klay.js' },
-  { url: 'https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js',                  file: 'cytoscape-klay.js' },
-  { url: 'https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js',            file: 'exceljs.min.js' },
-  { url: 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js',               file: 'jszip.min.js' },
-  { url: 'https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js',                 file: 'd3.min.js' },
-  { url: 'https://cdnjs.cloudflare.com/ajax/libs/d3-sankey/0.12.3/d3-sankey.min.js',  file: 'd3-sankey.min.js' },
-];
-
-function _downloadVendorLib(url, dest) {
-  return new Promise((resolve, reject) => {
-    const client = url.startsWith('https') ? require('https') : require('http');
-    const tmp = dest + '.tmp';
-    const file = fs.createWriteStream(tmp);
-    function get(u) {
-      const opts = Object.assign(new URL(u), { rejectUnauthorized: false });
-      client.get(opts, res => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const next = res.headers.location.startsWith('http')
-            ? res.headers.location
-            : new URL(res.headers.location, u).href;
-          return get(next);
-        }
-        if (res.statusCode !== 200) {
-          file.close(); try { fs.unlinkSync(tmp); } catch(_) {}
-          return reject(new Error(`HTTP ${res.statusCode}`));
-        }
-        res.pipe(file);
-        file.on('finish', () => { file.close(); fs.renameSync(tmp, dest); resolve(); });
-        file.on('error', err => { try { fs.unlinkSync(tmp); } catch(_) {} reject(err); });
-      }).on('error', reject);
-    }
-    get(url);
-  });
-}
-
-async function _ensureVendorLibs() {
-  try { fs.mkdirSync(_vendorDir, { recursive: true }); } catch(_) {}
-  for (const lib of _vendorLibs) {
-    const dest = path.join(_vendorDir, lib.file);
-    if (fs.existsSync(dest)) continue;
-    try {
-      await _downloadVendorLib(lib.url, dest);
-      console.log(`[vendor] downloaded ${lib.file}`);
-    } catch (err) {
-      console.warn(`[vendor] failed to download ${lib.file}: ${err.message}`);
-    }
-  }
-}
-
 // ─── Start server ─────────────────────────────────────────────────────────────
+// Vendor libraries must be pre-downloaded by running: node scripts/vendor-libs.js
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Graph Explorer running on http://localhost:${PORT}`);
-  _ensureVendorLibs(); // runs in background; server is already accepting requests
 });
 
 // ─── Neo4j schema introspection ───────────────────────────────────────────────
@@ -1899,7 +1857,7 @@ app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, r
     UNWIND $nodeParams AS np
     MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
     WHERE np.label IN labels(p)
-    OPTIONAL MATCH path = (p)-[:is_a*]->(parent)
+    OPTIONAL MATCH path = (p)-[:is_a|part_of*]->(parent)
     WITH p, collect(DISTINCT path) AS paths
     RETURN p, paths
   `;
@@ -2053,12 +2011,14 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
 
   const username = req.user.username;
 
-  // Coerce semicolon-separated strings → arrays for list properties
+  // Coerce semicolon-separated strings → arrays for list properties.
+  // Keys are validated against an allowlist before touching the object — breaks CodeQL taint path.
+  const _PROP_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]{0,199}$/;
   const relProps = Object.create(null);
   Object.entries(properties).forEach(([k, v]) => {
     if (v == null || v === '') return;
     const key = String(k);
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+    if (!_PROP_KEY_RE.test(key)) return; // reject anything that isn't a safe identifier
     relProps[key] = (typeof v === 'string' && v.includes(';'))
       ? v.split(';').map(s => s.trim()).filter(Boolean) : v;
   });
@@ -2185,7 +2145,7 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
     UNWIND $nodeParams AS np
     MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
     WHERE np.label IN labels(p)
-    OPTIONAL MATCH path = (child)-[:is_a*]->(p)
+    OPTIONAL MATCH path = (child)-[:is_a|part_of*]->(p)
     WITH p, collect(DISTINCT path) AS paths
     RETURN p, paths
   `;
@@ -2286,12 +2246,17 @@ app.post('/api/ontology/direct-children', dbLimiter, authMiddleware, async (req,
 // Body: { urns: string[], graphUrns: string[] }
 // For each ontology URN, counts how many graphUrns are descendants of it.
 // Returns { counts: { [urn]: number } }
+const _URN_KEY_RE = /^[a-zA-Z0-9:@%.~_\-]{1,500}$/; // allowlist for URN-shaped object keys
+
 app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, res) => {
   const { urns = [], graphUrns = [] } = req.body || {};
   if (!Array.isArray(urns) || !urns.length) return res.json({ counts: {} });
+  // Validate every URN before it can be used as an object key
+  const safeUrns = urns.filter(u => typeof u === 'string' && _URN_KEY_RE.test(u));
+  if (!safeUrns.length) return res.json({ counts: {} });
   if (!Array.isArray(graphUrns) || !graphUrns.length) {
     const counts = Object.create(null);
-    urns.forEach(u => { counts[String(u)] = 0; });
+    safeUrns.forEach(u => { counts[u] = 0; });
     return res.json({ counts });
   }
 
@@ -2304,12 +2269,12 @@ app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, re
   `;
   const session = neo4jDriver.session({ database: NEO4J_DB });
   try {
-    const result = await session.run(cypher, { urns, graphUrns });
+    const result = await session.run(cypher, { urns: safeUrns, graphUrns });
     const counts = Object.create(null);
     result.records.forEach(r => {
       const u = String(r.get('parentUrn'));
-      const c = r.get('cnt');
-      counts[u] = neo4j.isInt(c) ? c.toNumber() : (Number(c) || 0);
+      // Only write keys that passed the original allowlist check
+      if (_URN_KEY_RE.test(u)) counts[u] = neo4j.isInt(r.get('cnt')) ? r.get('cnt').toNumber() : (Number(r.get('cnt')) || 0);
     });
     res.json({ counts });
   } catch (err) {
