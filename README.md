@@ -140,7 +140,11 @@ Change this password immediately after first login via **⚙ Settings ▾ → Ad
 | **User management** | Admin can add/remove users and assign roles (admin/user) |
 | **DB settings** | Admin can update Neo4j and Postgres connection credentials at runtime without restarting the server |
 | **SQL query** | Admin can run read-only PostgreSQL SELECT queries from the browser |
-| **Security** | JWT auth (12 h), bcrypt passwords, rate limiting, credentials stored in settings.json (not in source code) |
+| **Ontology Analysis** | Database → Ontology submenu: browse ontology tree rooted at any term; expand nodes; see per-term entity counts in the current graph; copy term to clipboard |
+| **CSV export** | Export query results as CSV directly from the Large Export Warning dialog; configurable row limit |
+| **Merge Similar Relations** | Graph → Merge Similar Relations collapses duplicate edges; CLASS_SCORE priority (FunctionalAssociation < Regulation < QuantitativeChange/StateChange < MolTransport/MolSynthesis/Expression < Biomarker < Binding < ProtModification < PromoterBinding/DirectRegulation); Regulation merges into QuantitativeChange when they connect the same nodes |
+| **Schema preloading** | Neo4j schema (labels, relation types, property keys) is loaded immediately at login — not on first dialog open; Create/Edit Relation dialog shows a blocking spinner if schema is not yet ready |
+| **Security** | JWT auth (12 h), bcrypt passwords, rate limiting, credentials stored in settings.json (not in source code); HTTP security headers via `helmet`; internal errors sanitized before reaching the client; settings endpoints restricted to admin role |
 
 ---
 
@@ -203,6 +207,8 @@ Colleagues connect at: `http://<server-ip>:3000`
 | Tooltip blocks node drag | Update to latest app.js — tooltip hides on node grab |
 | Undo skips node moves | Update to latest app.js — node drag now pushes its own undo snapshot |
 | Autocomplete not appearing | Schema is fetched on login; ensure Neo4j connection is configured in Settings |
+| Create/Edit Relation shows "?" | Schema was not yet loaded; the dialog now blocks with a spinner until schema is ready — wait for it to disappear |
+| `Unsafe PostgreSQL schema name rejected` on start | Open `settings.json` and replace `"your-pg-schema"` with your actual PostgreSQL schema name, then restart |
 
 ---
 
@@ -212,3 +218,7 @@ Colleagues connect at: `http://<server-ip>:3000`
 - The `/api/sql-query` endpoint accepts SELECT/WITH statements only and is restricted to admin users.
 - The Database settings endpoints (`/api/settings/neo4j`, `/api/settings/postgres`) are restricted to admin users.
 - JWT tokens expire after 12 hours.
+- HTTP security headers (CSP, HSTS, X-Frame-Options, etc.) are set by `helmet`.
+- Internal error messages are never forwarded to the client in production mode — only a generic "Internal server error" string is returned.
+- History query payloads are capped at 10 000 characters and rate-limited.
+- The `NEO4J_URN_PROP` environment variable is validated as a safe identifier at startup.
