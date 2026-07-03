@@ -869,9 +869,18 @@ function populateSelectByLabelMenu() {
   }
   sub.innerHTML = labels.map(function(lbl) {
     var count = cy.nodes('[nodeType="' + lbl + '"]').not('[?isClone]').length;
-    return '<div class="menu-item" onclick="selectNodesByLabel(' + JSON.stringify(lbl) + ')">'
-      + lbl + ' <span style="color:#7a8099;font-size:11px">(' + count + ')</span></div>';
+    var escaped = lbl.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    return '<div class="menu-item" data-select-label="' + escaped + '">'
+      + escaped + ' <span style="color:#7a8099;font-size:11px">(' + count + ')</span></div>';
   }).join('');
+  // Attach delegation listener once per submenu element (flag prevents duplicates)
+  if (!sub._labelListenerAttached) {
+    sub._labelListenerAttached = true;
+    sub.addEventListener('click', function(e) {
+      var item = e.target.closest('[data-select-label]');
+      if (item) selectNodesByLabel(item.getAttribute('data-select-label'));
+    });
+  }
 }
 
 // ─── Cypher query bar: auto-resize + live linting ────────────────────────────
