@@ -55,7 +55,7 @@
       <span id="app-title">Graph Explorer</span>
     </div>
     <div id="header-center">
-      <div id="graph-stats"></div><div id="progress-msg" style="display:none;margin-left:14px;padding:2px 12px;background:#1e2235;border:1px solid #4f8ef7;border-radius:12px;color:#7ab4ff;font-size:12px;font-style:italic;white-space:nowrap;"></div><button id="undo-btn" onclick="undoGraphOperation()" title="Undo last graph operation" disabled style="margin-left:10px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer;opacity:0.4">↩</button><button id="redo-btn" onclick="redoGraphOperation()" title="Redo last undone operation" disabled style="margin-left:2px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer;opacity:0.4">↪</button><button onclick="zoomOut()" title="Zoom Out" style="margin-left:6px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">−</button><button id="fit-btn" onclick="zoomFit()" title="Fit graph to window" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">Fit</button><button onclick="zoomIn()" title="Zoom In" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">+</button><button onclick="alignNodesHorizontally()" title="Align selected nodes horizontally (same Y as focus node)" style="margin-left:6px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 26 16" width="22" height="13" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="1" y1="8" x2="25" y2="8" stroke="#5a6080" stroke-width="1.2"/><circle cx="5"  cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="13" cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="21" cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/></svg></button><button onclick="alignNodesVertically()" title="Align selected nodes vertically (same X as focus node)" style="margin-left:2px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 16 26" width="13" height="22" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="8" y1="1" x2="8" y2="25" stroke="#5a6080" stroke-width="1.2"/><circle cx="8" cy="5"  r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="8" cy="13" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="8" cy="21" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/></svg></button><button id="highlight-btn" onclick="toggleHighlightPicker(event)" title="Highlight selected nodes" style="margin-left:8px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 20 20" width="16" height="16" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><circle cx="10" cy="10" r="9.5" fill="#e74c3c" fill-opacity="0.75"/><circle cx="10" cy="10" r="5" fill="#f1c40f"/></svg></button><button id="nodecolor-btn" onclick="toggleNodeColorPicker(event)" title="Change node color" style="margin-left:2px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 28 22" width="19" height="12" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="7" y1="7" x2="21" y2="7" stroke="#5a6080" stroke-width="1.5"/><line x1="7" y1="7" x2="14" y2="18" stroke="#5a6080" stroke-width="1.5"/><line x1="21" y1="7" x2="14" y2="18" stroke="#5a6080" stroke-width="1.5"/><circle cx="7" cy="7" r="5.5" fill="#e74c3c"/><circle cx="21" cy="7" r="5.5" fill="#f1c40f"/><circle cx="14" cy="18" r="5.5" fill="#3498db"/></svg></button><button id="find-btn" onclick="toggleFindPopup(event)" title="Find nodes on graph" style="margin-left:8px;padding:2px 6px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 16 16" width="14" height="14" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><circle cx="6.5" cy="6.5" r="4.5" fill="none" stroke="#7a8099" stroke-width="1.6"/><line x1="10" y1="10" x2="14.5" y2="14.5" stroke="#7a8099" stroke-width="1.6" stroke-linecap="round"/></svg></button><button onclick="resizeSelectedNodes(1.3)" title="Increase node size" style="margin-left:8px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">⊕</button><button onclick="resizeSelectedNodes(0.77)" title="Decrease node size" style="margin-left:2px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">⊖</button>
+      <div id="graph-stats"></div><div id="progress-msg" style="display:none;margin-left:14px;padding:2px 12px;background:#1e2235;border:1px solid #4f8ef7;border-radius:12px;color:#7ab4ff;font-size:12px;font-style:italic;white-space:nowrap;"></div><button id="undo-btn" onclick="undoGraphOperation()" title="Undo last graph operation" disabled style="margin-left:10px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer;opacity:0.4">↩</button><button id="redo-btn" onclick="redoGraphOperation()" title="Redo last undone operation" disabled style="margin-left:2px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer;opacity:0.4">↪</button><button onclick="zoomOut()" title="Zoom Out" style="margin-left:6px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">−</button><button id="fit-btn" onclick="zoomFit()" title="Fit graph to window" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">Fit</button><button onclick="zoomIn()" title="Zoom In" style="margin-left:2px;padding:1px 8px;font-size:11px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">+</button><span title="Layout Scale — spreads or compresses node positions without changing node size. Resets when a new layout is applied." style="margin-left:8px;display:inline-flex;align-items:center;gap:3px;vertical-align:middle"><span style="font-size:10px;color:#7a8099;white-space:nowrap">Scale</span><input type="range" id="layout-scale-slider" min="0.01" max="4" step="0.05" value="1" style="width:72px;cursor:pointer;accent-color:#4f8ef7;vertical-align:middle" oninput="applyLayoutScale(this.value)"><span id="layout-scale-label" style="font-size:10px;color:#7a8099;min-width:26px;text-align:right">1×</span></span><button onclick="alignNodesHorizontally()" title="Align selected nodes horizontally (same Y as focus node)" style="margin-left:6px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 26 16" width="22" height="13" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="1" y1="8" x2="25" y2="8" stroke="#5a6080" stroke-width="1.2"/><circle cx="5"  cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="13" cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="21" cy="8" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/></svg></button><button onclick="alignNodesVertically()" title="Align selected nodes vertically (same X as focus node)" style="margin-left:2px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 16 26" width="13" height="22" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="8" y1="1" x2="8" y2="25" stroke="#5a6080" stroke-width="1.2"/><circle cx="8" cy="5"  r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="8" cy="13" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/><circle cx="8" cy="21" r="4" fill="#3a3f55" stroke="#7a8099" stroke-width="1.2"/></svg></button><button id="highlight-btn" onclick="toggleHighlightPicker(event)" title="Highlight selected nodes" style="margin-left:8px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 20 20" width="16" height="16" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><circle cx="10" cy="10" r="9.5" fill="#e74c3c" fill-opacity="0.75"/><circle cx="10" cy="10" r="5" fill="#f1c40f"/></svg></button><button id="nodecolor-btn" onclick="toggleNodeColorPicker(event)" title="Change node color" style="margin-left:2px;padding:2px 5px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 28 22" width="19" height="12" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><line x1="7" y1="7" x2="21" y2="7" stroke="#5a6080" stroke-width="1.5"/><line x1="7" y1="7" x2="14" y2="18" stroke="#5a6080" stroke-width="1.5"/><line x1="21" y1="7" x2="14" y2="18" stroke="#5a6080" stroke-width="1.5"/><circle cx="7" cy="7" r="5.5" fill="#e74c3c"/><circle cx="21" cy="7" r="5.5" fill="#f1c40f"/><circle cx="14" cy="18" r="5.5" fill="#3498db"/></svg></button><button id="find-btn" onclick="toggleFindPopup(event)" title="Find nodes on graph" style="margin-left:8px;padding:2px 6px;background:transparent;border:1px solid #3a3f55;border-radius:4px;cursor:pointer;line-height:0"><svg viewBox="0 0 16 16" width="14" height="14" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle"><circle cx="6.5" cy="6.5" r="4.5" fill="none" stroke="#7a8099" stroke-width="1.6"/><line x1="10" y1="10" x2="14.5" y2="14.5" stroke="#7a8099" stroke-width="1.6" stroke-linecap="round"/></svg></button><button onclick="resizeSelectedNodes(1.3)" title="Increase node size" style="margin-left:8px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">⊕</button><button onclick="resizeSelectedNodes(0.77)" title="Decrease node size" style="margin-left:2px;padding:1px 8px;font-size:13px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#7a8099;cursor:pointer">⊖</button>
     </div>
     <div id="header-right">
       <span id="current-user-label"></span>
@@ -100,15 +100,29 @@
     <div class="menu-entry" id="me-database">
       <div class="menu-label" onclick="toggleMenu('me-database')" onmouseenter="hoverMenu('me-database')">Database</div>
       <div class="menu-dropdown">
-        <div class="menu-item" onclick="focusCypherInput();closeMenus()">Neo4j Cypher</div>
+        <div class="menu-item has-sub">Neo4j Cypher
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="focusCypherInput();closeMenus()">Open Cypher editor</div>
+            <div class="menu-item" onclick="openSankeyDialog();closeMenus()">Sankey diagram</div>
+            <div class="menu-item" onclick="openCypherHistory();closeMenus()">Cypher history</div>
+          </div>
+        </div>
         <div class="menu-item" onclick="openSqlDialog();closeMenus()">Postgres SQL</div>
         <div class="menu-separator"></div>
         <div class="menu-item" onclick="openLoadNodePropertiesDialog();closeMenus()">Load node properties</div>
         <div class="menu-item" onclick="loadSimilarRelations();closeMenus()">Load similar relations</div>
         <div class="menu-item" onclick="mergeSimilarRelations();closeMenus()">Merge similar relations</div>
         <div class="menu-separator"></div>
-        <div class="menu-item" onclick="findOntologyChildren();closeMenus()">Find ontology children</div>
-        <div class="menu-item" onclick="findOntologyParents();closeMenus()">Find ontology parents</div>
+        <div class="menu-item has-sub">Ontology
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="findOntologyChildren();closeMenus()">Find ontology children</div>
+            <div class="menu-item" onclick="findOntologyParents();closeMenus()">Find ontology parents</div>
+            <div class="menu-separator"></div>
+            <div class="menu-item" onclick="openOntologyAnalysis();closeMenus()">Ontology analysis…</div>
+          </div>
+        </div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" id="me-create-relation" style="display:none;color:#3a4060;pointer-events:none" onclick="openRelationCurationDialog();closeMenus()">Create/Edit relation</div>
         <div class="menu-item has-sub">Find relations between Selected and Unselected
           <div class="menu-submenu">
             <div class="menu-item" onclick="findRelationsBetweenGroups('all');closeMenus()">All relations</div>
@@ -211,8 +225,12 @@
       <div class="menu-dropdown">
         <div class="menu-item" id="me-select-area" onclick="toggleBoxSelect();closeMenus()">By area</div>
         <div class="menu-item" onclick="selectAllNodes();closeMenus()">Nodes</div>
+        <div class="menu-item has-sub" onmouseenter="populateSelectByLabelMenu()">Nodes by label
+          <div class="menu-submenu" id="select-by-label-submenu"><div class="menu-item" style="color:#7a8099;font-style:italic">Loading…</div></div>
+        </div>
         <div class="menu-item" onclick="selectAllEdges();closeMenus()">Relations</div>
         <div class="menu-separator"></div>
+        <div class="menu-item" onclick="addNeighborsToSelection();closeMenus()">Add neighbors to selection</div>
         <div class="menu-item" onclick="invertSelection();closeMenus()">Invert selection</div>
         <div class="menu-separator"></div>
         <div class="menu-item" id="mi-select-from-clipboard" onclick="selectFromClipboard();closeMenus()" style="color:#7a8099">Select from clipboard</div>
@@ -402,6 +420,31 @@
     <div class="modal-actions">
       <button class="btn-ghost" onclick="document.getElementById('change-pw-modal').style.display='none'">Cancel</button>
       <button class="btn-primary" onclick="submitChangePassword()">Update Password</button>
+    </div>
+  </div>
+</div>
+
+<!-- Cypher history modal -->
+<div id="cypher-history-modal" class="modal-backdrop" style="display:none" onclick="if(event.target===this)this.style.display='none'">
+  <div class="modal-box" style="min-width:700px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column">
+    <h3 style="margin:0 0 12px">Cypher Query History</h3>
+    <p style="margin:0 0 10px;font-size:12px;color:#a0aec0">Click a query row to load it, or choose a destination from the dropdown.</p>
+    <div id="cypher-history-status" style="color:#a0aec0;font-size:13px;margin-bottom:6px"></div>
+    <div style="overflow:auto;flex:1;border:1px solid #2a3050;border-radius:6px">
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="background:#1a1f35;position:sticky;top:0">
+            <th style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050">Date</th>
+            <th style="padding:7px 10px;text-align:right;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050">Result Count</th>
+            <th style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;border-bottom:1px solid #2a3050">Cypher Query</th>
+            <th style="padding:7px 10px;text-align:center;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050">Open in</th>
+          </tr>
+        </thead>
+        <tbody id="cypher-history-tbody"></tbody>
+      </table>
+    </div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn-ghost" onclick="document.getElementById('cypher-history-modal').style.display='none'">Close</button>
     </div>
   </div>
 </div>
@@ -598,6 +641,37 @@
     </div>
   </div>
 
+  <!-- ══════════════ Ontology Analysis Dialog ══════════════ -->
+  <div id="ontology-analysis-modal" style="display:none;position:fixed;inset:0;background:rgba(10,15,40,0.65);z-index:4000;align-items:center;justify-content:center">
+    <div style="background:#1a2035;border:1px solid #2a3555;border-radius:10px;width:720px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px #000c">
+      <!-- Header -->
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #2a3555;flex-shrink:0">
+        <span style="font-size:14px;font-weight:600;color:#e8ecf3">Ontology Analysis</span>
+        <div style="display:flex;align-items:center;gap:18px">
+          <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#7a8099;cursor:pointer">
+            <input type="radio" name="ontology-layout" value="hierarchical" checked onchange="setOntologyLayout('hierarchical')" style="accent-color:#4f8ef7">
+            Hierarchical
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#7a8099;cursor:pointer">
+            <input type="radio" name="ontology-layout" value="orthogonal" onchange="setOntologyLayout('orthogonal')" style="accent-color:#4f8ef7">
+            Orthogonal
+          </label>
+          <button onclick="closeOntologyAnalysis()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;padding:0 2px;line-height:1;margin-left:4px">×</button>
+        </div>
+      </div>
+      <!-- Status bar -->
+      <div id="ontology-status-bar" style="padding:5px 18px;font-size:11px;color:#7a8099;border-bottom:1px solid #222c44;min-height:24px;flex-shrink:0"></div>
+      <!-- Tree -->
+      <div id="ontology-tree-container" style="flex:1;overflow:auto;padding:6px 4px"></div>
+    </div>
+  </div>
+
+  <!-- Ontology right-click context menu -->
+  <div id="ontology-ctx-menu" style="display:none;position:fixed;background:#1a2035;border:1px solid #2a3555;border-radius:6px;z-index:5000;min-width:200px;box-shadow:0 4px 20px #000b;padding:4px 0">
+    <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-children')">Copy children to clipboard</div>
+    <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-neighborhood')">Copy neighborhood to clipboard</div>
+  </div>
+
   <!-- ══════════════ Expansion results confirmation ══════════════ -->
   <div id="expand-confirm-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:3000;align-items:center;justify-content:center">
     <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;min-width:360px;max-width:520px">
@@ -619,7 +693,196 @@
 <script src="https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-sankey/0.12.3/d3-sankey.min.js"></script>
 <script src="app.js"></script>
+
+<!-- ══════════════ Create / Edit Relation dialog ══════════════ -->
+<div id="rel-curation-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:2500;align-items:flex-start;justify-content:center;overflow-y:auto;padding:36px 16px 60px">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:760px;max-width:96vw;display:flex;flex-direction:column;gap:16px" onclick="event.stopPropagation()">
+
+    <!-- Header -->
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <div id="rc-title" style="font-size:15px;font-weight:600;color:#e0e0e0">Create Relation</div>
+      <button onclick="closeRelationCurationDialog()" style="background:none;border:none;color:#7a8099;font-size:22px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+    </div>
+
+    <!-- Nodes -->
+    <div>
+      <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5a6080;margin-bottom:8px">Selected Nodes</div>
+      <div id="rc-nodes" style="display:flex;flex-direction:column;gap:4px"></div>
+    </div>
+
+    <div style="border-top:1px solid #2a3050"></div>
+
+    <!-- Relation type (mandatory) -->
+    <div style="display:flex;align-items:center;gap:10px">
+      <div style="font-size:13px;color:#c0c4d4;min-width:106px">Relation type <span style="color:#e05060">*</span></div>
+      <select id="rc-reltype" onchange="rcOnRelTypeChange()" style="flex:1;background:#0d1117;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 10px;font-size:13px">
+        <option value="">— select type —</option>
+      </select>
+    </div>
+
+    <!-- Properties -->
+    <div>
+      <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5a6080;margin-bottom:8px">Properties</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
+        <datalist id="rc-prop-key-list"></datalist>
+        <datalist id="rc-prop-val-list"></datalist>
+        <input type="text" id="rc-prop-key" list="rc-prop-key-list" placeholder="Property name" oninput="rcOnPropKeyInput(this,'rc-prop-val-list')" onkeydown="if(event.key==='Enter')rcAddProperty()"
+          style="flex:1;background:#0d1117;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 8px;font-size:13px">
+        <input type="text" id="rc-prop-val" list="rc-prop-val-list" placeholder="Value" onkeydown="if(event.key==='Enter')rcAddProperty()"
+          style="flex:2;background:#0d1117;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 10px;font-size:13px">
+        <button onclick="rcAddProperty()" style="background:#2a3050;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 14px;font-size:13px;cursor:pointer;white-space:nowrap">Add</button>
+      </div>
+      <div style="font-size:11px;color:#4a5070;margin-bottom:8px">To add multiple values as a list, separate each value with a semicolon (;).</div>
+      <div id="rc-props" style="display:flex;flex-direction:column;gap:2px"></div>
+    </div>
+
+    <!-- References panel (collapsed by default) -->
+    <div id="rc-refs-section" style="display:none;border-top:1px solid #2a3050;padding-top:14px">
+      <div style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#5a6080;margin-bottom:10px">References</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span id="rc-ref-counter" style="font-size:12px;color:#7a8099">No references</span>
+        <div style="display:flex;gap:6px">
+          <button id="rc-nav-first" onclick="rcNavRef('first')" title="First" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">«</button>
+          <button id="rc-nav-prev"  onclick="rcNavRef('prev')"  title="Previous" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">‹</button>
+          <button id="rc-nav-next"  onclick="rcNavRef('next')"  title="Next" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">›</button>
+          <button id="rc-nav-last"  onclick="rcNavRef('last')"  title="Last" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">»</button>
+          <button onclick="rcAddNewRef()" title="New reference" style="background:#0e2040;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;padding:3px 10px;font-size:12px;cursor:pointer">+ New</button>
+        </div>
+      </div>
+      <div id="rc-ref-card" style="min-height:80px"></div>
+    </div>
+
+    <!-- Footer -->
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <div style="flex:1;font-size:11px;color:#3a4060;min-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        RelationID: <span id="rc-rel-id" style="font-family:monospace;color:#5a6a90">—</span>
+      </div>
+      <button onclick="rcToggleRefs()" id="rc-refs-btn"
+        style="background:#1a2040;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 14px;font-size:13px;cursor:pointer">References</button>
+      <button onclick="closeRelationCurationDialog()"
+        style="background:transparent;border:1px solid #3a3f55;border-radius:6px;color:#7a8099;padding:6px 14px;font-size:13px;cursor:pointer">Cancel</button>
+      <button onclick="rcSaveToDatabase()"
+        style="background:#4f8ef7;border:none;border-radius:6px;color:#fff;padding:6px 20px;font-size:13px;cursor:pointer;font-weight:600">Add to Database</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Relation for Pair modal -->
+<div id="rc-pair-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:2500;align-items:flex-start;justify-content:center;overflow-y:auto;padding:36px 16px 60px">
+  <div style="background:#0d1117;border:1px solid #3a3f55;border-radius:10px;width:560px;max-width:95vw;box-shadow:0 8px 40px rgba(0,0,0,.7);position:relative">
+    <div id="rcp-schema-loading" style="display:none;position:absolute;inset:0;background:rgba(13,17,23,.88);border-radius:10px;z-index:10;flex-direction:column;align-items:center;justify-content:center;gap:12px">
+      <div style="width:28px;height:28px;border:3px solid #2a3555;border-top-color:#4f8ef7;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+      <div style="font-size:13px;color:#7a8099">Database schema is loading…</div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 22px 14px;border-bottom:1px solid #1a2040">
+      <span id="rcp-title" style="font-size:16px;font-weight:600;color:#e0e4f4">Create/Edit Relation</span>
+      <button onclick="closePairRelationDialog()" style="background:none;border:none;color:#7a8099;font-size:22px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+    </div>
+    <div style="padding:18px 22px;display:flex;flex-direction:column;gap:16px">
+      <div>
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:6px">Relation type <span style="color:#e05060">*</span></label>
+        <select id="rcp-reltype" onchange="rcPairOnRelTypeChange()" style="width:100%;background:#0a0f1e;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:7px 10px;font-size:13px;cursor:pointer">
+          <option value="">— select relation type —</option>
+        </select>
+      </div>
+      <div id="rcp-visual" style="background:#080c18;border:1px solid #1a2040;border-radius:8px;padding:18px 14px;min-height:80px;display:flex;flex-direction:column;align-items:center;justify-content:center">
+        <div style="color:#2a3050;font-size:12px;font-style:italic">Select a relation type above</div>
+      </div>
+      <div>
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:6px">Properties</label>
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <datalist id="rcp-prop-key-list"></datalist>
+          <datalist id="rcp-prop-val-list"></datalist>
+          <input type="text" id="rcp-prop-key" list="rcp-prop-key-list" placeholder="Property name" oninput="rcOnPropKeyInput(this,'rcp-prop-val-list')" onkeydown="if(event.key==='Enter')rcPairAddProperty()" style="flex:1;background:#0a0f1e;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 8px;font-size:12px">
+          <input id="rcp-prop-val" type="text" list="rcp-prop-val-list" placeholder="Value" onkeydown="if(event.key==='Enter')rcPairAddProperty()" style="flex:1;background:#0a0f1e;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:6px 8px;font-size:12px">
+          <button onclick="rcPairAddProperty()" style="background:#1a2a50;border:1px solid #3a3f55;border-radius:6px;color:#4f8ef7;padding:6px 12px;font-size:12px;cursor:pointer;white-space:nowrap">Add</button>
+        </div>
+        <div id="rcp-props" style="max-height:140px;overflow-y:auto"></div>
+      </div>
+      <div>
+        <button id="rcp-refs-btn" onclick="rcPairToggleRefs()" style="background:#1a2040;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:7px 14px;font-size:13px;cursor:pointer;width:100%;text-align:left">▶ References</button>
+        <div id="rcp-refs-section" style="display:none;margin-top:10px;background:#080c18;border:1px solid #1a2040;border-radius:8px;padding:14px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:6px">
+            <span id="rcp-ref-counter" style="font-size:12px;color:#7a8099">No references</span>
+            <div style="display:flex;gap:5px">
+              <button id="rcp-nav-first" onclick="rcPairNavRef('first')" title="First" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">«</button>
+              <button id="rcp-nav-prev"  onclick="rcPairNavRef('prev')"  title="Previous" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">‹</button>
+              <button id="rcp-nav-next"  onclick="rcPairNavRef('next')"  title="Next" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">›</button>
+              <button id="rcp-nav-last"  onclick="rcPairNavRef('last')"  title="Last" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">»</button>
+              <button onclick="rcPairAddNewRef()" title="New reference" style="background:#0e2040;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;padding:3px 10px;font-size:12px;cursor:pointer">+ New</button>
+            </div>
+          </div>
+          <div id="rcp-ref-card" style="min-height:80px"></div>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 22px 18px;border-top:1px solid #1a2040;gap:12px">
+      <div style="font-size:11px;color:#4a5070;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">
+        RelationID: <code id="rcp-rel-id" style="color:#4f8ef7;font-size:10px">—</code>
+      </div>
+      <div style="display:flex;gap:10px;flex-shrink:0">
+        <button onclick="closePairRelationDialog()" style="background:#1a2040;border:1px solid #3a3f55;border-radius:6px;color:#c0c4d4;padding:8px 18px;font-size:13px;cursor:pointer">Cancel</button>
+        <button onclick="rcPairSaveToDatabase()" style="background:#0e2a50;border:1px solid #4f8ef7;border-radius:6px;color:#4f8ef7;padding:8px 18px;font-size:13px;cursor:pointer;font-weight:600">Save to Database</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scripts: load order matters for Cytoscape extensions -->
+<script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
+<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+<script src="https://unpkg.com/klayjs@0.4.1/klay.js"></script>
+<script src="https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="app.js"></script>
+
+<!-- ══════════════ Sankey diagram modal ══════════════ -->
+<div id="sankey-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:3000;align-items:flex-start;justify-content:center;overflow-y:auto;padding:30px 16px 60px" onclick="if(event.target===this)closeSankeyDialog()">
+  <div style="background:#0d1117;border:1px solid #3a3f55;border-radius:10px;width:1100px;max-width:97vw;box-shadow:0 8px 40px rgba(0,0,0,.7);display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:16px 22px 12px;border-bottom:1px solid #1a2040">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0">Sankey Diagram — Cypher Query</span>
+      <button onclick="closeSankeyDialog()" style="background:none;border:none;color:#7a8099;font-size:22px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+    </div>
+    <div style="padding:16px 22px;display:flex;flex-direction:column;gap:10px">
+      <div style="font-size:12px;color:#7a8099">
+        Query must return nodes and relations: <code style="color:#98c379">MATCH (a)-[r]-&gt;(b) RETURN a, r, b</code> or paths.
+        Link width = value property (default: RelationNumberOfReferences), or 1 if absent.
+      </div>
+      <div style="position:relative">
+        <textarea id="sankey-cypher" rows="3"
+          style="width:100%;box-sizing:border-box;background:#111827;border:1px solid #2a3050;border-radius:6px;color:#c8d0e8;padding:10px 12px;font-family:monospace;font-size:13px;resize:vertical"
+          placeholder="MATCH (a)-[r]-&gt;(b) RETURN a, r, b LIMIT 200"
+          oninput="onSankeyCypherInput(this)"
+          onkeydown="onSankeyCypherKeydown(event)"
+        ></textarea>
+        <div id="sankey-autocomplete" style="display:none;position:absolute;left:0;top:100%;z-index:9999;min-width:220px;max-width:420px;max-height:220px;overflow-y:auto;background:#1a1f35;border:1px solid #4f8ef7;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,0.5);font-size:13px;font-family:monospace"></div>
+      </div>
+      <div id="sankey-lint-panel" style="display:none"></div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button onclick="runSankeyQuery()" style="background:#4f8ef7;border:none;border-radius:6px;color:#fff;padding:7px 20px;font-size:13px;cursor:pointer;font-weight:600">▶ Run</button>
+        <button id="sankey-show-all-btn" onclick="sankeyShowAll()" style="display:none;background:none;border:1px solid #4f8ef7;border-radius:6px;color:#4f8ef7;padding:7px 16px;font-size:12px;cursor:pointer">⊙ Show all</button>
+        <button onclick="showSankeyAsGraph()" style="background:none;border:1px solid #66bb6a;border-radius:6px;color:#66bb6a;padding:7px 16px;font-size:12px;cursor:pointer" title="Open selected nodes and edges in the Graph editor">📊 Show graph</button>
+        <button onclick="openOntologyAnalysisFromSankey()" style="background:none;border:1px solid #9c6fd6;border-radius:6px;color:#9c6fd6;padding:7px 16px;font-size:12px;cursor:pointer" title="Open Ontology Analysis for nodes in this Sankey diagram">🔬 Ontology analysis</button>
+        <button onclick="exportSankeyAsSvg()" style="background:none;border:1px solid #3a4060;border-radius:6px;color:#a0aec0;padding:7px 16px;font-size:12px;cursor:pointer">Export SVG</button>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#7a8099;cursor:pointer">
+          <input type="checkbox" id="sankey-show-labels" checked onchange="renderSankeyFromCache()"> Node labels
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#7a8099">
+          Value prop: <input type="text" id="sankey-value-prop" value="RelationNumberOfReferences"
+            style="background:#111827;border:1px solid #2a3050;border-radius:4px;color:#c8d0e8;padding:3px 8px;font-size:12px;width:200px"
+            onchange="renderSankeyFromCache()">
+        </label>
+        <span id="sankey-status" style="font-size:12px;color:#7a8099;margin-left:auto"></span>
+      </div>
+      <div id="sankey-svg-wrap" style="overflow:auto;background:#070c14;border-radius:8px;min-height:60px"></div>
+    </div>
+  </div>
+</div>
 
 <!-- Align hint toast -->
 <div id="align-toast" style="display:none;position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#2a2f45;border:1px solid #5a6080;color:#c8cfe0;padding:7px 18px;border-radius:6px;font-size:12px;z-index:9999;pointer-events:none;white-space:nowrap;box-shadow:0 3px 12px rgba(0,0,0,0.5)"></div>
@@ -646,4 +909,13 @@
 
 <!-- Highlight color picker -->
 <div id="highlight-picker" style="display:none;position:fixed;z-index:9999;background:#1e2235;border:1px solid #3a3f55;border-radius:8px;padding:8px 10px;gap:6px;align-items:center;box-shadow:0 4px 16px rgba(0,0,0,0.5);">
-  <span style="font-size:10px;color:#7a8099;
+  <span style="font-size:10px;color:#7a8099;width:100%;display:block;margin-bottom:2px">Highlight color:</span>
+  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+    <button onclick="setHighlightColor('#e74c3c')" title="Red"    style="width:22px;height:22px;border-radius:50%;background:#e74c3c;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor('#e67e22')" title="Orange" style="width:22px;height:22px;border-radius:50%;background:#e67e22;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor('#f1c40f')" title="Yellow" style="width:22px;height:22px;border-radius:50%;background:#f1c40f;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor('#2ecc71')" title="Green"  style="width:22px;height:22px;border-radius:50%;background:#2ecc71;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor('#3498db')" title="Blue"   style="width:22px;height:22px;border-radius:50%;background:#3498db;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor('#9b59b6')" title="Purple" style="width:22px;height:22px;border-radius:50%;background:#9b59b6;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor('#e91e8c')" title="Pink"   style="width:22px;height:22px;border-radius:50%;background:#e91e8c;border:2px solid transparent;cursor:pointer;padding:0"></button>
+    <button onclick="setHighlightColor(null)"      title="Remove highlight" style="width:22px;height:22px;border-radius:50%;background:#2a2f45;border:2px solid #5a6080;cursor:pointer
