@@ -685,18 +685,6 @@
   </div>
 
 
-<!-- Scripts: load order matters for Cytoscape extensions -->
-<script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
-<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
-<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
-<script src="https://unpkg.com/klayjs@0.4.1/klay.js"></script>
-<script src="https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/d3-sankey/0.12.3/d3-sankey.min.js"></script>
-<script src="app.js"></script>
-
 <!-- ══════════════ Create / Edit Relation dialog ══════════════ -->
 <div id="rel-curation-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:2500;align-items:flex-start;justify-content:center;overflow-y:auto;padding:36px 16px 60px">
   <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:760px;max-width:96vw;display:flex;flex-direction:column;gap:16px" onclick="event.stopPropagation()">
@@ -832,13 +820,15 @@
 </div>
 
 <!-- Scripts: load order matters for Cytoscape extensions -->
-<script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
-<script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
-<script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
-<script src="https://unpkg.com/klayjs@0.4.1/klay.js"></script>
-<script src="https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="/vendor/cytoscape.min.js"></script>
+<script src="/vendor/dagre.min.js"></script>
+<script src="/vendor/cytoscape-dagre.js"></script>
+<script src="/vendor/klay.js"></script>
+<script src="/vendor/cytoscape-klay.js"></script>
+<script src="/vendor/exceljs.min.js"></script>
+<script src="/vendor/jszip.min.js"></script>
+<script src="/vendor/d3.min.js"></script>
+<script src="/vendor/d3-sankey.min.js"></script>
 <script src="app.js"></script>
 
 <!-- ══════════════ Sankey diagram modal ══════════════ -->
