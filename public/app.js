@@ -13,6 +13,43 @@ let cy = null;
 let currentQuery = '';
 let graphData = { nodes: [], edges: [] };   // raw data from server
 let refsCache = {};                          // relId → [postgres rows]
+
+// ─── Relation Curation state (Create / Edit Relation dialog) ──────────────────
+var _rc = {
+  mode: 'create',       // 'create' | 'edit'
+  nodes: [],            // [{cyId, label, nodeType, nodeId, direction:'→'|'←'|'−'}]
+  props: [],            // [{id, key, value}]   user-added / pre-populated properties
+  existingEdge: null,   // cy edge element when editing an existing relation
+  refs: [],             // reference row objects loaded from Postgres + newly created
+  refIdx: 0,            // index of the currently displayed reference
+  refsVisible: false,
+  refsLoaded: false,
+  refCols: [],          // reference table column names (from /api/schema/columns)
+  relTypes: [],         // all Neo4j relation types (cached)
+  propKeys: [],         // all Neo4j relation property keys (cached)
+  currentRelId: '',     // live-calculated RelationID
+  _pid: 0,              // auto-incrementing property row ID
+  _debounce: null       // debounce timer for RelationID recalc
+};
+
+// Relation types that carry no directionality — displayed as a plain line (no arrow)
+var RC_NONDIRECTIONAL_TYPES = new Set(['Binding', 'FunctionalAssociation', 'CellExpression']);
+
+// State for the pair dialog (exactly 2 nodes selected → Create Relation for pair)
+var _rcPair = {
+  nodeA: null,        // {cyId, label, nodeType, nodeId}
+  nodeB: null,
+  flipped: false,     // false: A→B (A is regulator), true: B→A
+  isNonDir: false,    // true for Binding / FunctionalAssociation / CellExpression
+  props: [],
+  refs: [],
+  refIdx: 0,
+  refsVisible: false,
+  refsLoaded: false,
+  currentRelId: '',
+  _pid: 0,
+  _debounce: null
+};
 let typeColorMap = {};                       // relType → hex color
 let colorIdx = 0;
 let tooltipVisible = false;
@@ -239,7 +276,7 @@ window.addEventListener('DOMContentLoaded', function() {
   }
   // Hide autocomplete dropdown when textarea loses focus
   document.addEventListener('focusout', function(e) {
-    if (e.target && e.target.id === 'cypher-input') {
+    if (e.target && (e.target.id === 'cypher-input' || e.target.id === 'sankey-cypher')) {
       // Small delay so mousedown on suggestion fires first
       setTimeout(_acHide, 150);
     }
@@ -367,10 +404,11 @@ function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
   document.getElementById('current-user-label').textContent = currentUser;
+  // DB connection settings are available to all roles
+  document.getElementById('settings-db-section').style.display = '';
   if (currentRole === 'admin') {
     document.getElementById('admin-btn') && (document.getElementById('admin-btn').style.display = '');
     document.getElementById('settings-users-item').style.display = '';
-    document.getElementById('settings-db-section').style.display = '';
   }
   // Load saved column config or fall back to defaults
   columnDefs = loadColumnConfig() || DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
@@ -387,9 +425,11 @@ function showApp() {
   // Fetch available DB column lists (used by Columns dialog)
   api('/api/schema/columns', null).then(function(data) {
     availableDbColumns = { reference: data.reference || [], scopus_data: data.scopus_data || [] };
+    // Pre-populate curation refCols so dialogs open instantly with no loading delay
+    if (!_rc.refCols.length) _rc.refCols = data.referenceColumns || [];
   }).catch(function() {});
   initCytoscape();
-  setTimeout(_loadSchema, 200); // Preload schema for autocomplete
+  _loadSchema(); // Preload schema immediately so relation-type dropdowns are ready before any dialog opens
 
   // Initialize tab system with one empty tab
   tabs = [{ id: Date.now(), name: 'Pathway 1', snapshot: emptyTabSnapshot() }];
@@ -462,7 +502,7 @@ function initCytoscape() {
   cy = cytoscape({
     container: document.getElementById('cy'),
     elements: [],
-    minZoom: 0.05, maxZoom: 5,
+    minZoom: 0.001, maxZoom: 5,
     wheelSensitivity: 0.3,
     boxSelectionEnabled: true,    // always on; panning state controls which drag mode fires
     userPanningEnabled: false,    // default: drag = box select; Move mode re-enables panning
@@ -581,6 +621,9 @@ function initCytoscape() {
     currentLayout = 'manual';
     // Re-show handles if this was the focused node
     if (focusNodeId && evt.target.id() === focusNodeId) showResizeHandles(evt.target);
+    // Node was manually repositioned — reset the scale base so the slider
+    // starts fresh from the current (post-drag) positions next time it's moved.
+    _layoutBasePositions = null;
   });
 
   // Right-click on node
@@ -790,6 +833,47 @@ function selectAllEdges() {
   cy.edges().select();
 }
 
+function addNeighborsToSelection() {
+  if (!cy) return;
+  var selected = cy.nodes(':selected');
+  if (!selected.length) return;
+  var neighbors = selected.neighborhood('node').not('[?isClone]');
+  neighbors.select();
+  // Also select edges connecting input nodes to their neighbors
+  selected.edgesWith(neighbors).select();
+}
+
+function selectNodesByLabel(lbl) {
+  if (!cy) return;
+  cy.nodes().unselect();
+  cy.nodes('[nodeType="' + lbl + '"]').not('[?isClone]').select();
+  closeMenus();
+}
+
+function populateSelectByLabelMenu() {
+  var sub = document.getElementById('select-by-label-submenu');
+  if (!sub) return;
+  // Collect unique nodeType values from current graph
+  var labels = [];
+  if (cy && cy.nodes().length) {
+    var seen = {};
+    cy.nodes().not('[?isClone]').forEach(function(n) {
+      var t = n.data('nodeType');
+      if (t && !seen[t]) { seen[t] = true; labels.push(t); }
+    });
+    labels.sort(function(a, b) { return a.localeCompare(b); });
+  }
+  if (!labels.length) {
+    sub.innerHTML = '<div class="menu-item" style="color:#7a8099;font-style:italic">No nodes in graph</div>';
+    return;
+  }
+  sub.innerHTML = labels.map(function(lbl) {
+    var count = cy.nodes('[nodeType="' + lbl + '"]').not('[?isClone]').length;
+    return '<div class="menu-item" onclick="selectNodesByLabel(' + JSON.stringify(lbl) + ')">'
+      + lbl + ' <span style="color:#7a8099;font-size:11px">(' + count + ')</span></div>';
+  }).join('');
+}
+
 // ─── Cypher query bar: auto-resize + live linting ────────────────────────────
 
 function getCypherQuery() {
@@ -813,8 +897,11 @@ var _lintDebounce = null;
 
 // ─── Cypher Schema Autocomplete ───────────────────────────────────────────────
 var _schemaCache = null;          // { labels, relTypes, propKeys }
+var _schemaLoadPromise = null;    // in-flight fetch promise — shared so concurrent callers don't fire duplicate requests
 var _acSelectedIdx = -1;          // currently highlighted row index
 var _acItems = [];                 // current suggestion list
+var _acBoxId = 'cypher-autocomplete';   // active autocomplete dropdown element id
+var _lintPanelId = 'cypher-lint-panel'; // active lint panel element id
 
 var CYPHER_KEYWORDS = [
   'MATCH','OPTIONAL MATCH','WHERE','RETURN','WITH','UNWIND','CREATE','MERGE',
@@ -827,26 +914,48 @@ var CYPHER_KEYWORDS = [
   'shortestPath','allShortestPaths','nodes','relationships','length'
 ];
 
+// Populate relation-curation caches from a schema object (called whenever schema is fetched)
+function _applySchemaToRc(schema) {
+  if (!schema) return;
+  if (schema.relTypes && schema.relTypes.length && !_rc.relTypes.length) {
+    _rc.relTypes = schema.relTypes;
+  }
+  if (schema.propKeys && schema.propKeys.length && !_rc.propKeys.length) {
+    _rc.propKeys = schema.propKeys;
+  }
+}
+
 function _loadSchema() {
-  if (_schemaCache) return Promise.resolve(_schemaCache);
+  if (_schemaCache) {
+    _applySchemaToRc(_schemaCache);
+    return Promise.resolve(_schemaCache);
+  }
   if (!authToken) return Promise.resolve(null);   // not logged in yet
-  return fetch('/api/graph/schema', {
+  // Return the in-flight promise if a fetch is already underway — avoids duplicate server requests
+  if (_schemaLoadPromise) return _schemaLoadPromise;
+  _schemaLoadPromise = fetch('/api/graph/schema', {
     headers: { 'Authorization': 'Bearer ' + authToken }
   })
   .then(function(r) { return r.ok ? r.json() : null; })
   .then(function(d) {
-    if (d && d.labels) _schemaCache = d;  // only cache valid schema response
+    if (d && d.labels) { _schemaCache = d; _applySchemaToRc(d); }
     return _schemaCache;
   })
-  .catch(function() { return null; });
-  // Note: on failure _schemaCache stays null so next keystroke retries
+  .catch(function() { return null; })
+  .finally(function() { _schemaLoadPromise = null; }); // clear guard so a failed load can be retried
+  return _schemaLoadPromise;
 }
 
-// Invalidate schema cache when user reconnects to a different DB
-function _invalidateSchemaCache() { _schemaCache = null; }
+// Invalidate schema cache when user reconnects to a different DB, then immediately reload
+function _invalidateSchemaCache() {
+  _schemaCache = null;
+  _rc.relTypes = [];
+  _rc.propKeys = [];
+  _loadSchema(); // repopulate globals for new connection
+}
 
 function _acShow(items, ta) {
-  var box = document.getElementById('cypher-autocomplete');
+  var box = document.getElementById(_acBoxId);
   if (!box) return;
   _acItems = items;
   _acSelectedIdx = -1;
@@ -870,14 +979,14 @@ function _acShow(items, ta) {
 }
 
 function _acHide() {
-  var box = document.getElementById('cypher-autocomplete');
+  var box = document.getElementById(_acBoxId);
   if (box) box.style.display = 'none';
   _acItems = [];
   _acSelectedIdx = -1;
 }
 
 function _acSetIdx(idx, box) {
-  if (!box) box = document.getElementById('cypher-autocomplete');
+  if (!box) box = document.getElementById(_acBoxId);
   if (!box) return;
   _acSelectedIdx = idx;
   Array.from(box.children).forEach(function(row, i) {
@@ -907,7 +1016,7 @@ function _acAccept(ta, item) {
 }
 
 function _acHandleKey(e) {
-  var box = document.getElementById('cypher-autocomplete');
+  var box = document.getElementById(_acBoxId);
   if (!box || box.style.display === 'none' || !_acItems.length) return false;
   if (e.key === 'ArrowDown') {
     e.preventDefault();
@@ -1005,6 +1114,8 @@ function _acTrigger(ta) {
 }
 
 function onCypherInput(ta) {
+  _acBoxId = 'cypher-autocomplete';
+  _lintPanelId = 'cypher-lint-panel';
   cypherAutoResize(ta);
   // Autocomplete
   _acTrigger(ta);
@@ -1018,6 +1129,31 @@ function onCypherInput(ta) {
     _lintDebounce = null;
     runCypherExplainLint(ta.value);
   }, 1200);
+}
+
+// Sankey cypher textarea — same pipeline, different dropdown/lint elements
+function onSankeyCypherInput(ta) {
+  _acBoxId = 'sankey-autocomplete';
+  _lintPanelId = 'sankey-lint-panel';
+  cypherAutoResize(ta);
+  _acTrigger(ta);
+  var structErr = cypherStructuralCheck(ta.value);
+  if (structErr) { showCypherLint('error', structErr); return; }
+  showCypherLint(null);
+  if (_lintDebounce) clearTimeout(_lintDebounce);
+  _lintDebounce = setTimeout(function() {
+    _lintDebounce = null;
+    _lintPanelId = 'sankey-lint-panel'; // restore in case another field fired
+    runCypherExplainLint(ta.value);
+  }, 1200);
+}
+
+// Same keydown handler works for both editors; it reads e.target (the textarea)
+function onSankeyCypherKeydown(e) {
+  _acBoxId = 'sankey-autocomplete';
+  _lintPanelId = 'sankey-lint-panel';
+  if (_acHandleKey(e)) return;
+  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); runSankeyQuery(); }
 }
 
 // Check bracket/quote balance. Returns error string or null.
@@ -1134,7 +1270,7 @@ async function runCypherExplainLint(text) {
 }
 
 function showCypherLint(level, msg) {
-  var panel = document.getElementById('cypher-lint-panel');
+  var panel = document.getElementById(_lintPanelId);
   if (!panel) return;
   if (!level) { panel.style.display = 'none'; panel.textContent = ''; return; }
   panel.className = 'lint-' + level;
@@ -1347,6 +1483,527 @@ function openSqlDialog() {
   document.getElementById('sql-modal').style.display = 'flex';
   document.getElementById('sql-results').innerHTML = '';
   setTimeout(function() { document.getElementById('sql-input').focus(); }, 50);
+}
+
+// ─── Sankey diagram ───────────────────────────────────────────────────────────
+var _sankeyCache = null;         // last query result for re-render on option change
+var _sankeySelNodeIds = null;    // Set of graph node IDs in current Sankey selection (null = all)
+var _sankeySelEdgeIds = null;    // Set of graph edge IDs in current Sankey selection (null = all)
+
+// Module-level hook so sankeyShowAll() (called from HTML) can reach into the active render closure
+var _sankeyShowAll = null;
+
+function sankeyShowAll() {
+  if (_sankeyShowAll) _sankeyShowAll();
+}
+
+function openSankeyDialog() {
+  document.getElementById('sankey-modal').style.display = 'flex';
+  document.getElementById('sankey-status').textContent = '';
+  var btn = document.getElementById('sankey-show-all-btn');
+  if (btn) btn.style.display = 'none';
+  _sankeyShowAll = null;
+  _sankeySelNodeIds = null;
+  _sankeySelEdgeIds = null;
+  setTimeout(function() { document.getElementById('sankey-cypher').focus(); }, 50);
+}
+
+function closeSankeyDialog() {
+  document.getElementById('sankey-modal').style.display = 'none';
+}
+
+async function runSankeyQuery() {
+  var query = (document.getElementById('sankey-cypher').value || '').trim();
+  if (!query) return;
+  var status = document.getElementById('sankey-status');
+  var wrap   = document.getElementById('sankey-svg-wrap');
+  status.textContent = '⏳ Running…';
+  status.style.color = '#7a8099';
+  wrap.innerHTML = '';
+  try {
+    var data = await api('/api/graph/query', { query: query });
+    _sankeyCache = data;
+    renderSankeyFromCache();
+    var edgeCount = data.edges ? data.edges.length : 0;
+    status.textContent = data.nodes.length + ' nodes · ' + edgeCount + ' edges';
+    status.style.color = '#4caf50';
+    appendCypherHistory(query, edgeCount);
+  } catch (err) {
+    status.textContent = 'Error: ' + (err.message || err);
+    status.style.color = '#e05560';
+  }
+}
+
+function renderSankeyFromCache() {
+  if (!_sankeyCache) return;
+  var valueProp  = (document.getElementById('sankey-value-prop').value || '').trim();
+  var showLabels = document.getElementById('sankey-show-labels').checked;
+  _renderSankey(_sankeyCache.nodes, _sankeyCache.edges, valueProp, showLabels);
+}
+
+// Break cycles in-place by reversing back-edges found via iterative DFS.
+// links[i].source and .target are numeric indices into nodes[].
+// Effect node block colors (positive=red, negative=green, per Pathway Studio convention)
+var _EFFECT_COLORS = { positive:'#ef5350', negative:'#66bb6a', unknown:'#90a4ae', undefined:'#90a4ae' };
+function _sankeyEffectColor(e) { return _EFFECT_COLORS[(e||'unknown').toLowerCase()] || '#90a4ae'; }
+
+// Target spectrum color for effect-based link color shifting
+var _EFFECT_SPECTRUM = { positive:'#d32f2f', negative:'#388e3c', unknown:'#78909c', undefined:'#78909c' };
+function _effectSpectrumColor(e) { return _EFFECT_SPECTRUM[(e||'unknown').toLowerCase()] || '#78909c'; }
+
+// Blend two hex colors: t=0 → c1, t=1 → c2
+function _blendHex(c1, c2, t) {
+  function p(h) { return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)]; }
+  var a = p(c1 || '#9e9e9e'), b = p(c2 || '#9e9e9e');
+  return '#' + [0,1,2].map(function(i){
+    return ('0' + Math.round(a[i]*(1-t) + b[i]*t).toString(16)).slice(-2);
+  }).join('');
+}
+
+// (kept for potential direct-graph mode in future)
+function _sankeyBreakCycles(nodeCount, links) {
+  var WHITE = 0, GRAY = 1, BLACK = 2;
+  var color = new Array(nodeCount).fill(WHITE);
+  // adjacency: node → [link index, ...]
+  var adj = [];
+  for (var i = 0; i < nodeCount; i++) adj.push([]);
+  links.forEach(function(l, li) {
+    if (l.source !== l.target) adj[l.source].push(li);
+  });
+
+  var reversed = new Set();
+  for (var start = 0; start < nodeCount; start++) {
+    if (color[start] !== WHITE) continue;
+    // Iterative DFS — frame = { node, edgeIdx }
+    var stack = [{ node: start, ei: 0 }];
+    color[start] = GRAY;
+    while (stack.length) {
+      var frame = stack[stack.length - 1];
+      var u = frame.node;
+      var moved = false;
+      while (frame.ei < adj[u].length) {
+        var li = adj[u][frame.ei++];
+        if (reversed.has(li)) continue;
+        var v = links[li].target;
+        if (color[v] === GRAY) {
+          // back-edge → reverse it to break the cycle
+          reversed.add(li);
+          var tmp = links[li].source;
+          links[li].source = links[li].target;
+          links[li].target = tmp;
+          // add to adj of new source so DFS stays consistent
+          adj[links[li].source].push(li);
+        } else if (color[v] === WHITE) {
+          color[v] = GRAY;
+          stack.push({ node: v, ei: 0 });
+          moved = true;
+          break;
+        }
+      }
+      if (!moved) {
+        color[u] = BLACK;
+        stack.pop();
+      }
+    }
+  }
+}
+
+// Generates a closed filled-ribbon SVG path for a Sankey link.
+// Using filled paths (vs. wide strokes) gives pixel-accurate hit detection:
+// mouse events fire on the exact visible ribbon, not on the stroke bounding box.
+// customWidth overrides d._w0/d.width — used for proportional selection scaling.
+function sankeyLinkFilled(d, customWidth) {
+  var w  = Math.max(0.5, customWidth !== undefined ? customWidth : (d._w0 || d.width || 1));
+  var hw = w / 2;
+  var x0 = d.source.x1, x1 = d.target.x0, xm = (x0 + x1) / 2;
+  var y0 = d.y0, y1 = d.y1;
+  return 'M' + x0 + ',' + (y0 - hw)
+    + 'C' + xm + ',' + (y0 - hw) + ' ' + xm + ',' + (y1 - hw) + ' ' + x1 + ',' + (y1 - hw)
+    + 'L' + x1 + ',' + (y1 + hw)
+    + 'C' + xm + ',' + (y1 + hw) + ' ' + xm + ',' + (y0 + hw) + ' ' + x0 + ',' + (y0 + hw)
+    + 'Z';
+}
+
+function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
+  var wrap = document.getElementById('sankey-svg-wrap');
+  wrap.innerHTML = '';
+
+  if (!gNodes || !gNodes.length) {
+    wrap.innerHTML = '<div style="color:#7a8099;padding:20px;font-size:13px">No nodes returned.</div>';
+    return;
+  }
+
+  // ── Anchor detection ──────────────────────────────────────────────────────
+  var degree = {};
+  gEdges.forEach(function(e) {
+    var s = String(e.startNodeId), t = String(e.endNodeId);
+    degree[s] = (degree[s] || 0) + 1;
+    degree[t] = (degree[t] || 0) + 1;
+  });
+  var anchorGId = Object.keys(degree).sort(function(a, b) { return degree[b] - degree[a]; })[0];
+  var nodeById = {};
+  gNodes.forEach(function(n) { nodeById[String(n.id)] = n; });
+  var anchorProp = (nodeById[anchorGId] || {}).properties || {};
+  var anchorName = anchorProp.Name || anchorProp.name || anchorGId || 'Hub';
+
+  var _skipL = { Entity:1, Named:1, Validated:1, Object:1 };
+  function primaryLabel(node) {
+    var ls = (node || {}).labels || [];
+    return ls.find(function(l) { return !_skipL[l]; }) || ls[0] || 'Unknown';
+  }
+
+  // ── Aggregate groups + collect raw edge/node metadata ────────────────────
+  // upstream key  = "entityLabel|||effect|||relType"
+  // downstream key= "relType|||effect|||entityLabel"
+  var upAgg = {}, downAgg = {};
+  var upMeta = {}, downMeta = {};   // key → { edgeCount, nodeSet, edgeIdSet }
+
+  gEdges.forEach(function(e) {
+    var src = String(e.startNodeId), tgt = String(e.endNodeId);
+    if (src === tgt) return;
+    var isDown = (src === anchorGId), isUp = (tgt === anchorGId);
+    if (!isDown && !isUp) return;
+    var otherId = isDown ? tgt : src;
+    var other   = nodeById[otherId];
+    if (!other) return;
+    var label   = primaryLabel(other);
+    var effect  = (e.properties || {}).Effect || 'unknown';
+    var relType = e.type || 'Unknown';
+    var rv      = valueProp ? (e.properties || {})[valueProp] : null;
+    var value   = (rv != null && isFinite(parseFloat(rv)) && parseFloat(rv) > 0) ? parseFloat(rv) : 1;
+    var eid     = String(e.id !== undefined ? e.id : (e.elementId || (src+'_'+tgt)));
+    if (isUp) {
+      var k = label+'|||'+effect+'|||'+relType;
+      upAgg[k] = (upAgg[k] || 0) + value;
+      if (!upMeta[k]) upMeta[k] = { edgeCount:0, nodeSet:new Set(), edgeIdSet:new Set() };
+      upMeta[k].edgeCount++; upMeta[k].nodeSet.add(otherId); upMeta[k].nodeSet.add(anchorGId);
+      upMeta[k].edgeIdSet.add(eid);
+    } else {
+      var k = relType+'|||'+effect+'|||'+label;
+      downAgg[k] = (downAgg[k] || 0) + value;
+      if (!downMeta[k]) downMeta[k] = { edgeCount:0, nodeSet:new Set(), edgeIdSet:new Set() };
+      downMeta[k].edgeCount++; downMeta[k].nodeSet.add(otherId); downMeta[k].nodeSet.add(anchorGId);
+      downMeta[k].edgeIdSet.add(eid);
+    }
+  });
+
+  // ── Sankey builder helpers ────────────────────────────────────────────────
+  var sNodes = [], nodeIdxMap = {};
+  function addNode(key, name, color) {
+    if (!(key in nodeIdxMap)) { nodeIdxMap[key] = sNodes.length; sNodes.push({ key:key, name:name, color:color }); }
+    return nodeIdxMap[key];
+  }
+  var sLinkMap = {};
+  var sLinkGroupVal = {};  // linkKey → { groupKey → value } — for proportional rescaling
+  function addLink(si, ti, val, color, gk) {
+    var k = si+'|'+ti;
+    // Track per-group contribution so we can rescale width on selection
+    if (gk) {
+      if (!sLinkGroupVal[k]) sLinkGroupVal[k] = {};
+      sLinkGroupVal[k][gk] = (sLinkGroupVal[k][gk] || 0) + val;
+    }
+    if (sLinkMap[k]) {
+      sLinkMap[k].value += val;
+      if (gk && sLinkMap[k]._gks.indexOf(gk) < 0) sLinkMap[k]._gks.push(gk);
+    } else {
+      sLinkMap[k] = { source:si, target:ti, value:val, color:color||'#7a8099', _lk:k, _gks:gk?[gk]:[] };
+    }
+  }
+
+  // Group ↔ Sankey element associations (for selection tracing)
+  var nodeKeyGroups = {};    // sankeyNodeKey → [groupKey]
+  var linkKeyGroups = {};    // linkKey       → [groupKey]
+  var groupNodeKeys = {};    // groupKey → [sankeyNodeKey]
+  var groupLinkKeys = {};    // groupKey → [linkKey]
+  function assoc(nodeKey, linkKey, gk) {
+    function push(map, k, v) { if (!map[k]) map[k]=[]; if(map[k].indexOf(v)<0) map[k].push(v); }
+    if (nodeKey) { push(nodeKeyGroups, nodeKey, gk); push(groupNodeKeys, gk, nodeKey); }
+    if (linkKey) { push(linkKeyGroups, linkKey, gk); push(groupLinkKeys, gk, linkKey); }
+  }
+
+  var _ecMap = {};
+  function entityColor(l) { if(!_ecMap[l]) _ecMap[l]=NODE_COLORS[l]||DEFAULT_NODE_COLOR; return _ecMap[l]; }
+  function relBaseColor(t) { return RELATION_COLORS[t]||DEFAULT_NODE_COLOR; }
+  var ANCHOR_CLR = '#b71c1c';
+  var aIdx = addNode('__anchor__', anchorName, ANCHOR_CLR);
+
+  Object.keys(upAgg).forEach(function(k) {
+    var p=k.split('|||'), label=p[0], effect=p[1], relType=p[2], val=upAgg[k];
+    var ec=entityColor(label), efc=_sankeyEffectColor(effect), rc=relBaseColor(relType), sp=_effectSpectrumColor(effect);
+    var eIdx  = addNode('up_e_'+label,             label,   ec);
+    var efIdx = addNode('up_ef_'+label+'_'+effect, effect,  efc);
+    var rIdx  = addNode('up_r_'+relType,           relType, rc);
+    var lk1=eIdx+'|'+efIdx, lk2=efIdx+'|'+rIdx, lk3=rIdx+'|'+aIdx;
+    addLink(eIdx, efIdx, val, _blendHex(ec, sp, 0.5), k);
+    addLink(efIdx, rIdx, val, _blendHex(rc, sp, 0.5), k);
+    addLink(rIdx,  aIdx, val, rc, k);
+    ['up_e_'+label,'up_ef_'+label+'_'+effect,'up_r_'+relType,'__anchor__'].forEach(function(nk){ assoc(nk,null,k); });
+    [lk1,lk2,lk3].forEach(function(lk){ assoc(null,lk,k); });
+  });
+
+  Object.keys(downAgg).forEach(function(k) {
+    var p=k.split('|||'), relType=p[0], effect=p[1], label=p[2], val=downAgg[k];
+    var ec=entityColor(label), efc=_sankeyEffectColor(effect), rc=relBaseColor(relType), sp=_effectSpectrumColor(effect);
+    var rIdx  = addNode('down_r_'+relType,             relType, rc);
+    var efIdx = addNode('down_ef_'+relType+'_'+effect, effect,  efc);
+    var eIdx  = addNode('down_e_'+label,               label,   ec);
+    var lk1=aIdx+'|'+rIdx, lk2=rIdx+'|'+efIdx, lk3=efIdx+'|'+eIdx;
+    addLink(aIdx,  rIdx,  val, rc, k);
+    addLink(rIdx,  efIdx, val, _blendHex(rc, sp, 0.5), k);
+    addLink(efIdx, eIdx,  val, _blendHex(ec, sp, 0.5), k);
+    ['__anchor__','down_r_'+relType,'down_ef_'+relType+'_'+effect,'down_e_'+label].forEach(function(nk){ assoc(nk,null,k); });
+    [lk1,lk2,lk3].forEach(function(lk){ assoc(null,lk,k); });
+  });
+
+  var sLinks = Object.values(sLinkMap);
+  if (!sLinks.length) {
+    wrap.innerHTML = '<div style="color:#7a8099;padding:20px;font-size:13px">No edges connected to hub node (' + escHtml(anchorName) + ').</div>';
+    return;
+  }
+
+  // ── Layout ────────────────────────────────────────────────────────────────
+  var HEADER = 52;
+  var W = Math.max(wrap.clientWidth || 1000, 700);
+  var H = Math.max(420, sNodes.length * 16 + 80);
+
+  var sankey = d3.sankey()
+    .nodeWidth(16).nodePadding(8)
+    .extent([[2, 2], [W - 2, H - 2]])
+    .nodeAlign(d3.sankeyLeft);
+
+  var graph;
+  try {
+    graph = sankey({
+      nodes: sNodes.map(function(n) { return Object.assign({}, n); }),
+      links: sLinks.map(function(l) { return Object.assign({}, l); })
+    });
+  } catch(err) {
+    wrap.innerHTML = '<div style="color:#e05560;padding:20px;font-size:13px">Layout error: ' + escHtml(err.message) + '</div>';
+    return;
+  }
+  // Cache each link's d3-sankey-computed width so clearHighlight can reliably restore it
+  graph.links.forEach(function(l) { l._w0 = l.width || 1; });
+
+  // ── SVG scaffold ──────────────────────────────────────────────────────────
+  var svg = d3.select(wrap).append('svg')
+    .attr('width', W).attr('height', H + HEADER)
+    .attr('id', 'sankey-svg')
+    .style('font-family', 'sans-serif').style('font-size', '11px');
+
+  // Column headers
+  var depthX = {};
+  graph.nodes.forEach(function(n) { if (!(n.depth in depthX)) depthX[n.depth] = n.x0; });
+  var maxD = d3.max(Object.keys(depthX).map(Number));
+  function colLabel(d) {
+    if (d===0||d===maxD) return 'ENTITY';
+    if (d===1||d===maxD-1) return 'EFFECT';
+    if (d===2||d===maxD-2) return 'RELATION';
+    return null;
+  }
+  Object.keys(depthX).forEach(function(d) {
+    d=+d; var lbl=colLabel(d); if(!lbl) return;
+    svg.append('text').attr('x',depthX[d]).attr('y',HEADER-10)
+      .attr('fill','#8090b0').attr('font-size','9px').attr('font-weight','700').attr('letter-spacing','1.5px').text(lbl);
+  });
+
+  // UPSTREAM / DOWNSTREAM banners
+  var upNd = graph.nodes.filter(function(n){ return n.key&&n.key.indexOf('up_')===0; });
+  var dnNd = graph.nodes.filter(function(n){ return n.key&&n.key.indexOf('down_')===0; });
+  function bannerX(ns){ return [d3.min(ns,function(n){return n.x0;}),d3.max(ns,function(n){return n.x1;})]; }
+  if (upNd.length){ var bx=bannerX(upNd); svg.append('text').attr('x',(bx[0]+bx[1])/2).attr('y',16).attr('text-anchor','middle').attr('fill','#7a9fd4').attr('font-size','11px').attr('font-weight','bold').attr('letter-spacing','2px').text('UPSTREAM'); }
+  if (dnNd.length){ var bx=bannerX(dnNd); svg.append('text').attr('x',(bx[0]+bx[1])/2).attr('y',16).attr('text-anchor','middle').attr('fill','#7a9fd4').attr('font-size','11px').attr('font-weight','bold').attr('letter-spacing','2px').text('DOWNSTREAM'); }
+
+  var g = svg.append('g').attr('transform', 'translate(0,'+HEADER+')');
+
+  // ── Interactive selection ─────────────────────────────────────────────────
+  var statusEl   = document.getElementById('sankey-status');
+  var showAllBtn = document.getElementById('sankey-show-all-btn');
+  var _selKey    = null;  // currently selected element key (or null)
+  var _origText  = '';    // captured lazily on first selection (after query status is written)
+
+  function resolveGroups(key, isLink) {
+    // If anchor node selected, include ALL groups
+    if (!isLink && key === '__anchor__') {
+      return Object.keys(upMeta).concat(Object.keys(downMeta));
+    }
+    return (isLink ? linkKeyGroups[key] : nodeKeyGroups[key]) || [];
+  }
+
+  // Semi-transparent fog overlay — shown during selection to dim unselected areas
+  var fogRect = g.append('rect')
+    .attr('x', 0).attr('y', -HEADER).attr('width', W).attr('height', H + HEADER)
+    .attr('fill', '#070c14').attr('fill-opacity', 0).style('pointer-events', 'none');
+
+  // Sum the contribution of the selected groups to a specific link
+  function _selLinkVal(lk, groups) {
+    var map = sLinkGroupVal[lk];
+    if (!map) return 0;
+    var sum = 0;
+    groups.forEach(function(gk) { sum += (map[gk] || 0); });
+    return sum;
+  }
+
+  function applyHighlight(selNodeSet, selLinkSet, groups) {
+    // Show button immediately — before the heavy per-link SVG recalculation below
+    if (showAllBtn) showAllBtn.style.display = '';
+    fogRect.transition().duration(150).attr('fill-opacity', 0.62);
+    linkSel.attr('fill-opacity', function(d) { return selLinkSet.has(d._lk) ? 0.82 : 0; });
+    // Regenerate the ribbon path at scaled width for proportional flow display
+    linkSel.attr('d', function(d) {
+      var origW = d._w0 || d.width || 1;
+      if (!selLinkSet.has(d._lk)) return sankeyLinkFilled(d, origW);
+      var selVal = _selLinkVal(d._lk, groups);
+      var scale  = (d.value > 0 && selVal > 0) ? selVal / d.value : 1;
+      return sankeyLinkFilled(d, Math.max(1, origW * scale));
+    });
+    nodeSel.attr('opacity', function(d) { return selNodeSet.has(d.key) ? 1 : 0; });
+    if (labelSel) labelSel.attr('opacity', function(d) { return selNodeSet.has(d.key) ? 1 : 0; });
+  }
+
+  function clearHighlight() {
+    fogRect.transition().duration(150).attr('fill-opacity', 0);
+    // Restore full-width ribbon paths and opacity
+    linkSel.attr('fill-opacity', 0.42);
+    linkSel.attr('d', function(d) { return sankeyLinkFilled(d); });
+    nodeSel.attr('opacity', 0.92);
+    if (labelSel) labelSel.attr('opacity', 1);
+    if (statusEl) { statusEl.textContent = _origText; statusEl.style.color = '#4caf50'; }
+    if (showAllBtn) showAllBtn.style.display = 'none';
+    _selKey = null;
+    _sankeySelNodeIds = null;
+    _sankeySelEdgeIds = null;
+  }
+
+  function selectElement(key, isLink) {
+    if (_selKey === key) { clearHighlight(); return; }   // toggle off
+    // Capture the current status text as the restore point only on the first selection
+    // (runSankeyQuery writes the "N nodes · M edges" total AFTER _renderSankey returns,
+    //  so capturing here guarantees we get the completed status, not "⏳ Running…")
+    if (_selKey === null && statusEl) _origText = statusEl.textContent;
+    _selKey = key;
+
+    var groups = resolveGroups(key, isLink);
+    if (!groups.length) { clearHighlight(); return; }
+
+    // Collect all Sankey elements that belong to these groups
+    var selNodeKeys = new Set(), selLinkKeys = new Set();
+    var totalEdges = 0, allNodeIds = new Set(), allEdgeIds = new Set();
+    groups.forEach(function(gk) {
+      (groupNodeKeys[gk] || []).forEach(function(nk) { selNodeKeys.add(nk); });
+      (groupLinkKeys[gk] || []).forEach(function(lk) { selLinkKeys.add(lk); });
+      var meta = upMeta[gk] || downMeta[gk];
+      if (meta) {
+        totalEdges += meta.edgeCount;
+        meta.nodeSet.forEach(function(id) { allNodeIds.add(id); });
+        if (meta.edgeIdSet) meta.edgeIdSet.forEach(function(id) { allEdgeIds.add(id); });
+      }
+    });
+
+    // Expose selected graph element IDs so "Show graph" can filter the dataset
+    _sankeySelNodeIds = allNodeIds;
+    _sankeySelEdgeIds = allEdgeIds;
+
+    applyHighlight(selNodeKeys, selLinkKeys, groups);
+
+    if (statusEl) {
+      statusEl.textContent = allNodeIds.size + ' nodes · ' + totalEdges + ' edges selected';
+      statusEl.style.color = '#4caf50';
+    }
+  }
+
+  // ── Render links as filled ribbons ────────────────────────────────────────
+  // Filled paths give pixel-accurate hit detection — events fire only on the
+  // visible ribbon area, not on the wide stroke bounding box that causes the
+  // "wrong path highlighted on hover" bug when paths overlap.
+  var linkSel = g.append('g').attr('stroke', 'none')
+    .selectAll('path').data(graph.links).join('path')
+      .attr('d', function(d) { return sankeyLinkFilled(d); })
+      .attr('fill', function(d) { return d.color || d.source.color || '#7a8099'; })
+      .attr('fill-opacity', 0.42)
+      .style('cursor', 'pointer')
+      .on('click', function(event, d) {
+        event.stopPropagation();
+        selectElement(d._lk, true);
+      });
+  // Append tooltip titles separately so linkSel stays as <path> selection
+  linkSel.append('title').text(function(d) {
+    return d.source.name + ' → ' + d.target.name + '\nValue: ' + d.value.toFixed(0);
+  });
+
+  // ── Render nodes ──────────────────────────────────────────────────────────
+  var nodeSel = g.append('g').selectAll('rect').data(graph.nodes).join('rect')
+    .attr('x',      function(d){ return d.x0; })
+    .attr('y',      function(d){ return d.y0; })
+    .attr('height', function(d){ return Math.max(2, d.y1-d.y0); })
+    .attr('width',  function(d){ return d.x1-d.x0; })
+    .attr('fill',   function(d){ return d.color || '#7a8099'; })
+    .attr('opacity', 0.92)
+    .style('cursor', 'pointer')
+    .on('click', function(event, d) {
+      event.stopPropagation();
+      selectElement(d.key, false);
+    });
+  // Append tooltip titles separately so nodeSel stays as <rect> selection
+  nodeSel.append('title').text(function(d){ return d.name; });
+
+  // ── Labels ────────────────────────────────────────────────────────────────
+  var labelSel = null;
+  if (showLabels) {
+    labelSel = g.append('g').selectAll('text').data(graph.nodes).join('text')
+      .attr('x',    function(d){ return d.x0 < W/2 ? d.x1+5 : d.x0-5; })
+      .attr('y',    function(d){ return (d.y1+d.y0)/2; })
+      .attr('dy',   '0.35em')
+      .attr('text-anchor', function(d){ return d.x0 < W/2 ? 'start' : 'end'; })
+      .attr('fill', '#c8d0e8').attr('font-size', '11px')
+      .style('pointer-events', 'none')
+      .text(function(d){ return d.name; });
+  }
+
+  // Expose clearHighlight AFTER linkSel/nodeSel/labelSel are fully built,
+  // so the closure captures all selections with their final values.
+  _sankeyShowAll = clearHighlight;
+
+  // Click SVG background to deselect
+  svg.on('click', function() { clearHighlight(); });
+}
+
+function exportSankeyAsSvg() {
+  var svgEl = document.getElementById('sankey-svg');
+  if (!svgEl) { alert('Run a query first.'); return; }
+  var blob = new Blob([svgEl.outerHTML], { type: 'image/svg+xml' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'sankey.svg';
+  a.click();
+  setTimeout(function() { URL.revokeObjectURL(a.href); }, 2000);
+}
+
+function showSankeyAsGraph() {
+  if (!_sankeyCache) { alert('Run a query first.'); return; }
+  var data = _sankeyCache;
+  var filteredData;
+
+  if (_sankeySelNodeIds && _sankeySelNodeIds.size > 0) {
+    // A path is selected — show only the nodes and edges in that selection
+    var nodeSet = _sankeySelNodeIds;
+    var edgeSet = _sankeySelEdgeIds;
+    filteredData = {
+      nodes: data.nodes.filter(function(n) { return nodeSet.has(String(n.id)); }),
+      edges: data.edges.filter(function(e) {
+        // Use tracked edge IDs when available, otherwise fall back to endpoint membership
+        return edgeSet && edgeSet.size > 0
+          ? edgeSet.has(String(e.id !== undefined ? e.id : (e.elementId || '')))
+          : (nodeSet.has(String(e.startNodeId)) && nodeSet.has(String(e.endNodeId)));
+      })
+    };
+  } else {
+    // No selection — show the full query result
+    filteredData = { nodes: data.nodes, edges: data.edges };
+  }
+
+  closeSankeyDialog();
+  hideQueryResultTable();
+  renderGraph(filteredData);
 }
 
 function closeSqlModal(e) {
@@ -1836,6 +2493,7 @@ function mergeGraphData(newData) {
 
   // ── Step 4: add new nodes ────────────────────────────────────────────────
   var addedNodes = 0;
+  var newNodeIds = [];
   newNodes.forEach(function(n) {
     var nid = String(n.id);
     if (neo4jToCy[nid]) return;            // already on canvas (anchor)
@@ -1847,6 +2505,7 @@ function mergeGraphData(newData) {
     if (urn) urnToCyId[urn] = nid;
     graphData.nodes.push(n);
     addedNodes++;
+    newNodeIds.push(nid);
     cy.add({
       group: 'nodes',
       data: _buildCyNodeData(n),
@@ -1854,11 +2513,22 @@ function mergeGraphData(newData) {
     });
   });
 
-  // ── Step 5: add new edges ────────────────────────────────────────────────
+  // ── Step 5: add / update edges ───────────────────────────────────────────
   var addedEdges = 0;
   newEdges.forEach(function(e) {
     var eid = String(e.id);
-    if (existingEdgeIds.has(eid)) return;
+    if (existingEdgeIds.has(eid)) {
+      // Edge already on canvas — update properties in graphData and Cytoscape
+      if (e.properties) {
+        var ge = graphData.edges.find(function(x) { return String(x.id) === eid; });
+        if (ge) Object.assign(ge.properties, e.properties);
+        var cyEdge = cy.getElementById(eid);
+        if (cyEdge.length) {
+          Object.keys(e.properties).forEach(function(k) { cyEdge.data(k, e.properties[k]); });
+        }
+      }
+      return;
+    }
     existingEdgeIds.add(eid);
 
     var srcCyId = neo4jToCy[String(e.startNodeId)];
@@ -1876,6 +2546,15 @@ function mergeGraphData(newData) {
       data: _buildCyEdgeData(e, srcCyId, tgtCyId)
     });
   });
+
+  // Select newly added nodes so the user can immediately drag them as a group
+  if (newNodeIds.length) {
+    cy.nodes(':selected').unselect();
+    newNodeIds.forEach(function(id) {
+      var n = cy.getElementById(id);
+      if (n.length) n.select();
+    });
+  }
 
   return { addedNodes: addedNodes, addedEdges: addedEdges };
 }
@@ -2053,11 +2732,18 @@ function applyLayout(name, btn) {
 
   updateLayoutMenu(name);
 
+  // Reset scale slider whenever a new layout is applied
+  resetLayoutScale();
+
+  // circle/concentric: disable built-in fit (it ignores label extents) and do a
+  // label-aware fit ourselves via zoomFit() once the layout has placed nodes.
+  var needsLabelFit = (name === 'circle' || name === 'concentric');
+
   var layoutConfigs = {
     cose:      { name: 'cose',      animate: false, numIter: 100, nodeRepulsion: 4500, idealEdgeLength: 100, fit: true, padding: 40 },
     dagre:     { name: 'dagre',     rankDir: 'TB', nodeSep: 60, rankSep: 80, animate: false, fit: true, padding: 40 },
-    circle:    { name: 'circle',    animate: false, fit: true, padding: 40 },
-    concentric:{ name: 'concentric',animate: false, fit: true, padding: 40, minNodeSpacing: 40 },
+    circle:    { name: 'circle',    animate: false, fit: false, padding: 40 },
+    concentric:{ name: 'concentric',animate: false, fit: false, padding: 40, minNodeSpacing: 40 },
     grid:      { name: 'grid',      animate: false, fit: true, padding: 40, avoidOverlap: true },
     klay:      { name: 'klay',      animate: false, fit: true, padding: 40,
                  klay: { direction: 'DOWN', edgeRouting: 'ORTHOGONAL',
@@ -2067,7 +2753,11 @@ function applyLayout(name, btn) {
 
   var config = layoutConfigs[name] || layoutConfigs.cose;
   try {
-    cy.layout(config).run();
+    var layoutInst = cy.layout(config);
+    if (needsLabelFit) {
+      layoutInst.on('layoutstop', function() { zoomFit(); });
+    }
+    layoutInst.run();
   } catch(err) {
     cy.layout(layoutConfigs.cose).run();
   }
@@ -2093,8 +2783,82 @@ function zoomOut() {
 
 function zoomFit() {
   if (!cy) return;
-  cy.fit(cy.elements(), 40);
+  var padding = 40;
+  // Use a label-inclusive bounding box so wrapped node labels don't get clipped
+  // at the viewport edge (most visible on circular / concentric layouts where
+  // every outermost node sits right at the fitted boundary).
+  var bb;
+  try { bb = cy.nodes().boundingBox({ includeLabels: true }); } catch(e) { bb = null; }
+  if (!bb || !isFinite(bb.w) || !isFinite(bb.h) || bb.w === 0 || bb.h === 0) {
+    cy.fit(cy.elements(), padding);
+    updateZoomLabel();
+    return;
+  }
+  var zoom = Math.min(
+    (cy.width()  - 2 * padding) / bb.w,
+    (cy.height() - 2 * padding) / bb.h
+  );
+  // Do NOT clamp to cy.minZoom() — Fit must always show the whole graph even
+  // if that requires going below the interactive zoom floor.
+  zoom = Math.min(Math.max(zoom, 0.001), cy.maxZoom());
+  cy.viewport({
+    zoom: zoom,
+    pan: {
+      x: cy.width()  / 2 - zoom * (bb.x1 + bb.x2) / 2,
+      y: cy.height() / 2 - zoom * (bb.y1 + bb.y2) / 2
+    }
+  });
   updateZoomLabel();
+}
+
+// ─── Layout scale slider ──────────────────────────────────────────────────────
+var _layoutBasePositions = null;  // node positions captured when slider was first moved
+
+function applyLayoutScale(val) {
+  if (!cy) return;
+  val = parseFloat(val);
+
+  // Update the label
+  var lbl = document.getElementById('layout-scale-label');
+  if (lbl) lbl.textContent = (val === 1 ? '1' : val.toFixed(2).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')) + '×';
+
+  // Capture base positions the first time the slider moves after a reset
+  if (!_layoutBasePositions) {
+    pushUndo();
+    _layoutBasePositions = {};
+    cy.nodes().not('[?isClone]').forEach(function(n) {
+      var p = n.position();
+      _layoutBasePositions[n.id()] = { x: p.x, y: p.y };
+    });
+  }
+
+  // Centroid of base positions
+  var ids = Object.keys(_layoutBasePositions);
+  if (!ids.length) return;
+  var cx = 0, cy_ = 0;
+  ids.forEach(function(id) { cx += _layoutBasePositions[id].x; cy_ += _layoutBasePositions[id].y; });
+  cx /= ids.length;
+  cy_ /= ids.length;
+
+  // Scale each node's offset from the centroid
+  cy.startBatch();
+  cy.nodes().not('[?isClone]').forEach(function(n) {
+    var base = _layoutBasePositions[n.id()];
+    if (!base) return;
+    n.position({
+      x: cx + (base.x - cx) * val,
+      y: cy_ + (base.y - cy_) * val
+    });
+  });
+  cy.endBatch();
+}
+
+function resetLayoutScale() {
+  _layoutBasePositions = null;
+  var slider = document.getElementById('layout-scale-slider');
+  if (slider) slider.value = '1';
+  var lbl = document.getElementById('layout-scale-label');
+  if (lbl) lbl.textContent = '1×';
 }
 
 // ─── Rotate graph ─────────────────────────────────────────────────────────────
@@ -3083,6 +3847,7 @@ async function runQuery() {
     if (countRes && typeof countRes.edgeCount === 'number') {
       _edgeCount = countRes.edgeCount;
       if (_edgeCount >= 1000) _tooLarge = true;
+      appendCypherHistory(query, _edgeCount);
     } else if (_limitVal >= 1000) {
       _tooLarge = true;
     }
@@ -3160,6 +3925,95 @@ async function runQuery() {
   }
 }
 
+// ─── Cypher history ────────────────────────────────────────────────────────────
+function appendCypherHistory(query, count) {
+  // Fire-and-forget — never blocks the UI
+  api('/api/cypher/history', { query: query, count: count }).catch(function() {});
+}
+
+async function openCypherHistory() {
+  var modal  = document.getElementById('cypher-history-modal');
+  var tbody  = document.getElementById('cypher-history-tbody');
+  var status = document.getElementById('cypher-history-status');
+  tbody.innerHTML = '';
+  status.textContent = 'Loading…';
+  modal.style.display = 'flex';
+  try {
+    var data = await api('/api/cypher/history');
+    var rows = (data.rows || []).slice().reverse(); // newest first
+    status.textContent = '';
+    if (!rows.length) { status.textContent = 'No history yet.'; return; }
+    rows.forEach(function(r) {
+      var tr = document.createElement('tr');
+      var dt = '';
+      try { dt = new Date(r.date).toLocaleString(); } catch(e) { dt = r.date; }
+
+      // Date
+      var tdDate = document.createElement('td');
+      tdDate.textContent = dt;
+      tdDate.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;color:#a0aec0;font-size:12px;vertical-align:top';
+
+      // Result count
+      var tdCount = document.createElement('td');
+      tdCount.textContent = (typeof r.count === 'number' ? r.count.toLocaleString() : r.count);
+      tdCount.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:right;color:#7ee8a2;font-size:12px;vertical-align:top';
+
+      // Query text — clicking loads into Graph editor (default)
+      var tdQuery = document.createElement('td');
+      tdQuery.textContent = r.query;
+      tdQuery.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;font-family:monospace;font-size:12px;word-break:break-all;cursor:pointer;color:#e2e8f0;vertical-align:top';
+      tdQuery.title = 'Click to open in Graph editor';
+      tdQuery.addEventListener('click', function() {
+        var ta = document.getElementById('cypher-input');
+        if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
+        document.getElementById('cypher-history-modal').style.display = 'none';
+      });
+
+      // "Open in" dropdown
+      var tdOpen = document.createElement('td');
+      tdOpen.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:center;vertical-align:top';
+
+      var sel = document.createElement('select');
+      sel.style.cssText = 'background:#1a1f35;border:1px solid #3a4060;border-radius:5px;color:#c8d0e8;font-size:12px;padding:3px 8px;cursor:pointer;outline:none';
+      [['graph','📊 Graph'], ['sankey','🔀 Sankey']].forEach(function(opt) {
+        var o = document.createElement('option');
+        o.value = opt[0]; o.textContent = opt[1];
+        sel.appendChild(o);
+      });
+
+      sel.addEventListener('change', function() {
+        var dest = sel.value;
+        document.getElementById('cypher-history-modal').style.display = 'none';
+        if (dest === 'sankey') {
+          // Open Sankey dialog and populate its textarea
+          var sankeyTa = document.getElementById('sankey-cypher');
+          if (sankeyTa) {
+            openSankeyDialog();
+            sankeyTa.value = r.query;
+            onSankeyCypherInput(sankeyTa);
+          }
+        } else {
+          // Default: load into Graph Cypher editor
+          var ta = document.getElementById('cypher-input');
+          if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
+        }
+        // Reset dropdown so it can be triggered again for the same option
+        setTimeout(function() { sel.value = 'graph'; }, 300);
+      });
+
+      tdOpen.appendChild(sel);
+
+      tr.appendChild(tdDate);
+      tr.appendChild(tdCount);
+      tr.appendChild(tdQuery);
+      tr.appendChild(tdOpen);
+      tbody.appendChild(tr);
+    });
+  } catch(e) {
+    status.textContent = 'Error loading history: ' + e.message;
+  }
+}
+
 function handleQueryKeydown(e) {
   var ta = e.target;
 
@@ -3205,12 +4059,32 @@ function clearGraph() {
   currentSubgraphName = '';
   currentQuery = '';
   document.getElementById('graph-stats').textContent = '';
+  _restoreMatchStatus();
   document.getElementById('legend-items').innerHTML = '';
   updateCurrentTabName('New Tab');
   updateSelectionInfo();
 }
 
 // ─── Stats & Legend ───────────────────────────────────────────────────────────
+
+// Re-append the "Matching relations…" span if a match is still running.
+// Call this after any write to #graph-stats so the status is never lost.
+var _simSpan = null;  // active "Searching for similar relations…" span element
+
+function _restoreMatchStatus() {
+  var statsEl = document.getElementById('graph-stats');
+  if (!statsEl) return;
+  // Restore RNEF match span
+  if (matchingInProgress && !document.getElementById('match-rnef-status')) {
+    statsEl.insertAdjacentHTML('beforeend',
+      ' <span id="match-rnef-status" style="color:#4caf50;font-size:11px">· Matching relations…</span>');
+  }
+  // Restore similar-search span (preserves its current text/colour)
+  if (_simSpan && !_simSpan.parentNode) {
+    statsEl.appendChild(_simSpan);
+  }
+}
+
 function updateStats() {
   var n = cy.nodes().length;
   var e = cy.edges().length;
@@ -3219,6 +4093,7 @@ function updateStats() {
     : '';
   document.getElementById('graph-stats').innerHTML =
     namePrefix + n + ' node' + (n !== 1 ? 's' : '') + ' · ' + e + ' relation' + (e !== 1 ? 's' : '');
+  _restoreMatchStatus();
 }
 
 function updateSelectionInfo() {
@@ -3227,12 +4102,15 @@ function updateSelectionInfo() {
   var selEdges = cy.edges(':selected').length;
   if (selNodes === 0 && selEdges === 0) {
     updateStats();
+    rcUpdateMenuState(0, 0);
     return;
   }
   var parts = [];
   if (selNodes > 0) parts.push(selNodes + ' node' + (selNodes !== 1 ? 's' : '') + ' selected');
   if (selEdges > 0) parts.push(selEdges + ' relation' + (selEdges !== 1 ? 's' : '') + ' selected');
   document.getElementById('graph-stats').textContent = parts.join(' · ');
+  _restoreMatchStatus();
+  rcUpdateMenuState(selNodes, selEdges);
 }
 
 function updateLegend() {
@@ -5508,6 +6386,7 @@ async function loadSimilarRelations() {
   simSpan.id = 'sim-rel-status';
   simSpan.style.cssText = 'color:#7a8099;font-size:11px';
   simSpan.textContent = ' · Searching for similar relations…';
+  _simSpan = simSpan;
   if (statsEl) statsEl.appendChild(simSpan);
 
   try {
@@ -5652,9 +6531,9 @@ async function loadSimilarRelations() {
       if (addedEdges > 0) {
         simSpan.style.color = '#4caf50';
         simSpan.textContent = ' · ' + addedEdges + ' similar relation(s) added';
-        setTimeout(function() { if (simSpan.parentNode) simSpan.remove(); }, 5000);
+        setTimeout(function() { if (simSpan.parentNode) simSpan.remove(); _simSpan = null; }, 5000);
       } else {
-        simSpan.remove();
+        simSpan.remove(); _simSpan = null;
       }
     }
 
@@ -5668,6 +6547,7 @@ async function loadSimilarRelations() {
 
   } catch (err) {
     if (simSpan.parentNode) simSpan.remove();
+    _simSpan = null;
     alert('Load similar relations failed: ' + err.message);
   }
 }
@@ -5973,22 +6853,25 @@ async function mergeSimilarRelations() {
     'Binding':          new Set(['DirectRegulation','ProtModification','Regulation']),
     'ProtModification': new Set(['DirectRegulation','Binding','Regulation','FunctionalAssociation']),
     'Biomarker':        new Set(['QuantitativeChange','StateChange','FunctionalAssociation']),
-    'QuantitativeChange': new Set(['Biomarker']),
+    'QuantitativeChange': new Set(['Biomarker','Regulation']),
     'StateChange':      new Set(['Biomarker']),
     'FunctionalAssociation': new Set(['Biomarker','Regulation','DirectRegulation','ProtModification','MolTransport','MolSynthesis']),
     'MolSynthesis':     new Set(['Regulation','FunctionalAssociation']),
     'MolTransport':     new Set(['Regulation','FunctionalAssociation']),
     'PromoterBinding':  new Set(['Expression','Regulation']),
     'Expression':       new Set(['PromoterBinding']),
-    'Regulation':       new Set(['DirectRegulation','FunctionalAssociation','PromoterBinding','MolSynthesis','MolTransport','ProtModification']),
+    'Regulation':       new Set(['DirectRegulation','FunctionalAssociation','PromoterBinding','MolSynthesis','MolTransport','ProtModification','QuantitativeChange']),
   };
 
   // ── Anchor class precedence (FRD 3.2): higher = preferred anchor ─────────────
   var CLASS_SCORE = {
-    'DirectRegulation': 6, 'ProtModification': 5, 'Biomarker': 4,
-    'MolTransport': 3,  'MolSynthesis': 3,  'Regulation': 2,
-    'Binding': 1, 'PromoterBinding': 1, 'Expression': 1,
-    'QuantitativeChange': 0, 'StateChange': 0, 'FunctionalAssociation': 0,
+    'DirectRegulation': 6, 'PromoterBinding': 6,
+    'ProtModification': 5,
+    'Binding': 4,
+    'Biomarker': 3,
+    'MolTransport': 1, 'MolSynthesis': 1, 'Expression': 1,
+    'QuantitativeChange': 0, 'StateChange': 0,
+    'Regulation': -1, 'FunctionalAssociation': -2,
   };
 
   function normEff(v) {
@@ -6201,8 +7084,8 @@ async function mergeSimilarRelations() {
     return graphData.edges.find(function(ge) { return ge.id === info.id; });
   }
 
-  Object.values(groups).forEach(function(group) {
-    if (group.length < 2) return;
+  for (var group of Object.values(groups)) {
+    if (group.length < 2) continue;
 
     // Completeness tier: 2 = effect+mechanism, 1 = effect only, 0 = neither
     function tier(e) { return (e.effect ? 1 : 0) + (e.mechanism ? 1 : 0); }
@@ -6267,6 +7150,16 @@ async function mergeSimilarRelations() {
       }
     }
 
+    // FRD 4.1 (mechanism): if anchor has no mechanism, take from the non-anchor with most refs
+    var resolvedMechanism = anchor.mechanism;
+    if (!resolvedMechanism) {
+      var withMech = others.filter(function(e) { return e.mechanism; });
+      if (withMech.length) {
+        withMech.sort(function(a, b) { return b.numRefs - a.numRefs; });
+        resolvedMechanism = withMech[0].mechanism;
+      }
+    }
+
     // FRD 5: merge + deduplicate references by (year, journal, first-30-of-sentence)
     var allRefs = anchor.refs.slice();
     others.forEach(function(e) { allRefs = allRefs.concat(e.refs); });
@@ -6293,6 +7186,9 @@ async function mergeSimilarRelations() {
     if (resolvedEffect !== anchor.effect) {
       anchor.cyEdge.data('effect', normEffectDisplay(resolvedEffect));
     }
+    if (resolvedMechanism !== anchor.mechanism) {
+      anchor.cyEdge.data('mechanism', resolvedMechanism);
+    }
     anchor.cyEdge.data('numRefs',      refCount);
     anchor.cyEdge.data('numSentences', dedupedRefs.length);
     anchor.cyEdge.data('thickness',    getEdgeThickness(refCount));
@@ -6306,6 +7202,10 @@ async function mergeSimilarRelations() {
       if (resolvedEffect !== anchor.effect) {
         anchorGEdge.properties.Effect  = normEffectDisplay(resolvedEffect);
         anchorGEdge.properties.effect  = normEffectDisplay(resolvedEffect);
+      }
+      if (resolvedMechanism !== anchor.mechanism) {
+        anchorGEdge.properties.Mechanism = resolvedMechanism;
+        anchorGEdge.properties.mechanism = resolvedMechanism;
       }
       anchorGEdge.properties.references = dedupedRefs;
       anchorGEdge.properties.NumRefs = refCount;
@@ -6342,11 +7242,17 @@ async function mergeSimilarRelations() {
         // Both are RNEF: if one connects to a clone endpoint and the other to an
         // original endpoint, they are different visual anchors for the same relation
         // — keep both so neither the clone nor the original node loses its connection.
-        var anchorHasClone = cloneEndpointCount(anchor) > 0;
-        var eHasClone      = cloneEndpointCount(e)      > 0;
-        if (anchorHasClone !== eHasClone) {
-          console.log('[MERGE-DEBUG] KEEP (clone vs original split): skipping removal of', e.id.slice(0,60));
-          return; // keep this RNEF edge — different endpoint type than anchor
+        // Exception: when the anchor is strictly superior (higher class score), the
+        // inferior edge must always be removed regardless of clone positioning.
+        var anchorScore = CLASS_SCORE[anchor.relType] !== undefined ? CLASS_SCORE[anchor.relType] : 0;
+        var eScore      = CLASS_SCORE[e.relType]      !== undefined ? CLASS_SCORE[e.relType]      : 0;
+        if (anchorScore === eScore) {
+          var anchorHasClone = cloneEndpointCount(anchor) > 0;
+          var eHasClone      = cloneEndpointCount(e)      > 0;
+          if (anchorHasClone !== eHasClone) {
+            console.log('[MERGE-DEBUG] KEEP (clone vs original split): skipping removal of', e.id.slice(0,60));
+            return; // keep this RNEF edge — different endpoint type than anchor
+          }
         }
       }
       var idx = graphData.edges.findIndex(function(ge) {
@@ -6373,8 +7279,49 @@ async function mergeSimilarRelations() {
       });
     });
 
+    // ── Recompute RelationID via myhash when effect/mechanism was resolved or RelationID is missing ──
+    var needsRelIdUpdate = resolvedEffect !== anchor.effect || resolvedMechanism !== anchor.mechanism || !anchor.relId;
+    if (needsRelIdUpdate) {
+      var anchorSrcCyId = anchor.cyEdge.data('source');
+      var anchorTgtCyId = anchor.cyEdge.data('target');
+      var anchorSrcNodeId = cy.$id(anchorSrcCyId).data('NodeID');
+      var anchorTgtNodeId = cy.$id(anchorTgtCyId).data('NodeID');
+      if (anchorSrcNodeId && anchorTgtNodeId) {
+        try {
+          var ridResult = await api('/api/curation/calculate-relation-id', {
+            inref:        [String(anchorSrcNodeId)],
+            outref:       [String(anchorTgtNodeId)],
+            inoutref:     [],
+            control_type: anchor.relType,
+            ontology:     '',
+            relationship: '',
+            effect:       resolvedEffect || '',
+            mechanism:    resolvedMechanism || ''
+          });
+          if (ridResult && ridResult.relationId) {
+            var newRelId = ridResult.relationId;
+            anchor.cyEdge.data('relId', newRelId);
+            if (anchorGEdge) {
+              anchorGEdge.properties.RelationID = newRelId;
+              // Update refsCache under the new RelationID as well
+              refsCache[newRelId] = dedupedRefs;
+              uniqueGroupRelIds = uniqueGroupRelIds.filter(function(id) { return id !== anchor.relId; });
+              if (!uniqueGroupRelIds.includes(newRelId)) uniqueGroupRelIds.unshift(newRelId);
+              if (uniqueGroupRelIds.length > 1) {
+                anchor.cyEdge.data('relIds', uniqueGroupRelIds);
+                anchorGEdge.properties.RelationIDs = uniqueGroupRelIds;
+              }
+            }
+            console.log('[MERGE-DEBUG] RelationID recomputed:', newRelId, '(effect:', resolvedEffect, ')');
+          }
+        } catch(e) {
+          console.warn('[MERGE-DEBUG] RelationID recompute failed:', e.message);
+        }
+      }
+    }
+
     mergedGroupCount++;
-  });
+  }
 
   alert('Merge complete:\n  ' + mergedGroupCount + ' group(s) merged\n  ' + removedEdgeCount + ' duplicate relation(s) removed');
   updateStats();
@@ -6404,7 +7351,7 @@ async function expandSelectedNodes(mode) {
 
   var selectedNodes = cy.nodes(':selected').not('[?isClone]');
   if (selectedNodes.length === 0) {
-    showAlignToast('Please select at least one node to perform an expansion.');
+    showAlignHint('Please select at least one node to perform an expansion.');
     return;
   }
 
@@ -6414,7 +7361,7 @@ async function expandSelectedNodes(mode) {
     if (urn) urns.push(urn);
   });
   if (!urns.length) {
-    showAlignToast('Selected nodes have no URN — cannot expand.');
+    showAlignHint('Selected nodes have no URN — cannot expand.');
     return;
   }
 
@@ -6434,7 +7381,7 @@ async function findOntologyChildren() {
 
   var selectedNodes = cy.nodes(':selected').not('[?isClone]');
   if (selectedNodes.length === 0) {
-    showAlignToast('Please select at least one node to find ontology children.');
+    showAlignHint('Please select at least one node to find ontology children.');
     return;
   }
 
@@ -6445,7 +7392,7 @@ async function findOntologyChildren() {
     if (urn && label) nodeParams.push({ label: label, urn: urn });
   });
   if (!nodeParams.length) {
-    showAlignToast('Selected nodes have no URN or label — cannot query ontology children.');
+    showAlignHint('Selected nodes have no URN or label — cannot query ontology children.');
     return;
   }
 
@@ -6487,7 +7434,7 @@ async function findOntologyParents() {
 
   var selectedNodes = cy.nodes(':selected').not('[?isClone]');
   if (selectedNodes.length === 0) {
-    showAlignToast('Please select at least one node to find ontology parents.');
+    showAlignHint('Please select at least one node to find ontology parents.');
     return;
   }
 
@@ -6498,7 +7445,7 @@ async function findOntologyParents() {
     if (urn && label) nodeParams.push({ label: label, urn: urn });
   });
   if (!nodeParams.length) {
-    showAlignToast('Selected nodes have no URN or label — cannot query ontology parents.');
+    showAlignHint('Selected nodes have no URN or label — cannot query ontology parents.');
     return;
   }
 
@@ -6529,6 +7476,1733 @@ async function findOntologyParents() {
   } catch(err) {
     setProgressMsg(null);
     alert('Ontology parents query failed: ' + (err.message || err));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ONTOLOGY ANALYSIS  (Database → Ontology → Ontology analysis)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── State ─────────────────────────────────────────────────────────────────────
+// Each tree node: { id, name, urn, labels, graphCount, children, expanded, loading }
+// graphCount: null = not yet fetched, number = count, '?' = fetch failed
+var _ontologyTree        = [];
+var _ontologyLayout      = 'hierarchical';  // 'hierarchical' | 'orthogonal'
+var _ontologyCtxNode     = null;            // node right-clicked
+var _ontologySourceData  = null;  // when set, use this {nodes,edges} instead of cy for URNs & copy
+
+// ── Open / close ──────────────────────────────────────────────────────────────
+function openOntologyAnalysisFromSankey() {
+  if (!_sankeyCache || !_sankeyCache.nodes) {
+    showAlignHint('Run a Sankey query first.');
+    return;
+  }
+  // If a path is selected, restrict to only those nodes/edges
+  if (_sankeySelNodeIds && _sankeySelNodeIds.size > 0) {
+    _ontologySourceData = {
+      nodes: _sankeyCache.nodes.filter(function(n) {
+        return _sankeySelNodeIds.has(String(n.id));
+      }),
+      edges: _sankeyCache.edges.filter(function(e) {
+        return _sankeySelEdgeIds && _sankeySelEdgeIds.has(String(
+          e.id !== undefined ? e.id : (e.elementId || '')
+        ));
+      })
+    };
+  } else {
+    _ontologySourceData = _sankeyCache;
+  }
+  _openOntologyAnalysisDialog();
+}
+
+function openOntologyAnalysis() {
+  if (!cy || !graphData) {
+    showAlignHint('Please open a graph or run a Cypher query first.');
+    return;
+  }
+  _ontologySourceData = null;  // use cy
+  _openOntologyAnalysisDialog();
+}
+
+function _openOntologyAnalysisDialog() {
+  var modal = document.getElementById('ontology-analysis-modal');
+  if (!modal) return;
+
+  // Reset state
+  _ontologyTree   = [];
+  _ontologyLayout = 'hierarchical';
+  // Reset radio buttons
+  var radios = modal.querySelectorAll('input[name="ontology-layout"]');
+  radios.forEach(function(r) { r.checked = r.value === 'hierarchical'; });
+
+  modal.style.display = 'flex';
+  _renderOntologyTree();
+  _setOntologyStatus('Loading root ontology groups…');
+  _loadOntologyRoots();
+
+  // Close context menu on any click outside it
+  document.addEventListener('click', _hideOntologyCtxMenu, true);
+}
+
+function closeOntologyAnalysis() {
+  var modal = document.getElementById('ontology-analysis-modal');
+  if (modal) modal.style.display = 'none';
+  _hideOntologyCtxMenu();
+  document.removeEventListener('click', _hideOntologyCtxMenu, true);
+}
+
+function setOntologyLayout(mode) {
+  _ontologyLayout = mode;
+  _renderOntologyTree();
+}
+
+function _setOntologyStatus(msg) {
+  var el = document.getElementById('ontology-status-bar');
+  if (el) el.textContent = msg || '';
+}
+
+// ── Graph URN helpers ─────────────────────────────────────────────────────────
+function _getGraphUrns() {
+  // When called from Sankey context, read URNs from the source data
+  if (_ontologySourceData) {
+    var urns = [];
+    (_ontologySourceData.nodes || []).forEach(function(n) {
+      var u = n.properties && (n.properties.URN || n.properties.urn);
+      if (u) urns.push(String(u));
+    });
+    return urns;
+  }
+  if (!cy) return [];
+  var urns = [];
+  cy.nodes().not('[?isClone]').forEach(function(n) {
+    var u = n.data('URN') || n.data('urn');
+    if (u) urns.push(String(u));
+  });
+  return urns;
+}
+
+// ── Data loading ──────────────────────────────────────────────────────────────
+async function _loadOntologyRoots() {
+  try {
+    var result = await api('/api/ontology/roots');   // GET
+    var nodes  = result.nodes || [];
+    _ontologyTree = nodes.map(function(n) {
+      return { id: n.id, name: n.name, urn: n.urn, labels: n.labels || [],
+               graphCount: null, children: null, expanded: false, loading: false };
+    });
+    _renderOntologyTree();
+    _setOntologyStatus(nodes.length + ' root group' + (nodes.length !== 1 ? 's' : '') + ' loaded. Double-click to expand.');
+    if (_ontologyTree.length) _fetchGraphCountsBatch(_ontologyTree);
+  } catch(e) {
+    _setOntologyStatus('Error loading roots: ' + (e.message || e));
+  }
+}
+
+async function _fetchGraphCountsBatch(treeNodes) {
+  var urns = treeNodes.map(function(n) { return n.urn; }).filter(Boolean);
+  if (!urns.length) return;
+  var graphUrns = _getGraphUrns();
+  if (!graphUrns.length) {
+    treeNodes.forEach(function(n) { n.graphCount = 0; });
+    _renderOntologyTree();
+    return;
+  }
+  try {
+    var result = await api('/api/ontology/batch-counts', { urns: urns, graphUrns: graphUrns });
+    var counts = result.counts || {};
+    treeNodes.forEach(function(n) {
+      n.graphCount = counts[n.urn] !== undefined ? counts[n.urn] : 0;
+    });
+    _renderOntologyTree();
+  } catch(e) {
+    console.warn('ontology batch-counts failed:', e);
+    treeNodes.forEach(function(n) { n.graphCount = '?'; });
+    _renderOntologyTree();
+  }
+}
+
+async function _expandOntologyNode(node) {
+  // Toggle collapse if already expanded
+  if (node.expanded) {
+    node.expanded = false;
+    _renderOntologyTree();
+    return;
+  }
+  // Already loaded — just expand
+  if (node.children !== null) {
+    node.expanded = true;
+    _renderOntologyTree();
+    return;
+  }
+  // Fetch children
+  node.loading = true;
+  _renderOntologyTree();
+  try {
+    var result = await api('/api/ontology/direct-children', { urn: node.urn });
+    node.children = (result.nodes || []).map(function(n) {
+      return { id: n.id, name: n.name, urn: n.urn, labels: n.labels || [],
+               graphCount: null, children: null, expanded: false, loading: false };
+    });
+    node.expanded = true;
+    node.loading  = false;
+    _renderOntologyTree();
+    if (node.children.length) {
+      _fetchGraphCountsBatch(node.children);
+    } else {
+      _setOntologyStatus('"' + node.name + '" has no children.');
+    }
+  } catch(e) {
+    node.loading  = false;
+    node.children = [];
+    _renderOntologyTree();
+    showAlignHint('Error loading children: ' + (e.message || e));
+  }
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+function _renderOntologyTree() {
+  var container = document.getElementById('ontology-tree-container');
+  if (!container) return;
+  if (_ontologyLayout === 'orthogonal') {
+    _renderOntologyOrthogonal(container);
+  } else {
+    _renderOntologyHierarchical(container);
+  }
+}
+
+// Shared helper: count badge HTML
+function _ontoCntBadge(graphCount) {
+  if (graphCount === null) return '<span style="color:#3a4060;font-size:10px;margin-left:6px">…</span>';
+  if (graphCount === '?')  return '<span style="color:#6a4040;font-size:10px;margin-left:6px">?</span>';
+  if (graphCount > 0)
+    return '<span style="background:#0e2a4a;color:#4f8ef7;border-radius:10px;padding:1px 8px;font-size:10px;margin-left:6px">'
+           + graphCount + '</span>';
+  return '<span style="color:#3a4060;font-size:10px;margin-left:6px">0</span>';
+}
+
+// ── Hierarchical (indented list) ──────────────────────────────────────────────
+function _renderOntologyHierarchical(container) {
+  if (!_ontologyTree.length) {
+    container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:24px;text-align:center">Loading…</div>';
+    return;
+  }
+
+  var rows = [];
+  function collect(nodes, level) {
+    nodes.forEach(function(node) {
+      rows.push({ node: node, level: level });
+      if (node.expanded && node.children && node.children.length) collect(node.children, level + 1);
+    });
+  }
+  collect(_ontologyTree, 0);
+
+  var html = rows.map(function(r) {
+    var node   = r.node;
+    var indent = r.level * 18 + 8;
+    var hasKids = node.children === null || (node.children && node.children.length > 0);
+    var arrow;
+    if (node.loading)        arrow = '<span style="color:#4f8ef7;width:14px;display:inline-block;text-align:center">⋯</span>';
+    else if (hasKids)        arrow = '<span style="color:#7a8099;width:14px;display:inline-block;text-align:center;cursor:pointer">' + (node.expanded ? '▼' : '▶') + '</span>';
+    else                     arrow = '<span style="color:#2a3555;width:14px;display:inline-block;text-align:center">·</span>';
+    var safeUrn = _ontoEscAttr(node.urn);
+    return '<div class="onto-row" data-urn="' + safeUrn + '"'
+      + ' style="padding:4px 8px 4px ' + indent + 'px;display:flex;align-items:center;gap:5px;'
+      + 'border-radius:4px;font-size:12px;color:#c0c8e0;white-space:nowrap;'
+      + 'overflow:hidden;user-select:none;cursor:pointer" '
+      + 'onmouseenter="this.style.background=\'#151f35\'" onmouseleave="this.style.background=\'\'">'
+      + arrow
+      + '<span style="overflow:hidden;text-overflow:ellipsis;flex:1" title="' + safeUrn + '">'
+      + _ontoEscHtml(node.name) + '</span>'
+      + _ontoCntBadge(node.graphCount)
+      + '</div>';
+  }).join('');
+
+  container.innerHTML = html;
+
+  // Event delegation — double-click to expand, right-click for context menu
+  container.ondblclick = function(e) {
+    var urn = _ontoUrnFromEvent(e, container);
+    if (urn) { var n = _findOntologyNode(urn); if (n) _expandOntologyNode(n); }
+  };
+  container.oncontextmenu = function(e) {
+    e.preventDefault();
+    var urn = _ontoUrnFromEvent(e, container);
+    if (urn) _showOntologyCtxMenu(e, urn);
+  };
+}
+
+// ── Orthogonal (SVG horizontal tree) ─────────────────────────────────────────
+function _renderOntologyOrthogonal(container) {
+  // Collect flat ordered rows first (same traversal as hierarchical)
+  var rows = [];
+  function collect(nodes, level) {
+    nodes.forEach(function(node) {
+      var rowIdx = rows.length;
+      rows.push({ node: node, level: level, rowIdx: rowIdx });
+      if (node.expanded && node.children && node.children.length) collect(node.children, level + 1);
+    });
+  }
+  collect(_ontologyTree, 0);
+
+  if (!rows.length) {
+    container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:24px;text-align:center">Loading…</div>';
+    return;
+  }
+
+  var NODE_W = 170, NODE_H = 28, COL_W = 200, ROW_H = 36, PAD_X = 10, PAD_Y = 8;
+  var urnToRow = {};
+  rows.forEach(function(r) {
+    r.x = PAD_X + r.level * COL_W;
+    r.y = PAD_Y + r.rowIdx * ROW_H;
+    urnToRow[r.node.urn] = r;
+  });
+
+  var svgW = 0, svgH = 0;
+  rows.forEach(function(r) {
+    svgW = Math.max(svgW, r.x + NODE_W + PAD_X);
+    svgH = Math.max(svgH, r.y + NODE_H + PAD_Y);
+  });
+
+  var parts = ['<svg width="' + svgW + '" height="' + svgH
+    + '" xmlns="http://www.w3.org/2000/svg" style="display:block;font-family:system-ui,sans-serif">'];
+
+  // Connections first (so nodes render on top)
+  rows.forEach(function(r) {
+    if (!r.node.expanded || !r.node.children || !r.node.children.length) return;
+    var px  = r.x + NODE_W;
+    var pcy = r.y + NODE_H / 2;
+    var midX = px + (COL_W - NODE_W) / 2;
+    r.node.children.forEach(function(child) {
+      var cr = urnToRow[child.urn];
+      if (!cr) return;
+      var ccy = cr.y + NODE_H / 2;
+      parts.push('<path d="M' + px + ',' + pcy + ' H' + midX + ' V' + ccy + ' H' + cr.x + '"'
+        + ' stroke="#253050" stroke-width="1.5" fill="none" stroke-linejoin="round"/>');
+    });
+  });
+
+  // Node boxes
+  rows.forEach(function(r) {
+    var n = r.node;
+    var x = r.x, y = r.y;
+    var hasCnt = typeof n.graphCount === 'number' && n.graphCount > 0;
+    var fill   = hasCnt ? '#0e2035' : '#141c30';
+    var stroke = hasCnt ? '#1e4070' : '#252f4a';
+    var safeUrn  = _ontoEscAttr(n.urn);
+    var safeName = _ontoEscHtml(n.name.length > 19 ? n.name.slice(0, 17) + '…' : n.name);
+
+    // Box
+    parts.push('<rect x="' + x + '" y="' + y + '" width="' + NODE_W + '" height="' + NODE_H
+      + '" rx="5" fill="' + fill + '" stroke="' + stroke + '" stroke-width="1"/>');
+
+    // Arrow indicator
+    var hasKids = n.children === null || (n.children && n.children.length > 0);
+    var arrowTxt = n.loading ? '⋯' : (hasKids ? (n.expanded ? '▼' : '▶') : '·');
+    parts.push('<text x="' + (x + 10) + '" y="' + (y + NODE_H / 2 + 4)
+      + '" font-size="9" fill="#5a6880">' + arrowTxt + '</text>');
+
+    // Name
+    parts.push('<text x="' + (x + 22) + '" y="' + (y + NODE_H / 2 + 4)
+      + '" font-size="11" fill="#b8c4dc">' + safeName + '</text>');
+
+    // Count badge
+    if (hasCnt) {
+      var bw = Math.max(24, String(n.graphCount).length * 7 + 10);
+      var bx = x + NODE_W - bw - 4;
+      parts.push('<rect x="' + bx + '" y="' + (y + 6) + '" width="' + bw + '" height="16" rx="8" fill="#0a2040"/>');
+      parts.push('<text x="' + (bx + bw / 2) + '" y="' + (y + 17)
+        + '" font-size="9" fill="#4f8ef7" text-anchor="middle">' + n.graphCount + '</text>');
+    } else if (n.graphCount === null) {
+      parts.push('<text x="' + (x + NODE_W - 12) + '" y="' + (y + NODE_H / 2 + 4)
+        + '" font-size="9" fill="#2a3555" text-anchor="middle">…</text>');
+    }
+
+    // Transparent hit target with data-urn
+    parts.push('<rect x="' + x + '" y="' + y + '" width="' + NODE_W + '" height="' + NODE_H
+      + '" rx="5" fill="transparent" data-urn="' + safeUrn + '" style="cursor:pointer"/>');
+  });
+
+  parts.push('</svg>');
+  container.innerHTML = parts.join('');
+
+  // Event delegation
+  container.ondblclick = function(e) {
+    var urn = _ontoUrnFromEvent(e, container);
+    if (urn) { var n = _findOntologyNode(urn); if (n) _expandOntologyNode(n); }
+  };
+  container.oncontextmenu = function(e) {
+    e.preventDefault();
+    var urn = _ontoUrnFromEvent(e, container);
+    if (urn) _showOntologyCtxMenu(e, urn);
+  };
+}
+
+// ── Interaction helpers ───────────────────────────────────────────────────────
+function _ontoUrnFromEvent(e, container) {
+  var el = e.target;
+  while (el && el !== container) {
+    var u = el.getAttribute('data-urn');
+    if (u) return u;
+    el = el.parentElement;
+  }
+  return null;
+}
+
+function _showOntologyCtxMenu(e, urn) {
+  _ontologyCtxNode = _findOntologyNode(urn);
+  if (!_ontologyCtxNode) return;
+  var menu = document.getElementById('ontology-ctx-menu');
+  if (!menu) return;
+  menu.style.display = 'block';
+  var mx = Math.min(e.clientX, window.innerWidth  - menu.offsetWidth  - 8);
+  var my = Math.min(e.clientY, window.innerHeight - menu.offsetHeight - 8);
+  menu.style.left = mx + 'px';
+  menu.style.top  = my + 'px';
+}
+
+function _hideOntologyCtxMenu() {
+  var menu = document.getElementById('ontology-ctx-menu');
+  if (menu) menu.style.display = 'none';
+}
+
+function _findOntologyNode(urn, nodes) {
+  nodes = nodes || _ontologyTree;
+  for (var i = 0; i < nodes.length; i++) {
+    if (nodes[i].urn === urn) return nodes[i];
+    if (nodes[i].children && nodes[i].children.length) {
+      var found = _findOntologyNode(urn, nodes[i].children);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function _ontoEscHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function _ontoEscAttr(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ── Context-menu copy actions ─────────────────────────────────────────────────
+async function ontologyCtxAction(action) {
+  _hideOntologyCtxMenu();
+  if (!_ontologyCtxNode || !cy) return;
+  var node = _ontologyCtxNode;
+
+  setProgressMsg('⏳ Fetching ontology descendants…');
+  try {
+    var graphUrns = _getGraphUrns();
+    var result = await api('/api/ontology/descendants', { urn: node.urn, graphUrns: graphUrns });
+    var descendantUrnSet = new Set((result.urns || []).map(String));
+    setProgressMsg(null);
+
+    if (!descendantUrnSet.size) {
+      showAlignHint('No graph nodes belong to "' + node.name + '".');
+      return;
+    }
+
+    if (_ontologySourceData) {
+      // ── Sankey context: build clipboard from raw cache data ──────────────
+      var srcNodes = (_ontologySourceData.nodes || []).filter(function(n) {
+        var u = n.properties && (n.properties.URN || n.properties.urn);
+        return u && descendantUrnSet.has(String(u));
+      });
+      if (!srcNodes.length) {
+        showAlignHint('No Sankey nodes found for "' + node.name + '".');
+        return;
+      }
+      var matchedIdSet = new Set(srcNodes.map(function(n) { return String(n.id); }));
+      var srcEdges = [];
+      if (action === 'copy-neighborhood') {
+        // Include neighbors reachable via Sankey edges
+        var neighborNodes = [];
+        (_ontologySourceData.edges || []).forEach(function(e) {
+          var s = String(e.startNodeId), t = String(e.endNodeId);
+          if (matchedIdSet.has(s) || matchedIdSet.has(t)) srcEdges.push(e);
+          if (matchedIdSet.has(s) && !matchedIdSet.has(t)) {
+            var nb = (_ontologySourceData.nodes || []).find(function(n) { return String(n.id) === t; });
+            if (nb) neighborNodes.push(nb);
+          }
+          if (matchedIdSet.has(t) && !matchedIdSet.has(s)) {
+            var nb = (_ontologySourceData.nodes || []).find(function(n) { return String(n.id) === s; });
+            if (nb) neighborNodes.push(nb);
+          }
+        });
+        // Deduplicate neighbors by ID (same node can be neighbor via multiple edges)
+        var seenNeighborIds = new Set();
+        neighborNodes.forEach(function(n) {
+          var id = String(n.id);
+          if (!matchedIdSet.has(id) && !seenNeighborIds.has(id)) {
+            seenNeighborIds.add(id);
+            srcNodes.push(n);
+          }
+        });
+      } else {
+        // copy-children: only internal edges
+        (_ontologySourceData.edges || []).forEach(function(e) {
+          if (matchedIdSet.has(String(e.startNodeId)) && matchedIdSet.has(String(e.endNodeId)))
+            srcEdges.push(e);
+        });
+      }
+      graphClipboard = {
+        nodes: srcNodes.map(function(n) {
+          return { data: Object.assign({ id: String(n.id), label: getNodeLabel(n),
+                     nodeType: (n.labels && n.labels[0]) || 'Unknown',
+                     color: getNodeColor(n.labels) }, n.properties),
+                   position: { x: 0, y: 0 }, raw: JSON.parse(JSON.stringify(n)) };
+        }),
+        edges: srcEdges.map(function(e) {
+          // Use _buildCyEdgeData so relId, numRefs, effect, mechanism etc. are all
+          // set correctly — the tooltip and references system depend on these fields.
+          return {
+            data: _buildCyEdgeData(e, String(e.startNodeId), String(e.endNodeId)),
+            raw:  JSON.parse(JSON.stringify(e))
+          };
+        })
+      };
+    } else {
+      // ── Graph-view context: use Cytoscape ─────────────────────────────────
+      var matchedNodes = cy.nodes().not('[?isClone]').filter(function(n) {
+        var u = n.data('URN') || n.data('urn');
+        return u && descendantUrnSet.has(String(u));
+      });
+
+      if (!matchedNodes.length) {
+        showAlignHint('No graph nodes found for "' + node.name + '".');
+        return;
+      }
+
+      var nodesToCopy, edgesToCopy;
+      if (action === 'copy-neighborhood') {
+        var neighbors = matchedNodes.neighborhood('node').not('[?isClone]');
+        nodesToCopy   = matchedNodes.union(neighbors);
+        edgesToCopy   = matchedNodes.edgesWith(neighbors).union(matchedNodes.edgesTo(matchedNodes));
+      } else {
+        nodesToCopy = matchedNodes;
+        edgesToCopy = matchedNodes.edgesTo(matchedNodes);
+      }
+
+      var nodeMap = {};
+      nodesToCopy.forEach(function(n) { nodeMap[n.id()] = n; });
+
+      graphClipboard = {
+        nodes: Object.values(nodeMap).map(function(n) {
+          var nUrn  = n.data('URN');
+          var gnRaw = graphData.nodes.find(function(gn) {
+            return gn.id === n.id() || (nUrn && gn.properties && gn.properties.URN === nUrn);
+          });
+          return { data: Object.assign({}, n.data()), position: Object.assign({}, n.position()),
+                   raw: gnRaw ? JSON.parse(JSON.stringify(gnRaw)) : null };
+        }),
+        edges: edgesToCopy.map(function(e) {
+          var geRaw = graphData.edges.find(function(ge) { return ge.id === e.id(); });
+          return { data: Object.assign({}, e.data()),
+                   raw: geRaw ? JSON.parse(JSON.stringify(geRaw)) : null };
+        })
+      };
+    }
+
+    // Update paste menu item
+    var mi = document.getElementById('mi-paste');
+    if (mi) mi.classList.remove('disabled');
+
+    // Status feedback
+    var nc = graphClipboard.nodes.length, ec = graphClipboard.edges.length;
+    var parts = [];
+    if (nc) parts.push(nc + ' node' + (nc !== 1 ? 's' : ''));
+    if (ec) parts.push(ec + ' edge' + (ec !== 1 ? 's' : ''));
+    var msg = parts.join(' and ') + ' from "' + node.name + '" copied.';
+    var statsEl = document.getElementById('graph-stats');
+    if (statsEl) statsEl.innerHTML = '<span style="color:#2a9d2a">' + msg + '</span>';
+    showAlignHint('✓ ' + msg);
+
+  } catch(e) {
+    setProgressMsg(null);
+    alert('Copy failed: ' + (e.message || e));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CREATE / EDIT RELATION  (Database → Create/Edit relation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Menu item state ───────────────────────────────────────────────────────────
+// Called from updateSelectionInfo on every select/deselect event.
+// Visible only for 'user' role; enabled when 2+ nodes or 1 edge are selected.
+function rcUpdateMenuState(selNodes, selEdges) {
+  var item = document.getElementById('me-create-relation');
+  if (!item) return;
+  if (currentRole !== 'user') { item.style.display = 'none'; return; }
+  item.style.display = '';
+  var enabled = selNodes >= 2 || (selEdges === 1 && selNodes === 0);
+  item.style.color         = enabled ? '' : '#3a4060';
+  item.style.pointerEvents = enabled ? '' : 'none';
+  item.style.cursor        = enabled ? '' : 'default';
+}
+
+// ── Dialog open ───────────────────────────────────────────────────────────────
+async function openRelationCurationDialog() {
+  if (!cy || currentRole !== 'user') return;
+
+  var selNodes = cy.nodes(':selected').not('[?isClone]');
+  var selEdges = cy.edges(':selected');
+
+  // Exactly 2 nodes → dedicated pair dialog (ignore any selected edges)
+  if (selNodes.length === 2) {
+    openPairRelationDialog();
+    return;
+  }
+
+  // Reset dialog state
+  Object.assign(_rc, {
+    mode: 'create', nodes: [], props: [], existingEdge: null,
+    refs: [], refIdx: 0, refsVisible: false, refsLoaded: false,
+    currentRelId: '', _pid: 0
+  });
+
+  if (selEdges.length === 1 && selNodes.length === 0) {
+    // ── EDIT existing edge ─────────────────────────────────────────────────
+    _rc.mode = 'edit';
+    var edge = selEdges[0];
+    _rc.existingEdge = edge;
+
+    var srcCy = cy.$id(edge.data('source'));
+    var tgtCy = cy.$id(edge.data('target'));
+
+    _rc.nodes = [
+      { cyId: srcCy.id(), label: srcCy.data('label') || srcCy.id(),
+        nodeType: srcCy.data('nodeType') || '', nodeId: srcCy.data('NodeID') || '', direction: '→' },
+      { cyId: tgtCy.id(), label: tgtCy.data('label') || tgtCy.id(),
+        nodeType: tgtCy.data('nodeType') || '', nodeId: tgtCy.data('NodeID') || '', direction: '←' }
+    ];
+
+    // Pre-populate properties from edge data (skip structural/audit fields)
+    var EDGE_SKIP = { RelationID:1, RelationIDs:1, RelationNumberOfReferences:1,
+                      RelationNumberOfSentences:1, createdAt:1, updatedAt:1,
+                      createdBy:1, updatedBy:1, id:1, source:1, target:1,
+                      elementId:1, relType:1, relId:1, relIds:1, color:1, label:1 };
+    Object.keys(edge.data()).forEach(function(k) {
+      if (EDGE_SKIP[k]) return;
+      var v = edge.data(k);
+      if (v == null || v === '') return;
+      _rc.props.push({ id: ++_rc._pid, key: k,
+        value: Array.isArray(v) ? v.join(';') : String(v) });
+    });
+
+  } else if (selNodes.length >= 2) {
+    // ── CREATE new edge ────────────────────────────────────────────────────
+    selNodes.forEach(function(n) {
+      _rc.nodes.push({
+        cyId: n.id(), label: n.data('label') || n.id(),
+        nodeType: n.data('nodeType') || '', nodeId: n.data('NodeID') || '',
+        direction: '−'
+      });
+    });
+  } else {
+    showAlignHint('Select 2+ nodes to create a relation, or 1 edge to edit it.');
+    return;
+  }
+
+  document.getElementById('rc-title').textContent =
+    _rc.mode === 'edit' ? 'Edit Relation' : 'Create/Edit Hyperedge';
+
+  // Show dialog immediately with whatever schema is already cached
+  rcRenderNodes();
+  rcRenderRelTypeDropdown();
+  rcRenderPropKeyDropdown();
+  rcRenderProps();
+  rcHideRefsPanel();
+  document.getElementById('rel-curation-modal').style.display = 'flex';
+
+  // Load schema caches in background and refresh dropdowns when done
+  var needSchema = !_rc.relTypes.length || !_rc.propKeys.length || !_rc.refCols.length;
+  if (needSchema) {
+    (async function() {
+      try {
+        if (!_rc.relTypes.length || !_rc.propKeys.length) {
+          var schema = await api('/api/graph/schema');
+          if (!_rc.relTypes.length) { _rc.relTypes = schema.relTypes || []; rcRenderRelTypeDropdown(); }
+          if (!_rc.propKeys.length) { _rc.propKeys = schema.propKeys || []; rcRenderPropKeyDropdown(); }
+        }
+      } catch(e) {}
+      try {
+        if (!_rc.refCols.length) {
+          _rc.refCols = (await api('/api/schema/columns')).referenceColumns || [];
+        }
+      } catch(e) {}
+    })();
+  }
+
+  rcScheduleRelIdCalc();
+}
+
+function closeRelationCurationDialog() {
+  document.getElementById('rel-curation-modal').style.display = 'none';
+}
+
+// ── Nodes section ─────────────────────────────────────────────────────────────
+function rcRenderNodes() {
+  var c = document.getElementById('rc-nodes');
+  c.innerHTML = '';
+  _rc.nodes.forEach(function(n, idx) {
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:5px 0;' +
+                        'border-bottom:1px solid #1a2040;min-height:32px';
+    var tag = n.nodeType
+      ? '<span style="font-size:10px;color:#4f8ef7;background:#1a2a50;border-radius:3px;padding:1px 5px;margin-right:5px;flex-shrink:0">' + escHtml(n.nodeType) + '</span>'
+      : '';
+    row.innerHTML =
+      '<div style="flex:1;font-size:13px;color:#c0c4d4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+        tag + escHtml(n.label) +
+      '</div>' +
+      '<select data-idx="' + idx + '" onchange="rcSetDirection(this)" ' +
+        'style="background:#0d1117;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;padding:4px 8px;font-size:13px;cursor:pointer">' +
+        '<option value="→"' + (n.direction === '→' ? ' selected' : '') + '>→  outbound</option>' +
+        '<option value="←"' + (n.direction === '←' ? ' selected' : '') + '>←  inbound</option>' +
+        '<option value="−"' + (n.direction === '−' ? ' selected' : '') + '>−  none</option>' +
+      '</select>';
+    c.appendChild(row);
+  });
+}
+
+function rcSetDirection(sel) {
+  _rc.nodes[parseInt(sel.getAttribute('data-idx'))].direction = sel.value;
+  rcScheduleRelIdCalc();
+}
+
+// ── Relation type dropdown ────────────────────────────────────────────────────
+function rcRenderRelTypeDropdown() {
+  var sel = document.getElementById('rc-reltype');
+  var cur = (_rc.mode === 'edit' && _rc.existingEdge) ? (_rc.existingEdge.data('relType') || '') : '';
+  sel.innerHTML = '<option value="">— select type —</option>';
+  _rc.relTypes.forEach(function(t) {
+    sel.insertAdjacentHTML('beforeend',
+      '<option value="' + escHtml(t) + '"' + (t === cur ? ' selected' : '') + '>' + escHtml(t) + '</option>');
+  });
+}
+
+function rcOnRelTypeChange() { rcScheduleRelIdCalc(); }
+
+// ── Property key dropdown + add ───────────────────────────────────────────────
+// ── Property value datalist helper ────────────────────────────────────────────
+// Called oninput on the prop-key field. For Effect/Mechanism, populates the
+// paired value datalist with known/fetched values so users don't mistype them.
+var _propValCache = {};   // cache: propName → [values]
+
+async function rcOnPropKeyInput(keyInput, valListId) {
+  var dl = document.getElementById(valListId);
+  if (!dl) return;
+  var key = keyInput.value.trim();
+  var lk  = key.toLowerCase();
+
+  // Clear datalist for unrecognised props
+  if (lk !== 'effect' && lk !== 'mechanism') { dl.innerHTML = ''; return; }
+
+  // Use cache if available
+  var canonical = lk === 'effect' ? 'Effect' : 'Mechanism';
+  if (_propValCache[canonical]) {
+    _fillValDatalist(dl, _propValCache[canonical]);
+    return;
+  }
+
+  // Effect values are fixed — no need to query Neo4j
+  if (canonical === 'Effect') {
+    _propValCache['Effect'] = ['Positive', 'Negative'];
+    _fillValDatalist(dl, _propValCache['Effect']);
+    return;
+  }
+
+  // Mechanism: fetch distinct values from Neo4j
+  try {
+    var data = await api('/api/schema/prop-values?prop=Mechanism');
+    _propValCache['Mechanism'] = data.values || [];
+    _fillValDatalist(dl, _propValCache['Mechanism']);
+  } catch(e) { /* leave datalist empty on error */ }
+}
+
+function _fillValDatalist(dl, values) {
+  dl.innerHTML = '';
+  values.forEach(function(v) {
+    var opt = document.createElement('option');
+    opt.value = v;
+    dl.appendChild(opt);
+  });
+}
+
+function rcRenderPropKeyDropdown() {
+  var dl = document.getElementById('rc-prop-key-list');
+  if (!dl) return;
+  dl.innerHTML = '';
+  _rc.propKeys.forEach(function(k) {
+    dl.insertAdjacentHTML('beforeend', '<option value="' + escHtml(k) + '">');
+  });
+}
+
+function rcAddProperty() {
+  var keyEl = document.getElementById('rc-prop-key');
+  var valEl = document.getElementById('rc-prop-val');
+  var key = keyEl.value.trim();
+  var val = valEl.value.trim();
+  if (!key)  { alert('Please enter a property name.'); return; }
+  if (!val)  { alert('Value cannot be empty.');     return; }
+  _rc.props.push({ id: ++_rc._pid, key: key, value: val });
+  valEl.value = ''; keyEl.value = '';
+  rcRenderProps();
+  rcScheduleRelIdCalc();
+}
+
+function rcDeleteProperty(pid) {
+  _rc.props = _rc.props.filter(function(p) { return p.id !== pid; });
+  rcRenderProps();
+  rcScheduleRelIdCalc();
+}
+
+function rcRenderProps() {
+  var c = document.getElementById('rc-props');
+  if (!_rc.props.length) {
+    c.innerHTML = '<div style="font-size:12px;color:#2a3050;font-style:italic;padding:4px 0">No properties added.</div>';
+    return;
+  }
+  c.innerHTML = '';
+  _rc.props.forEach(function(p) {
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 2px;border-bottom:1px solid #1a2040';
+    row.innerHTML =
+      '<div style="font-size:12px;color:#7a8099;min-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escHtml(p.key) + '">' + escHtml(p.key) + '</div>' +
+      '<div style="flex:1;font-size:13px;color:#c0c4d4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escHtml(String(p.value)) + '">' + escHtml(String(p.value)) + '</div>' +
+      '<button onclick="rcDeleteProperty(' + p.id + ')" title="Remove" ' +
+        'style="background:none;border:none;color:#8a2020;font-size:17px;cursor:pointer;line-height:1;padding:0 2px;flex-shrink:0">×</button>';
+    c.appendChild(row);
+  });
+}
+
+// ── RelationID live calculation ───────────────────────────────────────────────
+function rcScheduleRelIdCalc() {
+  if (_rc._debounce) clearTimeout(_rc._debounce);
+  _rc._debounce = setTimeout(rcCalcRelId, 380);
+}
+
+async function rcCalcRelId() {
+  var relType  = document.getElementById('rc-reltype').value;
+  var inref = [], outref = [], inoutref = [];
+  _rc.nodes.forEach(function(n) {
+    if (!n.nodeId) return;
+    if      (n.direction === '→') inref.push(n.nodeId);
+    else if (n.direction === '←') outref.push(n.nodeId);
+    else                          inoutref.push(n.nodeId);
+  });
+
+  function getProp(names) {
+    for (var i = 0; i < names.length; i++) {
+      var p = null;
+      for (var j = 0; j < _rc.props.length; j++) {
+        if (_rc.props[j].key.toLowerCase() === names[i].toLowerCase()) { p = _rc.props[j]; break; }
+      }
+      if (p) return p.value;
+    }
+    return '';
+  }
+
+  try {
+    var r = await api('/api/curation/calculate-relation-id', {
+      inref: inref, inoutref: inoutref, outref: outref,
+      control_type: relType,
+      ontology:     getProp(['ontology']),
+      relationship: getProp(['relationship']),
+      effect:       getProp(['effect','Effect']),
+      mechanism:    getProp(['mechanism','Mechanism'])
+    });
+    _rc.currentRelId = r.relationId || '';
+    var relIdEl = document.getElementById('rc-rel-id');
+    relIdEl.textContent = _rc.currentRelId || '—';
+    relIdEl.title = r.existingFound
+      ? 'Matched existing relation in database — Save will update it'
+      : 'New relation — computed hash';
+    relIdEl.style.color = r.existingFound ? '#4caf50' : '#5a6a90';
+  } catch(e) {
+    document.getElementById('rc-rel-id').textContent = '(error)';
+  }
+}
+
+// ── References panel ──────────────────────────────────────────────────────────
+async function rcToggleRefs() {
+  _rc.refsVisible = !_rc.refsVisible;
+  var btn = document.getElementById('rc-refs-btn');
+  if (_rc.refsVisible) {
+    document.getElementById('rc-refs-section').style.display = 'block';
+    btn.style.background   = '#0e2040';
+    btn.style.borderColor  = '#4f8ef7';
+    btn.style.color        = '#4f8ef7';
+    if (!_rc.refsLoaded) await rcLoadRefs();
+  } else {
+    rcHideRefsPanel();
+  }
+}
+
+function rcHideRefsPanel() {
+  _rc.refsVisible = false;
+  document.getElementById('rc-refs-section').style.display = 'none';
+  var btn = document.getElementById('rc-refs-btn');
+  btn.style.background  = '#1a2040';
+  btn.style.borderColor = '#3a3f55';
+  btn.style.color       = '#c0c4d4';
+}
+
+async function rcLoadRefs() {
+  // Ensure RelationID is fresh
+  if (_rc._debounce) { clearTimeout(_rc._debounce); await rcCalcRelId(); }
+
+  _rc.refs = [];
+  if (_rc.currentRelId) {
+    try {
+      var res = await api('/api/references/batch', { relationIds: [_rc.currentRelId], scopusColumns: [] });
+      var rows = res[_rc.currentRelId] || [];
+      _rc.refs = rows.map(function(r) { return Object.assign({ _mode: 'view' }, r); });
+    } catch(e) { /* no refs */ }
+  }
+
+  // Always start with at least one editable section for new relations
+  if (!_rc.refs.length) _rc.refs = [{ _mode: 'edit', _new: true }];
+
+  _rc.refsLoaded = true;
+  _rc.refIdx = 0;
+  rcRenderRefNav();
+  rcRenderRefCard();
+}
+
+function rcRenderRefNav() {
+  var total = _rc.refs.length;
+  var idx   = _rc.refIdx;
+  document.getElementById('rc-ref-counter').textContent =
+    total ? ('Reference ' + (idx + 1) + ' of ' + total) : 'No references';
+  var first = document.getElementById('rc-nav-first');
+  var prev  = document.getElementById('rc-nav-prev');
+  var next  = document.getElementById('rc-nav-next');
+  var last  = document.getElementById('rc-nav-last');
+  var dis = 'opacity:.35;pointer-events:none';
+  var ena = 'opacity:1;pointer-events:auto';
+  first.style.cssText += ';' + (idx === 0          ? dis : ena);
+  prev.style.cssText  += ';' + (idx === 0          ? dis : ena);
+  next.style.cssText  += ';' + (idx >= total - 1   ? dis : ena);
+  last.style.cssText  += ';' + (idx >= total - 1   ? dis : ena);
+}
+
+function rcNavRef(dir) {
+  if (!rcValidateCurrentRef()) return;
+  var total = _rc.refs.length;
+  if      (dir === 'first') _rc.refIdx = 0;
+  else if (dir === 'prev')  _rc.refIdx = Math.max(0, _rc.refIdx - 1);
+  else if (dir === 'next')  _rc.refIdx = Math.min(total - 1, _rc.refIdx + 1);
+  else if (dir === 'last')  _rc.refIdx = total - 1;
+  rcRenderRefNav();
+  rcRenderRefCard();
+}
+
+// Validate mandatory fields on the currently displayed reference (if in edit mode).
+// Returns true if valid or not in edit mode; false + alert if invalid.
+function rcValidateCurrentRef() {
+  var ref = _rc.refs[_rc.refIdx];
+  if (!ref || ref._mode !== 'edit') return true;
+
+  // Persist any live DOM edits back into the ref object first
+  rcSaveRefInputs();
+
+  var ID_FIELDS = ['doi','pmid','embase','pii','pui','nct_id'];
+  var hasId   = ID_FIELDS.some(function(f) { return (String(ref[f] || '')).trim() !== ''; });
+  var hasMsrc = (String(ref.msrc || '')).trim() !== '';
+
+  if (!hasId || !hasMsrc) {
+    var missing = [];
+    if (!hasId)   missing.push('at least one identifier: DOI, PMID, EMBASE, PII, PUI, or NCT ID');
+    if (!hasMsrc) missing.push('Sentence (msrc)');
+    alert('Reference ' + (_rc.refIdx + 1) + ' is missing:\n• ' + missing.join('\n• '));
+    return false;
+  }
+  return true;
+}
+
+function rcSaveRefInputs() {
+  var ref  = _rc.refs[_rc.refIdx];
+  var card = document.getElementById('rc-ref-card');
+  if (!ref || !card) return;
+  card.querySelectorAll('[data-ref-field]').forEach(function(el) {
+    ref[el.getAttribute('data-ref-field')] = el.value;
+  });
+}
+
+// ── Reference card rendering ──────────────────────────────────────────────────
+var RC_PROM_FIELDS = ['doi','pmid','embase','pii','pui','nct_id','msrc','pubyear','title','authors'];
+var RC_ID_FIELDS   = { doi:1, pmid:1, embase:1, pii:1, pui:1, nct_id:1 };
+var RC_SKIP_FIELDS = { _mode:1, _new:1, _deleted:1, unique_id:1, id:1 };
+
+function rcRenderRefCard() {
+  var card = document.getElementById('rc-ref-card');
+  var ref  = _rc.refs[_rc.refIdx];
+  if (!ref) { card.innerHTML = '<div style="color:#2a3050;font-size:12px">No reference.</div>'; return; }
+
+  if (ref._mode === 'edit') {
+    rcRenderRefEditMode(card, ref);
+  } else {
+    rcRenderRefViewMode(card, ref);
+  }
+}
+
+function rcRenderRefViewMode(card, ref) {
+  var fields = Object.keys(ref).filter(function(k) {
+    return !RC_SKIP_FIELDS[k] && ref[k] != null && ref[k] !== '';
+  });
+  // Sort: prominent fields first, then the rest alphabetically
+  fields.sort(function(a, b) {
+    var ai = RC_PROM_FIELDS.indexOf(a);
+    var bi = RC_PROM_FIELDS.indexOf(b);
+    if (ai === -1 && bi === -1) return a < b ? -1 : 1;
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+  var html = '<div style="display:flex;flex-direction:column;gap:5px;margin-bottom:12px">';
+  fields.forEach(function(k) {
+    var isId = RC_ID_FIELDS[k] ? '<span style="color:#4f8ef7;font-size:10px;margin-left:3px">ID</span>' : '';
+    html +=
+      '<div style="display:flex;gap:8px;align-items:flex-start">' +
+        '<div style="min-width:90px;font-size:11px;color:#7a8099;flex-shrink:0;padding-top:1px">' + escHtml(k) + isId + '</div>' +
+        '<div style="flex:1;font-size:12px;color:#c0c4d4;word-break:break-word">' + escHtml(String(ref[k])) + '</div>' +
+      '</div>';
+  });
+  html += '</div>';
+  html +=
+    '<div style="display:flex;gap:8px">' +
+      '<button onclick="rcEditRef()" title="Edit reference" ' +
+        'style="background:#1a2a50;border:1px solid #3a3f55;border-radius:5px;color:#4f8ef7;padding:4px 12px;font-size:12px;cursor:pointer">✎ Edit</button>' +
+      '<button onclick="rcDeleteRef()" title="Delete reference" ' +
+        'style="background:#280e0e;border:1px solid #7a2020;border-radius:5px;color:#cc4040;padding:4px 10px;font-size:12px;cursor:pointer">✕ Delete</button>' +
+    '</div>';
+  card.innerHTML = html;
+}
+
+function rcRenderRefEditMode(card, ref) {
+  // Build the ordered list of fields to show (prominent + any extras already on the ref)
+  var shown = {};
+  var fieldList = RC_PROM_FIELDS.slice();
+  Object.keys(ref).forEach(function(k) {
+    if (!RC_SKIP_FIELDS[k] && !shown[k] && RC_PROM_FIELDS.indexOf(k) === -1) fieldList.push(k);
+  });
+
+  var html = '<div style="display:flex;flex-direction:column;gap:7px">';
+  fieldList.forEach(function(k) {
+    if (RC_SKIP_FIELDS[k]) return;
+    shown[k] = 1;
+    var isReq = (k === 'msrc' || RC_ID_FIELDS[k]) ? '<span style="color:#e05060">*</span>' : '';
+    var label = escHtml(k) + isReq;
+    var val   = ref[k] != null ? escHtml(String(ref[k])) : '';
+    html +=
+      '<div style="display:flex;align-items:flex-start;gap:8px">' +
+        '<div style="min-width:80px;font-size:11px;color:#7a8099;flex-shrink:0;padding-top:7px">' + label + '</div>';
+    if (k === 'msrc') {
+      html += '<textarea data-ref-field="' + k + '" rows="3" ' +
+        'style="flex:1;background:#0a0f1e;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;padding:5px 8px;font-size:12px;resize:vertical">' + val + '</textarea>';
+    } else {
+      html += '<input type="text" data-ref-field="' + k + '" value="' + val + '" ' +
+        'style="flex:1;background:#0a0f1e;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;padding:5px 8px;font-size:12px">';
+    }
+    html += '</div>';
+  });
+
+  // Add extra field row
+  html +=
+    '<div style="display:flex;gap:6px;align-items:center;margin-top:4px;padding-top:6px;border-top:1px solid #1a2040">' +
+      '<select id="rc-ref-addcol" style="background:#0a0f1e;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:4px 6px;font-size:12px">' +
+        _rc.refCols.filter(function(c) { return !RC_SKIP_FIELDS[c] && !shown[c]; })
+          .map(function(c) { return '<option value="' + escHtml(c) + '">' + escHtml(c) + '</option>'; }).join('') +
+      '</select>' +
+      '<input type="text" id="rc-ref-addval" placeholder="value" ' +
+        'style="flex:1;background:#0a0f1e;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:4px 8px;font-size:12px">' +
+      '<button onclick="rcRefAddField()" ' +
+        'style="background:#2a3050;border:1px solid #3a3f55;border-radius:4px;color:#c0c4d4;padding:4px 10px;font-size:12px;cursor:pointer;white-space:nowrap">Add field</button>' +
+    '</div>';
+  html += '</div>';
+  card.innerHTML = html;
+}
+
+function rcEditRef() {
+  _rc.refs[_rc.refIdx]._mode = 'edit';
+  rcRenderRefCard();
+}
+
+function rcRefAddField() {
+  rcSaveRefInputs();  // persist current inputs first
+  var col = document.getElementById('rc-ref-addcol');
+  var val = document.getElementById('rc-ref-addval');
+  if (!col || !val || !val.value.trim()) return;
+  _rc.refs[_rc.refIdx][col.value] = val.value.trim();
+  rcRenderRefCard();
+}
+
+function rcDeleteRef() {
+  var ref = _rc.refs[_rc.refIdx];
+  if (!ref) return;
+  if (!ref._new) ref._deleted = true;   // mark for server-side deletion
+  _rc.refs.splice(_rc.refIdx, 1);
+  if (_rc.refIdx >= _rc.refs.length) _rc.refIdx = Math.max(0, _rc.refs.length - 1);
+  rcRenderRefNav();
+  rcRenderRefCard();
+}
+
+function rcAddNewRef() {
+  _rc.refs.push({ _mode: 'edit', _new: true });
+  _rc.refIdx = _rc.refs.length - 1;
+  rcRenderRefNav();
+  rcRenderRefCard();
+}
+
+// ── Save to database ──────────────────────────────────────────────────────────
+async function rcSaveToDatabase() {
+  var relType = document.getElementById('rc-reltype').value;
+  if (!relType) {
+    alert('Please add relation type before adding relation to database.');
+    return;
+  }
+
+  // Find source (→) and target (←)
+  var sourceNode = null, targetNode = null;
+  for (var i = 0; i < _rc.nodes.length; i++) {
+    var n = _rc.nodes[i];
+    if (n.direction === '→' && !sourceNode) sourceNode = n;
+    if (n.direction === '←' && !targetNode) targetNode = n;
+  }
+  if (!sourceNode) { alert('Please set one node as source (→).'); return; }
+  if (!targetNode) { alert('Please set one node as target (←).'); return; }
+  if (!sourceNode.nodeId || !targetNode.nodeId) {
+    alert('Source or target node is missing a NodeID. Cannot write to database.');
+    return;
+  }
+
+  // Ensure fresh RelationID
+  if (_rc._debounce) { clearTimeout(_rc._debounce); await rcCalcRelId(); }
+  if (!_rc.currentRelId) {
+    alert('Could not calculate RelationID. Ensure nodes have NodeIDs and a relation type is selected.');
+    return;
+  }
+
+  // Persist any in-progress reference edits
+  if (_rc.refsVisible && _rc.refs.length) rcSaveRefInputs();
+
+  // Collect properties map
+  var props = {};
+  _rc.props.forEach(function(p) { props[p.key] = p.value; });
+
+  // Refs to send: all (server filters by _deleted / _new)
+  var refsToSend = _rc.refs.filter(function(r) {
+    if (r._deleted) return true;
+    // Include non-empty new refs and all edited existing refs
+    return Object.keys(r).some(function(k) { return !k.startsWith('_') && r[k]; });
+  });
+
+  setProgressMsg('⏳ Saving relation…');
+  try {
+    var result = await api('/api/curation/write-relation', {
+      sourceNode: { nodeId: sourceNode.nodeId, nodeLabel: sourceNode.nodeType },
+      targetNode: { nodeId: targetNode.nodeId, nodeLabel: targetNode.nodeType },
+      relationType: relType,
+      properties:   props,
+      relationId:   _rc.currentRelId,
+      isNew:        _rc.mode === 'create',
+      references:   refsToSend
+    });
+    setProgressMsg(null);
+
+    if (result.error) { alert('Save failed: ' + result.error); return; }
+
+    // Merge the new/updated edge into the current graph
+    pushUndo();
+    var savedProps = Object.assign({ RelationID: _rc.currentRelId }, result.properties);
+
+    if (_rc.mode === 'create') {
+      // Brand-new edge — add via mergeGraphData (handles Cytoscape insertion)
+      mergeGraphData({
+        nodes: [],
+        edges: [{
+          id:          result.elementId,
+          elementId:   result.elementId,
+          type:        relType,
+          startNodeId: result.sourceNodeInternalId,
+          endNodeId:   result.targetNodeInternalId,
+          properties:  savedProps
+        }]
+      });
+    } else {
+      // Existing edge — look it up by RelationID and update in-memory data directly.
+      // (mergeGraphData ID-matching fails when the existing edge uses an integer ID
+      //  while the server returns a Neo4j element-ID string.)
+      var relIdStr = String(_rc.currentRelId);
+      var ge = graphData.edges.find(function(e) {
+        return e.properties && String(e.properties.RelationID) === relIdStr;
+      });
+      if (ge) {
+        Object.assign(ge.properties, savedProps);
+        var cyEdge = cy.getElementById(ge.id);
+        if (cyEdge && cyEdge.length) {
+          Object.keys(savedProps).forEach(function(k) { cyEdge.data(k, savedProps[k]); });
+        }
+      } else {
+        // Fallback: try mergeGraphData in case IDs do happen to match
+        mergeGraphData({
+          nodes: [],
+          edges: [{
+            id:          result.elementId,
+            elementId:   result.elementId,
+            type:        relType,
+            startNodeId: result.sourceNodeInternalId,
+            endNodeId:   result.targetNodeInternalId,
+            properties:  savedProps
+          }]
+        });
+      }
+    }
+    updateStats();
+
+    closeRelationCurationDialog();
+    showAlignHint('Relation saved to database.');
+  } catch(err) {
+    setProgressMsg(null);
+    alert('Save failed: ' + (err.message || err));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CREATE RELATION — PAIR DIALOG  (exactly 2 nodes selected)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function openPairRelationDialog() {
+  if (!cy || currentRole !== 'user') return;
+  var selNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selNodes.length !== 2) return;
+
+  var nA = selNodes[0], nB = selNodes[1];
+  _rcPair.nodeA      = { cyId: nA.id(), label: nA.data('label') || nA.id(), nodeType: nA.data('nodeType') || '', nodeId: nA.data('NodeID') || '' };
+  _rcPair.nodeB      = { cyId: nB.id(), label: nB.data('label') || nB.id(), nodeType: nB.data('nodeType') || '', nodeId: nB.data('NodeID') || '' };
+  _rcPair.flipped    = false;
+  _rcPair.isNonDir   = false;
+  _rcPair.props      = [];
+  _rcPair.refs       = [];
+  _rcPair.refIdx     = 0;
+  _rcPair.refsVisible = false;
+  _rcPair.refsLoaded  = false;
+  _rcPair.currentRelId = '';
+  _rcPair._pid       = 0;
+
+  document.getElementById('rcp-reltype').value = '';
+  document.getElementById('rcp-rel-id').textContent = '—';
+
+  rcPairRenderVisual();
+  rcPairRenderProps();
+  rcPairHideRefsPanel();
+  document.getElementById('rc-pair-modal').style.display = 'flex';
+
+  // Populate dropdowns from cache; load in background if cache is empty
+  rcPairPopulateRelTypeDropdown();
+  rcPairPopulatePropKeyDropdown();
+  if (!_rc.relTypes.length || !_rc.propKeys.length || !_rc.refCols.length) {
+    (async function() {
+      try {
+        if (!_rc.relTypes.length || !_rc.propKeys.length) {
+          var schema = await api('/api/graph/schema');
+          if (!_rc.relTypes.length) { _rc.relTypes = schema.relTypes || []; rcPairPopulateRelTypeDropdown(); }
+          if (!_rc.propKeys.length) { _rc.propKeys = schema.propKeys || []; rcPairPopulatePropKeyDropdown(); }
+        }
+      } catch(e) {}
+      try { if (!_rc.refCols.length)   { _rc.refCols   = (await api('/api/schema/columns')).referenceColumns || []; } } catch(e) {}
+    })();
+  }
+}
+
+function closePairRelationDialog() {
+  document.getElementById('rc-pair-modal').style.display = 'none';
+}
+
+// Open the pair Create/Edit dialog pre-populated from an existing Cytoscape edge
+function openPairRelationDialogForEdge(cyEdge) {
+  if (!cy || currentRole !== 'user' || !cyEdge || !cyEdge.length) return;
+
+  var srcCy = cy.$id(cyEdge.data('source'));
+  var tgtCy = cy.$id(cyEdge.data('target'));
+  if (!srcCy.length || !tgtCy.length) return;
+
+  var relType = cyEdge.data('relType') || '';
+
+  _rcPair.nodeA       = { cyId: srcCy.id(), label: srcCy.data('label') || srcCy.id(),
+                          nodeType: srcCy.data('nodeType') || '', nodeId: srcCy.data('NodeID') || '' };
+  _rcPair.nodeB       = { cyId: tgtCy.id(), label: tgtCy.data('label') || tgtCy.id(),
+                          nodeType: tgtCy.data('nodeType') || '', nodeId: tgtCy.data('NodeID') || '' };
+  _rcPair.flipped     = false;
+  _rcPair.relType     = relType;
+  _rcPair.isNonDir    = RC_NONDIRECTIONAL_TYPES.has(relType);
+  _rcPair.currentRelId = '';
+  _rcPair.refs        = [];
+  _rcPair.refIdx      = 0;
+  _rcPair.refsVisible = false;
+  _rcPair.refsLoaded  = false;
+  _rcPair._pid        = 0;
+
+  // Pre-populate properties from edge data (skip structural/audit fields)
+  var EDGE_SKIP = { RelationID:1, RelationIDs:1, RelationNumberOfReferences:1,
+                    RelationNumberOfSentences:1, createdAt:1, updatedAt:1,
+                    createdBy:1, updatedBy:1, id:1, source:1, target:1,
+                    elementId:1, relType:1, relId:1, relIds:1, color:1, label:1,
+                    numRefs:1, numSentences:1, thickness:1, directed:1 };
+  _rcPair.props = [];
+  Object.keys(cyEdge.data()).forEach(function(k) {
+    if (EDGE_SKIP[k]) return;
+    var v = cyEdge.data(k);
+    if (v == null || v === '') return;
+    _rcPair.props.push({ id: ++_rcPair._pid, key: k,
+      value: Array.isArray(v) ? v.join(';') : String(v) });
+  });
+
+  // Set relation type in dropdown after populating
+  document.getElementById('rcp-rel-id').textContent = '—';
+  document.getElementById('rcp-title').textContent = 'Create/Edit Relation';
+
+  rcPairRenderProps();
+  rcPairHideRefsPanel();
+
+  document.getElementById('rc-pair-modal').style.display = 'flex';
+
+  var loadingEl = document.getElementById('rcp-schema-loading');
+
+  if (!_rc.relTypes.length) {
+    // Schema not yet ready — show blocking overlay, wait for load, then populate
+    if (loadingEl) loadingEl.style.display = 'flex';
+    _loadSchema().then(function() {
+      if (loadingEl) loadingEl.style.display = 'none';
+      rcPairPopulateRelTypeDropdown();
+      rcPairPopulatePropKeyDropdown();
+      var sel = document.getElementById('rcp-reltype');
+      if (sel) sel.value = relType;
+      rcPairRenderVisual();
+      rcPairCalcRelId();
+      if (!_rc.refCols.length) {
+        api('/api/schema/columns', null).then(function(d) {
+          _rc.refCols = d.referenceColumns || [];
+        }).catch(function() {});
+      }
+    }).catch(function() {
+      if (loadingEl) loadingEl.style.display = 'none';
+    });
+  } else {
+    // Schema already cached — populate immediately
+    rcPairPopulateRelTypeDropdown();
+    rcPairPopulatePropKeyDropdown();
+    var sel = document.getElementById('rcp-reltype');
+    if (sel) sel.value = relType;
+    rcPairRenderVisual();
+    rcPairCalcRelId();
+    if (!_rc.refCols.length) {
+      api('/api/schema/columns', null).then(function(d) {
+        _rc.refCols = d.referenceColumns || [];
+      }).catch(function() {});
+    }
+  }
+}
+
+// ── Dropdowns ─────────────────────────────────────────────────────────────────
+function rcPairPopulateRelTypeDropdown() {
+  var sel = document.getElementById('rcp-reltype');
+  var cur = sel.value;
+  sel.innerHTML = '<option value="">— select relation type —</option>';
+  _rc.relTypes.forEach(function(t) {
+    sel.insertAdjacentHTML('beforeend',
+      '<option value="' + escHtml(t) + '"' + (t === cur ? ' selected' : '') + '>' + escHtml(t) + '</option>');
+  });
+}
+
+function rcPairPopulatePropKeyDropdown() {
+  var dl = document.getElementById('rcp-prop-key-list');
+  if (!dl) return;
+  dl.innerHTML = '';
+  _rc.propKeys.forEach(function(k) {
+    dl.insertAdjacentHTML('beforeend', '<option value="' + escHtml(k) + '">');
+  });
+}
+
+// ── Relation type change ───────────────────────────────────────────────────────
+function rcPairOnRelTypeChange() {
+  var relType = document.getElementById('rcp-reltype').value;
+  _rcPair.relType  = relType;
+  _rcPair.isNonDir = RC_NONDIRECTIONAL_TYPES.has(relType);
+  if (_rcPair.isNonDir) _rcPair.flipped = false;
+  rcPairRenderVisual();
+  rcPairScheduleRelIdCalc();
+}
+
+function rcPairSwapDirection() {
+  _rcPair.flipped = !_rcPair.flipped;
+  rcPairRenderVisual();
+  rcPairScheduleRelIdCalc();
+}
+
+// ── Node pair visual ──────────────────────────────────────────────────────────
+function rcPairRenderVisual() {
+  var c = document.getElementById('rcp-visual');
+  var nA = _rcPair.nodeA, nB = _rcPair.nodeB;
+  if (!nA || !nB) { c.innerHTML = ''; return; }
+
+  var relType = document.getElementById('rcp-reltype').value || _rcPair.relType || '';
+  var src = _rcPair.flipped ? nB : nA;
+  var tgt = _rcPair.flipped ? nA : nB;
+
+  function nodeBox(n, roleLabel) {
+    return '<div style="display:flex;flex-direction:column;align-items:center;flex:1;min-width:0">'
+      + '<div style="background:#1a2040;border:1px solid #3a4060;border-radius:7px;padding:10px 12px;width:100%;box-sizing:border-box;text-align:center">'
+        + (n.nodeType ? '<div style="font-size:10px;color:#4f8ef7;margin-bottom:3px">' + escHtml(n.nodeType) + '</div>' : '')
+        + '<div style="font-size:13px;color:#e0e4f4;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escHtml(n.label) + '">' + escHtml(n.label) + '</div>'
+      + '</div>'
+      + (roleLabel ? '<div style="font-size:10px;color:#7a8099;margin-top:5px">' + roleLabel + '</div>' : '')
+    + '</div>';
+  }
+
+  var connector, swapHtml = '';
+  if (!relType) {
+    connector = '<div style="align-self:center;padding:0 8px;font-size:22px;color:#2a3050;flex-shrink:0">?</div>';
+  } else if (_rcPair.isNonDir) {
+    connector = '<div style="align-self:center;padding:0 8px;flex-shrink:0">'
+      + '<div style="width:48px;height:2px;background:#5a6080"></div>'
+    + '</div>';
+  } else {
+    connector = '<div style="align-self:center;padding:0 4px;font-size:26px;color:#4f8ef7;flex-shrink:0;line-height:1">→</div>';
+    swapHtml = '<div style="display:flex;justify-content:center;margin-top:10px">'
+      + '<button onclick="rcPairSwapDirection()" '
+        + 'style="background:#1a2040;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;'
+        + 'padding:5px 16px;font-size:12px;cursor:pointer">⇄ Swap regulator / target</button>'
+    + '</div>';
+  }
+
+  var regLabel  = _rcPair.isNonDir ? '' : 'Regulator';
+  var tgtLabel  = _rcPair.isNonDir ? '' : 'Target';
+
+  c.innerHTML = '<div style="display:flex;align-items:flex-start;gap:8px;width:100%">'
+      + nodeBox(src, regLabel)
+      + connector
+      + nodeBox(tgt, tgtLabel)
+    + '</div>'
+    + swapHtml;
+}
+
+// ── Properties ────────────────────────────────────────────────────────────────
+function rcPairAddProperty() {
+  var keyEl = document.getElementById('rcp-prop-key');
+  var valEl = document.getElementById('rcp-prop-val');
+  var key = keyEl.value.trim(), val = valEl.value.trim();
+  if (!key) { alert('Please enter a property name.'); return; }
+  if (!val) { alert('Value cannot be empty.');    return; }
+  _rcPair.props.push({ id: ++_rcPair._pid, key: key, value: val });
+  valEl.value = ''; keyEl.value = '';
+  rcPairRenderProps();
+  rcPairScheduleRelIdCalc();
+}
+
+function rcPairDeleteProperty(pid) {
+  _rcPair.props = _rcPair.props.filter(function(p) { return p.id !== pid; });
+  rcPairRenderProps();
+  rcPairScheduleRelIdCalc();
+}
+
+function rcPairRenderProps() {
+  var c = document.getElementById('rcp-props');
+  if (!_rcPair.props.length) {
+    c.innerHTML = '<div style="font-size:12px;color:#2a3050;font-style:italic;padding:4px 0">No properties added.</div>';
+    return;
+  }
+  c.innerHTML = '';
+  _rcPair.props.forEach(function(p) {
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:4px 2px;border-bottom:1px solid #1a2040';
+    row.innerHTML =
+      '<div style="font-size:12px;color:#7a8099;min-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(p.key) + '</div>'
+      + '<div style="flex:1;font-size:13px;color:#c0c4d4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(String(p.value)) + '</div>'
+      + '<button onclick="rcPairDeleteProperty(' + p.id + ')" style="background:none;border:none;color:#8a2020;font-size:17px;cursor:pointer;line-height:1;padding:0 2px;flex-shrink:0">×</button>';
+    c.appendChild(row);
+  });
+}
+
+// ── RelationID ────────────────────────────────────────────────────────────────
+function rcPairScheduleRelIdCalc() {
+  if (_rcPair._debounce) clearTimeout(_rcPair._debounce);
+  _rcPair._debounce = setTimeout(rcPairCalcRelId, 380);
+}
+
+async function rcPairCalcRelId() {
+  var relType = document.getElementById('rcp-reltype').value;
+  var src = _rcPair.flipped ? _rcPair.nodeB : _rcPair.nodeA;
+  var tgt = _rcPair.flipped ? _rcPair.nodeA : _rcPair.nodeB;
+  var inref = [], outref = [], inoutref = [];
+  if (_rcPair.isNonDir) {
+    if (_rcPair.nodeA.nodeId) inoutref.push(_rcPair.nodeA.nodeId);
+    if (_rcPair.nodeB.nodeId) inoutref.push(_rcPair.nodeB.nodeId);
+  } else {
+    if (src.nodeId) inref.push(src.nodeId);
+    if (tgt.nodeId) outref.push(tgt.nodeId);
+  }
+  function getProp(names) {
+    for (var i = 0; i < names.length; i++)
+      for (var j = 0; j < _rcPair.props.length; j++)
+        if (_rcPair.props[j].key.toLowerCase() === names[i].toLowerCase()) return _rcPair.props[j].value;
+    return '';
+  }
+  try {
+    var r = await api('/api/curation/calculate-relation-id', {
+      inref: inref, inoutref: inoutref, outref: outref,
+      control_type: relType,
+      ontology:     getProp(['ontology']),
+      relationship: getProp(['relationship']),
+      effect:       getProp(['effect','Effect']),
+      mechanism:    getProp(['mechanism','Mechanism'])
+    });
+    _rcPair.currentRelId = r.relationId || '';
+    document.getElementById('rcp-rel-id').textContent = _rcPair.currentRelId || '—';
+  } catch(e) {
+    document.getElementById('rcp-rel-id').textContent = '(error)';
+  }
+}
+
+// ── References ────────────────────────────────────────────────────────────────
+async function rcPairToggleRefs() {
+  _rcPair.refsVisible = !_rcPair.refsVisible;
+  var btn = document.getElementById('rcp-refs-btn');
+  if (_rcPair.refsVisible) {
+    document.getElementById('rcp-refs-section').style.display = 'block';
+    btn.style.background  = '#0e2040'; btn.style.borderColor = '#4f8ef7'; btn.style.color = '#4f8ef7';
+    if (!_rcPair.refsLoaded) await rcPairLoadRefs();
+  } else {
+    rcPairHideRefsPanel();
+  }
+}
+
+function rcPairHideRefsPanel() {
+  _rcPair.refsVisible = false;
+  document.getElementById('rcp-refs-section').style.display = 'none';
+  var btn = document.getElementById('rcp-refs-btn');
+  btn.style.background  = '#1a2040'; btn.style.borderColor = '#3a3f55'; btn.style.color = '#c0c4d4';
+}
+
+async function rcPairLoadRefs() {
+  if (_rcPair._debounce) { clearTimeout(_rcPair._debounce); await rcPairCalcRelId(); }
+  _rcPair.refs = [];
+  if (_rcPair.currentRelId) {
+    try {
+      var res = await api('/api/references/batch', { relationIds: [_rcPair.currentRelId], scopusColumns: [] });
+      _rcPair.refs = (res[_rcPair.currentRelId] || []).map(function(r) { return Object.assign({ _mode: 'view' }, r); });
+    } catch(e) {}
+  }
+  if (!_rcPair.refs.length) _rcPair.refs = [{ _mode: 'edit', _new: true }];
+  _rcPair.refsLoaded = true;
+  _rcPair.refIdx = 0;
+  rcPairRenderRefNav();
+  rcPairRenderRefCard();
+}
+
+function rcPairRenderRefNav() {
+  var total = _rcPair.refs.length, idx = _rcPair.refIdx;
+  document.getElementById('rcp-ref-counter').textContent =
+    total ? ('Reference ' + (idx + 1) + ' of ' + total) : 'No references';
+  var dis = 'opacity:.35;pointer-events:none', ena = 'opacity:1;pointer-events:auto';
+  ['rcp-nav-first','rcp-nav-prev'].forEach(function(id) { document.getElementById(id).style.cssText += ';' + (idx === 0        ? dis : ena); });
+  ['rcp-nav-next', 'rcp-nav-last'].forEach(function(id) { document.getElementById(id).style.cssText += ';' + (idx >= total - 1 ? dis : ena); });
+}
+
+function rcPairNavRef(dir) {
+  if (!rcPairValidateCurrentRef()) return;
+  var total = _rcPair.refs.length;
+  if      (dir === 'first') _rcPair.refIdx = 0;
+  else if (dir === 'prev')  _rcPair.refIdx = Math.max(0, _rcPair.refIdx - 1);
+  else if (dir === 'next')  _rcPair.refIdx = Math.min(total - 1, _rcPair.refIdx + 1);
+  else if (dir === 'last')  _rcPair.refIdx = total - 1;
+  rcPairRenderRefNav();
+  rcPairRenderRefCard();
+}
+
+function rcPairValidateCurrentRef() {
+  var ref = _rcPair.refs[_rcPair.refIdx];
+  if (!ref || ref._mode !== 'edit') return true;
+  rcPairSaveRefInputs();
+  var ID_FIELDS = ['doi','pmid','embase','pii','pui','nct_id'];
+  var hasId   = ID_FIELDS.some(function(f) { return (String(ref[f] || '')).trim() !== ''; });
+  var hasMsrc = (String(ref.msrc || '')).trim() !== '';
+  if (!hasId || !hasMsrc) {
+    var missing = [];
+    if (!hasId)   missing.push('at least one identifier: DOI, PMID, EMBASE, PII, PUI, or NCT ID');
+    if (!hasMsrc) missing.push('Sentence (msrc)');
+    alert('Reference ' + (_rcPair.refIdx + 1) + ' is missing:\n• ' + missing.join('\n• '));
+    return false;
+  }
+  return true;
+}
+
+function rcPairSaveRefInputs() {
+  var ref = _rcPair.refs[_rcPair.refIdx];
+  var card = document.getElementById('rcp-ref-card');
+  if (!ref || !card) return;
+  card.querySelectorAll('[data-ref-field]').forEach(function(el) {
+    ref[el.getAttribute('data-ref-field')] = el.value;
+  });
+}
+
+function rcPairRenderRefCard() {
+  var card = document.getElementById('rcp-ref-card');
+  var ref  = _rcPair.refs[_rcPair.refIdx];
+  if (!ref) { card.innerHTML = '<div style="color:#2a3050;font-size:12px">No reference.</div>'; return; }
+  if (ref._mode === 'edit') {
+    rcPairRenderRefEditMode(card, ref);
+  } else {
+    rcPairRenderRefViewMode(card, ref);
+  }
+}
+
+function rcPairRenderRefViewMode(card, ref) {
+  var fields = Object.keys(ref).filter(function(k) { return !RC_SKIP_FIELDS[k] && ref[k] != null && ref[k] !== ''; });
+  fields.sort(function(a, b) {
+    var ai = RC_PROM_FIELDS.indexOf(a), bi = RC_PROM_FIELDS.indexOf(b);
+    if (ai === -1 && bi === -1) return a < b ? -1 : 1;
+    if (ai === -1) return 1; if (bi === -1) return -1;
+    return ai - bi;
+  });
+  var html = '<div style="display:flex;flex-direction:column;gap:5px;margin-bottom:12px">';
+  fields.forEach(function(k) {
+    var isId = RC_ID_FIELDS[k] ? '<span style="color:#4f8ef7;font-size:10px;margin-left:3px">ID</span>' : '';
+    html += '<div style="display:flex;gap:8px;align-items:flex-start">'
+      + '<div style="min-width:90px;font-size:11px;color:#7a8099;flex-shrink:0;padding-top:1px">' + escHtml(k) + isId + '</div>'
+      + '<div style="flex:1;font-size:12px;color:#c0c4d4;word-break:break-word">' + escHtml(String(ref[k])) + '</div>'
+      + '</div>';
+  });
+  html += '</div>';
+  html += '<div style="display:flex;gap:8px">'
+    + '<button onclick="rcPairEditRef()" style="background:#1a2a50;border:1px solid #3a3f55;border-radius:5px;color:#4f8ef7;padding:4px 12px;font-size:12px;cursor:pointer">✎ Edit</button>'
+    + '<button onclick="rcPairDeleteRef()" style="background:#280e0e;border:1px solid #7a2020;border-radius:5px;color:#cc4040;padding:4px 10px;font-size:12px;cursor:pointer">✕ Delete</button>'
+    + '</div>';
+  card.innerHTML = html;
+}
+
+function rcPairRenderRefEditMode(card, ref) {
+  var shown = {};
+  var fieldList = RC_PROM_FIELDS.slice();
+  Object.keys(ref).forEach(function(k) { if (!RC_SKIP_FIELDS[k] && !shown[k] && RC_PROM_FIELDS.indexOf(k) === -1) fieldList.push(k); });
+  var html = '<div style="display:flex;flex-direction:column;gap:7px">';
+  fieldList.forEach(function(k) {
+    if (RC_SKIP_FIELDS[k]) return;
+    shown[k] = 1;
+    var isReq = (k === 'msrc' || RC_ID_FIELDS[k]) ? '<span style="color:#e05060">*</span>' : '';
+    var val = ref[k] != null ? escHtml(String(ref[k])) : '';
+    html += '<div style="display:flex;align-items:flex-start;gap:8px">'
+      + '<div style="min-width:80px;font-size:11px;color:#7a8099;flex-shrink:0;padding-top:7px">' + escHtml(k) + isReq + '</div>';
+    if (k === 'msrc') {
+      html += '<textarea data-ref-field="' + k + '" rows="3" style="flex:1;background:#0a0f1e;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;padding:5px 8px;font-size:12px;resize:vertical">' + val + '</textarea>';
+    } else {
+      html += '<input type="text" data-ref-field="' + k + '" value="' + val + '" style="flex:1;background:#0a0f1e;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;padding:5px 8px;font-size:12px">';
+    }
+    html += '</div>';
+  });
+  var availCols = _rc.refCols.filter(function(c) { return !RC_SKIP_FIELDS[c] && !shown[c]; });
+  if (availCols.length) {
+    html += '<div style="display:flex;gap:6px;align-items:center;margin-top:4px;padding-top:6px;border-top:1px solid #1a2040">'
+      + '<select id="rcp-ref-addcol" style="background:#0a0f1e;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:4px 6px;font-size:12px">'
+      + availCols.map(function(c) { return '<option value="' + escHtml(c) + '">' + escHtml(c) + '</option>'; }).join('')
+      + '</select>'
+      + '<input type="text" id="rcp-ref-addval" placeholder="value" style="flex:1;background:#0a0f1e;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:4px 8px;font-size:12px">'
+      + '<button onclick="rcPairRefAddField()" style="background:#2a3050;border:1px solid #3a3f55;border-radius:4px;color:#c0c4d4;padding:4px 10px;font-size:12px;cursor:pointer;white-space:nowrap">Add field</button>'
+      + '</div>';
+  }
+  html += '</div>';
+  card.innerHTML = html;
+}
+
+function rcPairEditRef()   { _rcPair.refs[_rcPair.refIdx]._mode = 'edit'; rcPairRenderRefCard(); }
+function rcPairDeleteRef() {
+  var ref = _rcPair.refs[_rcPair.refIdx];
+  if (!ref) return;
+  if (!ref._new) ref._deleted = true;
+  _rcPair.refs.splice(_rcPair.refIdx, 1);
+  if (_rcPair.refIdx >= _rcPair.refs.length) _rcPair.refIdx = Math.max(0, _rcPair.refs.length - 1);
+  rcPairRenderRefNav(); rcPairRenderRefCard();
+}
+function rcPairAddNewRef() {
+  _rcPair.refs.push({ _mode: 'edit', _new: true });
+  _rcPair.refIdx = _rcPair.refs.length - 1;
+  rcPairRenderRefNav(); rcPairRenderRefCard();
+}
+function rcPairRefAddField() {
+  rcPairSaveRefInputs();
+  var col = document.getElementById('rcp-ref-addcol');
+  var val = document.getElementById('rcp-ref-addval');
+  if (!col || !val || !val.value.trim()) return;
+  _rcPair.refs[_rcPair.refIdx][col.value] = val.value.trim();
+  rcPairRenderRefCard();
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+async function rcPairSaveToDatabase() {
+  var relType = document.getElementById('rcp-reltype').value;
+  if (!relType) { alert('Please select a relation type.'); return; }
+
+  var src = _rcPair.flipped ? _rcPair.nodeB : _rcPair.nodeA;
+  var tgt = _rcPair.flipped ? _rcPair.nodeA : _rcPair.nodeB;
+  if (!src.nodeId || !tgt.nodeId) {
+    alert('One or both nodes are missing a NodeID. Cannot write to database.');
+    return;
+  }
+
+  if (!_rcPair.isNonDir) {
+    // For directional types, make sure the user explicitly swapped if needed
+    // (default A→B is acceptable; just ensure relType is set — already checked above)
+  }
+
+  if (_rcPair._debounce) { clearTimeout(_rcPair._debounce); await rcPairCalcRelId(); }
+  if (!_rcPair.currentRelId) {
+    alert('Could not calculate RelationID. Ensure nodes have NodeIDs and a relation type is selected.');
+    return;
+  }
+
+  if (_rcPair.refsVisible && _rcPair.refs.length) rcPairSaveRefInputs();
+
+  var props = {};
+  _rcPair.props.forEach(function(p) { props[p.key] = p.value; });
+
+  var refsToSend = _rcPair.refs.filter(function(r) {
+    if (r._deleted) return true;
+    return Object.keys(r).some(function(k) { return !k.startsWith('_') && r[k]; });
+  });
+
+  setProgressMsg('⏳ Saving relation…');
+  try {
+    var result = await api('/api/curation/write-relation', {
+      sourceNode:   { nodeId: src.nodeId,  nodeLabel: src.nodeType  },
+      targetNode:   { nodeId: tgt.nodeId,  nodeLabel: tgt.nodeType  },
+      relationType: relType,
+      properties:   props,
+      relationId:   _rcPair.currentRelId,
+      isNew:        true,
+      references:   refsToSend
+    });
+    setProgressMsg(null);
+    if (result.error) { alert('Save failed: ' + result.error); return; }
+
+    pushUndo();
+    mergeGraphData({
+      nodes: [],
+      edges: [{
+        id: result.elementId, elementId: result.elementId,
+        type: relType,
+        startNodeId: result.sourceNodeInternalId,
+        endNodeId:   result.targetNodeInternalId,
+        properties:  Object.assign({ RelationID: _rcPair.currentRelId }, result.properties)
+      }]
+    });
+    updateStats();
+    closePairRelationDialog();
+    showAlignHint('Relation saved to database.');
+  } catch(err) {
+    setProgressMsg(null);
+    alert('Save failed: ' + (err.message || err));
   }
 }
 
@@ -7134,6 +9808,26 @@ function hideContextMenu() {
 function openCurationFromContext() {
   hideContextMenu();
   if (!contextTarget) return;
+  if (contextTarget.type === 'edge' && currentRole === 'user') {
+    var cyEdge = cy.getElementById(contextTarget.id);
+    if (cyEdge && cyEdge.length) {
+      // Route based on number of distinct endpoint nodes
+      var srcId = cyEdge.data('source');
+      var tgtId = cyEdge.data('target');
+      var endpointCount = (srcId && tgtId && srcId !== tgtId) ? 2 : 1;
+      if (endpointCount === 2) {
+        // Standard 2-node relation → Create/Edit Relation (pair dialog)
+        openPairRelationDialogForEdge(cyEdge);
+      } else {
+        // Self-loop or multi-node hyperedge → hyperedge dialog
+        cy.elements().unselect();
+        cyEdge.select();
+        openRelationCurationDialog();
+      }
+      return;
+    }
+  }
+  // Nodes (or edges where cy element not found) → simple property editor
   openCurationModal(contextTarget.type, contextTarget.id, contextTarget.elementId,
     contextTarget.displayName, contextTarget.properties, contextTarget.relId);
 }
@@ -7933,6 +10627,7 @@ async function openCurationModal(type, id, elementId, displayName, properties, r
     if (refs.length === 0) {
       pgSection.innerHTML = '<div class="prop-section-title">PostgreSQL References</div>'
         + '<div style="color:#7a8099;font-size:12px">No references found for this relation.</div>';
+    } else {
       var pgHtml = '<div class="prop-section-title">PostgreSQL References</div>';
       refs.forEach(function(ref) {
         var year = ref.pubyear ? ' (' + ref.pubyear + ')' : '';
@@ -7970,6 +10665,7 @@ function renderCurationPropsHTML(props) {
   Object.keys(props || {}).forEach(function(key) {
     var val = props[key] != null ? String(props[key]) : '';
     html += '<div class="prop-row" data-key="' + escHtml(key) + '">'
+      + '<input class="prop-key" type="text" value="' + escHtml(key) + '" placeholder="Property name" readonly style="background:#111;color:#6a7090;cursor:default">'
       + '<input class="prop-val" type="text" value="' + escHtml(val) + '" placeholder="Value">'
       + '<button class="prop-delete" onclick="this.closest(\'.prop-row\').remove()" title="Remove">✕</button>'
       + '</div>';
@@ -7986,7 +10682,8 @@ async function saveCuration() {
   var rows = container.querySelectorAll('.prop-row');
   var props = {};
   rows.forEach(function(row) {
-    var key = (row.querySelector('.prop-key') || {}).value || '';
+    var keyEl = row.querySelector('.prop-key');
+    var key = (keyEl ? keyEl.value : null) || row.getAttribute('data-key') || '';
     var val = (row.querySelector('.prop-val') || {}).value || '';
     if (key.trim()) props[key.trim()] = val;
   });
@@ -8009,6 +10706,11 @@ async function saveCuration() {
     } else {
       var ge = graphData.edges.find(function(e) { return e.id === curationTarget.id; });
       if (ge) Object.assign(ge.properties, props);
+      // Also update Cytoscape edge data so re-opening "Edit properties" shows fresh values
+      var cyEdge = cy.getElementById(curationTarget.id);
+      if (cyEdge && cyEdge.length) {
+        Object.keys(props).forEach(function(k) { cyEdge.data(k, props[k]); });
+      }
     }
 
     status.textContent = 'Saved!';
