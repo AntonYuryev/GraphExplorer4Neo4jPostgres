@@ -16,7 +16,7 @@ try { helmet = require('helmet'); } catch(e) {
 }
 const app = express();
 // Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, etc.
-if (helmet) app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled — app loads inline scripts from CDN
+if (helmet) app.use(helmet({ contentSecurityPolicy: false })); // CSP disabled — scripts load from CDN
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -1609,12 +1609,25 @@ app.post('/api/graph/count-query', dbLimiter, authMiddleware, async (req, res) =
 });
 
 // ─── Cypher query history ─────────────────────────────────────────────────────
-// Tab-delimited file: Date \t CypherQuery \t ResultCount
+// NDJSON file: one JSON object per line — { date, query, count }
+// Legacy TSV lines (Date \t Query \t Count) are still parsed for backwards compatibility.
 app.get('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
   try {
     if (!fs.existsSync(HISTORY_FILE)) return res.json({ rows: [] });
     const content = fs.readFileSync(HISTORY_FILE, 'utf8');
     const rows = content.trim().split('\n').filter(l => l.trim()).map(line => {
+      // Try NDJSON first (new format)
+      if (line.trimStart().startsWith('{')) {
+        try {
+          const obj = JSON.parse(line);
+          return {
+            date:  String(obj.date  || ''),
+            query: String(obj.query || ''),
+            count: Number.isFinite(Number(obj.count)) ? Number(obj.count) : 0
+          };
+        } catch (_) { /* fall through to TSV */ }
+      }
+      // Legacy TSV format
       const parts = line.split('\t');
       const date  = parts[0] || '';
       const query = parts[1] || '';
@@ -1631,9 +1644,13 @@ const HISTORY_QUERY_MAX_CHARS = 10_000; // per-entry limit to prevent disk exhau
 app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
   const { query, count } = req.body || {};
   if (!query || !query.trim()) return res.status(400).json({ error: 'query required' });
-  const date       = new Date().toISOString();
-  const cleanQuery = String(query).replace(/[\t\r\n]+/g, ' ').trim().slice(0, HISTORY_QUERY_MAX_CHARS);
-  const line       = date + '\t' + cleanQuery + '\t' + (Number.isFinite(Number(count)) ? Number(count) : 0) + '\n';
+  const entry = {
+    date:  new Date().toISOString(),
+    query: String(query).slice(0, HISTORY_QUERY_MAX_CHARS),
+    count: Number.isFinite(Number(count)) ? Number(count) : 0
+  };
+  // JSON.stringify escapes all control characters — no log-injection possible
+  const line = JSON.stringify(entry) + '\n';
   try {
     fs.appendFileSync(HISTORY_FILE, line, 'utf8');
     res.json({ ok: true });
@@ -1642,10 +1659,69 @@ app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
   }
 });
 
+// ─── Vendor library auto-download ────────────────────────────────────────────
+// Downloads third-party JS bundles into public/vendor/ on first run so the
+// browser never needs to reach an external CDN.  Runs in the background after
+// the server starts; missing files are logged but do not crash the server.
+const _vendorDir = path.join(__dirname, 'public', 'vendor');
+const _vendorLibs = [
+  { url: 'https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js',                  file: 'cytoscape.min.js' },
+  { url: 'https://unpkg.com/dagre@0.8.5/dist/dagre.min.js',                           file: 'dagre.min.js' },
+  { url: 'https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js',                file: 'cytoscape-dagre.js' },
+  { url: 'https://unpkg.com/klayjs@0.4.1/klay.js',                                    file: 'klay.js' },
+  { url: 'https://unpkg.com/cytoscape-klay@3.1.4/cytoscape-klay.js',                  file: 'cytoscape-klay.js' },
+  { url: 'https://cdn.jsdelivr.net/npm/exceljs@4.3.0/dist/exceljs.min.js',            file: 'exceljs.min.js' },
+  { url: 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js',               file: 'jszip.min.js' },
+  { url: 'https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js',                 file: 'd3.min.js' },
+  { url: 'https://cdnjs.cloudflare.com/ajax/libs/d3-sankey/0.12.3/d3-sankey.min.js',  file: 'd3-sankey.min.js' },
+];
+
+function _downloadVendorLib(url, dest) {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith('https') ? require('https') : require('http');
+    const tmp = dest + '.tmp';
+    const file = fs.createWriteStream(tmp);
+    function get(u) {
+      const opts = Object.assign(new URL(u), { rejectUnauthorized: false });
+      client.get(opts, res => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const next = res.headers.location.startsWith('http')
+            ? res.headers.location
+            : new URL(res.headers.location, u).href;
+          return get(next);
+        }
+        if (res.statusCode !== 200) {
+          file.close(); try { fs.unlinkSync(tmp); } catch(_) {}
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        res.pipe(file);
+        file.on('finish', () => { file.close(); fs.renameSync(tmp, dest); resolve(); });
+        file.on('error', err => { try { fs.unlinkSync(tmp); } catch(_) {} reject(err); });
+      }).on('error', reject);
+    }
+    get(url);
+  });
+}
+
+async function _ensureVendorLibs() {
+  try { fs.mkdirSync(_vendorDir, { recursive: true }); } catch(_) {}
+  for (const lib of _vendorLibs) {
+    const dest = path.join(_vendorDir, lib.file);
+    if (fs.existsSync(dest)) continue;
+    try {
+      await _downloadVendorLib(lib.url, dest);
+      console.log(`[vendor] downloaded ${lib.file}`);
+    } catch (err) {
+      console.warn(`[vendor] failed to download ${lib.file}: ${err.message}`);
+    }
+  }
+}
+
 // ─── Start server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Graph Explorer running on http://localhost:${PORT}`);
+  _ensureVendorLibs(); // runs in background; server is already accepting requests
 });
 
 // ─── Neo4j schema introspection ───────────────────────────────────────────────
@@ -1978,10 +2054,12 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
   const username = req.user.username;
 
   // Coerce semicolon-separated strings → arrays for list properties
-  const relProps = {};
+  const relProps = Object.create(null);
   Object.entries(properties).forEach(([k, v]) => {
     if (v == null || v === '') return;
-    relProps[k] = (typeof v === 'string' && v.includes(';'))
+    const key = String(k);
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+    relProps[key] = (typeof v === 'string' && v.includes(';'))
       ? v.split(';').map(s => s.trim()).filter(Boolean) : v;
   });
 
@@ -2212,8 +2290,8 @@ app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, re
   const { urns = [], graphUrns = [] } = req.body || {};
   if (!Array.isArray(urns) || !urns.length) return res.json({ counts: {} });
   if (!Array.isArray(graphUrns) || !graphUrns.length) {
-    const counts = {};
-    urns.forEach(u => { counts[u] = 0; });
+    const counts = Object.create(null);
+    urns.forEach(u => { counts[String(u)] = 0; });
     return res.json({ counts });
   }
 
@@ -2227,9 +2305,9 @@ app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, re
   const session = neo4jDriver.session({ database: NEO4J_DB });
   try {
     const result = await session.run(cypher, { urns, graphUrns });
-    const counts = {};
+    const counts = Object.create(null);
     result.records.forEach(r => {
-      const u = r.get('parentUrn');
+      const u = String(r.get('parentUrn'));
       const c = r.get('cnt');
       counts[u] = neo4j.isInt(c) ? c.toNumber() : (Number(c) || 0);
     });
