@@ -7618,9 +7618,11 @@ async function _fetchGraphCountsBatch(treeNodes) {
   }
   try {
     var result = await api('/api/ontology/batch-counts', { urns: urns, graphUrns: graphUrns });
-    var counts = result.counts || {};
+    // Server returns { entries: [{urn, count}] } — convert to a local Map for O(1) lookup
+    var counts = new Map();
+    (result.entries || []).forEach(function(e) { counts.set(e.urn, e.count); });
     treeNodes.forEach(function(n) {
-      n.graphCount = counts[n.urn] !== undefined ? counts[n.urn] : 0;
+      n.graphCount = counts.has(n.urn) ? counts.get(n.urn) : 0;
     });
     _renderOntologyTree();
   } catch(e) {
@@ -9313,6 +9315,20 @@ function _expandCommit() {
   pushUndo();  // snapshot BEFORE merge so Undo restores pre-expand state
   var result = mergeGraphData(pending);
   console.log('[expand] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
+
+  updateStats();
+}
+
+function _expandCommitNewTab() {
+  document.getElementById('expand-confirm-modal').style.display = 'none';
+  if (!_expandPending) return;
+  var pending = _expandPending;
+  _expandPending = null;
+
+  // Save active tab state, create a fresh tab, then load the expansion into it
+  createNewTab('Expansion ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  var result = mergeGraphData(pending);
+  console.log('[expand→new tab] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
 
   updateStats();
 }
