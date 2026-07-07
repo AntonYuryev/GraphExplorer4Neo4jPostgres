@@ -1,0 +1,388 @@
+{
+  "mappings": [
+    {
+      "user_term": "leukemic blast",
+      "neo4j_name": "blast cells",
+      "neo4j_label": "CellType",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-04"
+    },
+    {
+      "user_term": "myeloid differentiation",
+      "neo4j_name": "myeloid blood cell differentiation",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-04"
+    },
+    {
+      "user_term": "hematopoietic differentiation",
+      "neo4j_name": "hematopoietic cell differentiation",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-04"
+    },
+    {
+      "user_term": "find proteins",
+      "neo4j_name": "Protein|FunctionalClass|Complex",
+      "neo4j_label": "",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "blast cell differentiation",
+      "neo4j_name": "blast cell differentiation",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "biological processes",
+      "neo4j_name": "Disease|CellProcess|ClinicalParameter",
+      "neo4j_label": "",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "anatomical concepts",
+      "neo4j_name": "Cell|CellType|Tissue|Organ|CellObject|",
+      "neo4j_label": "",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "NEXMIF",
+      "neo4j_name": "NEXMIF",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "NEXMIF",
+      "neo4j_name": "rs1057518728",
+      "neo4j_label": "GeneticVariant",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "NEXMIF",
+      "neo4j_name": "rs1569335056",
+      "neo4j_label": "GeneticVariant",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "NEXMIF",
+      "neo4j_name": "rs1556016352",
+      "neo4j_label": "GeneticVariant",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "NEXMIF",
+      "neo4j_name": "rs1556016224",
+      "neo4j_label": "GeneticVariant",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "PML-RARA",
+      "neo4j_name": "PML-RAR",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "PML-RARA",
+      "neo4j_name": "PRAM1",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "BRCA1",
+      "neo4j_name": "BRCA1",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "BRCA1",
+      "neo4j_name": "BRCA1-A complex",
+      "neo4j_label": "Complex",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "BRCA1",
+      "neo4j_name": "BRCA1/BARD1",
+      "neo4j_label": "Complex",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "BRCA1",
+      "neo4j_name": "BRCA1P1",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "BRCA1",
+      "neo4j_name": "BRCA1-PALB2-BRCA2",
+      "neo4j_label": "Complex",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-05"
+    },
+    {
+      "user_term": "acetylase",
+      "neo4j_name": "NDST3",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "acetylase",
+      "neo4j_name": "acetyl-CoA C-acetyltransferase",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "acetylase",
+      "neo4j_name": "carnitine O-acetyltransferase",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "acetylase",
+      "neo4j_name": "MACROD2",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "acetylase",
+      "neo4j_name": "HDAC1P2",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "pontine glioma",
+      "neo4j_name": "pontine glioma",
+      "neo4j_label": "Disease",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27M",
+      "neo4j_name": "H3K27me1",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27M",
+      "neo4j_name": "H3K27me3",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 4,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27M",
+      "neo4j_name": "H3K27me",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27M",
+      "neo4j_name": "H3K27me2",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "therapeutic approach",
+      "neo4j_name": "SmallMol",
+      "neo4j_label": "",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "drugs",
+      "neo4j_name": "SmallMol",
+      "neo4j_label": "",
+      "use_count": 1,
+      "confirmed": true,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3",
+      "neo4j_name": "H3",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3",
+      "neo4j_name": "H3P33",
+      "neo4j_label": "Protein",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3",
+      "neo4j_name": "H3K23deac",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3",
+      "neo4j_name": "H3C11",
+      "neo4j_label": "Protein",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3",
+      "neo4j_name": "H378",
+      "neo4j_label": "CellType",
+      "use_count": 2,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3.3",
+      "neo4j_name": "H3.3",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3.3",
+      "neo4j_name": "H3.3B",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3.3",
+      "neo4j_name": "H3.3A",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3.3",
+      "neo4j_name": "CHED1",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3.3",
+      "neo4j_name": "OLA1",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27",
+      "neo4j_name": "H3K27",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27",
+      "neo4j_name": "H3K27ar",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27",
+      "neo4j_name": "H3K27deac",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27",
+      "neo4j_name": "H3K27dear",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "H3K27",
+      "neo4j_name": "H3K27deme",
+      "neo4j_label": "FunctionalClass",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "panobinostat",
+      "neo4j_name": "panobinostat",
+      "neo4j_label": "SmallMol",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "Carvediol",
+      "neo4j_name": "carvedilol",
+      "neo4j_label": "SmallMol",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-06"
+    }
+  ]
+}
