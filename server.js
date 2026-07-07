@@ -6,7 +6,8 @@ const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
+const http = require('http');
 const rateLimit = require('express-rate-limit');
 const _crypto   = require('crypto');
 
@@ -101,6 +102,16 @@ const DEFAULT_SETTINGS = {
     schema:   'your-pg-schema',
     username: 'your-pg-username',
     password: ''
+  },
+  llm: {
+    url:        '',          // LLM API base URL (leave blank for Anthropic default)
+    apikey:     '',          // API key
+    username:   '',          // username if required by endpoint
+    password:   '',          // password if required by endpoint
+    model_name: 'claude-sonnet-4-6',
+    temperature: 0.2,
+    top_p:      0.9,
+    json_mode:  false
   }
 };
 
@@ -121,6 +132,22 @@ function saveAppSettings(s) {
 
 let appSettings = loadAppSettings();
 
+// ── Migrate legacy LLM config: convert single url → providers array ───────────
+(function _migrateLlmProviders() {
+  const llm = appSettings.llm || {};
+  if (llm.url && (!Array.isArray(llm.providers) || !llm.providers.length)) {
+    // Guess a friendly name from the URL
+    let name = 'Default';
+    if (llm.url.includes('generativelanguage.googleapis.com')) name = 'Google Gemini';
+    else if (llm.url.includes('anthropic.com')) name = 'Anthropic Claude';
+    else if (llm.url.includes('openai.com')) name = 'OpenAI';
+    llm.providers = [{ name, url: llm.url }];
+    appSettings.llm = llm;
+    saveAppSettings(appSettings);
+    console.log(`[INFO] Migrated LLM config: created providers array from url "${llm.url}"`);
+  }
+})();
+
 // ─── Neo4j ───────────────────────────────────────────────────────────────────
 // URN property name on Neo4j nodes — change to match your schema (e.g. 'id', '@id', 'URN')
 const _rawUrnProp = process.env.NEO4J_URN_PROP || 'URN';
@@ -130,11 +157,64 @@ if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(_rawUrnProp)) {
 const NEO4J_URN_PROP = _rawUrnProp;
 
 function makeNeo4jDriver(cfg) {
-  return neo4j.driver(cfg.url, neo4j.auth.basic(cfg.username, cfg.password));
+  return neo4j.driver(cfg.url, neo4j.auth.basic(cfg.username, cfg.password), {
+    // Pooled connections that sit idle for a while can be silently dropped by an
+    // intermediary (corporate firewall, load balancer, NAT timeout) without the
+    // driver noticing — especially likely for a remote host like this one, and
+    // exactly the failure mode of "run a query that's been sitting in Cypher
+    // History for a while": the pool hands back a connection that looks fine but
+    // is actually dead, and the query fails with a raw "socket disconnected
+    // before secure TLS connection was established" error instead of quietly
+    // reconnecting. Checking liveness before reuse (only pings connections idle
+    // longer than this threshold) avoids surfacing that failure to the user.
+    connectionLivenessCheckTimeout: 60_000,
+  });
 }
 
-let neo4jDriver = makeNeo4jDriver(appSettings.neo4j);
-let NEO4J_DB    = appSettings.neo4j.database;
+// ─── Per-user Neo4j connections ───────────────────────────────────────────────
+// The connection URL (host/port/scheme) is the only admin-managed piece —
+// which database, and which login, a request uses is each user's OWN setting
+// ("My Connection" dialog, available to every role), stored on their user
+// record in users.json. A user who hasn't set personal credentials yet falls
+// back to appSettings.neo4j's legacy database/username/password — the single
+// shared values this app used before per-user connections existed — so nobody
+// loses access on upgrade.
+// IMPORTANT: this cache is keyed by the Graph Explorer LOGIN username
+// (req.user.username, the same identity stamped onto createdBy/updatedBy) —
+// that identity never changes here. Only the Neo4j-side database/username/
+// password it resolves to is personal and reconfigurable.
+const _userNeo4jConns = new Map();  // loginUsername -> { driver, database }
+
+function _resolveNeo4jCfgForUser(loginUsername) {
+  const users    = loadUsers();
+  const u        = users.find(x => x.username === loginUsername);
+  const override = (u && u.neo4j) || {};
+  return {
+    url:      appSettings.neo4j.url,
+    database: override.database || appSettings.neo4j.database || 'neo4j',
+    username: override.username || appSettings.neo4j.username || '',
+    password: override.password || appSettings.neo4j.password || '',
+  };
+}
+
+function getNeo4jConnForUser(loginUsername) {
+  let entry = _userNeo4jConns.get(loginUsername);
+  if (entry) return entry;
+  const cfg = _resolveNeo4jCfgForUser(loginUsername);
+  entry = { driver: makeNeo4jDriver(cfg), database: cfg.database };
+  _userNeo4jConns.set(loginUsername, entry);
+  return entry;
+}
+
+function invalidateNeo4jConnForUser(loginUsername) {
+  const entry = _userNeo4jConns.get(loginUsername);
+  if (entry) { try { entry.driver.close(); } catch(e) {} }
+  _userNeo4jConns.delete(loginUsername);
+}
+
+function invalidateAllNeo4jConns() {
+  for (const username of Array.from(_userNeo4jConns.keys())) invalidateNeo4jConnForUser(username);
+}
 
 // ─── RNEF conversion ──────────────────────────────────────────────────────────
 // Path to rnef_to_json.py — defaults to same directory as server.js.
@@ -164,10 +244,8 @@ function makePgPool(cfg) {
   });
 }
 
-let pgPool    = makePgPool(appSettings.postgres);
-
 // Validate schema name: must be a plain SQL identifier (letters, digits, underscores).
-// This sanitises every downstream ${PG_SCHEMA} interpolation, preventing SQL injection
+// This sanitises every downstream schema interpolation, preventing SQL injection
 // regardless of how the schema was configured (settings.json or the Settings UI).
 function sanitizeSchemaName(name) {
   const s = (typeof name === 'string' ? name : '') || 'resnetcustomnov';
@@ -177,7 +255,45 @@ function sanitizeSchemaName(name) {
   return s;
 }
 
-let PG_SCHEMA = sanitizeSchemaName(appSettings.postgres.schema);
+// ─── Per-user PostgreSQL connections ─────────────────────────────────────────
+// Same reasoning as the Neo4j section above: host/port are admin-managed;
+// database/schema/username/password are each user's own setting, falling back
+// to appSettings.postgres's legacy shared values when a user has no personal
+// override yet.
+const _userPgConns = new Map();  // loginUsername -> { pool, schema }
+
+function _resolvePgCfgForUser(loginUsername) {
+  const users    = loadUsers();
+  const u        = users.find(x => x.username === loginUsername);
+  const override = (u && u.postgres) || {};
+  return {
+    host:     appSettings.postgres.host,
+    port:     appSettings.postgres.port,
+    database: override.database || appSettings.postgres.database || '',
+    schema:   override.schema   || appSettings.postgres.schema   || 'public',
+    username: override.username || appSettings.postgres.username || '',
+    password: override.password || appSettings.postgres.password || '',
+  };
+}
+
+function getPgConnForUser(loginUsername) {
+  let entry = _userPgConns.get(loginUsername);
+  if (entry) return entry;
+  const cfg = _resolvePgCfgForUser(loginUsername);
+  entry = { pool: makePgPool(cfg), schema: sanitizeSchemaName(cfg.schema) };
+  _userPgConns.set(loginUsername, entry);
+  return entry;
+}
+
+function invalidatePgConnForUser(loginUsername) {
+  const entry = _userPgConns.get(loginUsername);
+  if (entry) { try { entry.pool.end(); } catch(e) {} }
+  _userPgConns.delete(loginUsername);
+}
+
+function invalidateAllPgConns() {
+  for (const username of Array.from(_userPgConns.keys())) invalidatePgConnForUser(username);
+}
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 // JWT_SECRET resolution order:
@@ -232,8 +348,26 @@ function saveUsers(users) {
   // into the fs.writeFileSync call:
   //   - username/password: written as regex match[0], not the raw input string
   //   - role: written as a hardcoded string literal chosen by a ternary
+  //   - neo4j/postgres: each user's OWN database connection override (see
+  //     "Per-user database connections" below). These are opaque credential
+  //     strings — bounded length + type-checked only, then passed straight
+  //     through to the neo4j-driver / pg client as auth parameters. They are
+  //     never concatenated into a filesystem path, shell command, or query
+  //     string, so there is no injection surface for these values here.
   const NAME_RE   = /^[a-zA-Z0-9_-]{1,64}$/;
   const BCRYPT_RE = /^\$2[ab]\$\d{2}\$[./A-Za-z0-9]{53}$/;
+  const CONN_STR_MAX = 500;
+  const cleanConnStr = v => (typeof v === 'string' && v.length <= CONN_STR_MAX) ? v : undefined;
+  const cleanConn = (conn, fields) => {
+    if (!conn || typeof conn !== 'object') return undefined;
+    const out = {};
+    let has = false;
+    for (const f of fields) {
+      const v = cleanConnStr(conn[f]);
+      if (v !== undefined) { out[f] = v; has = true; }
+    }
+    return has ? out : undefined;
+  };
 
   const safe = [];
   for (const u of users) {
@@ -242,12 +376,17 @@ function saveUsers(users) {
     // Role is always a hardcoded literal — never the user-supplied value itself.
     const role = u.role === 'admin' ? 'admin' : 'user';
     if (nameMatch && hashMatch) {
-      safe.push({ username: nameMatch[0], password: hashMatch[0], role });
+      const entry = { username: nameMatch[0], password: hashMatch[0], role };
+      const neo4j    = cleanConn(u.neo4j,    ['database', 'username', 'password']);
+      const postgres = cleanConn(u.postgres, ['database', 'schema', 'username', 'password']);
+      if (neo4j)    entry.neo4j    = neo4j;
+      if (postgres) entry.postgres = postgres;
+      safe.push(entry);
     }
   }
   // codeql[js/network-data-written-to-file] - `safe` contains only regex match[0]
-  // values (NAME_RE / BCRYPT_RE) and hardcoded role literals; no raw network
-  // data reaches this write.
+  // values (NAME_RE / BCRYPT_RE), hardcoded role literals, and length/type-checked
+  // connection-credential strings used solely as driver/client auth parameters.
   fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
 }
 
@@ -261,12 +400,29 @@ function authMiddleware(req, res, next) {
   if (!header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'No token provided' });
   }
+  let user;
   try {
-    req.user = jwt.verify(header.slice(7), JWT_SECRET);
-    next();
+    user = jwt.verify(header.slice(7), JWT_SECRET);
   } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
+  req.user = user;
+  // Attach this user's own Neo4j/Postgres connection (lazily created, cached) so
+  // every route can do `req.neo4j.driver.session({ database: req.neo4j.database })`
+  // / `req.pg.pool.query(...)` + `req.pg.schema` instead of a single shared
+  // global connection. Failures here (e.g. a corrupt personal config) must not
+  // block routes that don't touch the database at all.
+  try {
+    req.neo4j = getNeo4jConnForUser(user.username);
+  } catch (e) {
+    console.error('[authMiddleware] Neo4j connection resolution failed for %s: %s', user.username, e.message);
+  }
+  try {
+    req.pg = getPgConnForUser(user.username);
+  } catch (e) {
+    console.error('[authMiddleware] Postgres connection resolution failed for %s: %s', user.username, e.message);
+  }
+  next();
 }
 
 // ─── Neo4j helpers ────────────────────────────────────────────────────────────
@@ -399,87 +555,193 @@ app.delete('/api/auth/users/:username', dbLimiter, authMiddleware, (req, res) =>
   res.json({ message: 'User deleted' });
 });
 
-// ─── Connection settings (admin only) ────────────────────────────────────────
+// ─── Connection settings ──────────────────────────────────────────────────────
+// Split in two tiers:
+//   - Admin-only: the shared connection ENDPOINT (Neo4j URL / Postgres host+port)
+//     — infrastructure, same for everyone.
+//   - Per-user "My Connection" (any role): WHICH database/schema and WHICH login
+//     to use against that endpoint — each user's own setting, stored on their
+//     own account. New users fall back to the legacy shared values (see
+//     _resolveNeo4jCfgForUser / _resolvePgCfgForUser) until they set their own.
+
 app.get('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, (req, res) => {
-  res.json({
-    url:      appSettings.neo4j.url,
-    database: appSettings.neo4j.database,
-    username: appSettings.neo4j.username,
-    password: appSettings.neo4j.password ? '••••••••' : ''  // never send real password to client
-  });
+  res.json({ url: appSettings.neo4j.url });
 });
 
 app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
-  const { url, database, username, password } = req.body || {};
-  if (!url || !database || !username) return res.status(400).json({ error: 'url, database, and username are required' });
+  const { url } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url is required' });
 
+  appSettings.neo4j.url = String(url).trim();
+  saveAppSettings(appSettings);
+  // The endpoint changed — every cached per-user driver was pointed at the old
+  // one, so drop them all; each reconnects (with that user's own database/
+  // username/password) against the new URL on next use.
+  invalidateAllNeo4jConns();
+
+  // Best-effort check using the saving admin's OWN personal Neo4j credentials
+  // — there's no shared admin-level credential to test with anymore, so a
+  // failure here is a warning, not a hard error (the URL can be correct even
+  // if this admin hasn't personally set up Neo4j credentials yet).
+  let warning = null;
+  try {
+    const { driver, database } = getNeo4jConnForUser(req.user.username);
+    const session = driver.session({ database });
+    try { await session.run('RETURN 1'); } finally { await session.close(); }
+  } catch (e) {
+    warning = 'Saved, but a test connection using your own Neo4j credentials failed: ' + e.message;
+  }
+  res.json({ success: true, warning });
+});
+
+// Any authenticated user can view/edit their OWN Neo4j database/username/password.
+app.get('/api/settings/my-neo4j', dbLimiter, authMiddleware, (req, res) => {
+  const cfg = _resolveNeo4jCfgForUser(req.user.username);
+  res.json({
+    url:      cfg.url,       // read-only here — set by an admin
+    database: cfg.database,
+    username: cfg.username,
+    password: cfg.password ? '••••••••' : ''  // never send real password to client
+  });
+});
+
+app.post('/api/settings/my-neo4j', dbLimiter, authMiddleware, async (req, res) => {
+  const { database, username, password } = req.body || {};
+  if (!database || !username) return res.status(400).json({ error: 'database and username are required' });
+
+  const current = _resolveNeo4jCfgForUser(req.user.username);
   const cfg = {
-    url:      String(url).trim(),
+    url:      appSettings.neo4j.url,
     database: String(database).trim(),
     username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : appSettings.neo4j.password
+    password: (password && password !== '••••••••') ? String(password) : current.password
   };
 
-  // Test the new connection before committing
   const testDriver = makeNeo4jDriver(cfg);
   try {
     const session = testDriver.session({ database: cfg.database });
-    await session.run('RETURN 1');
-    await session.close();
+    try { await session.run('RETURN 1'); } finally { await session.close(); }
   } catch(e) {
     await testDriver.close();
-    console.error('[settings/neo4j] Connection test failed:', e.message);
-    return res.status(400).json({ error: 'Connection test failed. Check URL, database name, and credentials.' });
+    console.error('[settings/my-neo4j] Connection test failed for %s: %s', req.user.username, e.message);
+    return res.status(400).json({ error: 'Connection test failed. Check database name and credentials.' });
   }
+  await testDriver.close();
 
-  // Commit: close old driver, switch to new
-  try { await neo4jDriver.close(); } catch(e) {}
-  neo4jDriver = testDriver;
-  NEO4J_DB    = cfg.database;
-  appSettings.neo4j = cfg;
-  saveAppSettings(appSettings);
+  const users = loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  u.neo4j = { database: cfg.database, username: cfg.username, password: cfg.password };
+  saveUsers(users);
+  invalidateNeo4jConnForUser(req.user.username);
   res.json({ success: true });
 });
 
 app.get('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, (req, res) => {
-  res.json({
-    host:     appSettings.postgres.host,
-    port:     appSettings.postgres.port,
-    database: appSettings.postgres.database,
-    schema:   appSettings.postgres.schema,
-    username: appSettings.postgres.username,
-    password: appSettings.postgres.password ? '••••••••' : ''  // never send real password to client
-  });
+  res.json({ host: appSettings.postgres.host, port: appSettings.postgres.port });
 });
 
 app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
-  const { host, port, database, schema, username, password } = req.body || {};
-  if (!host || !database || !schema || !username) return res.status(400).json({ error: 'host, database, schema, and username are required' });
+  const { host, port } = req.body || {};
+  if (!host) return res.status(400).json({ error: 'host is required' });
 
+  appSettings.postgres.host = String(host).trim();
+  appSettings.postgres.port = parseInt(port) || 5432;
+  saveAppSettings(appSettings);
+  invalidateAllPgConns();
+
+  let warning = null;
+  try {
+    const { pool } = getPgConnForUser(req.user.username);
+    await pool.query('SELECT 1');
+  } catch (e) {
+    warning = 'Saved, but a test connection using your own Postgres credentials failed: ' + e.message;
+  }
+  res.json({ success: true, warning });
+});
+
+// Any authenticated user can view/edit their OWN Postgres database/schema/username/password.
+app.get('/api/settings/my-postgres', dbLimiter, authMiddleware, (req, res) => {
+  const cfg = _resolvePgCfgForUser(req.user.username);
+  res.json({
+    host:     cfg.host,   // read-only here — set by an admin
+    port:     cfg.port,   // read-only here — set by an admin
+    database: cfg.database,
+    schema:   cfg.schema,
+    username: cfg.username,
+    password: cfg.password ? '••••••••' : ''
+  });
+});
+
+app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res) => {
+  const { database, schema, username, password } = req.body || {};
+  if (!database || !schema || !username) return res.status(400).json({ error: 'database, schema, and username are required' });
+
+  const current = _resolvePgCfgForUser(req.user.username);
   const cfg = {
-    host:     String(host).trim(),
-    port:     parseInt(port) || 5432,
+    host:     appSettings.postgres.host,
+    port:     appSettings.postgres.port,
     database: String(database).trim(),
     schema:   String(schema).trim(),
     username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : appSettings.postgres.password
+    password: (password && password !== '••••••••') ? String(password) : current.password
   };
 
-  // Test the new connection before committing
+  let safeSchema;
+  try { safeSchema = sanitizeSchemaName(cfg.schema); }
+  catch(e) { return res.status(400).json({ error: e.message }); }
+
   const testPool = makePgPool(cfg);
   try {
     await testPool.query('SELECT 1');
   } catch(e) {
     await testPool.end();
-    console.error('[settings/postgres] Connection test failed:', e.message);
-    return res.status(400).json({ error: 'Connection test failed. Check host, port, database, schema, and credentials.' });
+    console.error('[settings/my-postgres] Connection test failed for %s: %s', req.user.username, e.message);
+    return res.status(400).json({ error: 'Connection test failed. Check database, schema, and credentials.' });
   }
+  await testPool.end();
 
-  // Commit: end old pool, switch to new
-  try { await pgPool.end(); } catch(e) {}
-  pgPool    = testPool;
-  PG_SCHEMA = sanitizeSchemaName(cfg.schema);
-  appSettings.postgres = cfg;
+  const users = loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  u.postgres = { database: cfg.database, schema: safeSchema, username: cfg.username, password: cfg.password };
+  saveUsers(users);
+  invalidatePgConnForUser(req.user.username);
+  res.json({ success: true });
+});
+
+// ─── LLM / Agentic AI settings ───────────────────────────────────────────────
+// Returns providers list + global defaults. Any authenticated user can read.
+// Admin-only POST for write.
+app.get('/api/settings/llm', dbLimiter, authMiddleware, (req, res) => {
+  const s = appSettings.llm || {};
+  // Migrate legacy single-url config to providers array on the fly
+  const providers = Array.isArray(s.providers) && s.providers.length
+    ? s.providers
+    : (s.url ? [{ name: 'Default', url: s.url }] : []);
+  res.json({
+    providers:   providers,
+    temperature: s.temperature !== undefined ? s.temperature : 0.2,
+    top_p:       s.top_p      !== undefined ? s.top_p      : 0.9,
+    json_mode:   s.json_mode  || false,
+  });
+});
+
+app.post('/api/settings/llm', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
+  const { providers, temperature, top_p, json_mode } = req.body || {};
+  const existing = appSettings.llm || {};
+
+  const cfg = {
+    ...existing,  // preserve apikey, model_name, url (server-side fallbacks for agent push)
+    providers:   Array.isArray(providers)
+                   ? providers.filter(p => p && typeof p.name === 'string' && typeof p.url === 'string' && p.name.trim() && p.url.trim())
+                   : (existing.providers || []),
+    temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : (existing.temperature !== undefined ? existing.temperature : 0.2),
+    top_p:       Number.isFinite(Number(top_p))       ? Number(top_p)       : (existing.top_p      !== undefined ? existing.top_p      : 0.9),
+    json_mode:   json_mode === true || json_mode === 'true',
+  };
+
+  appSettings.llm = cfg;
   saveAppSettings(appSettings);
   res.json({ success: true });
 });
@@ -489,7 +751,7 @@ app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
   const { query } = req.body || {};
   if (!query || !query.trim()) return res.status(400).json({ error: 'Cypher query is required' });
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(query);
     const nodesMap = new Map();
@@ -549,7 +811,7 @@ app.post('/api/export/csv-query', dbLimiter, authMiddleware, async (req, res) =>
   // Allow up to 10 minutes for large export queries before the socket times out.
   req.socket.setTimeout(10 * 60 * 1000);
 
-  const session = neo4jDriver.session({ database: NEO4J_DB, fetchSize: 50000 });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database, fetchSize: 50000 });
   try {
     const result = await session.run(query);
     const nodesMap = new Map();
@@ -596,7 +858,7 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
 
   // NEO4J_URN_PROP is a server-side constant — safe to interpolate
   const cypher = 'MATCH (n) WHERE n.`' + NEO4J_URN_PROP + '` IN $urns RETURN n';
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { urns: safeUrns });
     const enriched = {};
@@ -636,17 +898,17 @@ app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
   try {
     const sql = `
       SELECT *
-      FROM ${PG_SCHEMA}.reference
+      FROM ${req.pg.schema}.reference
       WHERE id = ANY($1::bigint[])
       ORDER BY COALESCE(pubyear::text, '9999'), id
     `;
-    const result = await pgPool.query(sql, [validIds]);
+    const result = await req.pg.pool.query(sql, [validIds]);
     res.json(result.rows);
   } catch (err) {
     // Fallback without ORDER BY date in case column name differs
     try {
-      const sql2 = `SELECT * FROM ${PG_SCHEMA}.reference WHERE id = ANY($1::bigint[])`;
-      const result2 = await pgPool.query(sql2, [validIds]);
+      const sql2 = `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      const result2 = await req.pg.pool.query(sql2, [validIds]);
       res.json(result2.rows);
     } catch (err2) {
       console.error('PostgreSQL error:', err2.message);
@@ -703,20 +965,20 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
       const scopusSelect = scopusFragments.join(', ');
       sql = `
         SELECT r.*, ${scopusSelect}
-        FROM ${PG_SCHEMA}.reference r
-        LEFT JOIN ${PG_SCHEMA}.scopus_data sd ON r.unique_id = sd.reference_id
+        FROM ${req.pg.schema}.reference r
+        LEFT JOIN ${req.pg.schema}.scopus_data sd ON r.unique_id = sd.reference_id
         WHERE r.id = ANY($1::bigint[])
         ORDER BY r.id, COALESCE(r.pubyear::text, '9999')
       `;
     } else {
       sql = `
         SELECT *
-        FROM ${PG_SCHEMA}.reference
+        FROM ${req.pg.schema}.reference
         WHERE id = ANY($1::bigint[])
         ORDER BY id, COALESCE(pubyear::text, '9999')
       `;
     }
-    const result = await pgPool.query(sql, [validIds]);
+    const result = await req.pg.pool.query(sql, [validIds]);
 
     // Group by relation id (string key to match Neo4j RelationID strings)
     const grouped = {};
@@ -744,12 +1006,12 @@ app.post('/api/nodes/medscan', dbLimiter, authMiddleware, async (req, res) => {
   try {
     const sql = `
       SELECT n.id::text AS id, a.value
-      FROM ${PG_SCHEMA}.node AS n
-      JOIN ${PG_SCHEMA}.attr AS a ON a.id = ANY(n.attributes)
+      FROM ${req.pg.schema}.node AS n
+      JOIN ${req.pg.schema}.attr AS a ON a.id = ANY(n.attributes)
       WHERE a.name = 'MedScan ID'
       AND n.id = ANY($1::bigint[])
     `;
-    const result = await pgPool.query(sql, [validIds]);
+    const result = await req.pg.pool.query(sql, [validIds]);
     const map = {};
     result.rows.forEach(row => { map[row.id] = row.value; });
     res.json(map);
@@ -766,10 +1028,10 @@ app.post('/api/nodes/property-names', dbLimiter, authMiddleware, async (req, res
   if (!validIds.length) return res.json([]);
 
   try {
-    const result = await pgPool.query(
+    const result = await req.pg.pool.query(
       `SELECT DISTINCT a.name
-       FROM ${PG_SCHEMA}.node n
-       JOIN ${PG_SCHEMA}.attr a ON a.id = ANY(n.attributes)
+       FROM ${req.pg.schema}.node n
+       JOIN ${req.pg.schema}.attr a ON a.id = ANY(n.attributes)
        WHERE n.id = ANY($1::bigint[])
        ORDER BY a.name`,
       [validIds]
@@ -799,12 +1061,12 @@ app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, re
   if (validIds.length) {
     const sql = `
       SELECT n.id::text AS node_id, a.name, a.value
-      FROM ${PG_SCHEMA}.node AS n
-      JOIN ${PG_SCHEMA}.attr AS a ON a.id = ANY(n.attributes)
+      FROM ${req.pg.schema}.node AS n
+      JOIN ${req.pg.schema}.attr AS a ON a.id = ANY(n.attributes)
       WHERE n.id = ANY($1::bigint[])
         AND a.name = ANY($2::text[])
     `;
-    const result = await pgPool.query(sql, [validIds, safeProps]);
+    const result = await req.pg.pool.query(sql, [validIds, safeProps]);
     result.rows.forEach(row => {
       if (!byNodeId[row.node_id]) byNodeId[row.node_id] = {};
       const existing = byNodeId[row.node_id][row.name];
@@ -820,14 +1082,14 @@ app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, re
   if (safeUrns.length) {
     const sql = `
       SELECT a_urn.value AS urn, a.name, a.value
-      FROM ${PG_SCHEMA}.node AS n
-      JOIN ${PG_SCHEMA}.attr AS a_urn ON a_urn.id = ANY(n.attributes)
-      JOIN ${PG_SCHEMA}.attr AS a     ON a.id     = ANY(n.attributes)
+      FROM ${req.pg.schema}.node AS n
+      JOIN ${req.pg.schema}.attr AS a_urn ON a_urn.id = ANY(n.attributes)
+      JOIN ${req.pg.schema}.attr AS a     ON a.id     = ANY(n.attributes)
       WHERE a_urn.name = 'URN'
         AND a_urn.value = ANY($1::text[])
         AND a.name = ANY($2::text[])
     `;
-    const result = await pgPool.query(sql, [safeUrns, safeProps]);
+    const result = await req.pg.pool.query(sql, [safeUrns, safeProps]);
     result.rows.forEach(row => {
       if (!byUrn[row.urn]) byUrn[row.urn] = {};
       const existing = byUrn[row.urn][row.name];
@@ -849,7 +1111,7 @@ app.post('/api/nodes/connectivity', dbLimiter, authMiddleware, async (req, res) 
   const safeUrns = urns.map(String).filter(u => u.length > 0 && u.length < 500);
   if (!safeUrns.length) return res.json({});
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(
       `UNWIND $urns AS urn
@@ -879,8 +1141,8 @@ app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) =
   const safeId = /^-?\d+$/.test(String(id)) ? String(id) : null;
   if (!safeId) return res.status(400).json({ error: 'Invalid id' });
   try {
-    await pgPool.query(
-      `UPDATE ${PG_SCHEMA}.reference SET msrc = $1 WHERE id = $2::bigint`,
+    await req.pg.pool.query(
+      `UPDATE ${req.pg.schema}.reference SET msrc = $1 WHERE id = $2::bigint`,
       [msrc, safeId]
     );
     res.json({ ok: true });
@@ -896,7 +1158,7 @@ app.post('/api/graph/update-node', dbLimiter, authMiddleware, async (req, res) =
   if (!elementId || typeof properties !== 'object') {
     return res.status(400).json({ error: 'elementId and properties required' });
   }
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     await session.run(
       'MATCH (n) WHERE elementId(n) = $eid SET n += $props',
@@ -917,7 +1179,7 @@ app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, re
   if (!elementId || typeof properties !== 'object') {
     return res.status(400).json({ error: 'elementId and properties required' });
   }
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     await session.run(
       'MATCH ()-[r]->() WHERE elementId(r) = $eid SET r += $props',
@@ -938,11 +1200,11 @@ app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
   // always stays in sync with the columns the /api/references/batch endpoint
   // actually queries.
   try {
-    const refCols = await pgPool.query(
+    const refCols = await req.pg.pool.query(
       `SELECT column_name FROM information_schema.columns
        WHERE table_schema = $1 AND table_name = 'reference'
        ORDER BY ordinal_position`,
-      [PG_SCHEMA]
+      [req.pg.schema]
     );
     res.json({
       referenceColumns: refCols.rows.map(r => r.column_name),
@@ -984,7 +1246,7 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     // validated above to be a read-only SELECT/WITH query with no stacked
     // statements or comment injection.  Parameterised queries cannot be used
     // here because the entire query text is the user-supplied value.
-    const result = await pgPool.query(sql); // codeql[js/sql-injection] codeql[js/database-query-built-from-user-controlled-sources] — admin-only endpoint; sql validated as SELECT/WITH-only with no stacked statements
+    const result = await req.pg.pool.query(sql); // codeql[js/sql-injection] codeql[js/database-query-built-from-user-controlled-sources] — admin-only endpoint; sql validated as SELECT/WITH-only with no stacked statements
     res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -998,7 +1260,7 @@ app.post('/api/graph/lint', dbLimiter, authMiddleware, async (req, res) => {
   const { query } = req.body || {};
   if (!query || !query.trim()) return res.json({ ok: true });
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     await session.run('EXPLAIN ' + query);
     res.json({ ok: true });
@@ -1027,7 +1289,7 @@ app.post('/api/relations/match-rnef', dbLimiter, authMiddleware, async (req, res
   const { batch = [], hyperedgeBatch = [] } = req.body || {};
   const mapping = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     // ── Regular (1-to-1) relations ──────────────────────────────────────────
     // Cypher cannot parametrize relationship types, so we group the batch by
@@ -1138,7 +1400,7 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
   const safeProps = properties.filter(p => NEO4J_EDGE_PROP_WHITELIST.has(p));
   if (!validIds.length || !safeProps.length) return res.json({});
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const propReturn = safeProps.map(p => `r.\`${p}\` AS \`${p}\``).join(', ');
     // r.RelationID can be scalar (integer/string) OR a list (StringArray) in Neo4j.
@@ -1255,7 +1517,7 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
     };
   }
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
 
   try {
     // resultMap[idx] = { idx, check, relations: [...] }
@@ -1422,7 +1684,7 @@ app.post('/api/relations/find-between', dbLimiter, authMiddleware, async (req, r
     return s;
   }
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     // Find edges: one endpoint in selectedURNs, other in unselectedURNs.
     // Uses UNWIND + bidirectional match to avoid full-graph scan.
@@ -1517,7 +1779,7 @@ app.post('/api/relations/connect-selected', dbLimiter, authMiddleware, async (re
     return s;
   }
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     // Closed-loop: both endpoints must be in selectedURNs.
     // Bidirectional match covers both directions; dedup by RelationID.
@@ -1602,7 +1864,7 @@ app.post('/api/graph/count-query', dbLimiter, authMiddleware, async (req, res) =
   // Fallback: if no RETURN was found anywhere, run the original query.
   if (countQueries.length === 0) countQueries.push(query);
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     let edgeCount = 0;
     for (const cq of countQueries) {
@@ -1682,12 +1944,213 @@ app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
   }
 });
 
+// ─── Agentic AI — Python service lifecycle & proxy ───────────────────────────
+const AGENT_PORT     = parseInt(process.env.AGENT_PORT || '3001', 10);
+const AGENT_SCRIPT   = path.join(__dirname, 'agent_service.py');
+let   _agentProc     = null;
+let   _agentReady    = false;
+
+function _killPortProcess(port, cb) {
+  // Kill any existing process on the agent port (stale Python from a previous run).
+  // Uses netstat on Windows, lsof on Unix.
+  const isWin = process.platform === 'win32';
+  const cmd   = isWin
+    ? `FOR /F "tokens=5" %a IN ('netstat -ano ^| findstr :${port}') DO taskkill /F /PID %a`
+    : `lsof -ti tcp:${port} | xargs kill -9`;
+  require('child_process').exec(cmd, () => cb && cb());
+}
+
+function _startAgentService() {
+  if (!fs.existsSync(AGENT_SCRIPT)) {
+    console.warn('[agent] agent_service.py not found — Agentic AI disabled');
+    return;
+  }
+  // Kill any stale process from a previous run before spawning a fresh one.
+  _killPortProcess(AGENT_PORT, () => {
+    setTimeout(_doSpawnAgent, 500);  // brief pause after kill
+  });
+}
+
+function _doSpawnAgent() {
+  const py = process.env.PYTHON_CMD || PYTHON_CMD;
+  _agentProc = spawn(py, [AGENT_SCRIPT], {
+    env: { ...process.env, AGENT_PORT: String(AGENT_PORT) },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  _agentProc.stdout.on('data', d => process.stdout.write('[agent] ' + d));
+  _agentProc.stderr.on('data', d => process.stderr.write('[agent] ' + d));
+  _agentProc.on('exit', (code) => {
+    _agentReady = false;
+    console.log(`[agent] process exited (code ${code})`);
+    // Auto-restart after 5 s unless we killed it intentionally
+    if (code !== null && code !== 0) {
+      setTimeout(_startAgentService, 5000);
+    }
+  });
+
+  // Poll until the service responds to /health (give it up to 30 s)
+  let attempts = 0;
+  const poll = setInterval(() => {
+    attempts++;
+    http.get(`http://127.0.0.1:${AGENT_PORT}/health`, (r) => {
+      if (r.statusCode === 200) {
+        clearInterval(poll);
+        _agentReady = true;
+        console.log(`[agent] ready on port ${AGENT_PORT}`);
+        // Push schema + LLM/Neo4j config to agent.
+        // Always push credentials immediately (empty schema) so /health shows the
+        // right model name right away, then push again with the full schema once
+        // the Neo4j introspection query completes.
+        setTimeout(async () => {
+          // Immediate push — credentials + LLM, empty schema (status will show model name)
+          _pushSchemaToAgent({ labels: [], relTypes: [], propKeys: [] });
+          // Full push — only needed if schema not yet cached
+          if (!_schemaServerCache) {
+            // _fetchSchemaFromNeo4j calls _pushSchemaToAgent internally on success
+            await _fetchSchemaFromNeo4j().catch(() => null);
+          }
+        }, 500);
+      }
+    }).on('error', () => {});
+    if (attempts > 60) clearInterval(poll);
+  }, 500);
+}
+
+function _pushSchemaToAgent(schema) {
+  if (!_agentReady) return;
+  const cache = schema || _schemaServerCache;
+  if (!cache) return;
+  const llmCfg = appSettings.llm || {};
+  const neo4jCfg = {
+    url:      appSettings.neo4j.url,
+    database: appSettings.neo4j.database,
+    username: appSettings.neo4j.username,
+    password: appSettings.neo4j.password,
+  };
+  const schemaText = [
+    `Node labels: ${(cache.labels || []).join(', ')}`,
+    `Relationship types: ${(cache.relTypes || []).join(', ')}`,
+    `Relationship property keys: ${(cache.propKeys || []).join(', ')}`,
+  ].join('\n');
+
+  const pgCfg = appSettings.postgres ? {
+    host:     appSettings.postgres.host,
+    port:     appSettings.postgres.port,
+    database: appSettings.postgres.database,
+    schema:   appSettings.postgres.schema,
+    username: appSettings.postgres.username,
+    password: appSettings.postgres.password,
+  } : null;
+
+  const body = JSON.stringify({ neo4j: neo4jCfg, schema_text: schemaText, llm: llmCfg, postgres: pgCfg });
+  const opts = {
+    hostname: '127.0.0.1', port: AGENT_PORT, path: '/schema',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  };
+  const req = http.request(opts, r => {
+    if (r.statusCode === 200) console.log('[agent] schema pushed (' + schemaText.length + ' chars, pg=' + !!pgCfg + ')');
+  });
+  req.on('error', e => console.warn('[agent] schema push failed:', e.message));
+  req.write(body); req.end();
+}
+
+function _pushLLMConfigToAgent(llmCfg) {
+  if (!_agentReady) return;
+  const body = JSON.stringify(llmCfg);
+  const opts = {
+    hostname: '127.0.0.1', port: AGENT_PORT, path: '/llm-config',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  };
+  const req = http.request(opts, () => {});
+  req.on('error', () => {});
+  req.write(body); req.end();
+}
+
+// Intercept llm-config updates so settings.json stays in sync with the agent's
+// in-memory state — prevents _pushSchemaToAgent from reverting to the old model.
+app.post('/api/agent/llm-config', dbLimiter, authMiddleware, (req, res, next) => {
+  const { url, apikey, model_name, temperature, top_p, json_mode } = req.body || {};
+  const existing = appSettings.llm || {};
+  if (model_name && typeof model_name === 'string' && model_name.trim()) {
+    existing.model_name = model_name.trim();
+  }
+  if (typeof url === 'string') existing.url = url.trim();
+  if (typeof apikey === 'string' && apikey) existing.apikey = apikey.trim();
+  if (Number.isFinite(Number(temperature))) existing.temperature = Number(temperature);
+  if (Number.isFinite(Number(top_p)))       existing.top_p       = Number(top_p);
+  if (json_mode !== undefined) existing.json_mode = json_mode === true || json_mode === 'true';
+  appSettings.llm = existing;
+  saveAppSettings(appSettings);   // persist to settings.json
+  next();                          // continue to the generic proxy below
+});
+
+// Proxy all /api/agent/* requests to the Python service
+app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
+  if (!_agentReady) {
+    return res.status(503).json({ error: 'Agentic AI service is starting — please wait a moment and retry' });
+  }
+  const agentPath = req.url.replace(/^\/api\/agent/, '');
+  // Express body-parser has already consumed req's stream, so we must re-serialise
+  // req.body and set an accurate Content-Length instead of piping the raw stream.
+  const bodyStr = (req.method !== 'GET' && req.method !== 'HEAD' && req.body !== undefined)
+    ? JSON.stringify(req.body)
+    : null;
+
+  // x-ge-username is set here (never trusted from the client) so agent_service.py
+  // can resolve THIS user's own Neo4j/Postgres credentials for its cypher/postgres
+  // actions instead of one shared global connection — mirrors the per-user
+  // connection model used everywhere else in server.js.
+  const headers = { ...req.headers, host: `127.0.0.1:${AGENT_PORT}`, 'x-ge-username': req.user.username };
+  if (bodyStr !== null) {
+    headers['content-type']   = 'application/json';
+    headers['content-length'] = Buffer.byteLength(bodyStr).toString();
+    delete headers['transfer-encoding'];  // must not coexist with content-length
+  }
+
+  const opts = {
+    hostname: '127.0.0.1',
+    port:     AGENT_PORT,
+    path:     agentPath || '/',
+    method:   req.method,
+    headers,
+    timeout:  120_000,
+  };
+  const proxy = http.request(opts, (agentRes) => {
+    res.status(agentRes.statusCode);
+    Object.entries(agentRes.headers).forEach(([k, v]) => {
+      if (k !== 'transfer-encoding') res.setHeader(k, v);
+    });
+    agentRes.pipe(res, { end: true });
+  });
+  proxy.on('timeout', () => {
+    proxy.destroy();
+    if (!res.headersSent)
+      res.status(504).json({ error: 'AI Agent timed out — the LLM took too long to respond. Please retry.' });
+  });
+  proxy.on('error', (e) => {
+    console.error('[agent proxy] error:', e.message);
+    if (!res.headersSent)
+      res.status(502).json({ error: 'Agent service unavailable' });
+  });
+  if (bodyStr !== null) {
+    proxy.write(bodyStr);
+  }
+  proxy.end();
+});
+
 // ─── Start server ─────────────────────────────────────────────────────────────
 // Vendor libraries must be pre-downloaded by running: node scripts/vendor-libs.js
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Graph Explorer running on http://localhost:${PORT}`);
+  _startAgentService();
 });
+
+process.on('exit',    () => { if (_agentProc) _agentProc.kill(); });
+process.on('SIGINT',  () => { if (_agentProc) _agentProc.kill(); process.exit(); });
+process.on('SIGTERM', () => { if (_agentProc) _agentProc.kill(); process.exit(); });
 
 // ─── Neo4j schema introspection ───────────────────────────────────────────────
 // In-memory cache populated at startup and refreshed every 10 minutes.
@@ -1701,10 +2164,28 @@ async function _fetchSchemaFromNeo4j() {
   return _schemaFetchPromise;
 }
 
+// Schema introspection (autocomplete + the AI agent's system prompt) isn't
+// tied to one specific request, so there's no per-user req.neo4j to read here.
+// It uses the first admin account's own Neo4j connection as the "system"
+// connection — reasonable since this is just structural metadata (labels/
+// relationship types/property keys), and in practice everyone on a given
+// deployment points at the same underlying database. If a particular user's
+// personal credentials point at a genuinely different database, their
+// autocomplete/agent-prompt schema hints may not perfectly match what their
+// own queries see — only the schema HINTS are shared; actual query execution
+// always uses each user's own connection.
+function _getSystemNeo4jConn() {
+  const users = loadUsers();
+  const admin = users.find(u => u.role === 'admin') || users[0];
+  if (!admin) throw new Error('No users configured — cannot resolve a Neo4j connection for schema introspection');
+  return getNeo4jConnForUser(admin.username);
+}
+
 async function _doFetchSchemaFromNeo4j() {
-  const s1 = neo4jDriver.session({ database: NEO4J_DB });
-  const s2 = neo4jDriver.session({ database: NEO4J_DB });
-  const s3 = neo4jDriver.session({ database: NEO4J_DB });
+  const { driver, database } = _getSystemNeo4jConn();
+  const s1 = driver.session({ database });
+  const s2 = driver.session({ database });
+  const s3 = driver.session({ database });
   try {
     const [labelsResult, relTypesResult] = await Promise.all([
       s1.run('CALL db.labels()'),
@@ -1730,6 +2211,8 @@ async function _doFetchSchemaFromNeo4j() {
     }
     _schemaServerCache = { labels, relTypes, propKeys };
     console.log(`Schema cache refreshed: ${labels.length} labels, ${relTypes.length} relTypes, ${propKeys.length} propKeys`);
+    // Push to Agentic AI service so it can use the latest schema for text-to-Cypher
+    _pushSchemaToAgent(_schemaServerCache);
     return _schemaServerCache;
   } catch (err) {
     console.error('Schema cache fetch error:', err.message);
@@ -1770,7 +2253,7 @@ app.get('/api/schema/prop-values', dbLimiter, authMiddleware, async (req, res) =
   const prop = (req.query.prop || '').trim();
   if (!prop || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(prop))
     return res.status(400).json({ error: 'Invalid property name' });
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(
       `MATCH ()-[r]->() WHERE r[\`${prop}\`] IS NOT NULL AND r[\`${prop}\`] <> ''
@@ -1827,7 +2310,7 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
     targetClause +
     ' RETURN a, r, b LIMIT 2000';
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { urns });
     const nodesMap = new Map();
@@ -1847,10 +2330,12 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
 
 // ─── Find ontology parents via is_a hierarchy ────────────────────────────────
 // POST /api/graph/ontology-parents
-// Body: { nodeParams: [{label: string, urn: string}, ...] }
-// Returns { nodes, edges } of the full is_a ancestry chain for each given node.
+// Body: { nodeParams: [{label: string, urn: string}, ...], maxDepth?: 1-5 }
+// Returns { nodes, edges } of the is_a ancestry chain for each given node, up to
+// maxDepth levels up (omit/0 for the full, unbounded ancestry chain — deeper
+// traversals should generally go through "Ontology analysis" instead).
 app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, res) => {
-  const { nodeParams = [] } = req.body || {};
+  const { nodeParams = [], maxDepth } = req.body || {};
   if (!Array.isArray(nodeParams) || !nodeParams.length)
     return res.status(400).json({ error: 'nodeParams array is required' });
 
@@ -1860,16 +2345,21 @@ app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, r
   );
   if (!safe.length) return res.json({ nodes: [], edges: [] });
 
+  // Depth is menu-controlled (1-5), never user-typed — but validate anyway
+  // before inlining it into the Cypher path-length range.
+  const depth = Number.isInteger(maxDepth) && maxDepth >= 1 && maxDepth <= 5 ? maxDepth : null;
+  const hopRange = depth ? `*1..${depth}` : '*';
+
   const cypher = `
     UNWIND $nodeParams AS np
     MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
     WHERE np.label IN labels(p)
-    OPTIONAL MATCH path = (p)-[:is_a|part_of*]->(parent)
+    OPTIONAL MATCH path = (p)-[:is_a|part_of${hopRange}]->(parent)
     WITH p, collect(DISTINCT path) AS paths
     RETURN p, paths
   `;
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { nodeParams: safe });
     const nodesMap = new Map();
@@ -1886,6 +2376,72 @@ app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, r
   }
 });
 
+
+// ─── Shortest path between selected nodes ────────────────────────────────────
+// POST /api/graph/shortest-path
+// Body: { nodeParams: [{label, urn}, ...], maxLength: 1-15, relTypes: [string,...] }
+// For every pair among the given nodes, finds the shortest undirected path (up
+// to maxLength hops) using only the given relationship types, and returns the
+// union of nodes/edges across every path found (Database → Shortest path menu).
+app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeParams = [], maxLength, relTypes = [] } = req.body || {};
+
+  const safeNodes = (Array.isArray(nodeParams) ? nodeParams : []).filter(np =>
+    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    typeof np.urn === 'string' && np.urn.trim().length > 0
+  );
+  if (safeNodes.length < 2)
+    return res.status(400).json({ error: 'At least two valid selected nodes are required' });
+  if (safeNodes.length > 10)
+    return res.status(400).json({ error: 'Please select 10 or fewer nodes for shortest path (each pair is computed separately)' });
+
+  const len = Number.isInteger(maxLength) && maxLength >= 1 && maxLength <= 15 ? maxLength : 2;
+
+  const safeTypes = (Array.isArray(relTypes) ? relTypes : [])
+    .filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+  if (!safeTypes.length)
+    return res.status(400).json({ error: 'At least one relation type must be selected' });
+
+  const typePattern = safeTypes.map(t => '`' + t + '`').join('|');
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+    let pathsFound = 0;
+
+    for (let i = 0; i < safeNodes.length; i++) {
+      for (let j = i + 1; j < safeNodes.length; j++) {
+        const a = safeNodes[i], b = safeNodes[j];
+        const cypher = `
+          MATCH (a {\`${NEO4J_URN_PROP}\`: $urnA}), (b {\`${NEO4J_URN_PROP}\`: $urnB})
+          WHERE $labelA IN labels(a) AND $labelB IN labels(b)
+          MATCH p = shortestPath((a)-[:${typePattern}*1..${len}]-(b))
+          RETURN p
+        `;
+        const result = await session.run(cypher, {
+          urnA: a.urn, urnB: b.urn, labelA: a.label, labelB: b.label
+        });
+        result.records.forEach(record => {
+          const p = record.get('p');
+          if (p) { pathsFound++; processValue(p, nodesMap, edgesMap); }
+        });
+      }
+    }
+
+    res.json({
+      nodes: Array.from(nodesMap.values()),
+      edges: Array.from(edgesMap.values()),
+      pathsFound,
+      pairsChecked: (safeNodes.length * (safeNodes.length - 1)) / 2
+    });
+  } catch (err) {
+    console.error('shortest-path error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  RELATION CURATION  ──  Create / Edit relations from the UI
@@ -1932,7 +2488,7 @@ function calcRelationId({ inref=[], inoutref=[], outref=[], control_type='',
 
 // GET /api/schema/relation-types  — distinct Neo4j relationship types
 app.get('/api/schema/relation-types', dbLimiter, authMiddleware, async (req, res) => {
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const r = await session.run(
       'CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType'
@@ -1944,7 +2500,7 @@ app.get('/api/schema/relation-types', dbLimiter, authMiddleware, async (req, res
 
 // GET /api/schema/relation-properties  — distinct property keys on Neo4j relationships
 app.get('/api/schema/relation-properties', dbLimiter, authMiddleware, async (req, res) => {
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const r = await session.run(
       'MATCH ()-[rel]->() WITH keys(rel) AS k UNWIND k AS key RETURN DISTINCT key ORDER BY key LIMIT 300'
@@ -1967,7 +2523,7 @@ app.post('/api/curation/calculate-relation-id', dbLimiter, authMiddleware, async
   const safeType = /^[A-Za-z_][A-Za-z0-9_]*$/.test(control_type) ? control_type : null;
 
   if (safeType && (inref.length || outref.length || inoutref.length)) {
-    const session = neo4jDriver.session({ database: NEO4J_DB });
+    const session = req.neo4j.driver.session({ database: req.neo4j.database });
     try {
       let result;
       if (inref.length === 1 && outref.length === 1 && !inoutref.length) {
@@ -2030,7 +2586,7 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
       ? v.split(';').map(s => s.trim()).filter(Boolean) : v;
   });
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const cypher = `
       MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
@@ -2055,8 +2611,8 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
     const rec = result.records[0];
 
     // ── Write / delete references in Postgres ──────────────────────────────────
-    if (pgPool && Array.isArray(references) && references.length) {
-      const client = await pgPool.connect();
+    if (req.pg && req.pg.pool && Array.isArray(references) && references.length) {
+      const client = await req.pg.pool.connect();
       try {
         await client.query('BEGIN');
 
@@ -2065,7 +2621,7 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
           `SELECT column_name FROM information_schema.columns
            WHERE table_schema = $1 AND table_name = 'reference'
            ORDER BY ordinal_position`,
-          [PG_SCHEMA]
+          [req.pg.schema]
         );
         const validCols = new Set(colRes.rows.map(r => r.column_name));
 
@@ -2075,7 +2631,7 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
           // Delete
           if (ref._deleted) {
             if (ref.unique_id)
-              await client.query(`DELETE FROM ${PG_SCHEMA}.reference WHERE unique_id = $1`, [ref.unique_id]);
+              await client.query(`DELETE FROM ${req.pg.schema}.reference WHERE unique_id = $1`, [ref.unique_id]);
             continue;
           }
 
@@ -2090,16 +2646,26 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
             // Update existing row
             const setParts = cols.map((c, i) => `"${c}" = $${i + 2}`).join(', ');
             await client.query(
-              `UPDATE ${PG_SCHEMA}.reference SET ${setParts} WHERE unique_id = $1`,
+              `UPDATE ${req.pg.schema}.reference SET ${setParts} WHERE unique_id = $1`,
               [ref.unique_id, ...cols.map(k => ref[k])]
             );
           } else {
-            // Insert new row — always set id = RelationID
+            // Insert new row — always set id = RelationID.
+            // Deduplicate by PMID: skip if a reference with the same PMID already exists
+            // for this RelationID (guards against the agent re-submitting existing refs).
+            if (ref.pmid) {
+              const dupCheck = await client.query(
+                `SELECT 1 FROM ${req.pg.schema}.reference WHERE id = $1 AND pmid = $2 LIMIT 1`,
+                [BigInt(relationId), String(ref.pmid)]
+              );
+              if (dupCheck.rowCount > 0) continue; // already in DB — skip
+            }
+
             const allCols = ['id', ...cols];
             const vals    = [BigInt(relationId), ...cols.map(k => ref[k])];
             const ph      = vals.map((_, i) => `$${i + 1}`).join(', ');
             await client.query(
-              `INSERT INTO ${PG_SCHEMA}.reference (${allCols.map(c => `"${c}"`).join(', ')})
+              `INSERT INTO ${req.pg.schema}.reference (${allCols.map(c => `"${c}"`).join(', ')})
                VALUES (${ph})`,
               vals
             );
@@ -2157,7 +2723,7 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
     RETURN p, paths
   `;
 
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { nodeParams: safe });
     const nodesMap = new Map();
@@ -2189,7 +2755,7 @@ app.get('/api/ontology/roots', dbLimiter, authMiddleware, async (req, res) => {
     RETURN root
     ORDER BY root.name
   `;
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher);
     const nodes = result.records.map(r => {
@@ -2226,7 +2792,7 @@ app.post('/api/ontology/direct-children', dbLimiter, authMiddleware, async (req,
     RETURN DISTINCT child
     ORDER BY child.name
   `;
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { urn });
     const nodes = result.records.map(r => {
@@ -2276,7 +2842,7 @@ app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, re
     WHERE descendant.\`${NEO4J_URN_PROP}\` IN $graphUrns
     RETURN parentUrn, count(DISTINCT descendant) AS cnt
   `;
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { urns: safeUrns, graphUrns });
     // Use a Map (not a plain object) to accumulate Neo4j results; Map keys are not prototype-pollutable.
@@ -2316,7 +2882,7 @@ app.post('/api/ontology/descendants', dbLimiter, authMiddleware, async (req, res
     ${filterClause}
     RETURN DISTINCT descendant.\`${NEO4J_URN_PROP}\` AS urn
   `;
-  const session = neo4jDriver.session({ database: NEO4J_DB });
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { urn, graphUrns });
     const urns = result.records
@@ -2325,6 +2891,63 @@ app.post('/api/ontology/descendants', dbLimiter, authMiddleware, async (req, res
     res.json({ urns });
   } catch (err) {
     console.error('ontology-descendants error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+// POST /api/ontology/subtree
+// Body: { urn: string, graphUrns: string[] }
+// Returns the full ontology hierarchy from the given root down to the matching
+// graph entities, including all intermediate ontology nodes and their
+// is_a / part_of edges.  Used by "Copy ontology tree" in the context menu.
+app.post('/api/ontology/subtree', dbLimiter, authMiddleware, async (req, res) => {
+  const { urn, graphUrns = [] } = req.body || {};
+  if (!urn || typeof urn !== 'string' || !urn.trim())
+    return res.status(400).json({ error: 'urn is required' });
+  if (!Array.isArray(graphUrns) || !graphUrns.length)
+    return res.status(400).json({ error: 'graphUrns is required' });
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    // 1. All distinct nodes on any path from a matching entity up to the root
+    const nodeResult = await session.run(`
+      MATCH path = (entity)-[:is_a|part_of*0..]->(root)
+      WHERE root.\`${NEO4J_URN_PROP}\` = $urn
+        AND entity.\`${NEO4J_URN_PROP}\` IN $graphUrns
+      UNWIND nodes(path) AS n
+      WITH DISTINCT n
+      RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props
+    `, { urn, graphUrns });
+
+    // 2. All distinct is_a / part_of edges on those same paths
+    const edgeResult = await session.run(`
+      MATCH path = (entity)-[:is_a|part_of*0..]->(root)
+      WHERE root.\`${NEO4J_URN_PROP}\` = $urn
+        AND entity.\`${NEO4J_URN_PROP}\` IN $graphUrns
+      UNWIND relationships(path) AS r
+      WITH DISTINCT r
+      RETURN elementId(r) AS id, type(r) AS relType,
+             elementId(startNode(r)) AS startId,
+             elementId(endNode(r))   AS endId
+    `, { urn, graphUrns });
+
+    const nodes = nodeResult.records.map(rec => ({
+      id:     rec.get('id'),
+      labels: rec.get('labels'),
+      props:  toPlain(rec.get('props'))
+    }));
+    const edges = edgeResult.records.map(rec => ({
+      id:      rec.get('id'),
+      relType: rec.get('relType'),
+      startId: rec.get('startId'),
+      endId:   rec.get('endId')
+    }));
+
+    res.json({ nodes, edges });
+  } catch (err) {
+    console.error('ontology-subtree error:', err.message);
     res.status(500).json({ error: safeError(err) });
   } finally {
     await session.close();
