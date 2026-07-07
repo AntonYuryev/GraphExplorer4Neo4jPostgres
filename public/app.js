@@ -4856,11 +4856,15 @@ function colorSentence(text, regulatorMedScan, targetMedScan) {
 
 function escHtml(s) {
   if (!s) return '';
+  // Escapes both quote characters (not just "), so this is safe to use
+  // inside single-quoted attributes too, not only double-quoted ones —
+  // see the matching note on _esc() above for the exploit shape this closes.
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // ─── View toggle ──────────────────────────────────────────────────────────────
@@ -12707,19 +12711,26 @@ var _agentMatchingEntities = false;  // true while async /highlights fetch is in
 var _agentLibraryFiles = [];
 var _llmProviders      = [];   // [{name, url}] loaded from server (admin-configured)
 var _agentConfig = (function() {
-  // Restore persisted LLM config from localStorage on page load
+  // Restore persisted LLM config from localStorage on page load.
+  // apikey is deliberately NEVER read from (or written to) localStorage —
+  // it now persists server-side per-user via /api/settings/my-llm instead
+  // (see saveLLMSettings() and _initAgenticAI()), which is authenticated and
+  // access-controlled the same way the Neo4j/Postgres per-user credentials
+  // already are. localStorage is readable by any script on the page and
+  // never expires, so it's not an appropriate place to keep an API key
+  // (this was flagged by CodeQL as js/clear-text-storage-of-sensitive-data).
   try {
     var saved = JSON.parse(localStorage.getItem('agent_user_config_v1') || '{}');
     return {
       provider_name: saved.provider_name || '',
       url:           saved.url           || '',
-      apikey:        saved.apikey        || '',
+      apikey:        '',
       model_name:    saved.model_name    || '',
       temperature:   saved.temperature   !== undefined ? saved.temperature : 0.2,
       top_p:         saved.top_p         !== undefined ? saved.top_p         : 0.9,
       json_mode:     saved.json_mode     || false,
     };
-  } catch(e) { return { model_name: '', temperature: 0.2, top_p: 0.9, json_mode: false }; }
+  } catch(e) { return { apikey: '', model_name: '', temperature: 0.2, top_p: 0.9, json_mode: false }; }
 })();
 var _agentWorkflow     = [];
 var _agentStatusTimer  = null;
@@ -12735,31 +12746,43 @@ function _initAgenticAI() {
   var llmItem = document.getElementById('settings-llm-item');
   if (llmItem) llmItem.style.display = 'block';
 
-  // Load provider list + global defaults from server, then overlay user's localStorage prefs
+  // Load provider list + global defaults from server, then overlay user's saved prefs.
+  // Non-sensitive fields come from localStorage (restored at declaration time)
+  // AND from the server-side per-user record (GET /api/settings/my-llm) — the
+  // server copy wins when present, since it's authoritative across devices/
+  // browsers. The API key itself is never fetched back to the browser (the
+  // GET endpoint only returns a masked indicator); the agent service resolves
+  // it directly from users.json per-request instead (see agent_service.py's
+  // _resolve_llm_cfg), so there is nothing for the frontend to push here.
   api('/api/settings/llm', null, 'GET').then(function(d) {
     _llmProviders = (d.providers || []).slice();
 
-    // User's own config (already restored from localStorage at declaration time)
-    // but resolve provider URL now that we have the server list
+    return api('/api/settings/my-llm', null, 'GET').then(function(mine) {
+      if (mine) {
+        if (mine.provider_name) _agentConfig.provider_name = mine.provider_name;
+        if (mine.url)           _agentConfig.url            = mine.url;
+        if (mine.model_name)    _agentConfig.model_name     = mine.model_name;
+        if (mine.temperature !== undefined) _agentConfig.temperature = mine.temperature;
+        if (mine.top_p       !== undefined) _agentConfig.top_p       = mine.top_p;
+        if (mine.json_mode   !== undefined) _agentConfig.json_mode   = mine.json_mode;
+      }
+    }).catch(function() { /* no per-user record yet — fine, use localStorage/defaults */ });
+  }).then(function() {
+    // resolve provider URL now that we have the server list
     if (_agentConfig.provider_name) {
       var prov = _llmProviders.find(function(p) { return p.name === _agentConfig.provider_name; });
       if (prov) _agentConfig.url = prov.url;
     }
-    // If user has no personal model set, fall back to global admin defaults
-    if (!_agentConfig.model_name) {
-      _agentConfig.temperature = d.temperature !== undefined ? d.temperature : 0.2;
-      _agentConfig.top_p       = d.top_p      !== undefined ? d.top_p      : 0.9;
-      _agentConfig.json_mode   = !!d.json_mode;
-    }
 
-    // Push resolved config to agent service so status bar shows correct model immediately
+    // Push resolved (non-secret) config to agent service so status bar shows
+    // correct model immediately — the agent resolves the actual API key
+    // itself from the trusted server-side per-user record, not from this push.
     if (_agentConfig.model_name || _agentConfig.url) {
       var payload = { model_name:  _agentConfig.model_name  || null,
                       url:         _agentConfig.url          || null,
                       temperature: _agentConfig.temperature,
                       top_p:       _agentConfig.top_p,
                       json_mode:   _agentConfig.json_mode    || false };
-      if (_agentConfig.apikey) payload.apikey = _agentConfig.apikey;
       api('/api/agent/llm-config', payload)
         .catch(function(e) { console.warn('Agent LLM config push failed:', e); });
     }
@@ -13947,7 +13970,11 @@ function _loadUserConfig() {
   catch(e) { return {}; }
 }
 function _saveUserConfig(obj) {
-  try { localStorage.setItem(_AGENT_USER_CONFIG_KEY, JSON.stringify(obj)); } catch(e) {}
+  // apikey is intentionally excluded — see the _agentConfig initializer
+  // comment above for why it must not be cached in localStorage.
+  var toStore = { provider_name: obj.provider_name, url: obj.url, model_name: obj.model_name,
+                  temperature: obj.temperature, top_p: obj.top_p, json_mode: obj.json_mode };
+  try { localStorage.setItem(_AGENT_USER_CONFIG_KEY, JSON.stringify(toStore)); } catch(e) {}
 }
 
 function openAgentConfig() {
@@ -14099,14 +14126,21 @@ async function openLLMSettings() {
       sel.appendChild(opt);
     });
 
-    // Restore user's saved LLM config into the dialog
+    // Restore user's saved LLM config into the dialog. The API key itself is
+    // never held in _agentConfig outside of an active save/test action (see
+    // the _agentConfig initializer comment) — fetch the per-user record here
+    // so the field shows a masked placeholder when a key is already saved,
+    // same convention as the Neo4j/Postgres password fields, rather than
+    // looking blank/unset.
     var cfg = _agentConfig;
-    sel.value = cfg.provider_name || '';
-    document.getElementById('llms-user-apikey').value      = cfg.apikey      || '';
-    document.getElementById('llms-user-model').value       = cfg.model_name  || '';
-    document.getElementById('llms-user-temperature').value = cfg.temperature !== undefined ? cfg.temperature : 0.2;
-    document.getElementById('llms-user-top-p').value       = cfg.top_p       !== undefined ? cfg.top_p       : 0.9;
-    document.getElementById('llms-user-json-mode').checked = !!cfg.json_mode;
+    var mine = {};
+    try { mine = await api('/api/settings/my-llm', null, 'GET') || {}; } catch(e) { /* none saved yet */ }
+    sel.value = mine.provider_name || cfg.provider_name || '';
+    document.getElementById('llms-user-apikey').value      = mine.apikey      || '';
+    document.getElementById('llms-user-model').value       = mine.model_name || cfg.model_name  || '';
+    document.getElementById('llms-user-temperature').value = mine.temperature !== undefined ? mine.temperature : (cfg.temperature !== undefined ? cfg.temperature : 0.2);
+    document.getElementById('llms-user-top-p').value       = mine.top_p       !== undefined ? mine.top_p       : (cfg.top_p       !== undefined ? cfg.top_p       : 0.9);
+    document.getElementById('llms-user-json-mode').checked = mine.json_mode !== undefined ? !!mine.json_mode : !!cfg.json_mode;
     document.getElementById('llms-user-ping-result').textContent = '';
 
     // Admin section
@@ -14186,7 +14220,10 @@ async function saveLLMSettings() {
   okEl.style.display  = 'none';
   saveBtn.disabled    = true;
 
-  // Save user LLM config into _agentConfig and localStorage
+  // Save user LLM config: non-secret fields cache in localStorage for instant
+  // UI restore; the full config (including apikey) persists server-side via
+  // /api/settings/my-llm — see the _agentConfig initializer comment above for
+  // why the API key itself must not go into localStorage.
   var provName = document.getElementById('llms-user-provider').value;
   var prov = _llmProviders.find(function(p) { return p.name === provName; }) || {};
   _agentConfig.provider_name = provName;
@@ -14197,6 +14234,22 @@ async function saveLLMSettings() {
   _agentConfig.top_p         = parseFloat(document.getElementById('llms-user-top-p').value) || 0.9;
   _agentConfig.json_mode     = document.getElementById('llms-user-json-mode').checked;
   _saveUserConfig(_agentConfig);
+  try {
+    await api('/api/settings/my-llm', {
+      provider_name: _agentConfig.provider_name,
+      url:           _agentConfig.url,
+      apikey:        _agentConfig.apikey,
+      model_name:    _agentConfig.model_name,
+      temperature:   _agentConfig.temperature,
+      top_p:         _agentConfig.top_p,
+      json_mode:     _agentConfig.json_mode,
+    });
+  } catch(e) {
+    errEl.textContent = 'Save failed: ' + e.message;
+    errEl.style.display = 'block';
+    saveBtn.disabled = false;
+    return;
+  }
 
   // Admin: also save provider list + global defaults to server
   if (currentRole === 'admin') {
@@ -14217,13 +14270,17 @@ async function saveLLMSettings() {
     }
   }
 
-  // Push the active user config to the agent service
+  // Push the active user config to the agent service. apikey is deliberately
+  // NOT included here — it was just persisted server-side above via
+  // /api/settings/my-llm, and agent_service.py now resolves it per-user from
+  // that same trusted store (see _resolve_llm_cfg). Sending it from here
+  // would risk forwarding the literal "••••••••" mask (when the field was
+  // left untouched because a key was already saved) as if it were a real key.
   var pushPayload = { model_name:  _agentConfig.model_name  || null,
                       url:         _agentConfig.url          || null,
                       temperature: _agentConfig.temperature,
                       top_p:       _agentConfig.top_p,
                       json_mode:   _agentConfig.json_mode    || false };
-  if (_agentConfig.apikey) pushPayload.apikey = _agentConfig.apikey;
   api('/api/agent/llm-config', pushPayload)
     .catch(function(e) { console.warn('Agent LLM config push failed:', e); });
 
@@ -14562,7 +14619,21 @@ function _renderVocabRows() {
 }
 
 function _esc(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Escapes both quote characters, not just &/</> — this is used to build
+  // HTML attribute values (e.g. href="..."), and previously did NOT escape
+  // '"' at all, so a PubMed reference field (pmid/title/etc, which can
+  // reach this from external data, e.g. article metadata) containing a
+  // double-quote could break out of a double-quoted attribute and inject
+  // arbitrary attributes/event handlers (CodeQL: incomplete HTML attribute
+  // sanitization). Escaping both quote characters makes this safe regardless
+  // of whether the call site happens to use single- or double-quoted
+  // attributes.
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 async function agentVocabConfirm(idx) {
