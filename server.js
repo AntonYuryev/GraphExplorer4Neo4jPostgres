@@ -136,11 +136,20 @@ let appSettings = loadAppSettings();
 (function _migrateLlmProviders() {
   const llm = appSettings.llm || {};
   if (llm.url && (!Array.isArray(llm.providers) || !llm.providers.length)) {
-    // Guess a friendly name from the URL
+    // Guess a friendly name from the URL. Uses the actual parsed hostname
+    // (exact/suffix match), not a substring `.includes()` check — a
+    // substring check would treat a URL like
+    // "https://evil.example/?x=generativelanguage.googleapis.com" as if it
+    // were the real Google host (CodeQL: js/incomplete-url-substring-
+    // sanitization). This only ever picks a cosmetic display label — it does
+    // not affect which URL is actually called — but it's cheap to do
+    // properly regardless.
     let name = 'Default';
-    if (llm.url.includes('generativelanguage.googleapis.com')) name = 'Google Gemini';
-    else if (llm.url.includes('anthropic.com')) name = 'Anthropic Claude';
-    else if (llm.url.includes('openai.com')) name = 'OpenAI';
+    let urlHost = '';
+    try { urlHost = new URL(llm.url).hostname.toLowerCase(); } catch (_e) { /* leave as 'Default' */ }
+    if (urlHost === 'generativelanguage.googleapis.com') name = 'Google Gemini';
+    else if (urlHost === 'anthropic.com' || urlHost.endsWith('.anthropic.com')) name = 'Anthropic Claude';
+    else if (urlHost === 'openai.com' || urlHost.endsWith('.openai.com')) name = 'OpenAI';
     llm.providers = [{ name, url: llm.url }];
     appSettings.llm = llm;
     saveAppSettings(appSettings);
@@ -746,6 +755,50 @@ app.post('/api/settings/llm', dbLimiter, authMiddleware, adminMiddleware, async 
   res.json({ success: true });
 });
 
+// ─── Per-user LLM override (provider/model/API key) ──────────────────────────
+// Mirrors the /api/settings/my-neo4j and /api/settings/my-postgres pattern:
+// every user (not just admins) can save their own LLM provider/API key
+// override, persisted server-side in users.json rather than in the browser's
+// localStorage. This replaces an earlier design where the API key was cached
+// client-side in localStorage in plain text (CodeQL: js/clear-text-storage-
+// of-sensitive-data) — localStorage is readable by any script on the page
+// (e.g. a future XSS bug) and has no expiry, whereas this is protected by
+// the same authenticated, per-user access control as every other credential
+// in the app.
+app.get('/api/settings/my-llm', dbLimiter, authMiddleware, (req, res) => {
+  const users = loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  const cfg = (u && u.llm) || {};
+  res.json({
+    provider_name: cfg.provider_name || '',
+    url:           cfg.url           || '',
+    model_name:    cfg.model_name    || '',
+    temperature:   cfg.temperature   !== undefined ? cfg.temperature : 0.2,
+    top_p:         cfg.top_p         !== undefined ? cfg.top_p       : 0.9,
+    json_mode:     cfg.json_mode     || false,
+    apikey:        cfg.apikey ? '••••••••' : ''   // never echo the real key back
+  });
+});
+
+app.post('/api/settings/my-llm', dbLimiter, authMiddleware, (req, res) => {
+  const { provider_name, url, apikey, model_name, temperature, top_p, json_mode } = req.body || {};
+  const users = loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  const current = u.llm || {};
+  u.llm = {
+    provider_name: typeof provider_name === 'string' ? provider_name.trim() : (current.provider_name || ''),
+    url:           typeof url === 'string' ? url.trim() : (current.url || ''),
+    apikey:        (apikey && apikey !== '••••••••') ? String(apikey) : (current.apikey || ''),
+    model_name:    typeof model_name === 'string' ? model_name.trim() : (current.model_name || ''),
+    temperature:   Number.isFinite(Number(temperature)) ? Number(temperature) : (current.temperature !== undefined ? current.temperature : 0.2),
+    top_p:         Number.isFinite(Number(top_p))       ? Number(top_p)       : (current.top_p       !== undefined ? current.top_p       : 0.9),
+    json_mode:     json_mode === true || json_mode === 'true',
+  };
+  saveUsers(users);
+  res.json({ success: true });
+});
+
 // ─── Neo4j query ─────────────────────────────────────────────────────────────
 app.post('/api/graph/query', dbLimiter, authMiddleware, async (req, res) => {
   const { query } = req.body || {};
@@ -1245,8 +1298,16 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     // Note: sql originates from an authenticated admin request and has been
     // validated above to be a read-only SELECT/WITH query with no stacked
     // statements or comment injection.  Parameterised queries cannot be used
-    // here because the entire query text is the user-supplied value.
-    const result = await req.pg.pool.query(sql); // codeql[js/sql-injection] codeql[js/database-query-built-from-user-controlled-sources] — admin-only endpoint; sql validated as SELECT/WITH-only with no stacked statements
+    // here because the entire query text is the user-supplied value — this
+    // is the intentional design of an admin ad-hoc SQL runner, not an
+    // injection bug on top of it. If this alert is still open after the
+    // inline suppression below (GitHub's inline codeql[] suppression comments
+    // require a sufficiently recent CodeQL Action version / default-setup
+    // scanning — confirm your workflow supports it), dismiss it manually in
+    // the repo's Security tab with reason "Used in tests"/"Won't fix" and a
+    // note pointing back to this comment.
+    // codeql[js/sql-injection]
+    const result = await req.pg.pool.query(sql);
     res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -2052,6 +2113,16 @@ function _pushSchemaToAgent(schema) {
     if (r.statusCode === 200) console.log('[agent] schema pushed (' + schemaText.length + ' chars, pg=' + !!pgCfg + ')');
   });
   req.on('error', e => console.warn('[agent] schema push failed:', e.message));
+  // `body` includes credentials read from settings.json (neo4jCfg/pgCfg/llmCfg
+  // above) — CodeQL flags this as "file data in outbound network request"
+  // (js/file-access-to-http), which is the right thing to flag in general,
+  // but `opts.hostname` here is the hardcoded literal '127.0.0.1', never a
+  // variable — this is server.js pushing its own configuration to the Python
+  // agent_service.py process it spawned as a child process on the SAME host,
+  // over loopback only (see agent_service.py's uvicorn.run(host="127.0.0.1")).
+  // It is internal IPC between two halves of one application, not an
+  // exfiltration path to an external destination.
+  // codeql[js/file-access-to-http]
   req.write(body); req.end();
 }
 
