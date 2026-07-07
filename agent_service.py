@@ -768,7 +768,10 @@ def run_postgres(sql: str, params: tuple = ()) -> List[Dict]:
             # through psycopg2's real parameter binding here, not string-formatted
             # into `sql` — so this does not contain a traditional value-concatenation
             # injection bug on top of the inherent dynamic-query-text design.
-            # codeql[py/sql-injection]
+            # ACCEPTED FINDING (CodeQL: py/sql-injection) — dismiss manually in
+            # the repo's Security tab; inline suppression comments are not
+            # honored by this repo's CodeQL Action setup (confirmed after
+            # repeated testing with verified-correct syntax/query-ID).
             cur.execute(sql, params or None)
             rows = [dict(r) for r in cur.fetchmany(500)]   # cap at 500 rows
         return rows
@@ -3126,7 +3129,17 @@ def list_models(req: ListModelsRequest):
         if not apikey:
             return {"models": [], "error": "API key required for Gemini"}
         try:
-            murl = f"https://generativelanguage.googleapis.com/v1beta/models?key={apikey}&pageSize=100"
+            # Percent-encode the API key before interpolating it into the URL
+            # (CodeQL: py/partial-ssrf — "part of the URL depends on a
+            # user-provided value"). Without this, a key value containing a
+            # URL-structural character like '&' or '#' could inject extra
+            # query parameters or truncate the URL; urllib.parse.quote makes
+            # every character land as inert query-string data, regardless of
+            # content, closing this off properly rather than just papering
+            # over the alert.
+            from urllib.parse import quote as _urlquote
+            murl = (f"https://generativelanguage.googleapis.com/v1beta/models"
+                    f"?key={_urlquote(apikey, safe='')}&pageSize=100")
             with _urllib_req.urlopen(_urllib_req.Request(murl), timeout=10) as r:
                 data = json.loads(r.read())
             models = sorted([
@@ -3157,19 +3170,18 @@ def list_models(req: ListModelsRequest):
             return {"models": [], "error": _safe_exc_str(e)}
 
     # ── OpenAI-compatible /models ──────────────────────────────────────────────
-    # base_url was already validated (scheme + DNS-resolved to reject any
-    # private/loopback/link-local/reserved IP) by _assert_safe_external_url()
-    # a few lines above, unconditionally, before we ever reached this branch.
-    # CodeQL's SSRF query still flags the line below: it does not — and
-    # cannot, without a custom QL model — recognize a hand-written Python
-    # function like _assert_safe_external_url() as a taint-clearing sanitizer,
-    # since that requires understanding what the function's DNS/IP-range logic
-    # actually does, not just that some function was called on the value. The
-    # protection is real (see _assert_safe_external_url above this route) even
-    # though the static analyzer can't verify it from here.
-    # codeql[py/full-ssrf]
+    # ACCEPTED FINDING (CodeQL: py/full-ssrf) — dismiss manually in the repo's
+    # Security tab; inline suppression is not honored by this repo's CodeQL
+    # Action setup (confirmed after repeated testing with verified-correct
+    # syntax/query-ID). Rationale for the dismissal: base_url was already
+    # validated (scheme + DNS-resolved to reject any private/loopback/
+    # link-local/reserved IP) by _assert_safe_external_url() a few lines
+    # above, unconditionally, before this branch was ever reached. CodeQL
+    # cannot verify a hand-written Python validation function as a
+    # taint-clearing sanitizer — only a small set of recognized patterns
+    # (e.g. a literal hostname allowlist) — which isn't an option here since
+    # supporting "any OpenAI-compatible provider URL" is the actual feature.
     try:
-        # codeql[py/full-ssrf]
         http_req = _urllib_req.Request(
             base_url + "/models",
             headers={"Authorization": f"Bearer {apikey}"}
@@ -3226,7 +3238,13 @@ def _safe_library_path(file_id: str) -> Path:
 
 @app.get("/library/{file_id}")
 def load_library_file(file_id: str):
-    # codeql[py/path-injection]
+    # ACCEPTED FINDING (CodeQL: py/path-injection) — dismiss manually in the
+    # repo's Security tab; inline suppression is not honored by this repo's
+    # CodeQL Action setup. _safe_library_path() (defined above) already
+    # regex-allowlists file_id to [a-zA-Z0-9_-]{1,64} (no '.' or '/', ruling
+    # out '../' traversal) AND resolves + verifies the final path is still
+    # inside LIBRARY_DIR before returning it — CodeQL just can't verify a
+    # custom Python function as a sanitizer.
     p = _safe_library_path(file_id)
     if not p.exists():
         raise HTTPException(404, "File not found")
@@ -3245,7 +3263,13 @@ def save_library_file(payload: LibraryFile):
 
 @app.put("/library/{file_id}")
 def update_library_file(file_id: str, payload: LibraryFile):
-    # codeql[py/path-injection]
+    # ACCEPTED FINDING (CodeQL: py/path-injection) — dismiss manually in the
+    # repo's Security tab; inline suppression is not honored by this repo's
+    # CodeQL Action setup. _safe_library_path() (defined above) already
+    # regex-allowlists file_id to [a-zA-Z0-9_-]{1,64} (no '.' or '/', ruling
+    # out '../' traversal) AND resolves + verifies the final path is still
+    # inside LIBRARY_DIR before returning it — CodeQL just can't verify a
+    # custom Python function as a sanitizer.
     p = _safe_library_path(file_id)
     if not p.exists():
         raise HTTPException(404, "File not found")
@@ -3257,7 +3281,13 @@ def update_library_file(file_id: str, payload: LibraryFile):
 
 @app.delete("/library/{file_id}")
 def delete_library_file(file_id: str):
-    # codeql[py/path-injection]
+    # ACCEPTED FINDING (CodeQL: py/path-injection) — dismiss manually in the
+    # repo's Security tab; inline suppression is not honored by this repo's
+    # CodeQL Action setup. _safe_library_path() (defined above) already
+    # regex-allowlists file_id to [a-zA-Z0-9_-]{1,64} (no '.' or '/', ruling
+    # out '../' traversal) AND resolves + verifies the final path is still
+    # inside LIBRARY_DIR before returning it — CodeQL just can't verify a
+    # custom Python function as a sanitizer.
     p = _safe_library_path(file_id)
     if not p.exists():
         raise HTTPException(404, "File not found")
