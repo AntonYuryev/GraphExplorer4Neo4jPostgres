@@ -7,3 +7,23 @@ github-upload.js
 settings.json
 users.json
 backup/
+
+# Runtime/user-specific agent state — saved workflow snapshots under
+# agent_library/ can embed a live LLM API key in their llm_config (this has
+# already happened — e6800c16.json / 699a8b5d.json both contain a real
+# Gemini key). Exclude everything in this directory EXCEPT user_vocabulary.json
+# (deliberately shared as a starter/demo vocabulary — it only holds
+# user_term/neo4j_name/neo4j_label mappings, no credentials).
+# Note: use "agent_library/*" (not "agent_library/") for the exclude so git
+# still recurses into the directory to honor the negation below — gitignore
+# does not apply "!" exceptions to files inside a fully-excluded directory.
+agent_library/*
+!agent_library/user_vocabulary.json
+
+# Personal scratch/test files that have contained live API keys in the past.
+import openai.py
+gemini-2.5-flash.txt
+
+__pycache__/
+*.pyc
+cypher_history.tsv
