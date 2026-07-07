@@ -292,6 +292,9 @@ body {
 #data-table tbody tr:hover td { background: #1a1f2e; color: #fff; }
 #data-table tbody tr:nth-child(even) td { background: #12151f; }
 #data-table tbody tr:nth-child(odd) td { background: #0f1117; }
+/* Row selection — synchronized with the graph view's selected edges */
+#data-table tbody tr.table-row-selected td { background: #2a4a7f !important; color: #fff; }
+#data-table tbody tr.table-row-selected:hover td { background: #35599a !important; }
 
 /* Tooltip */
 #tooltip {
@@ -334,6 +337,7 @@ body {
   background: #12151f; color: #e0e0e0; font-size: 13px; outline: none;
 }
 .modal-box input:focus { border-color: #4f8ef7; }
+.modal-box input:disabled { background: #1a1c26; color: #5a6080; cursor: not-allowed; border-color: #22263a; }
 .modal-box select { cursor: pointer; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 
@@ -706,4 +710,27 @@ body.col-resizing * { cursor: col-resize !important; user-select: none; }
   box-sizing: border-box;
   transform: translate(-50%, -50%);
   pointer-events: auto;
+}
+
+/* ── Agent "Find concepts" button ─────────────────────────────────────────── */
+.agent-match-btn {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: #8ab4f8;
+  background: transparent;
+  border: 1px solid #3a4a70;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.agent-match-btn:hover:not(:disabled) {
+  background: #1e2a48;
+  border-color: #8ab4f8;
+  color: #c8d8ff;
+}
+.agent-match-btn:disabled {
+  cursor: default;
+  opacity: 0.75;
 }
