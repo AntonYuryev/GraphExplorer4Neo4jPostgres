@@ -68,6 +68,12 @@ let lastMouseX = 0, lastMouseY = 0;
 let tableRows = [];                          // all table rows
 let tableSortCol = null;
 let tableSortAsc = true;
+// Table ⇄ graph selection sync — the set of edge ids currently selected, kept in
+// lockstep with the Cytoscape graph's selected edges regardless of which view is
+// visible, so switching views never loses or hides the current selection.
+let _selectedTableEdgeIds  = new Set();
+let _selectedTableNodeIds  = new Set();  // Nodes-view analogue of _selectedTableEdgeIds
+let _lastClickedTableRowIdx = null;
 let currentLayout = 'cose';
 let currentStyle  = 'default';
 let currentSubgraphName = '';   // name from loaded JSON file
@@ -91,8 +97,9 @@ let availableDbColumns = { reference: [], scopus_data: [] };
 let dragSrcColIdx = null;    // for header drag-and-drop
 let colResizing   = null;    // { thEl, startX, startWidth } while resizing a column
 let columnWidths  = null;    // null = autofit on next render; {key:px} = user-customised widths
-let tableViewMode = 'reference'; // 'reference' | 'relation'
+let tableViewMode = 'reference'; // 'reference' | 'relation' | 'node'
 let relationRows  = [];      // rows for Relation view (one per edge, no Postgres)
+let nodeRows      = [];      // rows for Node view (one per node)
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DIRECT_TYPES = new Set([
@@ -106,6 +113,16 @@ const COLOR_PALETTE = [
   '#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22',
   '#2ca02c','#ff9896','#aec7e8','#ffbb78','#98df8a'
 ];
+
+// Node type → highlight color (mirrors Cytoscape stylesheet gradient-bottom stops)
+var NODE_TYPE_COLORS = {
+  Protein: '#d32f2f', SmallMol: '#00C853', Treatment: '#1565c0',
+  Disease: '#CC5500', CellProcess: '#f9a825', FunctionalClass: '#e65100',
+  Complex: '#7f0000', CellObject: '#757575', Tissue: '#6d4c41',
+  Organ: '#4a148c', CellType: '#29b6f6', Cell: '#29b6f6',
+  GeneticVariant: '#FF6D00', ClinicalParameter: '#5C6BC0',
+  MedicalProcedure: '#5dd6c5', Pathogen: '#61DE2A', Virus: '#B5BF50',
+};
 
 // Returns '#000000' or '#ffffff' — whichever contrasts better against the given hex color.
 function contrastColor(hex) {
@@ -264,6 +281,18 @@ const DEFAULT_COLUMNS = [
   { key: 'sentence',      label: 'Sentence',       visible: true,  source: 'reference', dbField: 'msrc' }
 ];
 
+// Default columns for the Nodes table view — source:'node_graph' is the node-view
+// analogue of 'graph' above (kept distinct so the two don't mix in the shared
+// columnDefs array). Additional per-node properties (Neo4j-native or fetched from
+// Postgres node/attr) are added dynamically as source:'node_col', mirroring how
+// NEO4J_PROP_DEFS / node_prop columns are added for the other views.
+const DEFAULT_NODE_COLUMNS = [
+  { key: 'name',       label: 'Name',      visible: true, source: 'node_graph' },
+  { key: 'nodeType',   label: 'Node Type', visible: true, source: 'node_graph' },
+  { key: 'urn',        label: 'URN',       visible: true, source: 'node_graph' },
+  { key: 'nodeIdProp', label: 'NodeID',    visible: true, source: 'node_graph' },
+];
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', function() {
   var saved = sessionStorage.getItem('authToken');
@@ -311,6 +340,14 @@ window.addEventListener('DOMContentLoaded', function() {
       var el = document.getElementById(id);
       return el && el.style.display !== 'none';
     })) return;
+    // Allow native Ctrl+C when the user has text selected in the agent chat panel
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+      var sel = window.getSelection();
+      if (sel && sel.toString().length > 0) {
+        var agentPanel = document.getElementById('agentic-panel');
+        if (agentPanel && agentPanel.contains(sel.anchorNode)) return;
+      }
+    }
 
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
       e.preventDefault();
@@ -404,12 +441,17 @@ function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
   document.getElementById('current-user-label').textContent = currentUser;
-  // DB connection settings are available to all roles
+  // "My Connection" (personal Neo4j/Postgres credentials) is available to all roles
   document.getElementById('settings-db-section').style.display = '';
   if (currentRole === 'admin') {
     document.getElementById('admin-btn') && (document.getElementById('admin-btn').style.display = '');
     document.getElementById('settings-users-item').style.display = '';
+    // Database endpoint (URL/host) configuration is admin-only
+    document.getElementById('settings-db-admin-section').style.display = '';
   }
+  // Initialise Agentic AI (show button, load LLM config)
+  window._currentUser = { name: currentUser, role: currentRole };
+  _initAgenticAI();
   // Load saved column config or fall back to defaults
   columnDefs = loadColumnConfig() || DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
   // Migration: inject numSentences column if absent (added after initial release)
@@ -422,6 +464,12 @@ function showApp() {
   // Migration: ensure numeric flag is set on numRefs (may be absent in older saved configs)
   var numRefsCol = columnDefs.find(function(c) { return c.key === 'numRefs'; });
   if (numRefsCol) numRefsCol.numeric = true;
+  // Migration: inject the Nodes-view default columns for configs saved before that view existed
+  DEFAULT_NODE_COLUMNS.forEach(function(defCol) {
+    if (!columnDefs.find(function(c) { return c.key === defCol.key; })) {
+      columnDefs.push(Object.assign({}, defCol));
+    }
+  });
   // Fetch available DB column lists (used by Columns dialog)
   api('/api/schema/columns', null).then(function(data) {
     availableDbColumns = { reference: data.reference || [], scopus_data: data.scopus_data || [] };
@@ -467,10 +515,18 @@ function formatEta(seconds) {
 // Yield to the event loop so the browser can repaint before starting heavy sync work.
 function yieldToUI() { return new Promise(function(r) { setTimeout(r, 0); }); }
 
-async function api(path, body, auth) {
-  if (auth === undefined) auth = true;
+async function api(path, body, methodOrAuth) {
+  // Third param may be: boolean (auth flag, legacy) or string (HTTP method override).
+  var auth   = true;
+  var method;
+  if (typeof methodOrAuth === 'string') {
+    method = methodOrAuth;                           // explicit: 'GET', 'DELETE', etc.
+  } else {
+    if (methodOrAuth !== undefined) auth = methodOrAuth;
+    method = (body !== null && body !== undefined) ? 'POST' : 'GET';
+  }
   var opts = {
-    method: body !== null && body !== undefined ? 'POST' : 'GET',
+    method:  method,
     headers: { 'Content-Type': 'application/json' }
   };
   if (auth && authToken) opts.headers['Authorization'] = 'Bearer ' + authToken;
@@ -750,7 +806,7 @@ function updateLayoutMenu(name) {
 }
 
 function updateViewMenu(view) {
-  var checks = { graph: 'mc-view-graph', relation: 'mc-view-relation', reference: 'mc-view-reference' };
+  var checks = { graph: 'mc-view-graph', relation: 'mc-view-relation', reference: 'mc-view-reference', node: 'mc-view-node' };
   Object.values(checks).forEach(function(id) {
     var el = document.getElementById(id); if (el) el.textContent = '';
   });
@@ -812,9 +868,11 @@ function toggleFilterRows() {
   var c1 = document.getElementById('mc-filter-rows');
   var c2 = document.getElementById('mc-filter-rows-ref');
   var c3 = document.getElementById('mc-filter-rows-view');
+  var c4 = document.getElementById('mc-filter-rows-node');
   if (c1) c1.textContent = mark;
   if (c2) c2.textContent = mark;
   if (c3) c3.textContent = mark;
+  if (c4) c4.textContent = mark;
   if (show) {
     input.focus();
   } else {
@@ -879,6 +937,45 @@ function populateSelectByLabelMenu() {
     sub.addEventListener('click', function(e) {
       var item = e.target.closest('[data-select-label]');
       if (item) selectNodesByLabel(item.getAttribute('data-select-label'));
+    });
+  }
+}
+
+function selectEdgesByType(relType) {
+  if (!cy) return;
+  cy.edges().unselect();
+  cy.edges('[relType="' + relType + '"]').select();
+  closeMenus();
+}
+
+function populateSelectByEdgeTypeMenu() {
+  var sub = document.getElementById('select-by-edge-type-submenu');
+  if (!sub) return;
+  // Collect unique relType values from current graph
+  var types = [];
+  if (cy && cy.edges().length) {
+    var seen = {};
+    cy.edges().forEach(function(e) {
+      var t = e.data('relType');
+      if (t && !seen[t]) { seen[t] = true; types.push(t); }
+    });
+    types.sort(function(a, b) { return a.localeCompare(b); });
+  }
+  if (!types.length) {
+    sub.innerHTML = '<div class="menu-item" style="color:#7a8099;font-style:italic">No relations in graph</div>';
+    return;
+  }
+  sub.innerHTML = types.map(function(t) {
+    var count = cy.edges('[relType="' + t + '"]').length;
+    var esc = t.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    return '<div class="menu-item" data-select-edge-type="' + esc + '">'
+      + esc + ' <span style="color:#7a8099;font-size:11px">(' + count + ')</span></div>';
+  }).join('');
+  if (!sub._edgeTypeListenerAttached) {
+    sub._edgeTypeListenerAttached = true;
+    sub.addEventListener('click', function(e) {
+      var item = e.target.closest('[data-select-edge-type]');
+      if (item) selectEdgesByType(item.getAttribute('data-select-edge-type'));
     });
   }
 }
@@ -1213,8 +1310,12 @@ function cypherStructuralCheck(text) {
     var _hint = _dm ? '"' + _dm[1] + '.\u2026"' : 'a property access';
     return 'Invalid property access: space after "." in ' + _hint + ' (remove the space)';
   }
-  // Consecutive dots
-  if (/\w\.\.[\w]/.test(stripped))
+  // Consecutive dots — but NOT a Cypher variable-length relationship range like
+  // [*1..2], [*..5], [*3..], which is valid syntax (the ".." there is a range
+  // separator, not a property-access typo). Strip those out first so e.g.
+  // "GeneticChange*1..2" doesn't false-positive as "consecutive dots".
+  var noRanges = stripped.replace(/\*\s*\d*\.\.\d*/g, '');
+  if (/\w\.\.[\w]/.test(noRanges))
     return 'Invalid property access: consecutive dots';
 
   return null;
@@ -1643,22 +1744,45 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
   }
 
   // ── Anchor detection ──────────────────────────────────────────────────────
-  var degree = {};
+  // The "hub" side is whichever endpoint role — source or target, across ALL
+  // returned edges — has FEWER distinct nodes. For a classic single-hub query
+  // (MATCH (hub)-[r]-(n) ...) that's exactly one node, so behavior matches the
+  // old highest-degree-single-node approach. But when a query legitimately
+  // returns several hub-like nodes on one side (e.g. an ontology-expanded set
+  // of processes, each with many activators pointing at it), ALL of them now
+  // become the combined hub — previously only the single highest-degree node
+  // was kept and every edge to the OTHER hub-like nodes was silently dropped.
+  var srcIdSet = new Set(), tgtIdSet = new Set();
   gEdges.forEach(function(e) {
-    var s = String(e.startNodeId), t = String(e.endNodeId);
-    degree[s] = (degree[s] || 0) + 1;
-    degree[t] = (degree[t] || 0) + 1;
+    srcIdSet.add(String(e.startNodeId));
+    tgtIdSet.add(String(e.endNodeId));
   });
-  var anchorGId = Object.keys(degree).sort(function(a, b) { return degree[b] - degree[a]; })[0];
+  var anchorSet = (srcIdSet.size <= tgtIdSet.size) ? srcIdSet : tgtIdSet;
   var nodeById = {};
   gNodes.forEach(function(n) { nodeById[String(n.id)] = n; });
-  var anchorProp = (nodeById[anchorGId] || {}).properties || {};
-  var anchorName = anchorProp.Name || anchorProp.name || anchorGId || 'Hub';
 
   var _skipL = { Entity:1, Named:1, Validated:1, Object:1 };
   function primaryLabel(node) {
     var ls = (node || {}).labels || [];
     return ls.find(function(l) { return !_skipL[l]; }) || ls[0] || 'Unknown';
+  }
+
+  var anchorName;
+  if (anchorSet.size <= 1) {
+    var _onlyId = anchorSet.size ? anchorSet.values().next().value : null;
+    var _p = (nodeById[_onlyId] || {}).properties || {};
+    anchorName = _p.Name || _p.name || _onlyId || 'Hub';
+  } else {
+    // Several hub-side nodes — describe them collectively (e.g. "49 CellProcess")
+    // instead of arbitrarily naming just one and hiding the rest.
+    var _hubLabelCounts = {};
+    anchorSet.forEach(function(id) {
+      var lbl = primaryLabel(nodeById[id]);
+      _hubLabelCounts[lbl] = (_hubLabelCounts[lbl] || 0) + 1;
+    });
+    anchorName = Object.keys(_hubLabelCounts).sort().map(function(l) {
+      return _hubLabelCounts[l] + ' ' + l;
+    }).join(' + ') + ' (' + anchorSet.size + ' nodes)';
   }
 
   // ── Aggregate groups + collect raw edge/node metadata ────────────────────
@@ -1670,10 +1794,12 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
   gEdges.forEach(function(e) {
     var src = String(e.startNodeId), tgt = String(e.endNodeId);
     if (src === tgt) return;
-    var isDown = (src === anchorGId), isUp = (tgt === anchorGId);
-    if (!isDown && !isUp) return;
-    var otherId = isDown ? tgt : src;
-    var other   = nodeById[otherId];
+    var srcIsAnchor = anchorSet.has(src), tgtIsAnchor = anchorSet.has(tgt);
+    if (srcIsAnchor === tgtIsAnchor) return; // both or neither on the hub side — ambiguous, skip
+    var isDown = srcIsAnchor, isUp = tgtIsAnchor;
+    var otherId  = isDown ? tgt : src;
+    var anchorId = isDown ? src : tgt;  // the SPECIFIC hub-side node this edge touches
+    var other    = nodeById[otherId];
     if (!other) return;
     var label   = primaryLabel(other);
     var effect  = (e.properties || {}).Effect || 'unknown';
@@ -1681,17 +1807,26 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
     var rv      = valueProp ? (e.properties || {})[valueProp] : null;
     var value   = (rv != null && isFinite(parseFloat(rv)) && parseFloat(rv) > 0) ? parseFloat(rv) : 1;
     var eid     = String(e.id !== undefined ? e.id : (e.elementId || (src+'_'+tgt)));
+    // Reference count is tracked independently of `value` above (which follows
+    // whatever "Value prop" the user picked) so the tooltip can always show the
+    // true literature reference sum regardless of that setting.
+    var refsN = parseFloat((e.properties || {}).RelationNumberOfReferences);
+    if (!isFinite(refsN) || refsN < 0) refsN = 0;
     if (isUp) {
       var k = label+'|||'+effect+'|||'+relType;
       upAgg[k] = (upAgg[k] || 0) + value;
-      if (!upMeta[k]) upMeta[k] = { edgeCount:0, nodeSet:new Set(), edgeIdSet:new Set() };
-      upMeta[k].edgeCount++; upMeta[k].nodeSet.add(otherId); upMeta[k].nodeSet.add(anchorGId);
+      if (!upMeta[k]) upMeta[k] = { edgeCount:0, refSum:0, nodeSet:new Set(), otherSet:new Set(), edgeIdSet:new Set() };
+      upMeta[k].edgeCount++; upMeta[k].refSum += refsN;
+      upMeta[k].nodeSet.add(otherId); upMeta[k].nodeSet.add(anchorId);
+      upMeta[k].otherSet.add(otherId);
       upMeta[k].edgeIdSet.add(eid);
     } else {
       var k = relType+'|||'+effect+'|||'+label;
       downAgg[k] = (downAgg[k] || 0) + value;
-      if (!downMeta[k]) downMeta[k] = { edgeCount:0, nodeSet:new Set(), edgeIdSet:new Set() };
-      downMeta[k].edgeCount++; downMeta[k].nodeSet.add(otherId); downMeta[k].nodeSet.add(anchorGId);
+      if (!downMeta[k]) downMeta[k] = { edgeCount:0, refSum:0, nodeSet:new Set(), otherSet:new Set(), edgeIdSet:new Set() };
+      downMeta[k].edgeCount++; downMeta[k].refSum += refsN;
+      downMeta[k].nodeSet.add(otherId); downMeta[k].nodeSet.add(anchorId);
+      downMeta[k].otherSet.add(otherId);
       downMeta[k].edgeIdSet.add(eid);
     }
   });
@@ -1934,9 +2069,28 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
         event.stopPropagation();
         selectElement(d._lk, true);
       });
-  // Append tooltip titles separately so linkSel stays as <path> selection
+  // Append tooltip titles separately so linkSel stays as <path> selection.
+  // A single rendered ribbon can merge several upAgg/downAgg groups (e.g. the
+  // same entity label + effect but different relation types all feeding the
+  // same node-to-node link) — d._gks lists exactly which ones, so sum their
+  // relation counts and reference counts across all of them.
   linkSel.append('title').text(function(d) {
-    return d.source.name + ' → ' + d.target.name + '\nValue: ' + d.value.toFixed(0);
+    var relCount = 0, refSum = 0;
+    (d._gks || []).forEach(function(gk) {
+      var meta = upMeta[gk] || downMeta[gk];
+      if (meta) { relCount += meta.edgeCount; refSum += meta.refSum; }
+    });
+    var lines = [
+      d.source.name + ' → ' + d.target.name,
+      'Number of relations: ' + relCount.toLocaleString(),
+      'Number of references: ' + Math.round(refSum).toLocaleString()
+    ];
+    // Only show the width-driving "Value" separately when it's not just the
+    // reference sum again (i.e. the user picked a different "Value prop").
+    if (valueProp && valueProp !== 'RelationNumberOfReferences') {
+      lines.push('Value (' + valueProp + '): ' + d.value.toFixed(0));
+    }
+    return lines.join('\n');
   });
 
   // ── Render nodes ──────────────────────────────────────────────────────────
@@ -1952,8 +2106,27 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
       event.stopPropagation();
       selectElement(d.key, false);
     });
-  // Append tooltip titles separately so nodeSel stays as <rect> selection
-  nodeSel.append('title').text(function(d){ return d.name; });
+  // Append tooltip titles separately so nodeSel stays as <rect> selection.
+  // Entity-label buckets (e.g. "Protein") and the hub node itself represent
+  // MANY real graph nodes collapsed into one Sankey box — show how many.
+  // Relation-type/effect buckets aren't a set of graph nodes, so they just
+  // show their name as before.
+  function _sankeyNodeCount(key) {
+    if (key === '__anchor__') return anchorSet.size;
+    if (key.indexOf('up_e_') === 0 || key.indexOf('down_e_') === 0) {
+      var ids = new Set();
+      (nodeKeyGroups[key] || []).forEach(function(gk) {
+        var meta = upMeta[gk] || downMeta[gk];
+        if (meta) meta.otherSet.forEach(function(id) { ids.add(id); });
+      });
+      return ids.size;
+    }
+    return null;
+  }
+  nodeSel.append('title').text(function(d){
+    var count = _sankeyNodeCount(d.key);
+    return count == null ? d.name : (d.name + '\n' + count.toLocaleString() + ' node' + (count === 1 ? '' : 's'));
+  });
 
   // ── Labels ────────────────────────────────────────────────────────────────
   var labelSel = null;
@@ -1979,12 +2152,25 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
 function exportSankeyAsSvg() {
   var svgEl = document.getElementById('sankey-svg');
   if (!svgEl) { alert('Run a query first.'); return; }
-  var blob = new Blob([svgEl.outerHTML], { type: 'image/svg+xml' });
+  // Deliberately NOT using `new Blob(...)` here: some browser extensions
+  // (observed with ExpressVPN's geolocation-spoofing feature) monkey-patch
+  // the global Blob constructor to inject their own <script> into any Blob
+  // created with type 'image/svg+xml', corrupting the exported file so it
+  // fails to render when opened. A data: URI never touches Blob at all, so
+  // it sidesteps that interference entirely.
+  // An <svg> living inside an HTML page doesn't need an xmlns attribute (the
+  // context already establishes it), so outerHTML omits it — but a standalone
+  // .svg file needs the explicit namespace to be recognized as SVG rather
+  // than falling back to a generic XML viewer. Add it if not already present.
+  var outerSvg = svgEl.outerHTML;
+  if (outerSvg.indexOf('xmlns=') === -1) {
+    outerSvg = outerSvg.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+  }
+  var svgText = '<?xml version="1.0" standalone="no"?>\r\n' + outerSvg;
   var a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  a.href = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgText);
   a.download = 'sankey.svg';
   a.click();
-  setTimeout(function() { URL.revokeObjectURL(a.href); }, 2000);
 }
 
 function showSankeyAsGraph() {
@@ -2073,7 +2259,10 @@ function getCyStyle() {
     },
     {
       selector: 'node:selected',
-      style: { 'border-width': 3, 'border-color': '#FFD700', 'border-opacity': 1 }
+      style: {
+        'border-width': 3, 'border-color': '#FFD700', 'border-opacity': 1,
+        'overlay-color': '#FFD700', 'overlay-opacity': 0.25, 'overlay-padding': 8
+      }
     },
     // ── Focus node — white border ring, used as alignment reference ───────────
     {
@@ -2105,8 +2294,17 @@ function getCyStyle() {
       }
     },
     {
+      // Previously just opacity+1px width — nearly invisible against an already
+      // near-opaque line. Now a clear gold "halo" matching node:selected, plus a
+      // real color/width jump so a table-driven selection is obvious at a glance.
       selector: 'edge:selected',
-      style: { 'opacity': 1, 'width': function(ele) { return ele.data('thickness') + 1; } }
+      style: {
+        'opacity': 1,
+        'width': function(ele) { return ele.data('thickness') + 2; },
+        'line-color': '#FFD700',
+        'target-arrow-color': '#FFD700',
+        'overlay-color': '#FFD700', 'overlay-opacity': 0.25, 'overlay-padding': 6
+      }
     },
     {
       selector: 'edge.faded',
@@ -2575,6 +2773,10 @@ function renderGraph(data, savedPositions) {
   medScanMap = {};
   typeColorMap = {};
   colorIdx = 0;
+  // Fresh graph data means old edge ids no longer exist — drop any stale
+  // table-selection state instead of risking it lingering onto unrelated rows.
+  _selectedTableEdgeIds = new Set();
+  _selectedTableNodeIds = new Set();
 
   var cyNodes = data.nodes.map(function(n) {
     var d = {
@@ -3819,67 +4021,50 @@ function confirmLargeExportCSV() {
   if (_largeExportResolve) { _largeExportResolve('csv');   _largeExportResolve = null; }
 }
 
-async function runQuery() {
+async function runQuery(mergeIntoExisting) {
   var query = getCypherQuery().trim();
   if (!query) return;
   currentQuery = query;
 
-  // ── Pre-execution count check (FR-1.1 / FR-1.2) ──────────────────────────
-  var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
+  // ── Pre-execution count check ──────────────────────────────
+  var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
   var _limitVal   = _limitMatch ? parseInt(_limitMatch[1], 10) : Infinity;
-  var _edgeCount  = _limitVal;
+  var _edgeCount  = NaN;
   var _tooLarge   = false;
 
-  // Fast intercept: LIMIT >= 1000 — skip counting, just show modal.
-  if (_limitVal >= 1000) {
-    // Still run count(*) so we can show the real number, but with a 5 s timeout.
-    setProgressMsg('⏳ Counting matching relations…');
-  } else {
-    setProgressMsg('⏳ Counting matching relations…');
-  }
+  setProgressMsg('\u23f3 Counting matching relations\u2026');
 
+  // Run the COUNT(*) version of the query with no client-side timeout so we
+  // always get the real number (the server enforces its own Neo4j timeout).
   try {
-    // Wrap the count API call with a 5-second timeout via AbortController.
-    var _abortCtrl   = new AbortController();
-    var _abortTimer  = setTimeout(function() { _abortCtrl.abort(); }, 5000);
-    var _countOpts   = {
-      method: 'POST',
+    var _countOpts = {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json',
                  'Authorization': authToken ? 'Bearer ' + authToken : '' },
       body: JSON.stringify({ query: query }),
-      signal: _abortCtrl.signal
     };
-    var _cRes  = await fetch('/api/graph/count-query', _countOpts);
-    clearTimeout(_abortTimer);
+    var _cRes    = await fetch('/api/graph/count-query', _countOpts);
     var countRes = await _cRes.json().catch(function() { return {}; });
-    setProgressMsg(null);
     if (countRes && typeof countRes.edgeCount === 'number') {
       _edgeCount = countRes.edgeCount;
-      if (_edgeCount >= 1000) _tooLarge = true;
       appendCypherHistory(query, _edgeCount);
-    } else if (_limitVal >= 1000) {
-      _tooLarge = true;
     }
   } catch (countErr) {
-    setProgressMsg(null);
-    if (countErr.name === 'AbortError') {
-      console.warn('count-query timed out — proceeding with main query');
-      // Timeout: if there is already a LIMIT >= 1000, still intercept.
-      if (_limitVal >= 1000) _tooLarge = true;
-      // No LIMIT + timeout → let the query run; the result may be large but we
-      // cannot know for sure, so don't block the user.
-    } else {
-      console.warn('count-query failed:', countErr.message);
-      if (_limitVal >= 1000) _tooLarge = true;
-    }
+    console.warn('count-query failed:', countErr.message);
   }
+  setProgressMsg(null);
+
+  // Intercept when we have a real count >= 1000, or when count failed but the
+  // query has an explicit LIMIT >= 1000 (safe conservative assumption).
+  _tooLarge = (_edgeCount >= 1000) ||
+              (isNaN(_edgeCount) && _limitVal >= 1000);
 
   if (_tooLarge) {
     _largeQueryPending = query;
-    var _countStr = isFinite(_edgeCount) ? _edgeCount.toLocaleString() : 'more than 1,000';
+    var _countStr = isFinite(_edgeCount) ? _edgeCount.toLocaleString() : 'over 1,000';
     document.getElementById('large-query-msg').textContent =
       'The query returns ' + _countStr + ' edges. ' +
-      'The results with more than 1,000 edges cannot be displayed in the App. ' +
+      'Results with more than 1,000 edges cannot be displayed in the App. ' +
       'Would you like to export the results to Excel instead?';
     document.getElementById('large-query-modal').style.display = 'flex';
     return;
@@ -3901,10 +4086,19 @@ async function runQuery() {
 
     if (startTabIdx === activeTabIdx) {
       // Still on the originating tab — render normally
-      updateCurrentTabName(shortQ);
       if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
         showQueryResultTable(data.table);
+      } else if (mergeIntoExisting && cy && cy.elements().length) {
+        // "Add to graph" — merge into whatever's already on the canvas instead of
+        // replacing it. mergeGraphData() dedupes nodes by URN and edges by id, so
+        // re-adding something already present is a harmless no-op.
+        hideQueryResultTable();
+        mergeGraphData(data);
+        if (document.getElementById('table-view').style.display !== 'none') {
+          await loadTableData();
+        }
       } else {
+        updateCurrentTabName(shortQ);
         hideQueryResultTable();
         renderGraph(data);
         if (document.getElementById('table-view').style.display !== 'none') {
@@ -3940,87 +4134,281 @@ function appendCypherHistory(query, count) {
   api('/api/cypher/history', { query: query, count: count }).catch(function() {});
 }
 
+// All history rows are fetched once per dialog open and filtered/sorted entirely
+// client-side (search text, date range, dedupe, sort) — fast even for hundreds of
+// entries, and avoids round-tripping to the server on every keystroke.
+var _chAllRows   = [];      // raw rows from the server, each with a parsed timestamp
+var _chRange     = 'all';   // 'all' | 'today' | '7d' | '30d'
+var _chSortField = 'date';  // 'date' | 'count'
+var _chSortDir   = 'desc';  // 'asc' | 'desc'
+
+// Persists the scroll position in the history list across close/reopen (and
+// across browser sessions, since it's localStorage) so reopening the dialog
+// drops you back exactly where you left off, instead of always at the top.
+var CH_SCROLL_KEY = 'cypher_history_scroll_v1';
+var _chScrollListenerAttached = false;
+
+// Which element actually scrolls depends on CSS layout details (.modal-box
+// itself has overflow-y:auto from the shared modal class, and the inner
+// #ch-scroll-container is a flex child that may or may not end up being the
+// one that truly overflows) — rather than betting on one, track and restore
+// against BOTH candidates so this keeps working regardless of which one the
+// browser actually scrolls.
+function _chScrollTargets() {
+  var inner = document.getElementById('ch-scroll-container');
+  var outer = inner ? inner.closest('.modal-box') : null;
+  return [inner, outer].filter(Boolean);
+}
+
+// Guards against a browser quirk confirmed via diagnostic logging: whenever
+// the row list is rebuilt (tbody.innerHTML cleared, which happens both when
+// closing isn't the issue — it's the START of openCypherHistory(), which
+// wipes the tbody before re-fetching) the container's scrollHeight collapses
+// to ~0. Since its scrollTop was still sitting at the old (larger) value, the
+// browser CLAMPS it down to the new max — usually 0 — and fires a 'scroll'
+// event as a side effect. That spurious event was being saved as the "real"
+// position, overwriting the correct value an instant before _chRestoreScroll()
+// even ran. This flag suppresses saving during that whole rebuild sequence;
+// it's released only once _chRestoreScroll() has actually applied the
+// restored value (see below), so real user scrolling is never mistakenly
+// suppressed once the dialog has settled.
+var _chSuppressSave = false;
+
+function _chSaveScroll(evt) {
+  if (_chSuppressSave) return;
+  var el = (evt && evt.target) || document.getElementById('ch-scroll-container');
+  if (!el) return;
+  try { localStorage.setItem(CH_SCROLL_KEY, String(el.scrollTop)); } catch(e) {}
+}
+
+function _chCloseModal() {
+  _chSuppressSave = true;
+  document.getElementById('cypher-history-modal').style.display = 'none';
+  // Belt-and-suspenders: also suppress across the close itself in case some
+  // browsers reset scrollTop on display:none. Released shortly after; the
+  // NEXT openCypherHistory() call re-engages the guard again regardless.
+  setTimeout(function() { _chSuppressSave = false; }, 150);
+}
+
+function _chRestoreScroll() {
+  var saved = 0;
+  try { saved = parseInt(localStorage.getItem(CH_SCROLL_KEY), 10) || 0; } catch(e) {}
+  // Two rAFs so this runs after the browser has actually laid out and painted
+  // the freshly-rendered rows — setting scrollTop before that can silently
+  // no-op if scrollHeight hasn't been recomputed yet.
+  requestAnimationFrame(function() {
+    requestAnimationFrame(function() {
+      _chScrollTargets().forEach(function(el) { el.scrollTop = saved; });
+      _chSuppressSave = false;  // layout has settled — re-arm real scroll saving
+    });
+  });
+}
+
 async function openCypherHistory() {
   var modal  = document.getElementById('cypher-history-modal');
-  var tbody  = document.getElementById('cypher-history-tbody');
   var status = document.getElementById('cypher-history-status');
-  tbody.innerHTML = '';
+  // Engage the guard BEFORE wiping tbody — clearing it collapses scrollHeight,
+  // which clamps the (still-stale) scrollTop and fires a spurious 'scroll'
+  // event that must not be saved as the real position. Released by
+  // _chRestoreScroll() once the new content is laid out and the saved
+  // position has actually been re-applied.
+  _chSuppressSave = true;
+  document.getElementById('cypher-history-tbody').innerHTML = '';
+  document.getElementById('ch-search-input').value = '';
+  document.getElementById('ch-dedupe').checked = false;
+  _chRange     = 'all';
+  _chSortField = 'date';
+  _chSortDir   = 'desc';
   status.textContent = 'Loading…';
   modal.style.display = 'flex';
+
+  if (!_chScrollListenerAttached) {
+    _chScrollTargets().forEach(function(el) { el.addEventListener('scroll', _chSaveScroll); });
+    _chScrollListenerAttached = true;
+  }
+
   try {
     var data = await api('/api/cypher/history');
-    var rows = (data.rows || []).slice().reverse(); // newest first
-    status.textContent = '';
-    if (!rows.length) { status.textContent = 'No history yet.'; return; }
-    rows.forEach(function(r) {
-      var tr = document.createElement('tr');
-      var dt = '';
-      try { dt = new Date(r.date).toLocaleString(); } catch(e) { dt = r.date; }
-
-      // Date
-      var tdDate = document.createElement('td');
-      tdDate.textContent = dt;
-      tdDate.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;color:#a0aec0;font-size:12px;vertical-align:top';
-
-      // Result count
-      var tdCount = document.createElement('td');
-      tdCount.textContent = (typeof r.count === 'number' ? r.count.toLocaleString() : r.count);
-      tdCount.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:right;color:#7ee8a2;font-size:12px;vertical-align:top';
-
-      // Query text — clicking loads into Graph editor (default)
-      var tdQuery = document.createElement('td');
-      tdQuery.textContent = r.query;
-      tdQuery.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;font-family:monospace;font-size:12px;word-break:break-all;cursor:pointer;color:#e2e8f0;vertical-align:top';
-      tdQuery.title = 'Click to open in Graph editor';
-      tdQuery.addEventListener('click', function() {
-        var ta = document.getElementById('cypher-input');
-        if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
-        document.getElementById('cypher-history-modal').style.display = 'none';
-      });
-
-      // "Open in" dropdown
-      var tdOpen = document.createElement('td');
-      tdOpen.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:center;vertical-align:top';
-
-      var sel = document.createElement('select');
-      sel.style.cssText = 'background:#1a1f35;border:1px solid #3a4060;border-radius:5px;color:#c8d0e8;font-size:12px;padding:3px 8px;cursor:pointer;outline:none';
-      [['graph','📊 Graph'], ['sankey','🔀 Sankey']].forEach(function(opt) {
-        var o = document.createElement('option');
-        o.value = opt[0]; o.textContent = opt[1];
-        sel.appendChild(o);
-      });
-
-      sel.addEventListener('change', function() {
-        var dest = sel.value;
-        document.getElementById('cypher-history-modal').style.display = 'none';
-        if (dest === 'sankey') {
-          // Open Sankey dialog and populate its textarea
-          var sankeyTa = document.getElementById('sankey-cypher');
-          if (sankeyTa) {
-            openSankeyDialog();
-            sankeyTa.value = r.query;
-            onSankeyCypherInput(sankeyTa);
-          }
-        } else {
-          // Default: load into Graph Cypher editor
-          var ta = document.getElementById('cypher-input');
-          if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
-        }
-        // Reset dropdown so it can be triggered again for the same option
-        setTimeout(function() { sel.value = 'graph'; }, 300);
-      });
-
-      tdOpen.appendChild(sel);
-
-      tr.appendChild(tdDate);
-      tr.appendChild(tdCount);
-      tr.appendChild(tdQuery);
-      tr.appendChild(tdOpen);
-      tbody.appendChild(tr);
+    _chAllRows = (data.rows || []).map(function(r) {
+      var t = new Date(r.date).getTime();
+      return { date: r.date, query: r.query, count: r.count, _time: isNaN(t) ? 0 : t };
     });
+    _chUpdateChips();
+    _chUpdateSortHeaders();
+    _chRender();
+    // Restore only right after the initial (default filters) render — the
+    // saved position is a raw pixel offset, so it only makes sense against
+    // the same "All time / Date desc / no search" list it was recorded from.
+    _chRestoreScroll();
   } catch(e) {
     status.textContent = 'Error loading history: ' + e.message;
+    _chSuppressSave = false;  // _chRestoreScroll() never ran to release it — don't stay stuck suppressed
   }
+}
+
+function _chSetRange(range) {
+  _chRange = range;
+  _chUpdateChips();
+  _chRender();
+}
+
+function _chUpdateChips() {
+  document.querySelectorAll('#ch-date-chips .ch-chip').forEach(function(btn) {
+    btn.classList.toggle('active', btn.getAttribute('data-range') === _chRange);
+  });
+}
+
+function _chSetSort(field) {
+  if (_chSortField === field) {
+    _chSortDir = (_chSortDir === 'asc') ? 'desc' : 'asc';
+  } else {
+    _chSortField = field;
+    _chSortDir   = 'desc';  // newest-first / highest-first by default when switching columns
+  }
+  _chUpdateSortHeaders();
+  _chRender();
+}
+
+function _chUpdateSortHeaders() {
+  var arrow   = _chSortDir === 'asc' ? ' ▲' : ' ▼';
+  var dateTh  = document.getElementById('ch-th-date');
+  var countTh = document.getElementById('ch-th-count');
+  dateTh.textContent  = 'Date'         + (_chSortField === 'date'  ? arrow : '');
+  countTh.textContent = 'Result Count' + (_chSortField === 'count' ? arrow : '');
+}
+
+function _chEscHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Wraps every case-insensitive occurrence of the search term in <mark class="ch-hit">.
+// Escapes both sides identically first so highlighting can never re-inject raw HTML
+// from the stored query text.
+function _chHighlight(text, term) {
+  var escaped = _chEscHtml(text);
+  if (!term) return escaped;
+  var escTerm = _chEscHtml(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!escTerm) return escaped;
+  var re = new RegExp('(' + escTerm + ')', 'ig');
+  return escaped.replace(re, '<mark class="ch-hit">$1</mark>');
+}
+
+function _chRender() {
+  var status = document.getElementById('cypher-history-status');
+  var tbody  = document.getElementById('cypher-history-tbody');
+  var search = (document.getElementById('ch-search-input').value || '').trim().toLowerCase();
+  var dedupe = document.getElementById('ch-dedupe').checked;
+
+  var rows  = _chAllRows;
+  var total = rows.length;
+
+  // ── Date range filter ──────────────────────────────────────────────────────
+  if (_chRange !== 'all') {
+    var cutoff;
+    if (_chRange === 'today') {
+      var d0 = new Date(); d0.setHours(0, 0, 0, 0);
+      cutoff = d0.getTime();
+    } else if (_chRange === '7d')  cutoff = Date.now() - 7  * 24 * 3600 * 1000;
+    else if (_chRange === '30d')   cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+    if (cutoff !== undefined) rows = rows.filter(function(r) { return r._time >= cutoff; });
+  }
+
+  // ── Search filter ──────────────────────────────────────────────────────────
+  if (search) {
+    rows = rows.filter(function(r) { return (r.query || '').toLowerCase().indexOf(search) !== -1; });
+  }
+
+  // ── Dedupe: keep only the most recent run of each distinct query text ──────
+  if (dedupe) {
+    var latestByQuery = {};
+    rows.forEach(function(r) {
+      var existing = latestByQuery[r.query];
+      if (!existing || r._time > existing._time) latestByQuery[r.query] = r;
+    });
+    rows = Object.keys(latestByQuery).map(function(k) { return latestByQuery[k]; });
+  }
+
+  var shown = rows.length;
+
+  // ── Sort ──────────────────────────────────────────────────────────────────
+  rows = rows.slice().sort(function(a, b) {
+    var av = _chSortField === 'count' ? (Number(a.count) || 0) : a._time;
+    var bv = _chSortField === 'count' ? (Number(b.count) || 0) : b._time;
+    return _chSortDir === 'asc' ? (av - bv) : (bv - av);
+  });
+
+  status.textContent = total === 0
+    ? 'No history yet.'
+    : 'Showing ' + shown.toLocaleString() + ' of ' + total.toLocaleString() + ' quer' + (total === 1 ? 'y' : 'ies') +
+      (shown === 0 ? ' — no matches.' : '');
+
+  tbody.innerHTML = '';
+  rows.forEach(function(r) {
+    var tr = document.createElement('tr');
+    var dt = '';
+    try { dt = new Date(r.date).toLocaleString(); } catch(e) { dt = r.date; }
+
+    // Date
+    var tdDate = document.createElement('td');
+    tdDate.textContent = dt;
+    tdDate.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;color:#a0aec0;font-size:12px;vertical-align:top';
+
+    // Result count
+    var tdCount = document.createElement('td');
+    tdCount.textContent = (typeof r.count === 'number' ? r.count.toLocaleString() : r.count);
+    tdCount.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:right;color:#7ee8a2;font-size:12px;vertical-align:top';
+
+    // Query text — clicking loads into Graph editor (default); search hits highlighted
+    var tdQuery = document.createElement('td');
+    tdQuery.innerHTML = _chHighlight(r.query, search);
+    tdQuery.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;font-family:monospace;font-size:12px;word-break:break-all;cursor:pointer;color:#e2e8f0;vertical-align:top';
+    tdQuery.title = 'Click to open in Graph editor';
+    tdQuery.addEventListener('click', function() {
+      var ta = document.getElementById('cypher-input');
+      if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
+      _chCloseModal();
+    });
+
+    // "Open in" dropdown
+    var tdOpen = document.createElement('td');
+    tdOpen.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:center;vertical-align:top';
+
+    var sel = document.createElement('select');
+    sel.style.cssText = 'background:#1a1f35;border:1px solid #3a4060;border-radius:5px;color:#c8d0e8;font-size:12px;padding:3px 8px;cursor:pointer;outline:none';
+    [['graph','📊 Graph'], ['sankey','🔀 Sankey']].forEach(function(opt) {
+      var o = document.createElement('option');
+      o.value = opt[0]; o.textContent = opt[1];
+      sel.appendChild(o);
+    });
+
+    sel.addEventListener('change', function() {
+      var dest = sel.value;
+      _chCloseModal();
+      if (dest === 'sankey') {
+        // Open Sankey dialog and populate its textarea
+        var sankeyTa = document.getElementById('sankey-cypher');
+        if (sankeyTa) {
+          openSankeyDialog();
+          sankeyTa.value = r.query;
+          onSankeyCypherInput(sankeyTa);
+        }
+      } else {
+        // Default: load into Graph Cypher editor
+        var ta = document.getElementById('cypher-input');
+        if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
+      }
+      // Reset dropdown so it can be triggered again for the same option
+      setTimeout(function() { sel.value = 'graph'; }, 300);
+    });
+
+    tdOpen.appendChild(sel);
+
+    tr.appendChild(tdDate);
+    tr.appendChild(tdCount);
+    tr.appendChild(tdQuery);
+    tr.appendChild(tdOpen);
+    tbody.appendChild(tr);
+  });
 }
 
 function handleQueryKeydown(e) {
@@ -4059,6 +4447,9 @@ function clearGraph() {
   refsCache = {};
   medScanMap = {};
   tableRows = [];
+  nodeRows = [];
+  _selectedTableEdgeIds = new Set();
+  _selectedTableNodeIds = new Set();
   undoStack = [];
   var btn = document.getElementById('undo-btn');
   if (btn) { btn.disabled = true; btn.style.opacity = '0.4'; }
@@ -4107,6 +4498,7 @@ function updateStats() {
 
 function updateSelectionInfo() {
   if (!cy) return;
+  _syncTableSelectionFromGraph();
   var selNodes = cy.nodes(':selected').length;
   var selEdges = cy.edges(':selected').length;
   if (selNodes === 0 && selEdges === 0) {
@@ -4487,9 +4879,17 @@ async function switchView(view) {
     cy.resize();
   }
 
-  if (view === 'table' && graphData.edges.length > 0) {
+  var _hasDataForView = tableViewMode === 'node' ? graphData.nodes.length > 0 : graphData.edges.length > 0;
+  if (view === 'table' && _hasDataForView) {
     if (tableViewMode === 'relation') {
       await loadRelationData();
+    } else if (tableViewMode === 'node') {
+      if (nodeRows.length > 0) {
+        renderTableHeader();
+        renderTableRows(nodeRows);
+      } else {
+        await loadNodeData();
+      }
     } else {
       if (tableRows.length > 0) {
         renderTableHeader();
@@ -4500,7 +4900,7 @@ async function switchView(view) {
     }
     // Re-apply active sort (survives tab switches and mode changes)
     if (tableSortCol) {
-      var _src = tableViewMode === 'relation' ? relationRows : tableRows;
+      var _src = _currentTableSourceRows();
       var _colDef = columnDefs.find(function(c) { return c.key === tableSortCol; });
       var _numeric = _colDef && _colDef.numeric;
       var _sorted = _src.slice().sort(function(a, b) {
@@ -4524,10 +4924,12 @@ async function switchView(view) {
 
 function syncTableModeIndicator(mode) {
   // Update View menu checkmarks for table modes
-  var relEl = document.getElementById('mc-view-relation');
-  var refEl = document.getElementById('mc-view-reference');
-  if (relEl) relEl.textContent = (mode === 'relation') ? '✓' : '';
-  if (refEl) refEl.textContent = (mode === 'reference') ? '✓' : '';
+  var relEl  = document.getElementById('mc-view-relation');
+  var refEl  = document.getElementById('mc-view-reference');
+  var nodeEl = document.getElementById('mc-view-node');
+  if (relEl)  relEl.textContent  = (mode === 'relation') ? '✓' : '';
+  if (refEl)  refEl.textContent  = (mode === 'reference') ? '✓' : '';
+  if (nodeEl) nodeEl.textContent = (mode === 'node') ? '✓' : '';
   // Also clear the Graph checkmark when in table mode
   var grEl = document.getElementById('mc-view-graph');
   if (grEl) grEl.textContent = '';
@@ -4537,10 +4939,17 @@ async function setTableViewMode(mode) {
   tableViewMode = mode;
   syncTableModeIndicator(mode);
   columnWidths = null;
-  if (document.getElementById('table-view').style.display !== 'none'
-      && graphData.edges.length > 0) {
+  var _hasData = mode === 'node' ? graphData.nodes.length > 0 : graphData.edges.length > 0;
+  if (document.getElementById('table-view').style.display !== 'none' && _hasData) {
     if (mode === 'relation') {
       loadRelationData();
+    } else if (mode === 'node') {
+      if (nodeRows.length > 0) {
+        renderTableHeader();
+        renderTableRows(nodeRows);
+      } else {
+        await loadNodeData();   // await so RAF fires after data is rendered
+      }
     } else {
       if (tableRows.length > 0) {
         renderTableHeader();
@@ -4568,6 +4977,23 @@ function selectTableMode(mode) {
   if (document.getElementById('table-view').style.display === 'none') {
     switchView('table');
   }
+}
+
+// Returns whichever row array backs the currently active table mode —
+// centralizes the 3-way branch used throughout sorting/filtering/reload code.
+function _currentTableSourceRows() {
+  if (tableViewMode === 'relation') return relationRows;
+  if (tableViewMode === 'node')     return nodeRows;
+  return tableRows;
+}
+
+// Reloads the table for whichever mode is currently active. Used after any
+// graph mutation (column changes, expand/connect actions, etc.) that could
+// have invalidated the cached rows.
+function _reloadCurrentTableMode() {
+  if (tableViewMode === 'relation')    { loadRelationData(); }
+  else if (tableViewMode === 'node')   { nodeRows = []; loadNodeData(); }
+  else                                 { tableRows = []; loadTableData(); }
 }
 
 // ─── Table ────────────────────────────────────────────────────────────────────
@@ -4856,6 +5282,88 @@ async function loadTableData() {
   renderTableRows(tableRows);
 }
 
+// ─── Nodes table view ─────────────────────────────────────────────────────────
+// One row per node in the current graph. Base columns (Name/Node Type/URN/
+// NodeID) come straight from graphData; additional property columns
+// (source:'node_col') are Neo4j-native OR Postgres node/attr properties — both
+// end up merged into node.properties by /api/nodes/load-properties, the same
+// endpoint the Relations/References node_prop columns already use, so reading
+// them at render time is uniform regardless of where the value came from.
+async function loadNodeData() {
+  var msg = document.getElementById('table-loading-msg');
+
+  var nodeColCols = columnDefs.filter(function(c) { return c.source === 'node_col' && c.visible; });
+  if (nodeColCols.length > 0) {
+    var npNodeIds = [], npUrns = [];
+    graphData.nodes.forEach(function(n) {
+      var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+      var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+      if (nid && /^-?\d+$/.test(nid)) npNodeIds.push(nid);
+      else if (urn) npUrns.push(urn);
+    });
+    if (npNodeIds.length || npUrns.length) {
+      var propNames = nodeColCols.map(function(c) { return c.dbField; });
+      try {
+        msg.style.display = 'inline';
+        msg.textContent = 'Loading node properties…';
+        var npResult = await api('/api/nodes/load-properties', { nodeIds: npNodeIds, urns: npUrns, properties: propNames });
+        var npById = npResult.byNodeId || {};
+        var npByUrn = npResult.byUrn   || {};
+        var urnToCyNode = {};
+        if (cy) cy.nodes().forEach(function(cyNode) {
+          var u = cyNode.data('URN');
+          if (u) urnToCyNode[String(u)] = cyNode;
+        });
+        graphData.nodes.forEach(function(n) {
+          var nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+          var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
+          var props = (nid && npById[nid]) ? npById[nid] : (urn && npByUrn[urn]) ? npByUrn[urn] : null;
+          if (!props) return;
+          Object.assign(n.properties, props);
+          var cyNode = (urn && urnToCyNode[urn]) ? urnToCyNode[urn] : (cy ? cy.getElementById(n.id) : null);
+          if (cyNode && cyNode.length) Object.keys(props).forEach(function(k) { cyNode.data(k, props[k]); });
+        });
+      } catch(e) {
+        console.warn('Node property fetch failed:', e.message);
+      }
+      msg.style.display = 'none';
+    }
+  }
+
+  function nodeLabel(node) {
+    if (!node) return '?';
+    if (cy) {
+      var cyNode = cy.$id(node.id);
+      if (cyNode && cyNode.length) { var lbl = cyNode.data('label'); if (lbl) return lbl; }
+      if (node.properties && node.properties.URN) {
+        cyNode = cy.$id(node.properties.URN);
+        if (cyNode && cyNode.length) { var lbl2 = cyNode.data('label'); if (lbl2) return lbl2; }
+      }
+    }
+    return getNodeLabel(node);
+  }
+
+  nodeRows = graphData.nodes.map(function(n) {
+    var row = {
+      nodeId:     n.id,   // matches the live Cytoscape element id — used for selection sync
+      elementId:  n.elementId || n.id,
+      name:       nodeLabel(n),
+      nodeType:   (n.labels && n.labels[0]) || '',
+      urn:        (n.properties && n.properties.URN != null) ? String(n.properties.URN) : '',
+      nodeIdProp: (n.properties && n.properties.NodeID != null) ? String(n.properties.NodeID) : '',
+    };
+    columnDefs.forEach(function(col) {
+      if (col.source === 'node_col') {
+        row[col.key] = (n.properties && n.properties[col.dbField] != null) ? String(n.properties[col.dbField]) : '';
+      }
+    });
+    return row;
+  });
+
+  renderTableHeader();
+  renderTableRows(nodeRows);
+}
+
 async function loadRelationData() {
   // Auto-fetch node properties for any active node_prop columns
   var relNpCols = columnDefs.filter(function(c) { return c.source === 'node_prop' && c.visible; });
@@ -4982,14 +5490,22 @@ async function loadRelationData() {
   renderTableRows(relationRows);
 }
 
+// Columns actually shown for the currently active table mode — the single
+// source of truth used by header/row rendering AND by drag-reorder, so
+// dragged indices always line up with what the header physically shows.
+function _visibleColsForMode() {
+  return columnDefs.filter(function(c) {
+    if (!c.visible) return false;
+    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
+    if (tableViewMode === 'node')     return c.source === 'node_graph' || c.source === 'node_col';
+    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
+  });
+}
+
 function renderTableHeader() {
   var thead = document.querySelector('#data-table thead tr');
   if (!thead) return;
-  var visCols = columnDefs.filter(function(c) {
-    if (!c.visible) return false;
-    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
-    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
-  });
+  var visCols = _visibleColsForMode();
   thead.innerHTML = visCols.map(function(col, i) {
     var sortAttr = ' onclick="sortTable(\'' + col.key + '\')"';
     var sortLabel = ' <span class="col-sort-arrow">⇅</span>';
@@ -5008,26 +5524,40 @@ function renderTableHeader() {
 }
 
 function renderTableRows(rows) {
-  var visCols = columnDefs.filter(function(c) {
-    if (!c.visible) return false;
-    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
-    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
-  });
+  var visCols = _visibleColsForMode();
   var tbody = document.getElementById('table-body');
   tbody.innerHTML = '';
-  rows.forEach(function(row) {
+  rows.forEach(function(row, idx) {
     var tr = document.createElement('tr');
     if (row.edgeId) {
       tr.dataset.edgeId = row.edgeId;
-      tr.title = 'Right-click to edit properties';
+      if (_selectedTableEdgeIds.has(row.edgeId)) tr.classList.add('table-row-selected');
+      tr.title = 'Click to select (Ctrl/Cmd = add, Shift = range) · Right-click to edit properties';
       tr.style.cursor = 'context-menu';
       tr.addEventListener('contextmenu', function(evt) {
         evt.preventDefault();
         var edge = graphData.edges.find(function(e) { return e.id === row.edgeId; });
         var props = edge ? edge.properties : {};
         var name = row.relationType + ': ' + row.regulator + ' → ' + row.target;
-        showContextMenu(evt.clientX, evt.clientY, 'edge', row.edgeId, row.elementId, name, props, row.relId);
+        // In the References table view, each row is ONE reference of the relation
+        // (rows share edgeId but differ in _ref_*) — pass its unique_id through so
+        // "Edit properties" can jump straight to that specific reference instead
+        // of always showing the first one.
+        showContextMenu(evt.clientX, evt.clientY, 'edge', row.edgeId, row.elementId, name, props, row.relId, row['_ref_unique_id']);
       });
+      tr.addEventListener('click', function(evt) { _handleTableRowClick(rows, idx, evt); });
+    } else if (row.nodeId) {
+      tr.dataset.nodeId = row.nodeId;
+      if (_selectedTableNodeIds.has(row.nodeId)) tr.classList.add('table-row-selected');
+      tr.title = 'Click to select (Ctrl/Cmd = add, Shift = range) · Right-click to edit properties';
+      tr.style.cursor = 'context-menu';
+      tr.addEventListener('contextmenu', function(evt) {
+        evt.preventDefault();
+        var node = graphData.nodes.find(function(n) { return n.id === row.nodeId; });
+        var props = node ? node.properties : {};
+        showContextMenu(evt.clientX, evt.clientY, 'node', row.nodeId, row.elementId, row.name, props, '');
+      });
+      tr.addEventListener('click', function(evt) { _handleTableRowClick(rows, idx, evt); });
     }
     var cells = visCols.map(function(col) {
       var val = row[col.key];
@@ -5071,8 +5601,121 @@ function renderTableRows(rows) {
   });
 }
 
+// ─── Table ⇄ graph selection sync ──────────────────────────────────────────────
+// Clicking a table row selects the same edge in the Cytoscape graph (and vice
+// versa) — Ctrl/Cmd+click toggles a row into/out of the selection, Shift+click
+// selects a contiguous range, a plain click replaces the selection with just
+// that row. Rows sharing an edgeId (the References view can have several rows
+// per edge, one per reference) are always selected/deselected together.
+function _handleTableRowClick(rows, idx, evt) {
+  var row = rows[idx];
+  if (!row) return;
+  // Nodes-view rows carry nodeId instead of edgeId — same click semantics,
+  // just against the node selection set / cy nodes instead of edges.
+  var isNodeRow = !!row.nodeId;
+  var rowKey    = isNodeRow ? 'nodeId' : 'edgeId';
+  if (!row[rowKey]) return;
+  var selSet = isNodeRow ? _selectedTableNodeIds : _selectedTableEdgeIds;
+
+  if (evt.shiftKey && _lastClickedTableRowIdx != null && rows[_lastClickedTableRowIdx]) {
+    // Standard range-select: REPLACE the whole selection with the span between the
+    // anchor (the last row clicked WITHOUT Shift) and this row — not additive, so
+    // shift-clicking a different row re-ranges from the same anchor instead of
+    // accumulating every range ever shift-clicked. The anchor itself doesn't move,
+    // so repeated Shift+clicks keep ranging from that same first-clicked row.
+    var lo = Math.min(_lastClickedTableRowIdx, idx);
+    var hi = Math.max(_lastClickedTableRowIdx, idx);
+    var rangeIds = new Set();
+    for (var i = lo; i <= hi; i++) {
+      if (rows[i] && rows[i][rowKey]) rangeIds.add(rows[i][rowKey]);
+    }
+    selSet = rangeIds;
+  } else if (evt.ctrlKey || evt.metaKey) {
+    if (selSet.has(row[rowKey])) selSet.delete(row[rowKey]);
+    else selSet.add(row[rowKey]);
+    _lastClickedTableRowIdx = idx;
+  } else {
+    selSet = new Set([row[rowKey]]);
+    _lastClickedTableRowIdx = idx;
+  }
+
+  if (isNodeRow) _selectedTableNodeIds = selSet;
+  else           _selectedTableEdgeIds = selSet;
+
+  _applyTableRowSelectionClasses();
+  _syncGraphSelectionFromTable();
+}
+
+// Toggles the .table-row-selected class on already-rendered rows without a
+// full re-render — cheap enough to call after every selection change.
+function _applyTableRowSelectionClasses() {
+  var tbody = document.getElementById('table-body');
+  if (!tbody) return;
+  Array.prototype.forEach.call(tbody.querySelectorAll('tr[data-edge-id]'), function(tr) {
+    tr.classList.toggle('table-row-selected', _selectedTableEdgeIds.has(tr.dataset.edgeId));
+  });
+  Array.prototype.forEach.call(tbody.querySelectorAll('tr[data-node-id]'), function(tr) {
+    tr.classList.toggle('table-row-selected', _selectedTableNodeIds.has(tr.dataset.nodeId));
+  });
+}
+
+// Guards against re-entrancy between the two sync functions below. Cytoscape
+// fires 'select'/'unselect' synchronously, so cy.elements().unselect() inside
+// _syncGraphSelectionFromTable() — when something was already selected — used
+// to trigger updateSelectionInfo() -> _syncTableSelectionFromGraph() mid-call,
+// which read cy's selection at the moment everything had JUST been cleared and
+// overwrote _selectedTableEdgeIds with an empty set BEFORE the loop below got a
+// chance to re-select the new set. Net effect: Ctrl+click a second row and the
+// first one's selection (and the graph's) would vanish instead of accumulating.
+var _suppressTableGraphSync = false;
+
+// Pushes the table's selected edge ids into the Cytoscape graph selection —
+// this is the definitive selection, so it replaces whatever was selected before.
+// The table's own state (_selectedTableEdgeIds, already set by the caller) must
+// win regardless of whether the mirroring into cy fully succeeds — e.g. if an
+// edgeId doesn't (yet) resolve to a live cy element, that should just mean the
+// graph doesn't get that one selected, NOT that the table's selection gets
+// wiped back to whatever cy happens to end up with. So the whole operation,
+// including the final updateSelectionInfo() call, stays under the suppression
+// guard — updateSelectionInfo() still refreshes the stats/menu display, it just
+// can't let _syncTableSelectionFromGraph() overwrite the table's own state.
+function _syncGraphSelectionFromTable() {
+  if (!cy) return;
+  _suppressTableGraphSync = true;
+  try {
+    cy.elements().unselect();
+    var toSelect = cy.collection();
+    // Which set drives the graph depends on which table is actually showing —
+    // a node row click should select nodes, an edge/reference row click
+    // should select edges, never both at once.
+    var idSet = (tableViewMode === 'node') ? _selectedTableNodeIds : _selectedTableEdgeIds;
+    idSet.forEach(function(id) {
+      var e = cy.getElementById(id);
+      if (e && e.length) toSelect = toSelect.union(e);
+    });
+    if (toSelect.length) toSelect.select();
+    updateSelectionInfo();
+  } finally {
+    _suppressTableGraphSync = false;
+  }
+}
+
+// Reads the graph's currently selected nodes/edges back into the table's
+// selection state — called from updateSelectionInfo() so ANY graph selection
+// change (click, box-select, Select All, agent-driven selection, etc.) keeps
+// the table view showing the same rows highlighted, even while the table
+// isn't the visible view — so switching to it never shows a stale selection.
+// Both sets are always kept current regardless of the active table mode, so
+// switching between Relations/References/Nodes never loses either kind.
+function _syncTableSelectionFromGraph() {
+  if (!cy || _suppressTableGraphSync) return;
+  _selectedTableEdgeIds = new Set(cy.edges(':selected').map(function(e) { return e.id(); }));
+  _selectedTableNodeIds = new Set(cy.nodes(':selected').map(function(n) { return n.id(); }));
+  _applyTableRowSelectionClasses();
+}
+
 function filterTable(q) {
-  var sourceRows = tableViewMode === 'relation' ? relationRows : tableRows;
+  var sourceRows = _currentTableSourceRows();
   if (!q) { renderTableRows(sourceRows); return; }
   var lower = q.toLowerCase();
   var filtered = sourceRows.filter(function(row) {
@@ -5088,7 +5731,7 @@ function sortTable(col) {
     tableSortCol = col;
     tableSortAsc = true;
   }
-  var sourceRows = tableViewMode === 'relation' ? relationRows : tableRows;
+  var sourceRows = _currentTableSourceRows();
   var colDef = columnDefs.find(function(c) { return c.key === col; });
   var isNumeric = colDef && colDef.numeric;
   var sorted = sourceRows.slice().sort(function(a, b) {
@@ -5117,10 +5760,15 @@ async function openColumnsDialog() {
     sdCols  = schema.scopusColumns    || [];
   } catch(e) {}
 
-  // ── Graph columns ──────────────────────────────────────────────────────
-  var graphList = document.getElementById('col-graph-list');
+  var isNodeView = tableViewMode === 'node';
+
+  // ── Graph columns — 'graph' for Relations/References, 'node_graph' for Nodes ──
+  var graphList  = document.getElementById('col-graph-list');
+  var graphTitle = document.getElementById('col-graph-title');
+  if (graphTitle) graphTitle.textContent = isNodeView ? 'graph columns (Node view)' : 'graph columns (both views)';
   graphList.innerHTML = '';
-  columnDefs.filter(function(c) { return c.source === 'graph'; }).forEach(function(col) {
+  var graphSource = isNodeView ? 'node_graph' : 'graph';
+  columnDefs.filter(function(c) { return c.source === graphSource; }).forEach(function(col) {
     var lb = document.createElement('label');
     lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
     lb.innerHTML = '<input type="checkbox" data-col-key="' + escHtml(col.key) + '"'
@@ -5158,8 +5806,8 @@ async function openColumnsDialog() {
   // ── Reference table columns (Reference view only) ──────────────────────
   var refSection = document.getElementById('col-ref-section');
   var refList    = document.getElementById('col-ref-list');
-  if (refSection) refSection.style.display = isRelationView ? 'none' : '';
-  if (!isRelationView) {
+  if (refSection) refSection.style.display = (isRelationView || isNodeView) ? 'none' : '';
+  if (!isRelationView && !isNodeView) {
     // Match by dbField to avoid duplicating columns with custom keys (e.g. sentence/msrc).
     var refByDbField = {};
     columnDefs.forEach(function(c) { if (c.source === 'reference') refByDbField[c.dbField] = c; });
@@ -5192,7 +5840,7 @@ async function openColumnsDialog() {
   columnDefs.forEach(function(c) { if (c.source === 'scopus_data') sdByKey[c.key] = c; });
 
   sdList.innerHTML = '';
-  if (isRelationView || sdCols.length === 0) {
+  if (isRelationView || isNodeView || sdCols.length === 0) {
     if (sdSection) sdSection.style.display = 'none';
   } else {
     if (sdSection) sdSection.style.display = '';
@@ -5229,7 +5877,7 @@ async function openColumnsDialog() {
     });
   }
 
-  if (!npNodeIds.length) {
+  if (!npNodeIds.length || isNodeView) {
     if (nodePropSection) nodePropSection.style.display = 'none';
   } else {
     if (nodePropSection) nodePropSection.style.display = '';
@@ -5280,6 +5928,50 @@ async function openColumnsDialog() {
       });
   }
 
+  // ── Node columns (Node view only) — single column per property (no reg/tgt
+  // pairing, since each row already IS one specific node). Sourced from the
+  // same Postgres node/attr property list as "node properties (both views)"
+  // above; Neo4j-native properties already on graphData.nodes show up here
+  // too since /api/nodes/property-names reflects whatever attr rows exist.
+  var nodeColSection = document.getElementById('col-nodecols-section');
+  var nodeColList    = document.getElementById('col-nodecols-list');
+  var nodeColNote     = document.getElementById('col-nodecols-note');
+  if (nodeColList) nodeColList.innerHTML = '';
+  if (nodeColNote) nodeColNote.textContent = '';
+
+  if (!isNodeView || !npNodeIds.length) {
+    if (nodeColSection) nodeColSection.style.display = 'none';
+  } else {
+    if (nodeColSection) nodeColSection.style.display = '';
+    var existingNodeColMap = {};
+    columnDefs.forEach(function(c) { if (c.source === 'node_col') existingNodeColMap[c.dbField] = c; });
+
+    api('/api/nodes/property-names', { nodeIds: npNodeIds })
+      .then(function(propNames) {
+        if (!propNames || !propNames.length) {
+          if (nodeColNote) nodeColNote.textContent = 'No properties found for nodes in this pathway.';
+          return;
+        }
+        if (nodeColNote) nodeColNote.textContent = 'Data fetched automatically when the table loads.';
+        propNames.forEach(function(propName) {
+          if (!existingNodeColMap[propName]) {
+            var nc = { key: 'nc_' + propName, label: propName, visible: false, source: 'node_col', dbField: propName };
+            columnDefs.push(nc);
+            existingNodeColMap[propName] = nc;
+          }
+          var col = existingNodeColMap[propName];
+          var lb = document.createElement('label');
+          lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
+          lb.innerHTML = '<input type="checkbox" data-col-key="' + escHtml(col.key) + '"'
+            + (col.visible ? ' checked' : '') + '> ' + escHtml(propName);
+          nodeColList.appendChild(lb);
+        });
+      })
+      .catch(function() {
+        if (nodeColNote) nodeColNote.textContent = 'Could not load property list from database.';
+      });
+  }
+
   document.getElementById('columns-modal').style.display = 'flex';
 }
 
@@ -5290,12 +5982,11 @@ function closeColumnsModal(e) {
 
 function resetColumnsToDefault() {
   try { localStorage.removeItem(COL_CONFIG_KEY); } catch(e) {}
-  columnDefs = DEFAULT_COLUMNS.map(function(c) { return Object.assign({}, c); });
+  columnDefs = DEFAULT_COLUMNS.concat(DEFAULT_NODE_COLUMNS).map(function(c) { return Object.assign({}, c); });
   document.getElementById('columns-modal').style.display = 'none';
   columnWidths = null;
   if (document.getElementById('table-view').style.display !== 'none') {
-    if (tableViewMode === 'relation') { loadRelationData(); }
-    else { tableRows = []; loadTableData(); }
+    _reloadCurrentTableMode();
   }
 }
 
@@ -5317,12 +6008,7 @@ function applyColumnsDialog() {
   document.getElementById('columns-modal').style.display = 'none';
   columnWidths = null;
   if (document.getElementById('table-view').style.display !== 'none') {
-    if (tableViewMode === 'relation') {
-      loadRelationData();
-    } else {
-      tableRows = [];
-      loadTableData();
-    }
+    _reloadCurrentTableMode();
   }
 }
 
@@ -5341,16 +6027,20 @@ function colDragOver(event) {
 function colDrop(event, targetIdx) {
   event.preventDefault();
   if (_colDragSrcIdx === null || _colDragSrcIdx === targetIdx) return;
-  var visCols = columnDefs.filter(function(c) { return c.visible; });
+  // Must match exactly what's rendered in the header for the CURRENT mode —
+  // using the raw "visible" flag here (regardless of source) used to let a
+  // column visible-but-irrelevant-to-this-mode throw off the index mapping.
+  var visCols = _visibleColsForMode();
   var moved = visCols.splice(_colDragSrcIdx, 1)[0];
   visCols.splice(targetIdx, 0, moved);
-  // Rebuild columnDefs: hidden cols keep their relative order; visible cols
-  // use the newly reordered array.
-  var hidden = columnDefs.filter(function(c) { return !c.visible; });
-  columnDefs = visCols.concat(hidden);
+  // Rebuild columnDefs: everything NOT part of this view's visible set keeps
+  // its relative order, appended after the newly reordered visible set.
+  var visKeys = new Set(visCols.map(function(c) { return c.key; }));
+  var others = columnDefs.filter(function(c) { return !visKeys.has(c.key); });
+  columnDefs = visCols.concat(others);
   saveColumnConfig();
   renderTableHeader();
-  renderTableRows(tableRows);
+  renderTableRows(_currentTableSourceRows());
 }
 
 function colDragEnd(event) {
@@ -5397,11 +6087,7 @@ function autofitColumns() {
 function applyColumnWidths() {
   if (!columnWidths) return;
   var ths = document.querySelectorAll('#data-table thead tr th');
-  var visCols = columnDefs.filter(function(c) {
-    if (!c.visible) return false;
-    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j';
-    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data';
-  });
+  var visCols = _visibleColsForMode();
   ths.forEach(function(th, i) {
     var col = visCols[i];
     if (col && columnWidths[col.key]) {
@@ -5413,11 +6099,7 @@ function applyColumnWidths() {
 
 function captureColumnWidths() {
   var ths = document.querySelectorAll('#data-table thead tr th');
-  var visCols = columnDefs.filter(function(c) {
-    if (!c.visible) return false;
-    if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j';
-    return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data';
-  });
+  var visCols = _visibleColsForMode();
   columnWidths = {};
   ths.forEach(function(th, i) {
     var col = visCols[i];
@@ -5428,7 +6110,7 @@ function captureColumnWidths() {
 // Returns the currently-displayed rows respecting active filter and sort state.
 // Used by both export functions so exports always match what the user sees.
 function getActiveTableRows() {
-  var sourceRows = tableViewMode === 'relation' ? relationRows : tableRows;
+  var sourceRows = _currentTableSourceRows();
 
   // Apply filter (match what filterTable() does)
   var filterInput = document.getElementById('table-search');
@@ -6714,8 +7396,7 @@ async function findRelationsBetweenGroups(filterType) {
 
   updateStats();
   if (document.getElementById('table-view').style.display !== 'none') {
-    if (tableViewMode === 'relation') loadRelationData();
-    else { tableRows = []; loadTableData(); }
+    _reloadCurrentTableMode();
   }
   if (added === 0) alert('No new edges could be placed (nodes not found in pathway).');
 }
@@ -6845,10 +7526,135 @@ async function connectSelectedNodes(filterType) {
 
   updateStats();
   if (document.getElementById('table-view').style.display !== 'none') {
-    if (tableViewMode === 'relation') loadRelationData();
-    else { tableRows = []; loadTableData(); }
+    _reloadCurrentTableMode();
   }
   if (added === 0) alert('No new edges could be placed (nodes not found in pathway).');
+}
+
+// ─── Shortest Path dialog (Database → Shortest path…) ───────────────────────
+// Runs Neo4j's shortestPath() between every pair of currently selected nodes,
+// bounded by a max hop count and restricted to user-checked relation types.
+// The excluded-type set persists forever in localStorage (per browser) so the
+// user's preferred filter survives reloads without having to re-check anything
+// each time — new relation types default to checked since we persist the
+// EXCLUDED set, not the included one.
+var SP_EXCLUDED_KEY = 'shortest_path_excluded_reltypes_v1';
+
+function _spLoadExcluded() {
+  try { return new Set(JSON.parse(localStorage.getItem(SP_EXCLUDED_KEY) || '[]')); }
+  catch(e) { return new Set(); }
+}
+function _spSaveExcluded(excludedSet) {
+  try { localStorage.setItem(SP_EXCLUDED_KEY, JSON.stringify(Array.from(excludedSet))); } catch(e) {}
+}
+
+async function openShortestPathDialog() {
+  if (!cy || !graphData) { alert('No pathway loaded.'); return; }
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  if (selectedNodes.length < 2) {
+    showAlignHint('Please select at least two nodes to find a shortest path between them.');
+    return;
+  }
+
+  document.getElementById('sp-select-hint').style.display = 'none';
+  var listEl = document.getElementById('sp-reltype-list');
+  listEl.innerHTML = '<div style="color:#5a6080;font-size:12px;font-style:italic">Loading relation types…</div>';
+  document.getElementById('shortest-path-modal').style.display = 'flex';
+
+  var schema = await _loadSchema();
+  var types = (schema && schema.relTypes ? schema.relTypes.slice() : []).sort();
+  if (!types.length) {
+    listEl.innerHTML = '<div style="color:#e05560;font-size:12px">No relation types found in the database schema.</div>';
+    return;
+  }
+
+  var excluded = _spLoadExcluded();
+  listEl.innerHTML = '';
+  types.forEach(function(t) {
+    var label = document.createElement('label');
+    label.className = 'sp-reltype-row';
+    label.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12px;color:#c0c4d4;cursor:pointer';
+    label.innerHTML = '<input type="checkbox" class="sp-reltype-cb" value="' + escHtml(t) + '"' +
+      (excluded.has(t) ? '' : ' checked') + ' onchange="_spPersistExcluded()"><span>' + escHtml(t) + '</span>';
+    listEl.appendChild(label);
+  });
+}
+
+function _spSelectAll(checked) {
+  document.querySelectorAll('.sp-reltype-cb').forEach(function(cb) { cb.checked = checked; });
+  _spPersistExcluded();
+}
+
+function _spPersistExcluded() {
+  var excluded = new Set();
+  document.querySelectorAll('.sp-reltype-cb').forEach(function(cb) {
+    if (!cb.checked) excluded.add(cb.value);
+  });
+  _spSaveExcluded(excluded);
+}
+
+function closeShortestPathDialog(e) {
+  if (e && e.target !== document.getElementById('shortest-path-modal')) return;
+  document.getElementById('shortest-path-modal').style.display = 'none';
+}
+
+async function runShortestPath() {
+  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var nodeParams = [];
+  selectedNodes.forEach(function(n) {
+    var urn   = n.data('URN') || n.data('urn') || '';
+    var label = n.data('nodeType') || '';
+    if (urn && label) nodeParams.push({ label: label, urn: urn });
+  });
+  if (nodeParams.length < 2) {
+    alert('Selected nodes have no URN or label — cannot query database.');
+    return;
+  }
+
+  var maxLength = parseInt(document.getElementById('sp-max-length').value, 10);
+  if (!maxLength || maxLength < 1) maxLength = 2;
+
+  var checkedTypes = Array.from(document.querySelectorAll('.sp-reltype-cb:checked')).map(function(cb) { return cb.value; });
+  if (!checkedTypes.length) {
+    document.getElementById('sp-select-hint').style.display = 'block';
+    return;
+  }
+
+  document.getElementById('shortest-path-modal').style.display = 'none';
+
+  var msg = 'Connecting selected entities with relation of types: ' + checkedTypes.join(', ') +
+            ' by path no longer than: ' + maxLength;
+  setProgressMsg('⏳ ' + msg);
+
+  try {
+    var result = await api('/api/graph/shortest-path', {
+      nodeParams: nodeParams, maxLength: maxLength, relTypes: checkedTypes
+    });
+    setProgressMsg(null);
+
+    if (result.error) { alert('Shortest path error: ' + result.error); return; }
+
+    var newNodes = result.nodes || [];
+    var newEdges = result.edges || [];
+    if (!newNodes.length && !newEdges.length) {
+      alert('No path found connecting the selected nodes within ' + maxLength + ' hop(s) ' +
+            'using the checked relation types.');
+      return;
+    }
+
+    var nodeWord = newNodes.length === 1 ? 'node' : 'nodes';
+    var edgeWord = newEdges.length === 1 ? 'relation' : 'relations';
+    var summary  = 'Found ' + (result.pathsFound || 0) + ' path(s). Will add ' +
+                   newNodes.length + ' ' + nodeWord + ' and ' + newEdges.length + ' ' + edgeWord + '.';
+
+    _expandPending = { nodes: newNodes, edges: newEdges };
+    document.getElementById('expand-confirm-msg').textContent = summary;
+    document.getElementById('expand-confirm-modal').style.display = 'flex';
+
+  } catch(err) {
+    setProgressMsg(null);
+    alert('Shortest path query failed: ' + (err.message || err));
+  }
 }
 
 
@@ -7335,8 +8141,7 @@ async function mergeSimilarRelations() {
   alert('Merge complete:\n  ' + mergedGroupCount + ' group(s) merged\n  ' + removedEdgeCount + ' duplicate relation(s) removed');
   updateStats();
   if (document.getElementById('table-view').style.display !== 'none') {
-    if (tableViewMode === 'relation') { loadRelationData(); }
-    else { tableRows = []; loadTableData(); }
+    _reloadCurrentTableMode();
   }
 
   // Re-render open tooltip so its reference count reflects the merged result.
@@ -7436,9 +8241,12 @@ async function findOntologyChildren() {
 }
 
 // ─── Find ontology parents (is_a hierarchy) ──────────────────────────────────
-// For each selected node, queries Neo4j for all nodes reachable via
-// (p)<-[:is_a*]-(parent), then merges results into the graph.
-async function findOntologyParents() {
+// For each selected node, queries Neo4j for nodes reachable via
+// (p)-[:is_a*]->(parent), then merges results into the graph. `maxDepth`
+// (1-5, from the menu) caps how many levels up to climb — omit for the full,
+// unbounded ancestry chain. Deeper needs should go through Ontology analysis
+// instead, which is why the menu only offers up to 5 levels here.
+async function findOntologyParents(maxDepth) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
   var selectedNodes = cy.nodes(':selected').not('[?isClone]');
@@ -7458,9 +8266,12 @@ async function findOntologyParents() {
     return;
   }
 
-  setProgressMsg('⏳ Finding ontology parents…');
+  var depthLabel = maxDepth ? (' (up to ' + maxDepth + ' level' + (maxDepth > 1 ? 's' : '') + ' up)') : '';
+  setProgressMsg('⏳ Finding ontology parents' + depthLabel + '…');
   try {
-    var result = await api('/api/graph/ontology-parents', { nodeParams: nodeParams });
+    var payload = { nodeParams: nodeParams };
+    if (maxDepth) payload.maxDepth = maxDepth;
+    var result = await api('/api/graph/ontology-parents', payload);
     setProgressMsg(null);
 
     if (result.error) { alert('Ontology parents error: ' + result.error); return; }
@@ -7469,14 +8280,14 @@ async function findOntologyParents() {
     var newEdges = result.edges || [];
 
     if (!newNodes.length && !newEdges.length) {
-      alert('No ontology parents found for the selected node' + (nodeParams.length > 1 ? 's' : '') + '.');
+      alert('No ontology parents found' + depthLabel + ' for the selected node' + (nodeParams.length > 1 ? 's' : '') + '.');
       return;
     }
 
     var nodeWord = newNodes.length === 1 ? 'node' : 'nodes';
     var edgeWord = newEdges.length === 1 ? 'is_a relation' : 'is_a relations';
     var summary  = 'Will add ' + newNodes.length + ' ' + nodeWord +
-                   ' and ' + newEdges.length + ' ' + edgeWord + '.';
+                   ' and ' + newEdges.length + ' ' + edgeWord + depthLabel + '.';
 
     _expandPending = { nodes: newNodes, edges: newEdges };
     document.getElementById('expand-confirm-msg').textContent = summary;
@@ -7499,6 +8310,22 @@ var _ontologyTree        = [];
 var _ontologyLayout      = 'hierarchical';  // 'hierarchical' | 'orthogonal'
 var _ontologyCtxNode     = null;            // node right-clicked
 var _ontologySourceData  = null;  // when set, use this {nodes,edges} instead of cy for URNs & copy
+var _ontologyScopeIds    = null;  // Set of cy node IDs in scope when analysis was opened (null = all)
+var _ontologyHideEmpty   = true;  // "Do not show empty branches" — checked by default
+
+// graphCount is descendant-inclusive (see /api/ontology/batch-counts), so a
+// branch with graphCount === 0 has NO matching nodes anywhere under it either
+// — safe to skip the whole subtree without walking into it. null ("…" still
+// loading) and '?' (fetch failed) are left visible rather than assumed empty.
+function _ontoIsEmptyBranch(node) {
+  return _ontologyHideEmpty && typeof node.graphCount === 'number' && node.graphCount === 0;
+}
+
+function toggleOntologyHideEmpty() {
+  var cb = document.getElementById('ontology-hide-empty');
+  _ontologyHideEmpty = cb ? cb.checked : true;
+  _renderOntologyTree();
+}
 
 // ── Open / close ──────────────────────────────────────────────────────────────
 function openOntologyAnalysisFromSankey() {
@@ -7521,6 +8348,7 @@ function openOntologyAnalysisFromSankey() {
   } else {
     _ontologySourceData = _sankeyCache;
   }
+  _ontologyScopeIds = null;  // Sankey uses _ontologySourceData, not cy scope
   _openOntologyAnalysisDialog();
 }
 
@@ -7530,6 +8358,14 @@ function openOntologyAnalysis() {
     return;
   }
   _ontologySourceData = null;  // use cy
+  // Scope to selected nodes if any are selected; otherwise use all graph nodes
+  var sel = cy.nodes(':selected').not('[?isClone]');
+  if (sel.length > 0) {
+    _ontologyScopeIds = new Set();
+    sel.forEach(function(n) { _ontologyScopeIds.add(n.id()); });
+  } else {
+    _ontologyScopeIds = null;  // no selection → full graph
+  }
   _openOntologyAnalysisDialog();
 }
 
@@ -7538,13 +8374,37 @@ function _openOntologyAnalysisDialog() {
   if (!modal) return;
 
   // Reset state
-  _ontologyTree   = [];
-  _ontologyLayout = 'hierarchical';
+  _ontologyTree      = [];
+  _ontologyLayout    = 'hierarchical';
+  _ontologyHideEmpty = true;
   // Reset radio buttons
   var radios = modal.querySelectorAll('input[name="ontology-layout"]');
   radios.forEach(function(r) { r.checked = r.value === 'hierarchical'; });
+  var hideEmptyCb = document.getElementById('ontology-hide-empty');
+  if (hideEmptyCb) hideEmptyCb.checked = true;
 
   modal.style.display = 'flex';
+
+  // Show input node count in header badge
+  var badge = document.getElementById('ontology-scope-badge');
+  if (badge) {
+    var count, label;
+    if (_ontologySourceData) {
+      // Sankey context
+      count = (_ontologySourceData.nodes || []).length;
+      label = count + ' node' + (count !== 1 ? 's' : '') + ' (Sankey)';
+    } else if (_ontologyScopeIds) {
+      // Graph-view selection
+      count = _ontologyScopeIds.size;
+      label = count + ' node' + (count !== 1 ? 's' : '') + ' selected';
+    } else {
+      // Full graph
+      count = cy ? cy.nodes().not('[?isClone]').length : 0;
+      label = count + ' node' + (count !== 1 ? 's' : '') + ' (full graph)';
+    }
+    badge.textContent = '— ' + label;
+  }
+
   _renderOntologyTree();
   _setOntologyStatus('Loading root ontology groups…');
   _loadOntologyRoots();
@@ -7584,6 +8444,7 @@ function _getGraphUrns() {
   if (!cy) return [];
   var urns = [];
   cy.nodes().not('[?isClone]').forEach(function(n) {
+    if (_ontologyScopeIds && !_ontologyScopeIds.has(n.id())) return;
     var u = n.data('URN') || n.data('urn');
     if (u) urns.push(String(u));
   });
@@ -7701,11 +8562,18 @@ function _renderOntologyHierarchical(container) {
   var rows = [];
   function collect(nodes, level) {
     nodes.forEach(function(node) {
+      if (_ontoIsEmptyBranch(node)) return;  // skip the branch — descendant-inclusive count is 0
       rows.push({ node: node, level: level });
       if (node.expanded && node.children && node.children.length) collect(node.children, level + 1);
     });
   }
   collect(_ontologyTree, 0);
+
+  if (!rows.length && _ontologyHideEmpty) {
+    container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:24px;text-align:center">'
+      + 'All branches are empty (0 matching nodes) — uncheck "Hide empty branches" to see them.</div>';
+    return;
+  }
 
   var html = rows.map(function(r) {
     var node   = r.node;
@@ -7748,6 +8616,7 @@ function _renderOntologyOrthogonal(container) {
   var rows = [];
   function collect(nodes, level) {
     nodes.forEach(function(node) {
+      if (_ontoIsEmptyBranch(node)) return;  // skip the branch — descendant-inclusive count is 0
       var rowIdx = rows.length;
       rows.push({ node: node, level: level, rowIdx: rowIdx });
       if (node.expanded && node.children && node.children.length) collect(node.children, level + 1);
@@ -7756,7 +8625,12 @@ function _renderOntologyOrthogonal(container) {
   collect(_ontologyTree, 0);
 
   if (!rows.length) {
-    container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:24px;text-align:center">Loading…</div>';
+    if (_ontologyTree.length && _ontologyHideEmpty) {
+      container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:24px;text-align:center">'
+        + 'All branches are empty (0 matching nodes) — uncheck "Hide empty branches" to see them.</div>';
+    } else {
+      container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:24px;text-align:center">Loading…</div>';
+    }
     return;
   }
 
@@ -7898,9 +8772,142 @@ function _ontoEscAttr(s) {
 // ── Context-menu copy actions ─────────────────────────────────────────────────
 async function ontologyCtxAction(action) {
   _hideOntologyCtxMenu();
-  if (!_ontologyCtxNode || !cy) return;
+  if (!_ontologyCtxNode) return;
   var node = _ontologyCtxNode;
 
+  // ── "Copy ontology tree" — full hierarchy from root to entity leaves ─────
+  if (action === 'copy-tree') {
+    setProgressMsg('⏳ Fetching ontology subtree…');
+    try {
+      var graphUrns = _getGraphUrns();
+      if (!graphUrns.length) {
+        showAlignHint('No graph nodes in scope.');
+        setProgressMsg(null);
+        return;
+      }
+      var subtree = await api('/api/ontology/subtree', { urn: node.urn, graphUrns: graphUrns });
+      setProgressMsg(null);
+
+      var snodes = subtree.nodes || [], sedges = subtree.edges || [];
+      if (!snodes.length) {
+        showAlignHint('No ontology nodes found for "' + node.name + '".');
+        return;
+      }
+
+      // Assign hierarchical (tree) layout positions.
+      // Build adjacency: parent → [children] where edges go child → parent (is_a/part_of).
+      var idToNode = {};
+      snodes.forEach(function(n) { idToNode[n.id] = n; });
+
+      var children = {};  // parentId → [childId]
+      sedges.forEach(function(e) {
+        // e.startId is child, e.endId is parent (is_a / part_of direction)
+        if (!children[e.endId]) children[e.endId] = [];
+        children[e.endId].push(e.startId);
+      });
+
+      // Find root (node matching the selected ontology group URN)
+      var rootId = null;
+      snodes.forEach(function(n) {
+        var u = n.props && (n.props.URN || n.props.urn);
+        if (u && String(u) === String(node.urn)) rootId = n.id;
+      });
+      if (!rootId && snodes.length) rootId = snodes[0].id;
+
+      // BFS to assign depth levels
+      var depth = {};
+      var queue = [rootId];
+      depth[rootId] = 0;
+      while (queue.length) {
+        var cur = queue.shift();
+        (children[cur] || []).forEach(function(cid) {
+          if (depth[cid] === undefined) {
+            depth[cid] = depth[cur] + 1;
+            queue.push(cid);
+          }
+        });
+      }
+
+      // Group nodes by depth level
+      var byLevel = {};
+      snodes.forEach(function(n) {
+        var d = depth[n.id] !== undefined ? depth[n.id] : 999;
+        if (!byLevel[d]) byLevel[d] = [];
+        byLevel[d].push(n.id);
+      });
+
+      // Assign x/y positions
+      var positions = {};
+      var levelGapY = 120, nodeGapX = 160;
+      Object.keys(byLevel).sort(function(a,b){return a-b;}).forEach(function(lv) {
+        var ids = byLevel[lv];
+        var totalWidth = (ids.length - 1) * nodeGapX;
+        ids.forEach(function(id, i) {
+          positions[id] = { x: i * nodeGapX - totalWidth / 2, y: lv * levelGapY };
+        });
+      });
+
+      // Build clipboard nodes
+      var clipNodes = snodes.map(function(n) {
+        var urn = n.props && (n.props.URN || n.props.urn);
+        var label = n.props && n.props.Name || n.props && n.props.name || (n.labels[0] || 'Node');
+        var pos = positions[n.id] || { x: 0, y: 0 };
+        // Determine whether this is an entity node (in graphUrns) or an ontology node
+        var isEntity = urn && graphUrns.indexOf(String(urn)) !== -1;
+        return {
+          data: {
+            id:       n.id,
+            label:    label,
+            nodeType: n.labels[0] || 'Unknown',
+            URN:      urn ? String(urn) : undefined,
+            color:    isEntity ? getNodeColor(n.labels) : '#2a4070'
+          },
+          position: pos,
+          raw: { id: n.id, elementId: n.id, labels: n.labels, properties: n.props }
+        };
+      });
+
+      // Build clipboard edges (is_a / part_of only). These are structural
+      // ontology edges with no literature backing (RelationNumberOfReferences
+      // is always 0), so they must render with the thinnest line available —
+      // set the same cy data fields _buildCyEdgeData() would (thickness,
+      // color, lineStyle) instead of leaving them undefined, which previously
+      // made Cytoscape fall back to its default (much thicker) edge width.
+      var clipEdges = sedges.map(function(e) {
+        return {
+          data: {
+            id:        e.id,
+            source:    e.startId,
+            target:    e.endId,
+            relType:   e.relType,
+            label:     e.relType,
+            numRefs:   0,
+            thickness: getEdgeThickness(0),
+            color:     getTypeColor(e.relType),
+            lineStyle: DIRECT_TYPES.has(e.relType || '') ? 'solid' : 'dashed'
+          },
+          raw: null
+        };
+      });
+
+      graphClipboard = { nodes: clipNodes, edges: clipEdges };
+
+      var mi = document.getElementById('mi-paste');
+      if (mi) mi.classList.remove('disabled');
+      var msg = clipNodes.length + ' node' + (clipNodes.length !== 1 ? 's' : '') +
+                ' and ' + clipEdges.length + ' edge' + (clipEdges.length !== 1 ? 's' : '') +
+                ' from "' + node.name + '" ontology tree copied.';
+      var statsEl = document.getElementById('graph-stats');
+      if (statsEl) statsEl.innerHTML = '<span style="color:#2a9d2a">' + msg + '</span>';
+      showAlignHint('✓ ' + msg);
+    } catch(e) {
+      setProgressMsg(null);
+      alert('Copy ontology tree failed: ' + (e.message || e));
+    }
+    return;
+  }
+
+  if (!cy) return;
   setProgressMsg('⏳ Fetching ontology descendants…');
   try {
     var graphUrns = _getGraphUrns();
@@ -7986,7 +8993,15 @@ async function ontologyCtxAction(action) {
 
       var nodesToCopy, edgesToCopy;
       if (action === 'copy-neighborhood') {
-        var neighbors = matchedNodes.neighborhood('node').not('[?isClone]');
+        // Restrict neighborhood to nodes that were in scope when the analysis was opened.
+        // Without this, neighbors from the full graph get included, producing a copy of
+        // the entire pathway instead of just the ontology-group subtree.
+        var scopeNodes = _ontologyScopeIds
+          ? cy.nodes().not('[?isClone]').filter(function(n) { return _ontologyScopeIds.has(n.id()); })
+          : cy.nodes().not('[?isClone]');
+        var neighbors = matchedNodes.neighborhood('node').not('[?isClone]').filter(function(n) {
+          return scopeNodes.has(n);
+        });
         nodesToCopy   = matchedNodes.union(neighbors);
         edgesToCopy   = matchedNodes.edgesWith(neighbors).union(matchedNodes.edgesTo(matchedNodes));
       } else {
@@ -8483,9 +9498,10 @@ function rcRenderRefViewMode(card, ref) {
   });
   html += '</div>';
   html +=
-    '<div style="display:flex;gap:8px">' +
+    '<div style="display:flex;gap:8px;align-items:center">' +
       '<button onclick="rcEditRef()" title="Edit reference" ' +
         'style="background:#1a2a50;border:1px solid #3a3f55;border-radius:5px;color:#4f8ef7;padding:4px 12px;font-size:12px;cursor:pointer">✎ Edit</button>' +
+      '<div style="flex:1"></div>' +
       '<button onclick="rcDeleteRef()" title="Delete reference" ' +
         'style="background:#280e0e;border:1px solid #7a2020;border-radius:5px;color:#cc4040;padding:4px 10px;font-size:12px;cursor:pointer">✕ Delete</button>' +
     '</div>';
@@ -8733,7 +9749,7 @@ function closePairRelationDialog() {
 }
 
 // Open the pair Create/Edit dialog pre-populated from an existing Cytoscape edge
-function openPairRelationDialogForEdge(cyEdge) {
+function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
   if (!cy || currentRole !== 'user' || !cyEdge || !cyEdge.length) return;
 
   var srcCy = cy.$id(cyEdge.data('source'));
@@ -8755,6 +9771,9 @@ function openPairRelationDialogForEdge(cyEdge) {
   _rcPair.refsVisible = false;
   _rcPair.refsLoaded  = false;
   _rcPair._pid        = 0;
+  // When set (right-clicked a specific row in the References table), rcPairLoadRefs()
+  // jumps refIdx to this reference once the batch fetch resolves, instead of index 0.
+  _rcPair.targetRefUniqueId = targetRefUniqueId || null;
 
   // Pre-populate properties from edge data (skip structural/audit fields)
   var EDGE_SKIP = { RelationID:1, RelationIDs:1, RelationNumberOfReferences:1,
@@ -8972,6 +9991,14 @@ async function rcPairCalcRelId() {
     });
     _rcPair.currentRelId = r.relationId || '';
     document.getElementById('rcp-rel-id').textContent = _rcPair.currentRelId || '—';
+    // Right-clicked a specific row in the References table — auto-open the
+    // References panel now that we have a RelationID to fetch refs for, so
+    // the user lands directly on that reference instead of needing an extra
+    // click plus manual navigation. Guarded by !refsVisible so this only
+    // fires once (rcPairCalcRelId also re-runs on every property edit).
+    if (_rcPair.targetRefUniqueId && !_rcPair.refsVisible && !_rcPair.refsLoaded) {
+      rcPairToggleRefs();
+    }
   } catch(e) {
     document.getElementById('rcp-rel-id').textContent = '(error)';
   }
@@ -9008,7 +10035,19 @@ async function rcPairLoadRefs() {
   }
   if (!_rcPair.refs.length) _rcPair.refs = [{ _mode: 'edit', _new: true }];
   _rcPair.refsLoaded = true;
+
+  // Jump to the specific reference that was right-clicked in the References
+  // table, if any — falls back to the first reference when not found (e.g.
+  // it was deleted since the table was loaded) or when opened normally.
   _rcPair.refIdx = 0;
+  if (_rcPair.targetRefUniqueId) {
+    var foundIdx = _rcPair.refs.findIndex(function(r) {
+      return r.unique_id != null && String(r.unique_id) === String(_rcPair.targetRefUniqueId);
+    });
+    if (foundIdx >= 0) _rcPair.refIdx = foundIdx;
+    _rcPair.targetRefUniqueId = null;  // one-shot — manual navigation takes over after this
+  }
+
   rcPairRenderRefNav();
   rcPairRenderRefCard();
 }
@@ -9087,8 +10126,9 @@ function rcPairRenderRefViewMode(card, ref) {
       + '</div>';
   });
   html += '</div>';
-  html += '<div style="display:flex;gap:8px">'
+  html += '<div style="display:flex;gap:8px;align-items:center">'
     + '<button onclick="rcPairEditRef()" style="background:#1a2a50;border:1px solid #3a3f55;border-radius:5px;color:#4f8ef7;padding:4px 12px;font-size:12px;cursor:pointer">✎ Edit</button>'
+    + '<div style="flex:1"></div>'
     + '<button onclick="rcPairDeleteRef()" style="background:#280e0e;border:1px solid #7a2020;border-radius:5px;color:#cc4040;padding:4px 10px;font-size:12px;cursor:pointer">✕ Delete</button>'
     + '</div>';
   card.innerHTML = html;
@@ -9595,17 +10635,17 @@ document.addEventListener('click', function(e) {
   if (wrap && !wrap.contains(e.target)) closeSettingsMenu();
 });
 
-// ─── Neo4j settings dialog ────────────────────────────────────────────────────
+// ─── Neo4j endpoint dialog (admin only) ──────────────────────────────────────
+// Only the shared URL lives here now — database/username/password moved to
+// each user's own "My Connection" dialog below. The menu item itself is
+// hidden for non-admins (see showApp()), so this dialog assumes admin.
 async function openNeo4jSettings() {
   var errEl = document.getElementById('neo4j-settings-error');
   var okEl  = document.getElementById('neo4j-settings-success');
   errEl.style.display = 'none'; okEl.style.display = 'none';
   try {
     var s = await api('/api/settings/neo4j');
-    document.getElementById('ns-url').value      = s.url      || '';
-    document.getElementById('ns-database').value = s.database || '';
-    document.getElementById('ns-username').value = s.username || '';
-    document.getElementById('ns-password').value = '';  // never pre-fill password
+    document.getElementById('ns-url').value = s.url || '';
   } catch(e) { /* show empty form */ }
   document.getElementById('neo4j-settings-modal').style.display = 'flex';
 }
@@ -9618,44 +10658,33 @@ async function saveNeo4jSettings() {
   var okEl  = document.getElementById('neo4j-settings-success');
   var btn   = document.getElementById('ns-save-btn');
   errEl.style.display = 'none'; okEl.style.display = 'none';
-  var payload = {
-    url:      document.getElementById('ns-url').value.trim(),
-    database: document.getElementById('ns-database').value.trim(),
-    username: document.getElementById('ns-username').value.trim(),
-    password: document.getElementById('ns-password').value  // blank = keep current
-  };
-  if (!payload.url || !payload.database || !payload.username) {
-    errEl.textContent = 'URL, database, and username are required.';
-    errEl.style.display = 'block'; return;
-  }
-  btn.disabled = true; btn.textContent = 'Testing…';
+  var url = document.getElementById('ns-url').value.trim();
+  if (!url) { errEl.textContent = 'URL is required.'; errEl.style.display = 'block'; return; }
+
+  btn.disabled = true; btn.textContent = 'Saving…';
   try {
-    await api('/api/settings/neo4j', payload, 'POST');
-    okEl.textContent = 'Saved! Neo4j reconnected successfully.';
+    var result = await api('/api/settings/neo4j', { url: url }, 'POST');
+    okEl.textContent = result.warning || 'Saved! Every user reconnects with their own credentials.';
     okEl.style.display = 'block';
-    setTimeout(function() { document.getElementById('neo4j-settings-modal').style.display = 'none'; }, 1500);
+    setTimeout(function() { document.getElementById('neo4j-settings-modal').style.display = 'none'; }, 1800);
     _invalidateSchemaCache(); // reset schema autocomplete for new connection
   } catch(err) {
     errEl.textContent = err.message;
     errEl.style.display = 'block';
   } finally {
-    btn.disabled = false; btn.textContent = 'Test & Save';
+    btn.disabled = false; btn.textContent = 'Save';
   }
 }
 
-// ─── Postgres settings dialog ─────────────────────────────────────────────────
+// ─── Postgres endpoint dialog (admin only) ───────────────────────────────────
 async function openPostgresSettings() {
   var errEl = document.getElementById('pg-settings-error');
   var okEl  = document.getElementById('pg-settings-success');
   errEl.style.display = 'none'; okEl.style.display = 'none';
   try {
     var s = await api('/api/settings/postgres');
-    document.getElementById('pgs-host').value     = s.host     || '';
-    document.getElementById('pgs-port').value     = s.port     || 5432;
-    document.getElementById('pgs-database').value = s.database || '';
-    document.getElementById('pgs-schema').value   = s.schema   || '';
-    document.getElementById('pgs-username').value = s.username || '';
-    document.getElementById('pgs-password').value = '';  // never pre-fill password
+    document.getElementById('pgs-host').value = s.host || '';
+    document.getElementById('pgs-port').value = s.port || 5432;
   } catch(e) { /* show empty form */ }
   document.getElementById('postgres-settings-modal').style.display = 'flex';
 }
@@ -9669,23 +10698,117 @@ async function savePostgresSettings() {
   var btn   = document.getElementById('pgs-save-btn');
   errEl.style.display = 'none'; okEl.style.display = 'none';
   var payload = {
-    host:     document.getElementById('pgs-host').value.trim(),
-    port:     parseInt(document.getElementById('pgs-port').value) || 5432,
-    database: document.getElementById('pgs-database').value.trim(),
-    schema:   document.getElementById('pgs-schema').value.trim(),
-    username: document.getElementById('pgs-username').value.trim(),
-    password: document.getElementById('pgs-password').value
+    host: document.getElementById('pgs-host').value.trim(),
+    port: parseInt(document.getElementById('pgs-port').value) || 5432
   };
-  if (!payload.host || !payload.database || !payload.schema || !payload.username) {
-    errEl.textContent = 'Host, database, schema, and username are required.';
+  if (!payload.host) { errEl.textContent = 'Host is required.'; errEl.style.display = 'block'; return; }
+
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    var result = await api('/api/settings/postgres', payload, 'POST');
+    okEl.textContent = result.warning || 'Saved! Every user reconnects with their own credentials.';
+    okEl.style.display = 'block';
+    setTimeout(function() { document.getElementById('postgres-settings-modal').style.display = 'none'; }, 1800);
+  } catch(err) {
+    errEl.textContent = err.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save';
+  }
+}
+
+// ─── My Neo4j Connection dialog (every role) ─────────────────────────────────
+// Each user's OWN database/username/password — separate from their Graph
+// Explorer login (which stays personal and is what createdBy/updatedBy stamps
+// use). The URL is shown read-only here for visibility/sync with whatever the
+// admin has configured.
+async function openMyNeo4jSettings() {
+  var errEl = document.getElementById('my-neo4j-error');
+  var okEl  = document.getElementById('my-neo4j-success');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  try {
+    var s = await api('/api/settings/my-neo4j');
+    document.getElementById('mns-url').value      = s.url      || '';
+    document.getElementById('mns-database').value = s.database || '';
+    document.getElementById('mns-username').value = s.username || '';
+    document.getElementById('mns-password').value = '';  // never pre-fill password
+  } catch(e) { /* show empty form */ }
+  document.getElementById('my-neo4j-modal').style.display = 'flex';
+}
+function closeMyNeo4jSettingsModal(e) {
+  if (!e || e.target === document.getElementById('my-neo4j-modal'))
+    document.getElementById('my-neo4j-modal').style.display = 'none';
+}
+async function saveMyNeo4jSettings() {
+  var errEl = document.getElementById('my-neo4j-error');
+  var okEl  = document.getElementById('my-neo4j-success');
+  var btn   = document.getElementById('mns-save-btn');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  var payload = {
+    database: document.getElementById('mns-database').value.trim(),
+    username: document.getElementById('mns-username').value.trim(),
+    password: document.getElementById('mns-password').value  // blank = keep current
+  };
+  if (!payload.database || !payload.username) {
+    errEl.textContent = 'Database and username are required.';
     errEl.style.display = 'block'; return;
   }
   btn.disabled = true; btn.textContent = 'Testing…';
   try {
-    await api('/api/settings/postgres', payload, 'POST');
-    okEl.textContent = 'Saved! Postgres reconnected successfully.';
+    await api('/api/settings/my-neo4j', payload, 'POST');
+    okEl.textContent = 'Saved! Your Neo4j connection is ready.';
     okEl.style.display = 'block';
-    setTimeout(function() { document.getElementById('postgres-settings-modal').style.display = 'none'; }, 1500);
+    setTimeout(function() { document.getElementById('my-neo4j-modal').style.display = 'none'; }, 1500);
+    _invalidateSchemaCache();
+  } catch(err) {
+    errEl.textContent = err.message;
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Test & Save';
+  }
+}
+
+// ─── My Postgres Connection dialog (every role) ──────────────────────────────
+async function openMyPostgresSettings() {
+  var errEl = document.getElementById('my-pg-error');
+  var okEl  = document.getElementById('my-pg-success');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  try {
+    var s = await api('/api/settings/my-postgres');
+    document.getElementById('mpgs-host').value     = s.host     || '';
+    document.getElementById('mpgs-port').value     = s.port     || 5432;
+    document.getElementById('mpgs-database').value = s.database || '';
+    document.getElementById('mpgs-schema').value   = s.schema   || '';
+    document.getElementById('mpgs-username').value = s.username || '';
+    document.getElementById('mpgs-password').value = '';  // never pre-fill password
+  } catch(e) { /* show empty form */ }
+  document.getElementById('my-postgres-modal').style.display = 'flex';
+}
+function closeMyPostgresSettingsModal(e) {
+  if (!e || e.target === document.getElementById('my-postgres-modal'))
+    document.getElementById('my-postgres-modal').style.display = 'none';
+}
+async function saveMyPostgresSettings() {
+  var errEl = document.getElementById('my-pg-error');
+  var okEl  = document.getElementById('my-pg-success');
+  var btn   = document.getElementById('mpgs-save-btn');
+  errEl.style.display = 'none'; okEl.style.display = 'none';
+  var payload = {
+    database: document.getElementById('mpgs-database').value.trim(),
+    schema:   document.getElementById('mpgs-schema').value.trim(),
+    username: document.getElementById('mpgs-username').value.trim(),
+    password: document.getElementById('mpgs-password').value
+  };
+  if (!payload.database || !payload.schema || !payload.username) {
+    errEl.textContent = 'Database, schema, and username are required.';
+    errEl.style.display = 'block'; return;
+  }
+  btn.disabled = true; btn.textContent = 'Testing…';
+  try {
+    await api('/api/settings/my-postgres', payload, 'POST');
+    okEl.textContent = 'Saved! Your Postgres connection is ready.';
+    okEl.style.display = 'block';
+    setTimeout(function() { document.getElementById('my-postgres-modal').style.display = 'none'; }, 1500);
   } catch(err) {
     errEl.textContent = err.message;
     errEl.style.display = 'block';
@@ -9794,8 +10917,8 @@ async function deleteUser(username) {
 }
 
 // ─── Curation: context menu ───────────────────────────────────────────────────
-function showContextMenu(x, y, type, id, elementId, displayName, properties, relId) {
-  contextTarget = { type: type, id: id, elementId: elementId, displayName: displayName, properties: properties, relId: relId || '' };
+function showContextMenu(x, y, type, id, elementId, displayName, properties, relId, refUniqueId) {
+  contextTarget = { type: type, id: id, elementId: elementId, displayName: displayName, properties: properties, relId: relId || '', refUniqueId: refUniqueId || '' };
   var menu = document.getElementById('context-menu');
 
   // Show/hide clone items depending on whether target is a node and whether it's already a clone
@@ -9841,8 +10964,10 @@ function openCurationFromContext() {
       var tgtId = cyEdge.data('target');
       var endpointCount = (srcId && tgtId && srcId !== tgtId) ? 2 : 1;
       if (endpointCount === 2) {
-        // Standard 2-node relation → Create/Edit Relation (pair dialog)
-        openPairRelationDialogForEdge(cyEdge);
+        // Standard 2-node relation → Create/Edit Relation (pair dialog).
+        // refUniqueId (set when right-clicking a row in the References table)
+        // tells the dialog which specific reference to jump to once loaded.
+        openPairRelationDialogForEdge(cyEdge, contextTarget.refUniqueId);
       } else {
         // Self-loop or multi-node hyperedge → hyperedge dialog
         cy.elements().unselect();
@@ -10637,7 +11762,6 @@ async function openCurationModal(type, id, elementId, displayName, properties, r
   // For edges: load PostgreSQL references section
   if (type === 'edge' && relId) {
     var pgSection = document.createElement('div');
-    pgSection.id = 'pg-refs-section';
     pgSection.innerHTML = '<div class="prop-section-title">PostgreSQL References</div>'
       + '<div style="color:#7a8099;font-size:12px">Loading...</div>';
     container.appendChild(pgSection);
@@ -10759,6 +11883,7 @@ function emptyTabSnapshot() {
     refsCache:            {},
     medScanMap:           {},
     tableRows:            [],
+    nodeRows:             [],
     currentSubgraphName:  '',
     currentLayout:        'cose',
     currentStyle:         'default',
@@ -10768,7 +11893,9 @@ function emptyTabSnapshot() {
     activeView:           'graph',
     tableSortCol:         null,
     tableSortAsc:         true,
-    loadedPropertyNames:  []
+    loadedPropertyNames:  [],
+    selectedEdgeIds:      [],
+    selectedNodeIds:      []
   };
 }
 
@@ -10810,6 +11937,7 @@ function captureTabState() {
     refsCache:           Object.assign({}, refsCache),
     medScanMap:          Object.assign({}, medScanMap),
     tableRows:           JSON.parse(JSON.stringify(tableRows)),
+    nodeRows:            JSON.parse(JSON.stringify(nodeRows)),
     currentSubgraphName: currentSubgraphName,
     currentLayout:       currentLayout,
     currentStyle:        currentStyle,
@@ -10819,7 +11947,9 @@ function captureTabState() {
     activeView:          activeView,
     tableSortCol:        tableSortCol,
     tableSortAsc:        tableSortAsc,
-    loadedPropertyNames: Array.from(_loadedPropertyNames)
+    loadedPropertyNames: Array.from(_loadedPropertyNames),
+    selectedEdgeIds:     Array.from(_selectedTableEdgeIds),
+    selectedNodeIds:     Array.from(_selectedTableNodeIds)
   };
 }
 
@@ -10852,6 +11982,7 @@ function applyTabState(snapshot) {
     refsCache  = Object.assign({}, s.refsCache);
     medScanMap = Object.assign({}, s.medScanMap);
     tableRows  = [];
+    nodeRows   = [];
   } else {
     var hasPos = s.positions && Object.keys(s.positions).length > 0;
     var _sPosKeys = Object.keys(s.positions || {});
@@ -10869,19 +12000,30 @@ function applyTabState(snapshot) {
     // to re-fetch all references from the server (preserves MedScan IDs and
     // sentence colouring even when medScanMap hadn't finished loading at capture time).
     tableRows  = s.tableRows ? JSON.parse(JSON.stringify(s.tableRows)) : [];
+    nodeRows   = s.nodeRows  ? JSON.parse(JSON.stringify(s.nodeRows))  : [];
   }
   columnWidths = s.columnWidths ? Object.assign({}, s.columnWidths) : null;
   tableViewMode = s.tableViewMode || 'reference';
   tableSortCol  = s.tableSortCol  || null;
   tableSortAsc  = s.tableSortAsc  !== undefined ? s.tableSortAsc : true;
   syncTableModeIndicator(tableViewMode);
+
+  // Restore the table/graph selection this tab had when it was last left —
+  // renderGraph() above reset it (fresh graph data may have stale edge ids),
+  // so re-apply it now from the snapshot and push it into the freshly-rendered
+  // cy elements, then update the table's row highlighting to match.
+  _selectedTableEdgeIds = new Set(Array.isArray(s.selectedEdgeIds) ? s.selectedEdgeIds : []);
+  _selectedTableNodeIds = new Set(Array.isArray(s.selectedNodeIds) ? s.selectedNodeIds : []);
+  _syncGraphSelectionFromTable();
+  _applyTableRowSelectionClasses();
   updateSelectionInfo();
 
   // Restore the view the user was on when they left this tab.
   // Graph view was already set above (required for cy to render correctly);
   // switch to table now if that's where the user was.
   var restoredView = s.activeView || 'graph';
-  if (restoredView === 'table' && graphData.edges.length > 0) {
+  var _restoredHasData = tableViewMode === 'node' ? graphData.nodes.length > 0 : graphData.edges.length > 0;
+  if (restoredView === 'table' && _restoredHasData) {
     switchView('table');
   } else {
     updateViewMenu('graph');
@@ -11322,6 +12464,7 @@ function pasteClipboard() {
   });
 
   tableRows = [];
+  nodeRows = [];
   var pastedNodes = graphClipboard.nodes.map(function(n) {
     return n.raw || { properties: n.data };
   });
@@ -11551,3 +12694,1910 @@ document.addEventListener('click', function(e) {
     hideFindPopup();
   }
 });
+
+// ================================================================================
+// AGENTIC AI — frontend module
+// ================================================================================
+
+// ── State ────────────────────────────────────────────────────────────────────
+var _agentPanelOpen    = false;
+var _agentChatHistory    = [];   // [{role,content}]
+var _agentLastCypher     = null;
+var _agentMatchingEntities = false;  // true while async /highlights fetch is in flight
+var _agentLibraryFiles = [];
+var _llmProviders      = [];   // [{name, url}] loaded from server (admin-configured)
+var _agentConfig = (function() {
+  // Restore persisted LLM config from localStorage on page load
+  try {
+    var saved = JSON.parse(localStorage.getItem('agent_user_config_v1') || '{}');
+    return {
+      provider_name: saved.provider_name || '',
+      url:           saved.url           || '',
+      apikey:        saved.apikey        || '',
+      model_name:    saved.model_name    || '',
+      temperature:   saved.temperature   !== undefined ? saved.temperature : 0.2,
+      top_p:         saved.top_p         !== undefined ? saved.top_p         : 0.9,
+      json_mode:     saved.json_mode     || false,
+    };
+  } catch(e) { return { model_name: '', temperature: 0.2, top_p: 0.9, json_mode: false }; }
+})();
+var _agentWorkflow     = [];
+var _agentStatusTimer  = null;
+var _agentLastStatusOk    = null;   // null = unknown yet, true/false = last polled state
+var _agentPendingResume   = false;  // true when a loaded conversation still needs auto-confirmation
+var _agentResumeRetryCount = 0;     // caps automatic resume retries so a persistent failure doesn't loop forever
+
+// ── Panel open/close ─────────────────────────────────────────────────────────
+function _initAgenticAI() {
+  // Show AI Agent button for non-admin roles; LLM settings visible to all
+  var btn = document.getElementById('agentic-ai-btn');
+  if (btn) btn.style.display = (currentRole === 'admin') ? 'none' : 'inline-block';
+  var llmItem = document.getElementById('settings-llm-item');
+  if (llmItem) llmItem.style.display = 'block';
+
+  // Load provider list + global defaults from server, then overlay user's localStorage prefs
+  api('/api/settings/llm', null, 'GET').then(function(d) {
+    _llmProviders = (d.providers || []).slice();
+
+    // User's own config (already restored from localStorage at declaration time)
+    // but resolve provider URL now that we have the server list
+    if (_agentConfig.provider_name) {
+      var prov = _llmProviders.find(function(p) { return p.name === _agentConfig.provider_name; });
+      if (prov) _agentConfig.url = prov.url;
+    }
+    // If user has no personal model set, fall back to global admin defaults
+    if (!_agentConfig.model_name) {
+      _agentConfig.temperature = d.temperature !== undefined ? d.temperature : 0.2;
+      _agentConfig.top_p       = d.top_p      !== undefined ? d.top_p      : 0.9;
+      _agentConfig.json_mode   = !!d.json_mode;
+    }
+
+    // Push resolved config to agent service so status bar shows correct model immediately
+    if (_agentConfig.model_name || _agentConfig.url) {
+      var payload = { model_name:  _agentConfig.model_name  || null,
+                      url:         _agentConfig.url          || null,
+                      temperature: _agentConfig.temperature,
+                      top_p:       _agentConfig.top_p,
+                      json_mode:   _agentConfig.json_mode    || false };
+      if (_agentConfig.apikey) payload.apikey = _agentConfig.apikey;
+      api('/api/agent/llm-config', payload)
+        .catch(function(e) { console.warn('Agent LLM config push failed:', e); });
+    }
+  }).catch(function(e) { console.warn('Failed to load LLM settings:', e); });
+}
+
+function toggleAgenticPanel() {
+  var panel = document.getElementById('agentic-panel');
+  _agentPanelOpen = !_agentPanelOpen;
+  panel.style.display = _agentPanelOpen ? 'flex' : 'none';
+  if (_agentPanelOpen) {
+    _agentPollStatus();
+    document.getElementById('agent-input').focus();
+  } else {
+    clearTimeout(_agentStatusTimer);
+  }
+}
+
+function _agentPollStatus() {
+  api('/api/agent/health', null, 'GET')
+    .then(function(r) {
+      var label = r.llm_model || 'connected';
+      if (!r.has_anthropic)  label = 'anthropic package missing';
+      else if (!r.neo4j_url) label = 'Neo4j not configured';
+      _agentSetStatus(true, label);
+      var lbl = document.getElementById('agent-status-label');
+      if (lbl && r.schema_chars != null)
+        lbl.title = 'Schema: ' + r.schema_chars + ' chars (~' + Math.round(r.schema_chars / 4) + ' tokens)';
+    })
+    .catch(function(e) {
+      _agentSetStatus(false, 'service unavailable — ' + (e.message || 'check console'));
+    });
+  _agentStatusTimer = setTimeout(_agentPollStatus, 10000);
+}
+
+
+function _agentSetStatus(ok, label) {
+  var dot = document.getElementById('agent-status-dot');
+  var lbl = document.getElementById('agent-status-label');
+  if (dot) dot.style.background = ok ? '#3a9c66' : '#c0392b';
+  if (lbl) lbl.textContent = label;
+
+  // Announce the service coming back (or becoming ready for the first time
+  // this session) in the chat panel too — the header dot is easy to miss.
+  // Only fires on a genuine false→true transition, not on every healthy poll.
+  if (ok && _agentLastStatusOk === false) {
+    _agentAppendMessage('assistant', '✓ Agentic AI service is ready' + (label ? ' (' + label + ')' : '') + '.');
+    if (_agentPendingResume) {
+      _agentPendingResume = false;
+      _agentResumeContext();
+    }
+  }
+  _agentLastStatusOk = ok;
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+function agentInputKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); agentSend(); }
+}
+
+// Shown whenever the backend had to drop the oldest turns of a long conversation
+// to fit the LLM's context budget (see _HISTORY_TOKEN_BUDGET in agent_service.py).
+// This only affects what was SENT to the model for that one request — nothing is
+// deleted from _agentChatHistory, so the full conversation is still there to view
+// or save again.
+function _agentNoteHistoryTrim(result) {
+  var dropped = result && result.dropped_history_turns;
+  if (dropped) {
+    _agentAppendMessage('assistant', 'Note: this conversation is long, so the oldest ' + dropped +
+      ' message(s) were left out of what was sent to the agent this turn to stay within its context ' +
+      'limit. Nothing was deleted — your full history is still here and in any file you save.');
+  }
+}
+
+// Gives the agent real visibility into what's actually on the user's screen right
+// now — without this, the LLM has no way to know whether e.g. "BRCA1" is already
+// in the graph and can only guess from conversation history, which is exactly how
+// it can confidently state something false ("BRCA1 already exists in the graph")
+// when the graph view is actually empty.
+//
+// IMPORTANT: the edge list is not optional detail — an earlier version of this
+// summary sent only node names, and the agent (reasonably but wrongly) treated
+// "both endpoint names are somewhere in the graph" as "this relation is shown in
+// the graph". Two nodes can both be visible without the specific edge between
+// them being part of the current view (e.g. AURKA and AKT1 both shown for
+// unrelated reasons, with no AURKA→AKT1 edge actually rendered) — only the
+// explicit edge list below tells the agent which relations truly are on screen.
+//
+// Both lists are capped so a huge graph doesn't bloat every chat request — the
+// agent is told explicitly when either has been truncated.
+var _AGENT_GRAPH_STATE_NODE_CAP = 300;
+var _AGENT_GRAPH_STATE_EDGE_CAP = 300;
+function _currentGraphSummary() {
+  var nodes = (graphData && graphData.nodes) || [];
+  var edges = (graphData && graphData.edges) || [];
+
+  var nodeById = {};
+  nodes.forEach(function(n) { nodeById[n.id] = n; });
+  function nameOf(n) {
+    if (!n) return '?';
+    var p = n.properties || {};
+    return p.Name || p.name || '?';
+  }
+
+  var cappedNodes = nodes.slice(0, _AGENT_GRAPH_STATE_NODE_CAP).map(function(n) {
+    var p = n.properties || {};
+    return { name: p.Name || p.name || '', label: (n.labels && n.labels[0]) || '' };
+  });
+  var cappedEdges = edges.slice(0, _AGENT_GRAPH_STATE_EDGE_CAP).map(function(e) {
+    var p        = e.properties || {};
+    var relId    = p.RelationID != null ? String(p.RelationID) : null;
+    var effect   = p.Effect || p.effect || null;
+    var edgeInfo = {
+      relationId: relId,
+      source:     nameOf(nodeById[e.startNodeId]),
+      target:     nameOf(nodeById[e.endNodeId]),
+      type:       e.type || '',
+      effect:     effect
+    };
+    // If this edge's supporting sentences are already sitting in refsCache (fetched
+    // earlier — via a tooltip hover, "Colorize sentences", loading a saved subgraph
+    // with inline references, etc.) or inline on the edge itself, include them here
+    // for edges missing Effect. This is opportunistic only — never triggers a new
+    // fetch — so the agent can use what's already loaded instead of re-querying
+    // Postgres for data the app already has in memory. Capped per-edge so this
+    // doesn't balloon the payload for a graph with hundreds of missing-Effect edges.
+    if (!effect && relId) {
+      var cachedRefs = (refsCache && refsCache[relId]) ||
+                        (Array.isArray(p.references) ? p.references : null);
+      if (cachedRefs && cachedRefs.length) {
+        edgeInfo.sentences = cachedRefs.slice(0, 2)
+          .map(function(r) { return (r && r.msrc) ? String(r.msrc).slice(0, 300) : null; })
+          .filter(Boolean);
+        if (!edgeInfo.sentences.length) delete edgeInfo.sentences;
+      }
+    }
+    return edgeInfo;
+  });
+
+  return {
+    nodeCount:     nodes.length,
+    edgeCount:     edges.length,
+    nodes:         cappedNodes,
+    edges:         cappedEdges,
+    nodesTruncated: nodes.length > _AGENT_GRAPH_STATE_NODE_CAP,
+    edgesTruncated: edges.length > _AGENT_GRAPH_STATE_EDGE_CAP
+  };
+}
+
+async function agentSend() {
+  var input = document.getElementById('agent-input');
+  var msg = (input.value || '').trim();
+  if (!msg) return;
+  input.value = '';
+
+  _agentAppendMessage('user', msg);
+  _agentChatHistory.push({ role: 'user', content: msg });
+
+  var sendBtn  = document.getElementById('agent-send-btn');
+  var thinking = document.getElementById('agent-thinking-indicator');
+  sendBtn.disabled = true;
+
+  // Show elapsed-time counter so the user knows the agent is working
+  var _agentStartTime = Date.now();
+  var _agentTimerInterval = setInterval(function() {
+    var secs = Math.floor((Date.now() - _agentStartTime) / 1000);
+    var mins = Math.floor(secs / 60);
+    var s    = secs % 60;
+    var label = mins > 0 ? (mins + ':' + (s < 10 ? '0' : '') + s) : (secs + 's');
+    if (thinking) { thinking.textContent = '⏳ Thinking… ' + label; thinking.style.display = 'inline'; }
+  }, 1000);
+  if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'inline'; }
+
+  // Abort the request if the server takes longer than 130 s
+  var _agentAbort = new AbortController();
+  var _agentAbortTimer = setTimeout(function() { _agentAbort.abort(); }, 130000);
+
+  try {
+    var res = await fetch('/api/agent/chat', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
+      body:    JSON.stringify({ message: msg, history: _agentChatHistory.slice(0, -1), llm: _agentConfig,
+                                 current_graph: _currentGraphSummary() }),
+      signal:  _agentAbort.signal,
+    });
+    var result = await res.json().catch(function() { return {}; });
+    if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status));
+    _agentNoteHistoryTrim(result);
+
+    var reply    = result.reply || '(no reply)';
+    var histTurn = { role: 'assistant', content: reply };
+    // Keep whatever Cypher this turn produced attached to it, so it survives
+    // save/reload and still shows its own clickable box when restored.
+    if (result.generated_cypher) histTurn.cypher = result.generated_cypher;
+    else if (result.render && result.render.cypher) histTurn.cypher = result.render.cypher;
+    _agentChatHistory.push(histTurn);
+
+    // ── Display reply immediately — don't wait for entity matching ────────────
+    var bubble = _agentAppendMessage('assistant', reply, result.generated_cypher, result.cypher_results);
+
+    if (result.generated_cypher) {
+      _agentLastCypher = result.generated_cypher;
+    }
+
+    // ── Render hook — agent requested a visualization or export ──────────────
+    if (result.render && result.render.tool) {
+      _agentRenderResult(result.render);
+    }
+
+    // ── Write relation hook — agent wants to create a relation ────────────────
+    if (result.write_relation && result.write_relation.relation_id) {
+      _agentShowWriteRelModal(result.write_relation);
+    }
+
+    // ── Batch update hook — agent proposes multiple property changes ─────────
+    // (also fires when there are ONLY conflicts and nothing resolved to a value)
+    if (result.batch_update && (
+          (result.batch_update.updates   && result.batch_update.updates.length) ||
+          (result.batch_update.conflicts && result.batch_update.conflicts.length)
+        )) {
+      _agentShowBatchUpdateCard(result.batch_update);
+    }
+
+    // ── Entity matching button — user-triggered, not automatic ───────────────
+    var conceptTerms = result.concept_terms;
+    if (bubble && conceptTerms && conceptTerms.length) {
+      _agentAddMatchButton(bubble, reply, conceptTerms);
+    }
+  } catch(err) {
+    var errMsg = err.name === 'AbortError'
+      ? 'Request timed out after 130 seconds. The LLM may be overloaded — please retry.'
+      : 'Error: ' + (err.message || String(err));
+    _agentAppendMessage('error', errMsg);
+  } finally {
+    clearInterval(_agentTimerInterval);
+    clearTimeout(_agentAbortTimer);
+    sendBtn.disabled = false;
+    if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'none'; }
+  }
+}
+
+// Annotates plain text with inline colored spans for Neo4j-matched concepts.
+// Returns an HTML string (safe — unmatched portions are escHtml'd).
+function _agentHighlightConcepts(text, highlights) {
+  if (!highlights || !highlights.length) return escHtml(text);
+
+  // Sort longest term first so multi-word matches win over sub-terms
+  var sorted = highlights.slice().sort(function(a, b) { return b.term.length - a.term.length; });
+
+  var ranges = [];
+  sorted.forEach(function(h) {
+    // Search for both the original term and the matched DB name (they may differ
+    // in case or one may be an abbreviation of the other — color both in text).
+    var searchTerms = [h.term];
+    if (h.matched_name && h.matched_name.toLowerCase() !== (h.term || '').toLowerCase()) {
+      searchTerms.push(h.matched_name);
+    }
+    searchTerms.forEach(function(term) {
+      if (!term) return;
+      var re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+      var m;
+      while ((m = re.exec(text)) !== null) {
+        var s = m.index, e = m.index + m[0].length;
+        // Skip if embedded inside a longer word
+        var before = s > 0 ? text[s - 1] : ' ';
+        var after  = e < text.length ? text[e] : ' ';
+        if (/\w/.test(before) || /\w/.test(after)) continue;
+        // Skip overlapping matches
+        if (ranges.some(function(r) { return s < r.end && e > r.start; })) continue;
+        ranges.push({ start: s, end: e, highlight: h });
+      }
+    });
+  });
+  ranges.sort(function(a, b) { return a.start - b.start; });
+
+  var html = '', pos = 0;
+  ranges.forEach(function(r) {
+    if (r.start > pos) html += escHtml(text.slice(pos, r.start));
+    var h = r.highlight;
+    var color = NODE_TYPE_COLORS[h.node_type] || '#8ab4f8';
+    var tipLabel = (h.matched_name && h.matched_name !== h.term ? h.matched_name + ' · ' : '') + h.node_type + ' (in graph)';
+    html += '<span style="border-bottom:2px solid ' + color + ';color:' + color +
+            ';font-weight:500;cursor:default" title="' + escHtml(tipLabel) + '">' +
+            escHtml(text.slice(r.start, r.end)) + '</span>';
+    pos = r.end;
+  });
+  if (pos < text.length) html += escHtml(text.slice(pos));
+  return html;
+}
+
+// Add a "Find concepts" button to an assistant bubble that triggers entity highlighting on demand.
+function _agentAddMatchButton(bubble, content, conceptTerms) {
+  if (!bubble || !conceptTerms || !conceptTerms.length) return;
+  var btn = document.createElement('button');
+  btn.className = 'agent-match-btn';
+  btn.textContent = '🔍 Find concepts';
+  btn.title = 'Search graph for entities mentioned in this response';
+  btn.onclick = function() {
+    btn.disabled = true;
+    btn.textContent = '⏳ Searching…';
+    fetch('/api/agent/highlights', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
+      body:    JSON.stringify({ terms: conceptTerms }),
+    })
+    .then(function(hr) { return hr.ok ? hr.json() : Promise.resolve({}); })
+    .then(function(hdata) {
+      var hits = hdata.entity_highlights && hdata.entity_highlights.length;
+      if (hits) {
+        _agentApplyHighlights(bubble, content, hdata.entity_highlights);
+        btn.textContent = '✓ ' + hdata.entity_highlights.length + ' concept' + (hdata.entity_highlights.length === 1 ? '' : 's') + ' found';
+      } else {
+        btn.textContent = '— No concepts found';
+      }
+      btn.disabled = true;
+    })
+    .catch(function(e) {
+      console.warn('Entity highlight fetch failed:', e);
+      btn.textContent = '✗ Error — retry?';
+      btn.disabled = false;
+    });
+  };
+  bubble.appendChild(btn);
+}
+
+// Apply entity highlights to an already-displayed bubble (called after /highlights returns).
+function _agentApplyHighlights(bubble, content, highlights) {
+  if (!bubble || !highlights || !highlights.length) return;
+  bubble.style.whiteSpace = 'normal';
+  // Re-render only the text node part (first child text), preserving appended cypher/result boxes
+  var htmlContent = _agentHighlightConcepts(content, highlights).replace(/\n/g, '<br>');
+  // Insert highlighted HTML before any appended child elements (cypher box, result count)
+  var tempDiv = document.createElement('div');
+  tempDiv.innerHTML = htmlContent;
+  // Move existing appended children (cypher box etc.) to a temp holder
+  var extras = [];
+  while (bubble.firstChild) { extras.push(bubble.removeChild(bubble.firstChild)); }
+  // Re-add highlighted content nodes
+  while (tempDiv.firstChild) { bubble.appendChild(tempDiv.removeChild(tempDiv.firstChild)); }
+  // Re-add extras (cypher box, result count)
+  extras.forEach(function(el) { bubble.appendChild(el); });
+}
+
+function _agentAppendMessage(role, content, cypher, results) {
+  var container = document.getElementById('agent-chat-messages');
+  if (!container) return null;
+
+  var bubble = document.createElement('div');
+  var baseStyle = 'max-width:96%;padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word;';
+  if (role === 'user')        bubble.style.cssText = baseStyle + 'align-self:flex-end;background:#2a4a7f;color:#e0e8ff;border-bottom-right-radius:3px';
+  else if (role === 'error')  bubble.style.cssText = baseStyle + 'align-self:flex-start;background:#4a1c1c;color:#ffaaaa;border-bottom-left-radius:3px';
+  else                        bubble.style.cssText = baseStyle + 'align-self:flex-start;background:#1e2a45;color:#c8d0e8;border-bottom-left-radius:3px';
+
+  bubble.textContent = content;
+
+  if (cypher) {
+    var cypherBox = document.createElement('div');
+    cypherBox.style.cssText = 'margin-top:8px;background:#0d1220;border:1px solid #2a4a7f;border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px;color:#a0cfff;white-space:pre-wrap;word-break:break-all;cursor:pointer;user-select:text';
+    cypherBox.title = 'Click to load into Query Bar';
+    cypherBox.textContent = cypher;
+    var _hintEl = document.createElement('div');
+    _hintEl.style.cssText = 'font-size:10px;color:#4a5580;margin-top:4px;font-family:sans-serif';
+    _hintEl.textContent = 'Click to load into Query Bar';
+    cypherBox.appendChild(_hintEl);
+    cypherBox.onclick = function() { _agentLastCypher = cypher; agentLoadCypherToBar(); };
+    bubble.appendChild(cypherBox);
+  }
+  if (results && results.length > 0) {
+    var resBox = document.createElement('div');
+    resBox.style.cssText = 'margin-top:6px;font-size:11px;color:#7a8099';
+    resBox.textContent = results.length + ' row(s) returned';
+    bubble.appendChild(resBox);
+  }
+
+  container.appendChild(bubble);
+  container.scrollTop = container.scrollHeight;
+  return bubble;  // caller can use this to apply highlights later
+}
+
+// ── Batch update checkbox card ───────────────────────────────────────────────
+// Rendered inline in the chat any time the agent proposes multiple property
+// changes at once (e.g. inferred Effect signs from supporting sentences). Every
+// row defaults to checked; the user can uncheck any assertion they disagree
+// with before applying. The actual write happens via /api/agent/batch-write
+// for just the checked subset — the agent itself never executes this write.
+var _agentBatchCardSeq = 0;
+var _agentBatchCards   = {};  // cardId -> { property, updates }
+
+function _agentShowBatchUpdateCard(bu) {
+  var container = document.getElementById('agent-chat-messages');
+  var updates   = (bu && bu.updates)   || [];
+  var conflicts = (bu && bu.conflicts) || [];
+  if (!container || !bu || (!updates.length && !conflicts.length)) return;
+
+  var cardId    = 'agent-batch-card-' + (++_agentBatchCardSeq);
+  var itemClass = cardId + '-item';   // shared by both update and conflict checkboxes
+  _agentBatchCards[cardId] = { property: bu.property || 'Effect', updates: updates.slice(), conflicts: conflicts.slice() };
+
+  var card = document.createElement('div');
+  card.id = cardId;
+  card.style.cssText = 'align-self:flex-start;max-width:96%;background:#1e2a45;border:1px solid #2a4a7f;' +
+    'border-radius:10px;padding:10px 12px;font-size:12px;color:#c8d0e8';
+
+  var header = document.createElement('div');
+  header.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:10px';
+  var title = document.createElement('div');
+  title.style.cssText = 'font-weight:600;color:#e0e8ff';
+  var countParts = [];
+  if (updates.length)   countParts.push(updates.length + ' suggestion' + (updates.length !== 1 ? 's' : ''));
+  if (conflicts.length) countParts.push(conflicts.length + ' conflict' + (conflicts.length !== 1 ? 's' : ''));
+  title.textContent = (bu.description || ('Proposed ' + bu.property + ' updates')) + ' — ' + countParts.join(', ');
+  header.appendChild(title);
+
+  var selAllWrap = document.createElement('label');
+  selAllWrap.style.cssText = 'display:flex;align-items:center;gap:5px;font-size:11px;color:#9aa2c0;cursor:pointer;white-space:nowrap;flex-shrink:0';
+  var selAllCb = document.createElement('input');
+  selAllCb.type = 'checkbox';
+  selAllCb.checked = true;
+  selAllWrap.appendChild(selAllCb);
+  selAllWrap.appendChild(document.createTextNode('Select all'));
+  header.appendChild(selAllWrap);
+  card.appendChild(header);
+
+  var list = null;
+  if (updates.length) {
+    list = document.createElement('div');
+    list.style.cssText = 'display:flex;flex-direction:column;gap:6px;max-height:360px;overflow-y:auto;margin-bottom:10px';
+
+    updates.forEach(function(u, i) {
+      var row = document.createElement('label');
+      row.style.cssText = 'display:flex;gap:8px;align-items:flex-start;background:#151b2e;border-radius:6px;padding:6px 8px;cursor:pointer';
+
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.className = itemClass;
+      cb.dataset.kind = 'update';
+      cb.dataset.idx = i;
+      cb.style.cssText = 'margin-top:2px;flex-shrink:0';
+      row.appendChild(cb);
+
+      var body = document.createElement('div');
+      body.style.cssText = 'flex:1;min-width:0';
+
+      var valStr = String(u.value || '');
+      var valColor = /positive/i.test(valStr) ? '#4caf50' : (/negative/i.test(valStr) ? '#e57373' : '#b0b8d0');
+      var line1 = document.createElement('div');
+      line1.style.cssText = 'color:#e0e8ff';
+      line1.innerHTML = '<b>' + _esc(u.source || '?') + '</b> → <b>' + _esc(u.target || '?') + '</b>' +
+        (u.relationType ? ' <span style="color:#7a8099">(' + _esc(u.relationType) + ')</span>' : '') +
+        ' — ' + _esc(bu.property || 'Effect') + ': ' +
+        '<span style="color:' + valColor + ';font-weight:600">' + _esc(valStr) + '</span>';
+      body.appendChild(line1);
+
+      if (u.sentence) {
+        var sentEl = document.createElement('div');
+        sentEl.style.cssText = 'margin-top:3px;color:#8a92ad;font-style:italic;font-size:11px;line-height:1.4';
+        sentEl.textContent = '“' + u.sentence + '”';
+        body.appendChild(sentEl);
+      }
+      row.appendChild(body);
+      list.appendChild(row);
+    });
+    card.appendChild(list);
+  }
+
+  // ── Conflicting evidence — the agent deliberately did not pick a side.
+  // Each row gets its own Positive/Negative/Unknown dropdown (defaulting to
+  // Unknown) plus a checkbox (checked by default, like the updates above) so
+  // "Apply" can include or skip it the same way as an inferred suggestion.
+  var conflictSelectClass = cardId + '-conflict-select';
+  if (conflicts.length) {
+    var conflictWrap = document.createElement('div');
+    conflictWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;max-height:360px;overflow-y:auto;margin-bottom:10px';
+
+    var conflictHeader = document.createElement('div');
+    conflictHeader.style.cssText = 'color:#e0b34a;font-size:11px;font-weight:600;display:flex;align-items:center;gap:5px';
+    conflictHeader.textContent = '⚠ Conflicting evidence — you decide';
+    conflictWrap.appendChild(conflictHeader);
+
+    conflicts.forEach(function(c, i) {
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;align-items:flex-start;background:#2a2214;border:1px solid #4a3c1a;border-radius:6px;padding:6px 8px';
+
+      var cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.className = itemClass;
+      cb.dataset.kind = 'conflict';
+      cb.dataset.idx = i;
+      cb.style.cssText = 'margin-top:2px;flex-shrink:0';
+      row.appendChild(cb);
+
+      var body = document.createElement('div');
+      body.style.cssText = 'flex:1;min-width:0';
+
+      var line1 = document.createElement('div');
+      line1.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;color:#e0e8ff;flex-wrap:wrap';
+
+      var label = document.createElement('span');
+      label.innerHTML = '<b>' + _esc(c.source || '?') + '</b> → <b>' + _esc(c.target || '?') + '</b>' +
+        (c.relationType ? ' <span style="color:#7a8099">(' + _esc(c.relationType) + ')</span>' : '');
+      line1.appendChild(label);
+
+      var select = document.createElement('select');
+      select.className = conflictSelectClass;
+      select.dataset.idx = i;
+      select.style.cssText = 'background:#151b2e;border:1px solid #4a3c1a;border-radius:5px;color:#e0e8ff;font-size:11px;padding:3px 6px;cursor:pointer';
+      ['Positive', 'Negative', 'Unknown'].forEach(function(v) {
+        var o = document.createElement('option');
+        o.value = v;
+        o.textContent = v;
+        select.appendChild(o);
+      });
+      select.value = 'Unknown';  // default choice
+      line1.appendChild(select);
+      body.appendChild(line1);
+
+      (c.sentences || []).forEach(function(s) {
+        var dirStr = String(s.direction || '');
+        var dirColor = /positive/i.test(dirStr) ? '#4caf50' : (/negative/i.test(dirStr) ? '#e57373' : '#b0b8d0');
+        var sentEl = document.createElement('div');
+        sentEl.style.cssText = 'margin-top:4px;font-size:11px;line-height:1.4';
+        sentEl.innerHTML = '<span style="color:' + dirColor + ';font-weight:600">' + _esc(dirStr || '?') + '</span>' +
+          ' <span style="color:#8a92ad;font-style:italic">“' + _esc(s.text || '') + '”</span>';
+        body.appendChild(sentEl);
+      });
+      row.appendChild(body);
+      conflictWrap.appendChild(row);
+    });
+    card.appendChild(conflictWrap);
+  }
+
+  var footer = document.createElement('div');
+  footer.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;align-items:center';
+  var statusEl = document.createElement('span');
+  statusEl.style.cssText = 'font-size:11px;color:#7a8099;margin-right:auto';
+  footer.appendChild(statusEl);
+
+  var dismissBtn = document.createElement('button');
+  dismissBtn.textContent = 'Dismiss';
+  dismissBtn.style.cssText = 'background:none;border:1px solid #3a4570;color:#a0a8c8;border-radius:6px;padding:6px 12px;font-size:12px;cursor:pointer';
+  dismissBtn.onclick = function() { card.remove(); };
+  footer.appendChild(dismissBtn);
+
+  var applyBtn = document.createElement('button');
+  applyBtn.style.cssText = 'background:#2a6f4a;border:none;color:#eafff0;border-radius:6px;padding:6px 14px;font-size:12px;cursor:pointer;font-weight:600';
+  applyBtn.onclick = function() { _agentApplyBatchUpdate(cardId, applyBtn, statusEl, card, dismissBtn, selAllCb); };
+  footer.appendChild(applyBtn);
+
+  function _allCheckboxes() { return card.querySelectorAll('input.' + itemClass); }
+
+  function _refreshSelectAll() {
+    var all     = _allCheckboxes();
+    var checked = card.querySelectorAll('input.' + itemClass + ':checked');
+    selAllCb.checked = all.length > 0 && checked.length === all.length;
+    selAllCb.indeterminate = checked.length > 0 && checked.length < all.length;
+  }
+
+  function _updateApplyLabel() {
+    var n = card.querySelectorAll('input.' + itemClass + ':checked').length;
+    applyBtn.textContent = 'Apply selected (' + n + ')';
+    applyBtn.disabled = (n === 0);
+    applyBtn.style.opacity = (n === 0) ? '0.5' : '1';
+  }
+
+  selAllCb.onclick = function() {
+    _allCheckboxes().forEach(function(cb2) { cb2.checked = selAllCb.checked; });
+    _updateApplyLabel();
+  };
+  card.addEventListener('change', function(e) {
+    if (e.target && e.target.classList.contains(itemClass)) {
+      _refreshSelectAll();
+      _updateApplyLabel();
+    }
+  });
+  _updateApplyLabel();
+
+  card.appendChild(footer);
+  container.appendChild(card);
+  container.scrollTop = container.scrollHeight;
+}
+
+async function _agentApplyBatchUpdate(cardId, btn, statusEl, card, dismissBtn, selAllCb) {
+  var entry = _agentBatchCards[cardId];
+  if (!entry) return;
+  var conflictSelectClass = cardId + '-conflict-select';
+
+  var updates = [];
+  card.querySelectorAll('input[type=checkbox]:checked').forEach(function(cb) {
+    if (cb.dataset.idx === undefined) return;
+    var i = parseInt(cb.dataset.idx, 10);
+    if (cb.dataset.kind === 'conflict') {
+      var c = (entry.conflicts || [])[i];
+      if (!c) return;
+      var select = card.querySelector('select.' + conflictSelectClass + '[data-idx="' + i + '"]');
+      var value  = select ? select.value : 'Unknown';
+      updates.push({ relationId: c.relationId, value: value, relationType: c.relationType || '' });
+    } else {
+      var u = entry.updates[i];
+      if (!u) return;
+      // relationType lets the backend scope its MATCH to one relationship type
+      // instead of scanning every relationship in the database.
+      updates.push({ relationId: u.relationId, value: u.value, relationType: u.relationType || '' });
+    }
+  });
+
+  if (!updates.length) {
+    statusEl.style.color = '#e5a13a';
+    statusEl.textContent = 'Nothing selected.';
+    return;
+  }
+
+  var totalProposed = (entry.updates ? entry.updates.length : 0) + (entry.conflicts ? entry.conflicts.length : 0);
+
+  btn.disabled = true;
+  btn.textContent = 'Applying…';
+  statusEl.style.color = '#7a8099';
+  statusEl.textContent = '';
+
+  try {
+    var result = await api('/api/agent/batch-write', { property: entry.property, updates: updates, username: currentUser || '' });
+    var updated = (result && typeof result.updatedCount === 'number') ? result.updatedCount : updates.length;
+    statusEl.style.color = '#4caf50';
+    statusEl.textContent = '✓ Updated ' + updated + ' relation(s).';
+    btn.textContent = 'Applied ✓';
+
+    // Reflect the change in the currently displayed graph immediately — the
+    // write above only touched Neo4j, so without this the tooltip, Edit
+    // Properties dialog, and Effect-based arrow shapes would keep showing
+    // stale values until the user re-ran a query.
+    _applyBatchUpdateToLocalGraph(entry.property, updates);
+
+    // Lock the card so it can't be re-applied by accident
+    card.querySelectorAll('input[type=checkbox], select.' + conflictSelectClass).forEach(function(el) { el.disabled = true; });
+    if (selAllCb) selAllCb.disabled = true;
+    if (dismissBtn) dismissBtn.textContent = 'Close';
+
+    // Echo into chat history so a save/reload of the conversation keeps a record
+    _agentChatHistory.push({
+      role: 'assistant',
+      content: '✓ Applied ' + entry.property + ' update to ' + updated + ' relation(s) (' +
+        updates.length + ' selected of ' + totalProposed + ' proposed).'
+    });
+  } catch (err) {
+    statusEl.style.color = '#e57373';
+    statusEl.textContent = 'Failed: ' + (err.message || String(err));
+    btn.disabled = false;
+    btn.textContent = 'Apply selected (' + updates.length + ')';
+  }
+}
+
+// Patch graphData + the live Cytoscape elements so a just-applied batch_update
+// shows up immediately (tooltip, Edit Properties dialog, Effect arrow shapes)
+// without requiring the user to re-run a query. Matches by RelationID, and
+// also checks the list-valued RelationIDs some merged relations carry.
+function _applyBatchUpdateToLocalGraph(property, updates) {
+  if (!updates || !updates.length) return;
+  var byId = {};
+  updates.forEach(function(u) { byId[String(u.relationId)] = u.value; });
+
+  function matchesAny(rid, ridList) {
+    if (rid != null && byId.hasOwnProperty(String(rid))) return byId[String(rid)];
+    if (Array.isArray(ridList)) {
+      for (var i = 0; i < ridList.length; i++) {
+        if (byId.hasOwnProperty(String(ridList[i]))) return byId[String(ridList[i])];
+      }
+    }
+    return undefined;
+  }
+
+  // graphData — source of truth for context-menu / re-render paths
+  if (graphData && Array.isArray(graphData.edges)) {
+    graphData.edges.forEach(function(e) {
+      var p = e.properties || {};
+      var val = matchesAny(p.RelationID, p.RelationIDs);
+      if (val !== undefined) {
+        e.properties[property] = val;
+        e.properties[property.toLowerCase()] = val;  // some readers check the lowercase key
+      }
+    });
+  }
+
+  // Live Cytoscape elements — so tooltip / arrow shape / Edit Properties dialog
+  // (all of which read cy edge .data() directly) update without a re-render.
+  if (cy) {
+    cy.edges().forEach(function(ele) {
+      var val = matchesAny(ele.data('relId'), ele.data('relIds'));
+      if (val === undefined) return;
+      var dataKey = property.charAt(0).toLowerCase() + property.slice(1);  // Effect -> effect
+      ele.data(dataKey, property === 'Effect' ? normEffectDisplay(val) : val);
+    });
+  }
+}
+
+function agentLoadCypherToBar() {
+  if (!_agentLastCypher) return;
+  // Ensure the query bar is visible
+  var bar = document.getElementById('query-bar');
+  if (bar && bar.style.display === 'none') bar.style.display = '';
+  // Load into textarea and trigger auto-resize
+  var input = document.getElementById('cypher-input') || document.querySelector('textarea[placeholder*="Cypher"]');
+  if (input) {
+    input.value = _agentLastCypher;
+    if (typeof cypherAutoResize === 'function') cypherAutoResize(input);
+    input.dispatchEvent(new Event('input'));
+    setTimeout(function() { input.focus(); }, 50);
+  }
+  if (window.cypherEditor && window.cypherEditor.setValue) window.cypherEditor.setValue(_agentLastCypher);
+}
+
+function agentClearChat() {
+  _agentChatHistory = [];
+  _agentLastCypher  = null;
+  var container = document.getElementById('agent-chat-messages');
+  if (container) container.innerHTML = '<div style="text-align:center;color:#5a6080;font-size:12px;padding:20px 0">Ask anything about your graph &mdash; I can translate natural language to Cypher, run queries, and chain multi-step workflows.</div>';
+}
+
+// ── Save / load conversation to a local file ──────────────────────────────────
+// Lets the user archive a chat and later reload it (in this session or a future
+// one, on any machine) to continue where they left off — the agent is primed
+// with the restored history automatically (see _agentResumeContext below).
+function agentSaveConversation() {
+  if (!_agentChatHistory.length) { alert('No conversation to save yet.'); return; }
+
+  var saveData = {
+    type:       'graph-explorer-agent-conversation',
+    version:    2,   // v2 adds lastCypher + per-turn cypher on messages
+    savedAt:    new Date().toISOString(),
+    model:      _agentConfig.model_name || '',
+    lastCypher: _agentLastCypher || null,
+    messages:   _agentChatHistory
+  };
+
+  var blob = new Blob([JSON.stringify(saveData, null, 2)], { type: 'application/json' });
+  var url  = URL.createObjectURL(blob);
+  var a    = document.createElement('a');
+  var stamp = saveData.savedAt.replace(/[:.]/g, '-').slice(0, 19);
+  a.href = url;
+  a.download = 'agent-conversation_' + stamp + '.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function agentTriggerLoadConversation() {
+  var input = document.getElementById('agent-load-conv-input');
+  if (input) input.click();
+}
+
+function agentLoadConversationFile(event) {
+  var file = event.target.files[0];
+  if (!file) return;
+  event.target.value = '';  // allow re-selecting the same file later
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var data;
+    try {
+      data = JSON.parse(e.target.result);
+    } catch (err) {
+      alert('Could not parse this file as JSON: ' + err.message);
+      return;
+    }
+
+    // Accept either the { messages: [...] } format this app saves, or a bare
+    // array of {role, content} turns (in case a file was hand-edited/exported).
+    var raw = Array.isArray(data.messages) ? data.messages : (Array.isArray(data) ? data : null);
+    if (!raw || !raw.length) {
+      alert('This file does not contain a saved conversation.');
+      return;
+    }
+    var messages = raw.filter(function(m) {
+      return m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant');
+    });
+    if (!messages.length) {
+      alert('No valid messages found in this file.');
+      return;
+    }
+
+    _agentChatHistory = messages;
+
+    // Restore the last developed Cypher query. Prefer the explicit top-level
+    // field (saved by the current app version); fall back to scanning the
+    // messages for the most recent one that carried a `cypher` field, for
+    // files saved before that field existed.
+    var restoredCypher = data.lastCypher || null;
+    if (!restoredCypher) {
+      for (var i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].cypher) { restoredCypher = messages[i].cypher; break; }
+      }
+    }
+    _agentLastCypher = restoredCypher || null;
+
+    // Re-render the chat panel with the restored turns (including each
+    // turn's own Cypher box, if it had one)
+    var container = document.getElementById('agent-chat-messages');
+    if (container) container.innerHTML = '';
+    messages.forEach(function(m) { _agentAppendMessage(m.role, m.content, m.cypher); });
+
+    if (!_agentPanelOpen) toggleAgenticPanel();
+
+    // Load the last query straight into the Query Bar so it's one click
+    // (▶ Run) away — no need to dig through the chat to re-run it.
+    var cypherNote = '';
+    if (_agentLastCypher) {
+      agentLoadCypherToBar();
+      cypherNote = ' The last Cypher query from this conversation has been loaded into the Query Bar — click ▶ Run to re-execute it.';
+    }
+
+    var savedLabel = data.savedAt ? ' (saved ' + new Date(data.savedAt).toLocaleString() + ')' : '';
+    _agentAppendMessage('assistant', 'Conversation restored — ' + messages.length + ' message(s)' + savedLabel + '.' + cypherNote + ' Asking the agent to confirm it has the context…');
+
+    _agentPendingResume    = false;
+    _agentResumeRetryCount = 0;
+    _agentResumeContext();
+  };
+  reader.readAsText(file);
+}
+
+// After loading a saved conversation, silently prime the agent with the full
+// restored history so it can "read" the context before the user types anything.
+// The priming turn is added to _agentChatHistory (so it stays part of the
+// record and is included if the conversation is saved again), but the request
+// text itself is not shown as its own chat bubble — only the agent's reply is.
+async function _agentResumeContext() {
+  var thinking = document.getElementById('agent-thinking-indicator');
+  if (thinking) { thinking.textContent = '⏳ Reading restored context…'; thinking.style.display = 'inline'; }
+
+  var cypherNote = _agentLastCypher
+    ? ('\n\nFor reference, the last Cypher query developed in this conversation was:\n```\n' +
+       _agentLastCypher + '\n```\nIt has already been loaded into the app\'s Query Bar for the user ' +
+       'to re-run — you do not need to regenerate it unless the user asks for changes.')
+    : '';
+  var resumeMsg = '[This conversation was just restored from a saved file. Briefly confirm in ' +
+    'one or two sentences what we were discussing based on the history above, then wait for my ' +
+    'next message — do not run any new queries or actions yet.]' + cypherNote;
+  _agentChatHistory.push({ role: 'user', content: resumeMsg });
+
+  try {
+    var res = await fetch('/api/agent/chat', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
+      body:    JSON.stringify({
+        message: resumeMsg,
+        history: _agentChatHistory.slice(0, -1),
+        llm:     _agentConfig,
+        current_graph: _currentGraphSummary(),
+      }),
+    });
+    var result = await res.json().catch(function() { return {}; });
+    if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status));
+    _agentNoteHistoryTrim(result);
+
+    var reply = result.reply || '(no reply)';
+    _agentChatHistory.push({ role: 'assistant', content: reply });
+    _agentAppendMessage('assistant', reply);
+  } catch (err) {
+    // Restoring the history itself already succeeded — only the automatic
+    // confirmation round-trip failed. The user can still just start typing;
+    // the full restored history will go out with their next message.
+    _agentChatHistory.pop();  // drop the un-answered priming turn
+
+    var msg = err.message || String(err);
+    var isStarting = /starting|unavailable/i.test(msg);
+    if (isStarting && _agentResumeRetryCount < 3) {
+      // Service isn't up yet — wait for the next health poll to flip to "ready"
+      // (see _agentSetStatus) and retry automatically instead of leaving a
+      // stale error the user has to notice and act on themselves.
+      _agentResumeRetryCount++;
+      _agentPendingResume = true;
+      _agentAppendMessage('assistant', 'Agentic AI service is still starting — I\'ll automatically finish confirming the restored context as soon as it\'s ready.');
+    } else {
+      _agentAppendMessage('error', 'Could not auto-confirm context with the agent: ' + msg +
+        '. The history is still restored — you can continue the conversation normally.');
+    }
+  } finally {
+    if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'none'; }
+  }
+}
+
+// ── Library browser ───────────────────────────────────────────────────────────
+function openAgentLibrary() {
+  document.getElementById('agent-library-modal').style.display = 'flex';
+  agentLibraryRefresh();
+}
+function closeAgentLibrary() {
+  document.getElementById('agent-library-modal').style.display = 'none';
+}
+
+async function agentLibraryRefresh() {
+  var list = document.getElementById('agent-library-list');
+  list.innerHTML = '<div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">Loading...</div>';
+  try {
+    var data = await api('/api/agent/library', null, 'GET');
+    _agentLibraryFiles = data.files || [];
+    _renderLibraryList(_agentLibraryFiles);
+  } catch(e) {
+    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load library: ' + e.message + '</div>';
+  }
+}
+
+function agentLibraryFilter(q) {
+  var lower = q.toLowerCase();
+  _renderLibraryList(_agentLibraryFiles.filter(function(f) {
+    return f.name.toLowerCase().includes(lower) || (f.description || '').toLowerCase().includes(lower);
+  }));
+}
+
+function _renderLibraryList(files) {
+  var list = document.getElementById('agent-library-list');
+  if (!files.length) {
+    list.innerHTML = '<div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">No files found.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  files.forEach(function(f) {
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;background:#252a40;border:1px solid #2a3050;border-radius:6px;padding:10px 12px';
+    var desc = escHtml(f.description || '') + (f.steps ? ' &middot; ' + f.steps + ' step(s)' : '') + (f.created ? ' &middot; ' + f.created.slice(0,10) : '');
+    row.innerHTML =
+      '<div style="flex:1;min-width:0">' +
+        '<div style="font-size:13px;color:#e0e0e0;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escHtml(f.name) + '</div>' +
+        '<div style="font-size:11px;color:#5a6080;margin-top:2px">' + desc + '</div>' +
+      '</div>' +
+      '<button onclick="agentLibraryLoad(\'' + f.id + '\')" style="padding:4px 10px;background:#4f8ef7;border:none;border-radius:4px;color:#fff;font-size:11px;cursor:pointer;white-space:nowrap">Load</button>' +
+      '<button onclick="agentLibraryDelete(\'' + f.id + '\',this)" style="padding:4px 10px;background:transparent;border:1px solid #4a1c1c;border-radius:4px;color:#ff6b6b;font-size:11px;cursor:pointer;white-space:nowrap">Delete</button>';
+    list.appendChild(row);
+  });
+}
+
+async function agentLibraryLoad(fileId) {
+  try {
+    var data = await api('/api/agent/library/' + fileId, null, 'GET');
+    if (data.llm_config) Object.assign(_agentConfig, data.llm_config);
+    if (data.workflow && data.workflow.length) { _agentWorkflow = data.workflow; _syncWorkflowBtn(); }
+    var summary = 'Loaded: ' + data.name + (data.description ? '\n' + data.description : '');
+    if (data.notes) summary += '\n\nNotes: ' + data.notes;
+    if (data.workflow && data.workflow.length) {
+      summary += '\n\nWorkflow steps:\n' + data.workflow.map(function(s, i) {
+        return (i+1) + '. [' + s.type + '] ' + (s.description || s.prompt_template || '');
+      }).join('\n');
+    }
+    _agentAppendMessage('assistant', summary);
+    closeAgentLibrary();
+  } catch(e) { alert('Failed to load file: ' + e.message); }
+}
+
+async function agentLibraryDelete(fileId, btn) {
+  if (!confirm('Delete this library file?')) return;
+  btn.disabled = true;
+  try {
+    await api('/api/agent/library/' + fileId, null, 'DELETE');
+    agentLibraryRefresh();
+  } catch(e) { alert('Delete failed: ' + e.message); btn.disabled = false; }
+}
+
+function agentLibrarySaveNew() {
+  closeAgentLibrary();
+  document.getElementById('asave-name').value        = '';
+  document.getElementById('asave-description').value = '';
+  document.getElementById('asave-notes').value       = '';
+  document.getElementById('asave-error').style.display = 'none';
+  document.getElementById('agent-save-modal').style.display = 'flex';
+}
+
+async function agentLibraryDoSave() {
+  var name = (document.getElementById('asave-name').value || '').trim();
+  if (!name) {
+    document.getElementById('asave-error').textContent = 'Name is required';
+    document.getElementById('asave-error').style.display = 'block';
+    return;
+  }
+  try {
+    await api('/api/agent/library', {
+      name:        name,
+      description: document.getElementById('asave-description').value || '',
+      notes:       document.getElementById('asave-notes').value || '',
+      llm_config:  _agentConfig,
+      workflow:    _agentWorkflow,
+    });
+    closeAgentSave();
+  } catch(e) {
+    document.getElementById('asave-error').textContent = 'Save failed: ' + e.message;
+    document.getElementById('asave-error').style.display = 'block';
+  }
+}
+
+function closeAgentSave() {
+  document.getElementById('agent-save-modal').style.display = 'none';
+}
+
+// ── Cypher Examples browser ───────────────────────────────────────────────────
+// Exposes cypher_examples.json (the file that seeds the agent's "Cypher Query
+// Examples" system-prompt section) so users know it exists and can grow it —
+// add patterns/rules the agent keeps missing — without hand-editing a file on disk.
+var _agentExamplesCache  = [];   // in-memory mirror of cypher_examples.json
+var _agentExampleEditIdx = -1;   // -1 = adding new, >=0 = editing that index
+
+function openAgentExamples() {
+  document.getElementById('agent-examples-modal').style.display = 'flex';
+  agentExamplesRefresh();
+}
+function closeAgentExamples() {
+  document.getElementById('agent-examples-modal').style.display = 'none';
+}
+
+async function agentExamplesRefresh() {
+  var list = document.getElementById('agent-examples-list');
+  list.innerHTML = '<div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">Loading…</div>';
+  document.getElementById('aex-search-input').value = '';
+  document.getElementById('aex-sort-select').value  = 'rule';
+  try {
+    var data = await api('/api/agent/examples', null, 'GET');
+    _agentExamplesCache = data.examples || [];
+    _aexRender();
+  } catch(e) {
+    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load examples: ' + e.message + '</div>';
+  }
+}
+
+// Wraps every case-insensitive occurrence of `term` in <mark class="aex-hit">,
+// escaping both sides identically first so highlighting can't re-inject HTML.
+function _aexHighlight(text, term) {
+  var escaped = escHtml(text || '');
+  if (!term) return escaped;
+  var escTerm = escHtml(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!escTerm) return escaped;
+  return escaped.replace(new RegExp('(' + escTerm + ')', 'ig'), '<mark class="aex-hit">$1</mark>');
+}
+
+function _aexRender() {
+  var list    = document.getElementById('agent-examples-list');
+  var status  = document.getElementById('agent-examples-status');
+  var countEl = document.getElementById('agent-examples-count');
+  var search  = (document.getElementById('aex-search-input').value || '').trim().toLowerCase();
+  var sortBy  = document.getElementById('aex-sort-select').value;
+
+  var total = _agentExamplesCache.length;
+  if (countEl) countEl.textContent = total + (total === 1 ? ' example' : ' examples');
+
+  // Carry the ORIGINAL index through filtering/sorting — Edit/Delete and the
+  // "Rule #N" badge must always refer back to the true position in
+  // _agentExamplesCache, not the position in this filtered/sorted view.
+  var rows = _agentExamplesCache.map(function(ex, idx) { return { idx: idx, ex: ex }; });
+
+  if (search) {
+    rows = rows.filter(function(r) {
+      var haystack = [r.ex.question, r.ex.notes, r.ex.cypher].concat(r.ex.tags || [])
+        .join(' \n ').toLowerCase();
+      return haystack.indexOf(search) !== -1;
+    });
+  }
+
+  var shown = rows.length;
+  status.textContent = total === 0 ? '' :
+    'Showing ' + shown.toLocaleString() + ' of ' + total.toLocaleString() + ' example' + (total === 1 ? '' : 's') +
+    (shown === 0 ? ' — no matches.' : '');
+
+  if (sortBy === 'alpha') {
+    rows.sort(function(a, b) { return (a.ex.question || '').localeCompare(b.ex.question || ''); });
+  } else {
+    rows.sort(function(a, b) { return a.idx - b.idx; });
+  }
+
+  if (!total) {
+    list.innerHTML = '<div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">No examples yet — click "+ Add example" to teach the agent a query pattern.</div>';
+    return;
+  }
+  if (!shown) {
+    list.innerHTML = '<div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">No examples match your filters.</div>';
+    return;
+  }
+
+  list.innerHTML = '';
+  rows.forEach(function(r) {
+    var idx = r.idx, ex = r.ex;
+    var row = document.createElement('div');
+    row.style.cssText = 'background:#252a40;border:1px solid #2a3050;border-radius:6px;padding:10px 12px;display:flex;flex-direction:column;gap:6px';
+    var title = ex.question ? _aexHighlight(ex.question, search) : '<span style="color:#5a6080">(no question set)</span>';
+    var ruleTag = '<span style="font-size:10px;font-weight:700;color:#a0cfff;background:#0d1220;border:1px solid #2a4a7f;border-radius:9px;padding:1px 8px;flex-shrink:0">Rule #' + (idx + 1) + '</span>';
+    row.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">' +
+        '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' + ruleTag +
+          '<span style="font-size:13px;color:#e0e0e0;font-weight:500">' + title + '</span></div>' +
+        '<div style="display:flex;gap:6px;flex-shrink:0">' +
+          '<button onclick="agentExampleEdit(' + idx + ')" style="padding:3px 9px;background:#1e2235;border:1px solid #3a3f55;border-radius:4px;color:#c0c4d4;font-size:11px;cursor:pointer">Edit</button>' +
+          '<button onclick="agentExampleDelete(' + idx + ')" style="padding:3px 9px;background:transparent;border:1px solid #4a1c1c;border-radius:4px;color:#ff6b6b;font-size:11px;cursor:pointer">Delete</button>' +
+        '</div>' +
+      '</div>' +
+      '<div style="background:#0d1220;border-radius:5px;padding:6px 9px;font-family:monospace;font-size:11px;color:#a0cfff;white-space:pre-wrap;word-break:break-all;max-height:110px;overflow-y:auto">' +
+        _aexHighlight(ex.cypher || '', search) + '</div>' +
+      (ex.notes ? '<div style="font-size:11px;color:#7a8099">' + _aexHighlight(ex.notes, search) + '</div>' : '') +
+      ((ex.tags && ex.tags.length) ? '<div style="display:flex;gap:5px;flex-wrap:wrap">' +
+        ex.tags.map(function(tag) {
+          return '<span style="font-size:10px;color:#c0c4d4;background:#1e2235;border:1px solid #3a3f55;border-radius:8px;padding:1px 8px">' + _aexHighlight(tag, search) + '</span>';
+        }).join('') + '</div>' : '');
+    list.appendChild(row);
+  });
+}
+
+function agentExampleAddNew() {
+  _agentExampleEditIdx = -1;
+  document.getElementById('aex-modal-title').textContent = 'Add Cypher Example';
+  document.getElementById('aex-question').value = '';
+  document.getElementById('aex-cypher').value   = '';
+  document.getElementById('aex-notes').value    = '';
+  document.getElementById('aex-tags').value     = '';
+  document.getElementById('aex-error').style.display = 'none';
+  document.getElementById('agent-example-edit-modal').style.display = 'flex';
+}
+
+function agentExampleEdit(idx) {
+  var ex = _agentExamplesCache[idx];
+  if (!ex) return;
+  _agentExampleEditIdx = idx;
+  document.getElementById('aex-modal-title').textContent = 'Edit Cypher Example';
+  document.getElementById('aex-question').value = ex.question || '';
+  document.getElementById('aex-cypher').value   = ex.cypher   || '';
+  document.getElementById('aex-notes').value    = ex.notes    || '';
+  document.getElementById('aex-tags').value     = (ex.tags || []).join(', ');
+  document.getElementById('aex-error').style.display = 'none';
+  document.getElementById('agent-example-edit-modal').style.display = 'flex';
+}
+
+function closeAgentExampleEdit() {
+  document.getElementById('agent-example-edit-modal').style.display = 'none';
+}
+
+async function agentExampleSave() {
+  var question = document.getElementById('aex-question').value.trim();
+  var cypher   = document.getElementById('aex-cypher').value.trim();
+  var notes    = document.getElementById('aex-notes').value.trim();
+  var tags     = document.getElementById('aex-tags').value.split(',')
+                   .map(function(t) { return t.trim(); }).filter(Boolean);
+  var errEl    = document.getElementById('aex-error');
+  errEl.style.display = 'none';
+
+  if (!cypher) {
+    errEl.textContent = 'Cypher query is required.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  var entry = { question: question, cypher: cypher, notes: notes, tags: tags };
+  var next  = _agentExamplesCache.slice();
+  if (_agentExampleEditIdx >= 0) next[_agentExampleEditIdx] = entry;
+  else next.push(entry);
+
+  var saveBtn = document.getElementById('aex-save-btn');
+  saveBtn.disabled = true;
+  try {
+    await api('/api/agent/examples', { examples: next }, 'PUT');
+    _agentExamplesCache = next;
+    closeAgentExampleEdit();
+    _aexRender();
+  } catch(e) {
+    errEl.textContent = 'Save failed: ' + e.message;
+    errEl.style.display = 'block';
+  } finally {
+    saveBtn.disabled = false;
+  }
+}
+
+async function agentExampleDelete(idx) {
+  var ex = _agentExamplesCache[idx];
+  if (!ex) return;
+  if (!confirm('Delete this example?\n\n' + (ex.question || (ex.cypher || '').slice(0, 80)))) return;
+
+  var next = _agentExamplesCache.slice();
+  next.splice(idx, 1);
+  try {
+    await api('/api/agent/examples', { examples: next }, 'PUT');
+    _agentExamplesCache = next;
+    _aexRender();
+  } catch(e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+// ── Config dialog ─────────────────────────────────────────────────────────────
+var _AGENT_USER_CONFIG_KEY = 'agent_user_config_v1';
+
+function _loadUserConfig() {
+  try { return JSON.parse(localStorage.getItem(_AGENT_USER_CONFIG_KEY) || '{}'); }
+  catch(e) { return {}; }
+}
+function _saveUserConfig(obj) {
+  try { localStorage.setItem(_AGENT_USER_CONFIG_KEY, JSON.stringify(obj)); } catch(e) {}
+}
+
+function openAgentConfig() {
+  _renderWorkflowSteps();
+  document.getElementById('agent-config-modal').style.display = 'flex';
+}
+
+function closeAgentConfig() {
+  document.getElementById('agent-config-modal').style.display = 'none';
+}
+
+function _syncWorkflowBtn() {
+  var btn = document.getElementById('agent-run-workflow-btn');
+  if (btn) btn.style.display = _agentWorkflow.length ? 'inline-block' : 'none';
+}
+
+function _renderWorkflowSteps() {
+  var container = document.getElementById('acfg-workflow-steps');
+  container.innerHTML = '';
+  _syncWorkflowBtn();
+  if (!_agentWorkflow.length) {
+    container.innerHTML = '<div style="color:#5a6080;font-size:12px">No steps. Click &quot;+ Add step&quot; to build a multi-step workflow.</div>';
+    return;
+  }
+  _agentWorkflow.forEach(function(step, idx) {
+    var row = document.createElement('div');
+    row.style.cssText = 'background:#252a40;border:1px solid #2a3050;border-radius:6px;padding:8px 10px;display:flex;gap:8px;align-items:flex-start';
+    var typeOpts = ['text2cypher','llm','write_back'].map(function(t) {
+      return '<option value="' + t + '"' + (step.type === t ? ' selected' : '') + '>' + t + '</option>';
+    }).join('');
+    row.innerHTML =
+      '<div style="flex:1">' +
+        '<div style="display:flex;gap:6px;margin-bottom:4px">' +
+          '<select onchange="_agentUpdateStep(' + idx + ',\'type\',this.value)" style="background:#1e2235;border:1px solid #3a3f55;border-radius:4px;color:#e0e0e0;font-size:11px;padding:2px 4px">' + typeOpts + '</select>' +
+          '<span style="font-size:11px;color:#5a6080">Step ' + (idx+1) + '</span>' +
+        '</div>' +
+        '<input type="text" value="' + escHtml(step.description || '') + '" placeholder="Description" oninput="_agentUpdateStep(' + idx + ',\'description\',this.value)" style="width:100%;background:#1e2235;border:1px solid #3a3f55;border-radius:4px;color:#e0e0e0;font-size:11px;padding:3px 6px;margin-bottom:3px;box-sizing:border-box">' +
+        '<input type="text" value="' + escHtml(step.prompt_template || step.cypher_template || '') + '" placeholder="Prompt template — use {input} for user input" oninput="_agentUpdateStep(' + idx + ',\'prompt_template\',this.value)" style="width:100%;background:#1e2235;border:1px solid #3a3f55;border-radius:4px;color:#e0e0e0;font-size:11px;padding:3px 6px;box-sizing:border-box">' +
+      '</div>' +
+      '<button onclick="_agentRemoveStep(' + idx + ')" style="background:none;border:none;color:#ff6b6b;cursor:pointer;font-size:16px;padding:0;flex-shrink:0">x</button>';
+    container.appendChild(row);
+  });
+}
+
+function agentAddWorkflowStep() {
+  _agentWorkflow.push({ step: _agentWorkflow.length + 1, type: 'text2cypher', description: '', prompt_template: '{input}' });
+  _renderWorkflowSteps();
+}
+function _agentUpdateStep(idx, key, value) {
+  if (_agentWorkflow[idx]) _agentWorkflow[idx][key] = value;
+}
+function _agentRemoveStep(idx) {
+  _agentWorkflow.splice(idx, 1);
+  _agentWorkflow.forEach(function(s, i) { s.step = i + 1; });
+  _renderWorkflowSteps();
+}
+
+async function agentRunWorkflow() {
+  if (!_agentWorkflow.length) { alert('No workflow steps defined. Open the Config dialog to add steps.'); return; }
+  var input     = document.getElementById('agent-input');
+  var userInput = (input.value || '').trim() || '{input}';
+  input.value   = '';
+
+  _agentAppendMessage('user', 'Running workflow (' + _agentWorkflow.length + ' step(s))...\nInput: ' + userInput);
+  var sendBtn  = document.getElementById('agent-send-btn');
+  var thinking = document.getElementById('agent-thinking-indicator');
+  sendBtn.disabled = true;
+  if (thinking) thinking.style.display = 'inline';
+
+  try {
+    var result = await api('/api/agent/workflow/execute', {
+      workflow: _agentWorkflow,
+      input:    userInput,
+      llm:      _agentConfig,
+    });
+    var lines = ['Workflow completed:'];
+    (result.results || []).forEach(function(r) {
+      lines.push('Step ' + r.step + ' [' + r.type + ']: ' + (r.status || ''));
+      if (r.cypher) { lines.push('  Cypher: ' + r.cypher.slice(0, 120)); _agentLastCypher = r.cypher; }
+      if (r.row_count !== undefined) lines.push('  Rows: ' + r.row_count);
+      if (r.reply) lines.push('  ' + r.reply.slice(0, 300));
+      if (r.error) lines.push('  Error: ' + r.error);
+    });
+    _agentAppendMessage('assistant', lines.join('\n'));
+  } catch(e) {
+    _agentAppendMessage('error', 'Workflow failed: ' + e.message);
+  } finally {
+    sendBtn.disabled = false;
+    if (thinking) thinking.style.display = 'none';
+  }
+}
+
+// ── LLM Settings modal (admin) ─────────────────────────────────────────────────
+var _llmsProviderRows = [];   // [{name, url}] — draft state while dialog is open
+
+function llmsRenderProviders() {
+  var container = document.getElementById('llms-providers-list');
+  if (!container) return;
+  container.innerHTML = '';
+  if (!_llmsProviderRows.length) {
+    container.innerHTML = '<div style="color:#5a6080;font-size:12px;padding:8px 0">No providers configured. Click "+ Add provider" to add one.</div>';
+    return;
+  }
+  _llmsProviderRows.forEach(function(row, idx) {
+    var div = document.createElement('div');
+    div.style.cssText = 'display:grid;grid-template-columns:1fr 2fr auto;gap:8px;align-items:center;background:#252a40;border:1px solid #2a3050;border-radius:6px;padding:8px 10px';
+    div.innerHTML =
+      '<input type="text" placeholder="Name (e.g. Google Gemini)" value="' + escHtml(row.name) + '"' +
+        ' oninput="_llmsUpdateRow(' + idx + ',\'name\',this.value)"' +
+        ' style="background:#1e2235;border:1px solid #3a3f55;border-radius:4px;color:#e0e0e0;font-size:12px;padding:5px 8px;outline:none">' +
+      '<input type="text" placeholder="Base URL (e.g. https://…/v1/)" value="' + escHtml(row.url) + '"' +
+        ' oninput="_llmsUpdateRow(' + idx + ',\'url\',this.value)"' +
+        ' style="background:#1e2235;border:1px solid #3a3f55;border-radius:4px;color:#e0e0e0;font-size:12px;padding:5px 8px;outline:none">' +
+      '<button onclick="_llmsRemoveRow(' + idx + ')" style="background:none;border:none;color:#ff6b6b;cursor:pointer;font-size:18px;padding:0;line-height:1" title="Remove">×</button>';
+    container.appendChild(div);
+  });
+}
+
+function _llmsUpdateRow(idx, key, value) {
+  if (_llmsProviderRows[idx]) _llmsProviderRows[idx][key] = value;
+}
+function _llmsRemoveRow(idx) {
+  _llmsProviderRows.splice(idx, 1);
+  llmsRenderProviders();
+}
+function llmsAddProvider() {
+  _llmsProviderRows.push({ name: '', url: '' });
+  llmsRenderProviders();
+}
+
+async function openLLMSettings() {
+  document.getElementById('llm-settings-error').style.display   = 'none';
+  document.getElementById('llm-settings-success').style.display = 'none';
+
+  // Show/hide admin section based on role
+  var adminSec = document.getElementById('llms-admin-section');
+  if (adminSec) adminSec.style.display = (currentRole === 'admin') ? 'block' : 'none';
+
+  try {
+    var data = await api('/api/settings/llm', null, 'GET');
+    _llmProviders = (data.providers || []);
+
+    // Populate user provider dropdown from server list
+    var sel = document.getElementById('llms-user-provider');
+    sel.innerHTML = '<option value="">— Select provider —</option>';
+    _llmProviders.forEach(function(p) {
+      var opt = document.createElement('option');
+      opt.value = p.name; opt.textContent = p.name;
+      sel.appendChild(opt);
+    });
+
+    // Restore user's saved LLM config into the dialog
+    var cfg = _agentConfig;
+    sel.value = cfg.provider_name || '';
+    document.getElementById('llms-user-apikey').value      = cfg.apikey      || '';
+    document.getElementById('llms-user-model').value       = cfg.model_name  || '';
+    document.getElementById('llms-user-temperature').value = cfg.temperature !== undefined ? cfg.temperature : 0.2;
+    document.getElementById('llms-user-top-p').value       = cfg.top_p       !== undefined ? cfg.top_p       : 0.9;
+    document.getElementById('llms-user-json-mode').checked = !!cfg.json_mode;
+    document.getElementById('llms-user-ping-result').textContent = '';
+
+    // Admin section
+    if (currentRole === 'admin') {
+      _llmsProviderRows = _llmProviders.map(function(p) { return { name: p.name || '', url: p.url || '' }; });
+      document.getElementById('llms-temperature').value = data.temperature !== undefined ? data.temperature : 0.2;
+      document.getElementById('llms-top-p').value       = data.top_p      !== undefined ? data.top_p      : 0.9;
+      document.getElementById('llms-json-mode').checked = !!data.json_mode;
+      llmsRenderProviders();
+    }
+  } catch(e) {
+    document.getElementById('llm-settings-error').textContent = 'Failed to load settings: ' + e.message;
+    document.getElementById('llm-settings-error').style.display = 'block';
+  }
+  document.getElementById('llm-settings-modal').style.display = 'flex';
+}
+
+function closeLLMSettings(event) {
+  if (event && event.target !== document.getElementById('llm-settings-modal')) return;
+  document.getElementById('llm-settings-modal').style.display = 'none';
+}
+
+function llmsUserProviderChanged() {
+  // Clear model list when provider changes
+  document.getElementById('llms-user-model-list').innerHTML = '';
+  document.getElementById('llms-user-model').value = '';
+  document.getElementById('llms-user-models-status').textContent = '';
+}
+
+async function llmsUserFetchModels() {
+  var provName = document.getElementById('llms-user-provider').value;
+  var apikey   = document.getElementById('llms-user-apikey').value.trim();
+  var statusEl = document.getElementById('llms-user-models-status');
+  if (!provName) { statusEl.textContent = 'Select a provider first.'; return; }
+  var prov = _llmProviders.find(function(p) { return p.name === provName; });
+  if (!prov) { statusEl.textContent = 'Provider not found.'; return; }
+  statusEl.textContent = 'Fetching…';
+  try {
+    var data = await api('/api/agent/list-models', { url: prov.url, apikey: apikey });
+    var models = data.models || [];
+    var dl = document.getElementById('llms-user-model-list');
+    dl.innerHTML = models.map(function(m) { return '<option value="' + escHtml(m) + '">'; }).join('');
+    statusEl.textContent = models.length + ' model' + (models.length !== 1 ? 's' : '') + ' available';
+  } catch(e) {
+    statusEl.textContent = 'Fetch failed: ' + e.message;
+  }
+}
+
+async function llmsUserTestConnection() {
+  var pingEl = document.getElementById('llms-user-ping-result');
+  pingEl.textContent = '⏳ Testing…';
+  var provName = document.getElementById('llms-user-provider').value;
+  var prov = _llmProviders.find(function(p) { return p.name === provName; }) || {};
+  var cfg = {
+    url:        prov.url || '',
+    apikey:     document.getElementById('llms-user-apikey').value.trim(),
+    model_name: document.getElementById('llms-user-model').value.trim(),
+    temperature: parseFloat(document.getElementById('llms-user-temperature').value) || 0.2,
+    top_p:       parseFloat(document.getElementById('llms-user-top-p').value) || 0.9,
+    json_mode:   document.getElementById('llms-user-json-mode').checked,
+  };
+  try {
+    var res = await api('/api/agent/ping-llm', { llm: cfg });
+    pingEl.style.color = res.ok ? '#4caf50' : '#ff6b6b';
+    pingEl.textContent = res.ok ? ('✓ ' + (res.model || 'Connected')) : ('✗ ' + (res.error || 'Failed'));
+  } catch(e) {
+    pingEl.style.color = '#ff6b6b';
+    pingEl.textContent = '✗ ' + e.message;
+  }
+}
+
+async function saveLLMSettings() {
+  var errEl   = document.getElementById('llm-settings-error');
+  var okEl    = document.getElementById('llm-settings-success');
+  var saveBtn = document.getElementById('llms-save-btn');
+  errEl.style.display = 'none';
+  okEl.style.display  = 'none';
+  saveBtn.disabled    = true;
+
+  // Save user LLM config into _agentConfig and localStorage
+  var provName = document.getElementById('llms-user-provider').value;
+  var prov = _llmProviders.find(function(p) { return p.name === provName; }) || {};
+  _agentConfig.provider_name = provName;
+  _agentConfig.url           = prov.url || _agentConfig.url || '';
+  _agentConfig.apikey        = document.getElementById('llms-user-apikey').value.trim();
+  _agentConfig.model_name    = document.getElementById('llms-user-model').value.trim();
+  _agentConfig.temperature   = parseFloat(document.getElementById('llms-user-temperature').value) || 0.2;
+  _agentConfig.top_p         = parseFloat(document.getElementById('llms-user-top-p').value) || 0.9;
+  _agentConfig.json_mode     = document.getElementById('llms-user-json-mode').checked;
+  _saveUserConfig(_agentConfig);
+
+  // Admin: also save provider list + global defaults to server
+  if (currentRole === 'admin') {
+    var adminPayload = {
+      providers:   _llmsProviderRows.filter(function(r) { return r.name.trim() && r.url.trim(); }),
+      temperature: parseFloat(document.getElementById('llms-temperature').value) || 0.2,
+      top_p:       parseFloat(document.getElementById('llms-top-p').value) || 0.9,
+      json_mode:   document.getElementById('llms-json-mode').checked,
+    };
+    try {
+      await api('/api/settings/llm', adminPayload);
+      _llmProviders = adminPayload.providers.slice();
+    } catch(e) {
+      errEl.textContent = 'Admin save failed: ' + e.message;
+      errEl.style.display = 'block';
+      saveBtn.disabled = false;
+      return;
+    }
+  }
+
+  // Push the active user config to the agent service
+  var pushPayload = { model_name:  _agentConfig.model_name  || null,
+                      url:         _agentConfig.url          || null,
+                      temperature: _agentConfig.temperature,
+                      top_p:       _agentConfig.top_p,
+                      json_mode:   _agentConfig.json_mode    || false };
+  if (_agentConfig.apikey) pushPayload.apikey = _agentConfig.apikey;
+  api('/api/agent/llm-config', pushPayload)
+    .catch(function(e) { console.warn('Agent LLM config push failed:', e); });
+
+  okEl.textContent   = 'Settings saved.';
+  okEl.style.display = 'block';
+  saveBtn.disabled = false;
+}
+
+// ── Agent write-relation confirmation ────────────────────────────────────────
+
+var _awrPending = null;   // current write_relation payload awaiting user confirmation
+var _awrRefs    = [];     // mutable reference list shown in the confirmation modal
+
+function _agentShowWriteRelModal(wr) {
+  _awrPending = wr;
+  _awrRefs    = (wr.references || []).map(function(r) { return Object.assign({}, r); });
+
+  var src   = wr.source_node  || {};
+  var tgt   = wr.target_node  || {};
+  var props = wr.properties   || {};
+
+  document.getElementById('awr-src-name').textContent    = src.name  || src.node_id || '—';
+  document.getElementById('awr-src-label').textContent   = src.node_label || '';
+  document.getElementById('awr-tgt-name').textContent    = tgt.name  || tgt.node_id || '—';
+  document.getElementById('awr-tgt-label').textContent   = tgt.node_label || '';
+  document.getElementById('awr-rel-type').textContent    = wr.relation_type || '—';
+  document.getElementById('awr-relation-id').textContent = wr.relation_id || '';
+  document.getElementById('awr-source').value     = props.source    || '';
+  document.getElementById('awr-effect').value     = props.Effect    || '';
+  document.getElementById('awr-mechanism').value  = props.Mechanism || '';
+  document.getElementById('awr-ontology').value   = props.Ontology  || '';
+
+  _awrRenderRefs();
+
+  var statusEl = document.getElementById('awr-status');
+  statusEl.style.display = 'none';
+  statusEl.textContent = '';
+
+  // Adjust modal title and button label based on mode
+  var isAddRefs = (wr.mode === 'add_references');
+  var titleEl = document.getElementById('awr-modal-title');
+  if (titleEl) {
+    titleEl.textContent = isAddRefs
+      ? 'Add References to Existing Relation'
+      : 'Create New Relation';
+  }
+  var modeNoteEl = document.getElementById('awr-mode-note');
+  if (modeNoteEl) {
+    if (isAddRefs) {
+      modeNoteEl.textContent = 'This relation already exists in the graph. Only new references (not already in the database) will be added.';
+      modeNoteEl.style.display = 'block';
+    } else {
+      modeNoteEl.style.display = 'none';
+    }
+  }
+
+  var btn = document.getElementById('awr-confirm-btn');
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = isAddRefs ? 'Add References' : 'Save to Database';
+  }
+
+  document.getElementById('agent-write-rel-modal').style.display = 'flex';
+}
+
+function _awrRenderRefs() {
+  var section  = document.getElementById('awr-refs-section');
+  var listEl   = document.getElementById('awr-refs-list');
+  var countEl  = document.getElementById('awr-refs-count');
+
+  if (!_awrRefs.length) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = 'flex';
+  countEl.textContent = _awrRefs.length + ' reference' + (_awrRefs.length !== 1 ? 's' : '');
+
+  listEl.innerHTML = _awrRefs.map(function(ref, i) {
+    var title   = _esc(ref.title   || ref.pmid || '(no title)');
+    var authors = _esc(ref.authors || '');
+    var year    = _esc(String(ref.pubyear || ref.year || ''));
+    var journal = _esc(ref.journal || '');
+    var pmid    = ref.pmid ? '<a href="https://pubmed.ncbi.nlm.nih.gov/' + _esc(ref.pmid) + '/" target="_blank" style="color:#8ab4f8;font-size:10px">PMID ' + _esc(ref.pmid) + '</a>' : '';
+    return (
+      '<div style="background:#252a40;border-radius:6px;padding:8px 10px;display:flex;gap:10px;align-items:flex-start">' +
+        '<div style="flex:1;min-width:0">' +
+          '<div style="font-size:12px;color:#e0e0e0;line-height:1.4;margin-bottom:2px">' + title + '</div>' +
+          (authors ? '<div style="font-size:10px;color:#7a8099">' + authors + (year ? ' (' + year + ')' : '') + '</div>' : '') +
+          (journal ? '<div style="font-size:10px;color:#7a8099;font-style:italic">' + journal + '</div>' : '') +
+          (pmid    ? '<div style="margin-top:3px">' + pmid + '</div>' : '') +
+        '</div>' +
+        '<button onclick="_awrRemoveRef(' + i + ')" title="Remove this reference" ' +
+          'style="background:none;border:none;color:#7a8099;font-size:16px;cursor:pointer;padding:0;line-height:1;flex-shrink:0">×</button>' +
+      '</div>'
+    );
+  }).join('');
+}
+
+function _awrRemoveRef(idx) {
+  _awrRefs.splice(idx, 1);
+  _awrRenderRefs();
+}
+
+function _agentWriteRelCancel() {
+  document.getElementById('agent-write-rel-modal').style.display = 'none';
+  _awrPending = null;
+}
+
+async function _agentWriteRelConfirm() {
+  if (!_awrPending) return;
+  var wr    = _awrPending;
+  var src   = wr.source_node || {};
+  var tgt   = wr.target_node || {};
+  var btn   = document.getElementById('awr-confirm-btn');
+  var statusEl = document.getElementById('awr-status');
+
+  // Collect (possibly edited) property values from the modal
+  var props = Object.assign({}, wr.properties || {}, {
+    Effect:    document.getElementById('awr-effect').value    || '',
+    Mechanism: document.getElementById('awr-mechanism').value || '',
+    Ontology:  document.getElementById('awr-ontology').value  || '',
+    source:    document.getElementById('awr-source').value    || wr.properties.source || '',
+  });
+  // Remove empty strings to keep Neo4j clean
+  Object.keys(props).forEach(function(k) { if (props[k] === '') delete props[k]; });
+
+  btn.disabled    = true;
+  btn.textContent = 'Saving…';
+  statusEl.style.display = 'none';
+
+  try {
+    var payload = {
+      sourceNode:   { nodeId: src.node_id, nodeLabel: src.node_label },
+      targetNode:   { nodeId: tgt.node_id, nodeLabel: tgt.node_label },
+      relationType: wr.relation_type,
+      properties:   props,
+      relationId:   wr.relation_id,
+      isNew:        true,
+      references:   _awrRefs.slice(),   // snapshot of the (possibly trimmed) reference list
+    };
+
+    var result = await api('/api/curation/write-relation', payload);
+
+    if (result && result.success) {
+      var isAddRefs = (wr.mode === 'add_references');
+      statusEl.style.cssText = 'display:block;color:#4caf50;background:#1a3a1a;border-radius:5px;padding:8px 12px;font-size:12px';
+      statusEl.textContent = isAddRefs
+        ? '✓ References added — RelationID: ' + (result.relationId || wr.relation_id)
+        : '✓ Relation saved — RelationID: ' + (result.relationId || wr.relation_id);
+      btn.textContent = 'Saved ✓';
+
+      // Echo success back into the chat
+      var refNote = _awrRefs.length
+        ? '\n' + _awrRefs.length + ' reference' + (_awrRefs.length !== 1 ? 's' : '') + ' added.'
+        : '';
+      var chatMsg = isAddRefs
+        ? ('✅ References added to existing relation.\n' +
+           '**' + (src.name || src.node_id) + '** → **' + wr.relation_type + '** → **' + (tgt.name || tgt.node_id) + '**\n' +
+           'RelationID: `' + (result.relationId || wr.relation_id) + '`' + refNote)
+        : ('✅ Relation created successfully.\n' +
+           '**' + (src.name || src.node_id) + '** → **' + wr.relation_type + '** → **' + (tgt.name || tgt.node_id) + '**\n' +
+           'RelationID: `' + (result.relationId || wr.relation_id) + '`  source: `' + (props.source || '') + '`' + refNote);
+      _agentAppendMessage('assistant', chatMsg);
+
+      // Close modal after short delay
+      setTimeout(function() {
+        document.getElementById('agent-write-rel-modal').style.display = 'none';
+        _awrPending = null;
+      }, 1800);
+    } else {
+      throw new Error((result && result.error) || 'Server returned failure');
+    }
+  } catch(err) {
+    statusEl.style.cssText = 'display:block;color:#e57373;background:#3a1c1c;border-radius:5px;padding:8px 12px;font-size:12px';
+    statusEl.textContent = '✗ Save failed: ' + (err.message || String(err));
+    btn.disabled    = false;
+    btn.textContent = 'Retry';
+  }
+}
+
+// ── Agent visualization render hook ──────────────────────────────────────────
+
+var _RENDER_LABELS = {
+  'graph':                  'Graph view',
+  'sankey':                 'Sankey diagram',
+  'relations_table':        'Relations table',
+  'references_table':       'References table',
+  'export_excel_relations': 'Excel export (relations)',
+  'export_excel_references':'Excel export (references)',
+  'export_csv_relations':   'CSV export (relations)',
+  'export_csv_references':  'CSV export (references)',
+};
+
+async function _agentRenderResult(action) {
+  if (!action || !action.tool) return;
+  var tool        = action.tool;
+  var cypher      = (action.cypher || '').trim();
+  var label       = _RENDER_LABELS[tool] || tool;
+  var wantsNewTab = !!action.new_tab;
+
+  if (cypher) {
+    _agentLastCypher = cypher;
+  }
+
+  if (tool === 'graph' || tool === 'relations_table' || tool === 'references_table') {
+    if (cypher) {
+      // "new_tab" — user asked for a new window/tab instead of replacing the current view.
+      // Graph Explorer has no separate browser window for results, so a new tab is the
+      // equivalent: open one, then run the query into it (runQuery() always targets
+      // whichever tab is currently active).
+      if (wantsNewTab && typeof createNewTab === 'function') {
+        createNewTab('Agent result');
+        _agentAppendMessage('assistant', 'Opened a new tab for this result.');
+      }
+      agentLoadCypherToBar();
+      // Give the query-bar textarea's 'input' event (dispatched by agentLoadCypherToBar)
+      // a moment to settle before running — matches the previous setTimeout-based timing,
+      // just awaited so we can reliably act once the graph has actually finished loading.
+      await new Promise(function(resolve) { setTimeout(resolve, 100); });
+      // "mode": "add" — the user asked to ADD to the current graph ("add BRCA1 to
+      // the graph") rather than replace it. Only meaningful for the graph tool —
+      // tables always just show the query's own results.
+      var _wantsAdd = tool === 'graph' && action.mode === 'add';
+      await runQuery(_wantsAdd);
+
+      // Optional "layout" hint on the render block — e.g. the user asked for a
+      // hierarchical/tree/circular arrangement instead of the default force-directed
+      // one. Only meaningful for the graph view (tables have no layout concept).
+      // Validated against the same layout names applyLayout() actually supports, so
+      // a hallucinated value is silently ignored rather than throwing.
+      if (tool === 'graph' && action.layout) {
+        var _layoutName = String(action.layout).trim().toLowerCase();
+        var _validLayouts = ['cose', 'dagre', 'circle', 'concentric', 'grid', 'klay'];
+        if (_validLayouts.indexOf(_layoutName) !== -1 && typeof applyLayout === 'function') {
+          applyLayout(_layoutName);
+        } else if (_layoutName) {
+          console.warn('Agent requested unknown layout "' + action.layout + '" — ignored.');
+        }
+      }
+
+      // Optional "edge_references" — sentence-mining / keyword-filtered results. Maps
+      // RelationID (string) -> an array of reference rows the agent already found (e.g. via
+      // a Postgres keyword search). Pre-loading refsCache with these means the edge tooltip
+      // shows ONLY the matched sentence(s) instead of fetching and showing the relation's
+      // full, unfiltered reference list on hover. runQuery() (awaited above) already reset
+      // refsCache for the new graph, so it's safe to populate it here.
+      if (action.edge_references && typeof action.edge_references === 'object') {
+        var _refCount = 0;
+        Object.keys(action.edge_references).forEach(function(relId) {
+          var refs = action.edge_references[relId];
+          if (Array.isArray(refs)) { refsCache[relId] = refs; _refCount++; }
+        });
+        if (_refCount > 0) {
+          _agentAppendMessage('assistant', 'Loaded keyword-matched reference(s) into the tooltip for ' +
+            _refCount + ' edge' + (_refCount !== 1 ? 's' : '') + ' — hover an edge to see them.');
+        }
+      }
+    }
+  } else if (tool === 'sankey') {
+    if (cypher) {
+      // Actually open the Sankey dialog first — it's a hidden modal (#sankey-modal),
+      // not part of the tab canvas, so it needs to be shown explicitly before its
+      // textarea can be used. (This branch previously looked for a "#sankey-query-input"
+      // element that never existed — the real id is "#sankey-cypher" — so it always
+      // silently fell through to loading the query into the main Query Bar instead of
+      // ever showing the Sankey diagram.)
+      if (typeof openSankeyDialog === 'function') openSankeyDialog();
+      var sankeyInput = document.getElementById('sankey-cypher');
+      if (sankeyInput) {
+        sankeyInput.value = cypher;
+        await runSankeyQuery();
+      } else {
+        agentLoadCypherToBar();
+        _agentAppendMessage('assistant', 'Sankey query loaded into the Query Bar.');
+      }
+    }
+  } else if (tool === 'export_excel_relations' || tool === 'export_csv_relations') {
+    if (cypher) exportQueryRelations(cypher);
+  } else if (tool === 'export_excel_references' || tool === 'export_csv_references') {
+    if (cypher) exportQueryReferences(cypher);
+  } else {
+    _agentAppendMessage('assistant', 'Render tool "' + label + '" is not yet supported.');
+  }
+}
+
+// ── Vocabulary manager ────────────────────────────────────────────────────────
+// Recovered from backup/cypher_examples.zip — this implementation existed before
+// a prior editing session (predating this one) truncated it out of app.js, leaving
+// just this stub comment and a dead "🧠 Vocabulary" button. The HTML modal in
+// index.html (#agent-vocab-modal etc.) was never lost — only these functions were.
+var _vocabData = [];
+
+async function openAgentVocabulary() {
+  var modal = document.getElementById('agent-vocab-modal');
+  modal.style.display = 'flex';
+  await agentVocabRefresh();
+}
+
+function closeAgentVocabulary() {
+  document.getElementById('agent-vocab-modal').style.display = 'none';
+}
+
+async function agentVocabRefresh() {
+  var tbody = document.getElementById('agent-vocab-rows');
+  tbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#7a8099">Loading…</td></tr>';
+  try {
+    var data = await api('/api/agent/vocabulary', null, 'GET');
+    _vocabData = data.mappings || [];
+    _renderVocabRows();
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#e57373">Failed to load: ' + e.message + '</td></tr>';
+  }
+}
+
+function _renderVocabRows() {
+  var tbody = document.getElementById('agent-vocab-rows');
+  if (!_vocabData.length) {
+    tbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#7a8099">No vocabulary yet — start chatting and the agent will learn your terminology automatically.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = _vocabData.map(function(m, i) {
+    var tick    = m.confirmed ? '<span style="color:#4caf50;font-weight:700">✓</span>' : '<span style="color:#7a8099">○</span>';
+    var btnConf = m.confirmed ? '' :
+      '<button onclick="agentVocabConfirm(' + i + ')" style="padding:2px 8px;background:#2e5d3a;border:1px solid #4caf50;border-radius:4px;color:#4caf50;font-size:11px;cursor:pointer">✓ Confirm</button>';
+    return '<tr style="border-bottom:1px solid #2a2f45">' +
+      '<td style="padding:7px 8px;color:#e0e0e0">' + _esc(m.user_term) + '</td>' +
+      '<td style="padding:7px 8px;color:#8ab4f8;font-family:monospace">' + _esc(m.neo4j_name) + '</td>' +
+      '<td style="padding:7px 8px;color:#7a8099;font-size:11px">' + _esc(m.neo4j_label || '') + '</td>' +
+      '<td style="padding:7px 8px;text-align:center;color:#aaa">' + tick + ' ' + (m.use_count || 1) + '</td>' +
+      '<td style="padding:7px 8px;text-align:center;display:flex;gap:6px;justify-content:center">' +
+        btnConf +
+        '<button onclick="agentVocabDelete(' + i + ')" style="padding:2px 8px;background:#3a1c1c;border:1px solid #e57373;border-radius:4px;color:#e57373;font-size:11px;cursor:pointer">✕</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+function _esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function agentVocabConfirm(idx) {
+  var m = _vocabData[idx];
+  if (!m) return;
+  try {
+    await api('/api/agent/vocabulary/confirm', { user_term: m.user_term, neo4j_name: m.neo4j_name, neo4j_label: m.neo4j_label || '' }, 'PUT');
+    m.confirmed = true;
+    m.use_count = (m.use_count || 1) + 1;
+    _renderVocabRows();
+  } catch(e) { alert('Failed: ' + e.message); }
+}
+
+async function agentVocabDelete(idx) {
+  var m = _vocabData[idx];
+  if (!m) return;
+  if (!confirm('Remove mapping "' + m.user_term + '" → ' + m.neo4j_name + '?')) return;
+  try {
+    var qs = '?user_term=' + encodeURIComponent(m.user_term) + '&neo4j_name=' + encodeURIComponent(m.neo4j_name);
+    await apiDelete('/api/agent/vocabulary' + qs);
+    _vocabData.splice(idx, 1);
+    _renderVocabRows();
+  } catch(e) { alert('Failed: ' + e.message); }
+}
+
+async function agentVocabAdd() {
+  var term  = (document.getElementById('vocab-new-term').value  || '').trim();
+  var name  = (document.getElementById('vocab-new-name').value  || '').trim();
+  var label = (document.getElementById('vocab-new-label').value || '').trim();
+  if (!term || !name) { alert('Please fill in both "Your term" and "Neo4j name".'); return; }
+  try {
+    await api('/api/agent/vocabulary', { user_term: term, neo4j_name: name, neo4j_label: label, confirmed: true }, 'POST');
+    document.getElementById('vocab-new-term').value  = '';
+    document.getElementById('vocab-new-name').value  = '';
+    document.getElementById('vocab-new-label').value = '';
+    await agentVocabRefresh();
+  } catch(e) { alert('Failed: ' + e.message); }
+}
