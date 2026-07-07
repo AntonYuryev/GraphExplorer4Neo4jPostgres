@@ -77,6 +77,33 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [agent] %(message)s")
 log = logging.getLogger("agent")
 
+# ── Log injection hardening (CodeQL: py/log-injection, CWE-117) ─────────────
+# Many log.info/log.warning/log.error calls throughout this file interpolate
+# request-derived, LLM-generated, or external-system-derived strings (chat
+# messages, Cypher/SQL query text, vocabulary terms, driver exception text)
+# without stripping newlines first. A value containing \r/\n could forge
+# what looks like a separate, fake log line. Rather than sanitizing each of
+# the 15+ call sites individually (easy to miss one, and easy for a new call
+# site added later to reintroduce the gap), this Filter is attached once,
+# here, and strips newline/control characters from every log record's
+# message and substitution arguments before they're ever formatted/written.
+class _SanitizeLogFilter(logging.Filter):
+    _CONTROL_RE = re.compile(r'[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]+')
+
+    def _clean(self, value):
+        return self._CONTROL_RE.sub(" ", value) if isinstance(value, str) else value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._clean(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: self._clean(v) for k, v in record.args.items()}
+            else:
+                record.args = tuple(self._clean(a) for a in record.args)
+        return True
+
+log.addFilter(_SanitizeLogFilter())
+
 app = FastAPI(title="Graph Explorer Agent Service", version="1.0.0")
 # This service is only ever called by server.js's own reverse proxy
 # (127.0.0.1, see the AGENT_PORT/uvicorn.run() setup at the bottom of this
@@ -113,6 +140,20 @@ _CREDENTIAL_LIKE_RE = re.compile(
 )
 _URL_CREDENTIALS_RE = re.compile(r'://[^/\s@]+:[^/\s@]+@')
 
+def _sanitize_public_text(text: str, max_len: int = 300) -> str:
+    """Redact credential-shaped substrings and cap length on any text that's
+    about to be shown to a user — shared by _safe_exc_str() below (for Python
+    exceptions) and by every place that reads an external HTTP error response
+    body (he.read().decode(...) from urllib) before returning it to a client.
+    An external server's error response is just as capable of accidentally
+    (or, from a malicious/compromised provider, deliberately) including
+    something credential-shaped as a Python exception's str() is."""
+    text = _URL_CREDENTIALS_RE.sub("://***:***@", text)
+    text = _CREDENTIAL_LIKE_RE.sub(lambda m: m.group(1) + "=***", text)
+    if len(text) > max_len:
+        text = text[:max_len] + "... (truncated)"
+    return text
+
 def _safe_exc_str(exc: BaseException, max_len: int = 300) -> str:
     """Render an exception as a short, user-facing string — CodeQL flags several
     spots (py/stack-trace-exposure) where a raw exception's str() reaches an
@@ -128,12 +169,23 @@ def _safe_exc_str(exc: BaseException, max_len: int = 300) -> str:
     to keep the message genuinely useful for debugging (e.g. a Neo4j syntax
     error, a timeout notice) without the credential-leak risk of the raw
     exception text."""
-    text = str(exc)
-    text = _URL_CREDENTIALS_RE.sub("://***:***@", text)
-    text = _CREDENTIAL_LIKE_RE.sub(lambda m: m.group(1) + "=***", text)
-    if len(text) > max_len:
-        text = text[:max_len] + "... (truncated)"
-    return f"{type(exc).__name__}: {text}"
+    return f"{type(exc).__name__}: {_sanitize_public_text(str(exc), max_len)}"
+
+def _safe_http_error_str(he, max_len: int = 300) -> str:
+    """Render an urllib HTTPError as a short, user-facing string — same
+    rationale as _safe_exc_str(), but reads and sanitizes the response BODY
+    (he.read()), not just str(he), since these call sites want the external
+    provider's actual error detail (e.g. a Gemini/Anthropic/OpenAI-compatible
+    API's JSON error message), not just the generic 'HTTP Error 429' text.
+    CodeQL (py/stack-trace-exposure, 'Information exposure through an
+    exception') flags he.read().decode()[:200] reaching a response directly —
+    the exception's payload is still external, untrusted content and gets the
+    same credential-redaction/length-cap treatment before it's shown."""
+    try:
+        body = he.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    return f"HTTP {he.code}: {_sanitize_public_text(body, max_len)}"
 
 @app.exception_handler(Exception)
 async def _global_exception_handler(request: Request, exc: Exception):
@@ -2458,8 +2510,11 @@ def ping_llm(req: PingRequest = None):
                     with _urllib_req.urlopen(http_req, timeout=HARD_TIMEOUT) as r:
                         ping_result.append(json.loads(r.read()))
                 except _urllib_err.HTTPError as he:
-                    body = he.read().decode("utf-8", errors="replace")[:400]
-                    ping_error.append(("http", he.code, body))
+                    try:
+                        raw_body = he.read().decode("utf-8", errors="replace")
+                    except Exception:
+                        raw_body = ""
+                    ping_error.append(("http", he.code, _sanitize_public_text(raw_body, 400)))
                 except Exception as _e:
                     ping_error.append(("err", 0, str(_e)))
 
@@ -3188,7 +3243,7 @@ def list_models(req: ListModelsRequest):
             ])
             return {"models": models}
         except _urllib_err.HTTPError as he:
-            return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
+            return {"models": [], "error": _safe_http_error_str(he, 200)}
         except Exception as e:
             return {"models": [], "error": _safe_exc_str(e)}
 
@@ -3204,7 +3259,7 @@ def list_models(req: ListModelsRequest):
             models = sorted([m["id"] for m in data.get("data", [])], reverse=True)
             return {"models": models}
         except _urllib_err.HTTPError as he:
-            return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
+            return {"models": [], "error": _safe_http_error_str(he, 200)}
         except Exception as e:
             return {"models": [], "error": _safe_exc_str(e)}
 
@@ -3227,7 +3282,7 @@ def list_models(req: ListModelsRequest):
         models = sorted([m["id"] for m in data.get("data", [])])
         return {"models": models}
     except _urllib_err.HTTPError as he:
-        return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
+        return {"models": [], "error": _safe_http_error_str(he, 200)}
     except Exception as e:
         return {"models": [], "error": _safe_exc_str(e)}
 
