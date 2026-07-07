@@ -1,0 +1,316 @@
+[
+  {
+    "question": "Find all protein kinases that phosphorylate Notch1",
+    "cypher": "MATCH (kinase:Protein)-[r:ProtModification]->(notch1:Protein)\nMATCH (kinase)-[:is_a|part_of*1..]->(fc:FunctionalClass|SemanticConcept)\nWHERE toLower(notch1.Name) = 'notch1'\n  AND toLower(fc.Name) CONTAINS 'protein kinase'\nWITH DISTINCT kinase, r, notch1\nRETURN kinase, r, notch1",
+    "notes": "Node property is always 'Name' (capital N). String matches always use toLower() on both sides. ALWAYS add WITH DISTINCT before RETURN when the query joins across an ontology hierarchy (is_a/part_of) — each kinase can match multiple ancestor nodes, producing duplicate rows without DISTINCT.",
+    "tags": []
+  },
+  {
+    "question": "Find kinases that phosphorylate AKT1 (generic: works for any enzyme class and any target)",
+    "cypher": "MATCH (kinase:Protein)-[r:ProtModification]->(target:Protein)\nMATCH (kinase)-[:is_a|part_of*1..]->(fc:FunctionalClass|SemanticConcept)\nWHERE toLower(target.Name) = toLower('AKT1')\n  AND toLower(fc.Name) CONTAINS 'kinase'\nWITH DISTINCT kinase, r, target\nRETURN kinase, r, target",
+    "notes": "CONTAINS search must use the SINGULAR root form: 'kinase' not 'kinases'. 'kinase' matches protein kinase, receptor tyrosine kinase, serine/threonine kinase, and every other kinase subtype — all ontological children. Strip trailing plural 's' or 'es' from any term before putting it in a CONTAINS clause. Always use WITH DISTINCT to collapse duplicate rows from multiple ontology paths.",
+    "tags": []
+  },
+  {
+    "question": "Find drugs without PAINS compounds",
+    "cypher": "MATCH (d:SmallMol)\nWHERE (\n  (d)-[:is_a*]->(:SmallMol {Name:'plant medicinal product'})\n  OR (d)-[:is_a*]->(:SemanticConcept {Name:'drugs'})\n)\nAND NOT (d)-[:is_a]->(:SmallMol {Name:'PAINS compounds'})\nRETURN d",
+    "notes": "Pattern predicates like this MUST live inside a single WHERE clause on one MATCH (d:SmallMol), not as separate MATCH statements joined by OR/AND. Use this example every time you need to select drugs from the list of SmallMol nodes — do NOT use the Treatment label for 'drugs'/'therapeutic approach'/'medication'/'compound' questions, SmallMol is the correct label for chemical/drug entities. IMPORTANT: this WHERE-clause refinement (the is_a-based drug/PAINS filter) is NOT just for standalone 'list all drugs' queries — apply the SAME refinement to the SmallMol node inside any larger query too, e.g. one that also matches a target protein and a disease. A bare 'MATCH (s:SmallMol)-[r]-(target) ...' with no further qualification returns EVERY SmallMol node connected to the target (reagents, metabolites, toxins, experimental compounds — not just real drugs), which is not what 'therapeutic approaches'/'drugs' questions are actually asking for. Fold this WHERE condition on the SmallMol variable into the combined query instead of dropping it.",
+    "tags": [
+      "drugs",
+      "drug",
+      "SmallMol",
+      "therapeutic",
+      "therapeutic approach",
+      "treatment",
+      "treatments",
+      "medication",
+      "medications",
+      "compound",
+      "compounds",
+      "chemical",
+      "small molecule",
+      "PAINS"
+    ]
+  },
+  {
+    "question": "What is the mechanism of action of the drug X?",
+    "cypher": "MATCH (drug:SmallMol)-[r1:DirectRegulation|Binding]-(target:Protein|FunctionalClass|Complex)\nWHERE toLower(drug.Name) = toLower('imatinib')\nWITH DISTINCT drug, target\nMATCH (drug)-[r2]-(target)\nRETURN drug, r2, target",
+    "notes": "Two-step pattern for 'mechanism of action' / 'how does drug X work' / 'what does drug X target' questions. STEP 1: identify the drug's genuine molecular targets by restricting to PHYSICAL interaction relation types only — DirectRegulation|Binding|ProtModification. These are the relation types that represent real physical contact between the drug and a protein/complex, as opposed to indirect, statistical, or purely correlative relations. Do NOT skip this restriction and do NOT substitute other relation types here — a drug can have hundreds of loosely-related nodes in the graph that are not real targets. target uses the same Protein|FunctionalClass|Complex label union as the 'find proteins' vocabulary category. STEP 2: once the true target set is fixed (WITH DISTINCT drug, target — required to avoid duplicate rows when multiple r1 relations connect the same pair), re-match the SAME drug/target pairs with NO relation-type restriction ([r2] with no colon-type) to pull back every other kind of relationship that exists between them (e.g. Regulation, QuantitativeChange, ClinicalTrial). This gives the full mechanism-of-action picture — not just the binding fact, but everything else known about how the drug affects that target. Replace 'imatinib' with the actual drug name from the user's question, toLower() both sides. If the drug label is ambiguous, apply the SmallMol drug/PAINS-exclusion filter from the 'Find drugs without PAINS compounds' example to the drug variable as well. ANSWER FORMAT — applies to this query's results, same reporting-then-asking flow as any other analytical question (see 'Never auto-visualize' rules — do NOT render automatically here either). Present the result as a RANKED drug-target list, not a raw dump of rows: for each distinct target node in the results, sum coalesce(r2.RelationNumberOfReferences, 0) across every r2 relation connecting it to the drug (a target can have more than one relation row/type), then sort targets by that summed total descending. In your chat text: (1) state the TOTAL number of distinct targets found, (2) list only the TOP 5 targets by name with their summed reference count and the relation type(s) involved, e.g. '1. EGFR — 1,204 references (Binding, Regulation)'. (3) Then close by offering the standard visualization choices (new Graph view vs. add to the current Graph view vs. Sankey vs. table) exactly like any other analytical result — never pick new-vs-add yourself, and never emit a render block until the user answers.",
+    "tags": [
+      "mechanism of action",
+      "mechanism",
+      "MOA",
+      "drug target",
+      "drug targets",
+      "targets",
+      "binding",
+      "physical interaction",
+      "how does it work",
+      "drugs",
+      "drug",
+      "SmallMol",
+      "DirectRegulation",
+      "ProtModification"
+    ]
+  },
+  {
+    "question": "Find the most-referenced/most-cited mechanism-of-action path between two entities, ranked among ALL tied-shortest paths in the physical interaction network, excluding high-level/generic ontology terms (nodes with more than N children in the ontology tree) from the path",
+    "cypher": "MATCH p = allShortestPaths((a:SmallMol)-[r:DirectRegulation|Binding|ProtModification*1..3]-(b:Protein|FunctionalClass|Complex))\nWHERE toLower(a.Name) = toLower('panobinostat')\n  AND toLower(b.Name) IN [toLower('H3'), toLower('H3K27me3')]\n  AND ALL(n IN nodes(p)[1..-1] WHERE size([(descendant)-[:is_a|part_of*]->(n) | descendant]) <= 10)\nWITH DISTINCT [n IN nodes(p) | n.Name] AS pathNodeNames,\n     [rel IN relationships(p) | type(rel)] AS pathRelTypes,\n     reduce(total = 0, rel IN relationships(p) | total + coalesce(rel.RelationNumberOfReferences, 0)) AS totalReferences\nRETURN pathNodeNames, pathRelTypes, totalReferences\nORDER BY totalReferences DESC\nLIMIT 1",
+    "notes": "RETURN LEAN DATA, NOT THE RAW PATH OBJECT — READ THIS FIRST: this query returns pathNodeNames/pathRelTypes (plain string lists) and totalReferences, NOT 'RETURN p'. A raw Neo4j path object serializes EVERY property of every node and relationship along it; for LIMIT 3-4 rows that can easily blow past the tool result's ~8,000-character sample cap, truncating rows mid-object. A real failure this caused: the agent reported '[truncated intermediate node]' and 'details truncated in sample' directly to the user for rows 3-4 — it was echoing the raw truncation artifact from its own tool output instead of having complete data to summarize, and separately reported the exact same path twice (rows 1 and 2, both 'HDAC1' at 89 references) because without DISTINCT on the logical path (node-name + relation-type sequence), duplicate underlying relationship records between the same two nodes produce duplicate 'paths' that look identical when rendered as text. The WITH DISTINCT on [n IN nodes(p)|n.Name] + [rel IN relationships(p)|type(rel)] collapses those duplicates, and returning only names/types/totalReferences (small scalars) instead of full node/relationship property blobs keeps every row complete even at LIMIT 5-10 — never truncated, never needing to guess at missing data. Render each row as e.g. 'panobinostat --(DirectRegulation)--> HDAC1 --(ProtModification)--> H3 (89 references)' by zipping pathNodeNames with pathRelTypes — do not report a row as truncated/incomplete when using this lean form, since there is nothing large left to truncate. IMPORTANT — this lean form is for the CHAT ANSWER only. If the user then asks to visualize the winning path(s) in the graph view, re-run a SEPARATE query returning full node/relationship objects for just those specific matched path(s) (e.g. constrain a MATCH by the exact node names from pathNodeNames and RETURN a,r,b triples per the normal render rules) — do not try to render from the lean scalar output directly. WHY allShortestPaths() HERE, NOT A BARE VARIABLE-LENGTH MATCH: 'most-cited/most-referenced mechanism path' only makes sense as a comparison among paths of the SAME (shortest) length — ranking a 2-hop path against an unrelated 3-hop path by citation count is comparing apples to oranges, since a longer path naturally accumulates more total references without being a more direct mechanism. allShortestPaths() first finds every path tied for the minimum length between a and b (subject to the relation-type and hop-bound-ceiling constraints), and ONLY THEN do we rank that tied-shortest set by summed citations — so 'most cited' means 'most cited AMONG the most direct routes', which is what the user actually wants. This is also cheaper than the old bare 'MATCH p = (a)-[...*1..3]-(b)' form: allShortestPaths() is BFS-bounded to the tied-shortest set, not an exhaustive enumeration of every path up to 3 hops. ONTOLOGY-EXCLUSION FILTER IS A POST-FILTER — IMPORTANT CAVEAT: the ALL(...) ontology-breadth check runs AFTER allShortestPaths() has already fixed the shortest length; it does not make Neo4j search for a longer alternative if every tied-shortest path happens to fail the filter. If this query returns ZERO rows, that means every path at the true shortest length was excluded by the ontology filter — widen the hop bound by exactly one (*1..3 → *1..4) and retry rather than concluding no mechanism exists. Use this pattern whenever the user asks to exclude 'high-level', 'generic', 'broad', or 'high-level ontology' terms/nodes from a path, and/or defines that concept themselves as 'a node with more than N children in the ontology tree'. DEFINITION — COUNT ALL DESCENDANTS, NOT JUST DIRECT CHILDREN: use the unbounded traversal (descendant)-[:is_a|part_of*]->(n) — i.e. every node classified under n at ANY depth, not only the ones one hop away. This matches the 'children' terminology already used elsewhere in this file (see 'Find ontology children for a given FunctionalClass node', which also treats is_a|part_of* — unbounded — as 'children'). A DIRECT-children-only count was tried first and undercounted real high-level terms: broad functional classes like 'acetylase' or 'histone acetylase' can have only a handful of immediate is_a children while still branching out to hundreds of descendants a few levels down — direct-only counting let those slip through the filter even though they are exactly the kind of generic umbrella term the user wants excluded. Compute it inline as a pattern-comprehension predicate, size([(descendant)-[:is_a|part_of*]->(n) | descendant]) <= 10, so it can be folded into a single WHERE/ALL clause rather than a separate OPTIONAL MATCH + count subquery — same embedding style as the is_a-based filter in 'Find drugs without PAINS compounds'. THRESHOLD CAVEAT: a descendant count is naturally much larger than a direct-child count for the same node, so the same numeric threshold (default 10) is now a much stricter/lower bar and will exclude more nodes than the old direct-only version did — use N from the user's own wording, and if they later report the filter is now EXCLUDING legitimate intermediate nodes (over-exclusion) rather than missing broad ones, that means the threshold needs to go up, not that the descendant-based definition is wrong. To check a specific term's real child/descendant count before trusting the filter, run the 'Find ontology children for a given FunctionalClass node' example on it (e.g. on 'acetylase') and count the results. CRITICAL — apply this filter ONLY to INTERMEDIATE path nodes: nodes(p)[1..-1] strips the first and last element of the path's node list, so the exclusion never accidentally removes the path's own start/end entities (e.g. the drug or the H3/H3K27 target) even if those happen to have many ontology children themselves. 'Most supported by references' / 'biggest number of references' means: sum coalesce(rel.RelationNumberOfReferences, 0) over every relationship in the path (reduce(...) above), then ORDER BY that total DESC. Use LIMIT 1 for 'the most supported path' (singular); drop to LIMIT 5 (or whatever N the user asks for) to return several ranked alternative tied-shortest paths instead of just the best one. Restrict the path's relationship types to whatever the user calls 'physical interaction' — DirectRegulation|Binding|ProtModification is this graph's established convention (see the mechanism-of-action drug-target example) — do not silently widen to Regulation/QuantitativeChange/etc. unless asked. HOP BOUND — this graph's diameter is only 6, so treat that as a hard ceiling, not a safe default: *1..3 is the right starting point for a drug-to-target mechanism path (most real mechanisms resolve in 2-3 hops); widen one hop at a time (only when zero rows come back, per the caveat above), never jump straight to the diameter. Only use this ranking pattern when the user explicitly asks to rank/compare paths by evidence/references/'most supported'/'most cited'/'best'. For a plain 'is there a path' / 'what links X to Y' question with no ranking requirement, use the plain shortestPath() example instead; for 'identify/find ALL targets connected to X' (enumeration, no ranking), use the allShortestPaths() enumeration example instead — this example is specifically for when BOTH enumeration among ties AND citation-based ranking are needed together.",
+    "tags": [
+      "high level ontology term",
+      "high-level ontology",
+      "generic term",
+      "generic ontology term",
+      "broad term",
+      "ontology children count",
+      "exclude ontology terms",
+      "mechanism of action path",
+      "most referenced path",
+      "most supported path",
+      "most cited path",
+      "most cited",
+      "path between",
+      "physical interaction network",
+      "shortest path",
+      "allShortestPaths",
+      "best path",
+      "children count",
+      "ontology breadth",
+      "deacetylase",
+      "tumor suppressor",
+      "histone",
+      "ProtModification",
+      "DirectRegulation",
+      "Binding"
+    ]
+  },
+  {
+    "question": "Confirm there IS a connection between two SPECIFIC, already-named entities via specific relation types (fast — NOT for enumerating/identifying which of several candidates are connected)",
+    "cypher": "MATCH p = shortestPath((a:SmallMol)-[:DirectRegulation|Binding|ProtModification*1..3]-(b))\nWHERE toLower(a.Name) = toLower('panobinostat')\n  AND toLower(b.Name) = toLower('H3')\nRETURN p",
+    "notes": "CRITICAL GOTCHA — READ BEFORE USING shortestPath(): shortestPath() returns exactly ONE path per matched (a,b) node pair, even when many other paths of the EXACT SAME minimal length also exist — it does not mean 'the cheapest of all ties', it means 'stop after finding a single shortest path and discard every other tie'. Real failure this caused: a user asked to 'identify panobinostat targets linked by physical interaction to H3 or H3K27' — b matched 2 named nodes (H3, H3K27), so shortestPath() returned exactly 2 results (one arbitrary 2-hop path per name), even though 27 different proteins (including HDAC1 and HDAC3) were each EQUALLY validly connected to panobinostat AND to H3/H3K27 by a direct physical interaction — all of them tied at the same path length, all silently discarded except one arbitrary pick per name. RULE: if the question is 'is there a path / what is the shortest path between X and Y' for ONE SPECIFIC pair of already-known entities, shortestPath() is correct and fast. If the question is 'identify/find ALL targets/entities linked to X', 'which proteins connect A and B', or b could match more than one node — that is an ENUMERATION question, not a single-path question — use the 'Find/identify ALL entities connected via physical interaction (enumerate every tied-shortest connection)' example instead (allShortestPaths()), or you will silently under-report the true result set exactly like the failure above. THE OTHER MISTAKE TO AVOID (this caused a real timeout): writing 'MATCH p = (a)-[:TYPE*1..N]-(b) ... RETURN p ORDER BY ... LIMIT 1' WITHOUT the shortestPath()/allShortestPaths() wrapper — that form makes Neo4j enumerate EVERY matching path up to length N before it can sort/limit, combinatorially explosive on this graph, and times out even with LIMIT 1. Reserve that enumerate-and-rank form (see the 'most-referenced mechanism-of-action path' example) strictly for when the user explicitly wants paths ranked by supporting evidence. HOP BOUND — this graph's diameter is only 6, so *1..6 is NOT a safe 'wide net' default; it lets the search expand across almost the entire graph. Default to *1..3 for physical-interaction/mechanism-of-action questions — most genuine direct mechanisms resolve within 2-3 hops. Widen ONE hop at a time (3 → 4 → 5), never jump straight to the diameter. Do not restrict node labels on the second endpoint unless needed — add a label filter only if entity resolution narrows it down.",
+    "tags": [
+      "shortest path",
+      "path between",
+      "linked by",
+      "physical interaction",
+      "target linked to",
+      "connects to",
+      "find a path",
+      "how are they connected",
+      "is there a path",
+      "timeout",
+      "slow query",
+      "ProtModification",
+      "DirectRegulation",
+      "Binding"
+    ]
+  },
+  {
+    "question": "Find/identify ALL entities connected to X via physical interaction — enumerate every tied-shortest connection, not just one (e.g. 'identify panobinostat targets linked by physical interaction to H3 or H3K27')",
+    "cypher": "MATCH p = allShortestPaths((a:SmallMol)-[:DirectRegulation|Binding|ProtModification*1..3]-(b:Protein|FunctionalClass|Complex))\nWHERE toLower(a.Name) = toLower('panobinostat')\n  AND toLower(b.Name) IN [toLower('H3'), toLower('H3K27me3')]\nRETURN DISTINCT [n IN nodes(p) | n.Name] AS pathNodeNames,\n       [rel IN relationships(p) | type(rel)] AS pathRelTypes,\n       last(nodes(p)).Name AS bridgeOrTargetName",
+    "notes": "RETURN LEAN DATA, NOT THE RAW PATH OBJECT: this returns pathNodeNames/pathRelTypes (plain string lists) and bridgeOrTargetName, NOT 'RETURN p'. A raw path object serializes every property of every node/relationship along it — with up to a few dozen results (this query can easily return 20-30+ tied paths on a well-connected drug), that blows past the tool result's ~8,000-character sample cap and truncates rows, which previously caused the agent to report garbled/incomplete rows straight to the user (see the 'most-referenced mechanism-of-action path' example's notes for the exact failure). DISTINCT here also collapses duplicate underlying relationship records between the same two nodes that would otherwise render as identical-looking repeated rows. Use allShortestPaths() — NOT shortestPath() — for ANY 'identify/find ALL targets/entities linked to X', 'which proteins connect A and B', 'what is connected to both X and Y' question, i.e. whenever the user wants to ENUMERATE candidates rather than confirm one specific pair is connected. shortestPath() returns only ONE path per (a,b) node pair and silently drops every other path tied at the same length — see the CRITICAL GOTCHA in the 'Confirm there IS a connection between two SPECIFIC entities' example for the real failure this caused (shortestPath() returned only 2 results for a panobinostat/H3/H3K27 query when 27 equally-connected bridge proteins actually existed, including HDAC1 and HDAC3). allShortestPaths() finds every path tied for the minimum length instead of one arbitrary pick, which is what actually answers an 'identify all X' question correctly. It is still BFS-based and efficient — NOT the expensive enumerate-then-rank pattern from the 'most-referenced mechanism-of-action path' example — safe to use as the default replacement for shortestPath() whenever the intent is enumeration. After running it, bridgeOrTargetName (the path's non-drug endpoint) is one distinct target/bridge entity — report the TOTAL distinct count and list them (e.g. via COUNT(DISTINCT bridgeOrTargetName) reasoning over the returned rows), following the same 'ANSWER FORMAT' reporting-then-asking convention as the mechanism-of-action example (do not auto-render). If the user then wants to visualize these in the graph view, re-run a separate query returning full node/relationship objects (RETURN a,r,b triples) for rendering — do not try to render from this lean scalar output directly. HOP BOUND — same rule as shortestPath(): default to *1..3 (this graph's diameter is 6), widen one hop at a time only if nothing is found, never jump straight to the diameter.",
+    "tags": [
+      "identify target",
+      "identify targets",
+      "find all targets",
+      "all shortest paths",
+      "allShortestPaths",
+      "enumerate",
+      "list all",
+      "connected to both",
+      "bridge protein",
+      "physical interaction",
+      "linked by",
+      "all connections",
+      "every target",
+      "which proteins connect"
+    ]
+  },
+  {
+    "question": "Find side effects / toxicities of a drug or list of drugs",
+    "cypher": "UNWIND ['imatinib', 'panobinostat'] AS drugName\nMATCH (drug:SmallMol)-[r:Regulation]->(dis:Disease)\nWHERE toLower(drug.Name) = toLower(drugName)\n  AND r.Effect = 'positive'\n  AND NOT (drug)-[:ClinicalTrial]-(dis)\nWITH DISTINCT drug, r, dis\nRETURN drug, r, dis",
+    "notes": "DEFINITION: a candidate side effect / toxicity is a Disease that is DOWNSTREAM of the drug (drug -[:Regulation]-> disease, directed — the drug increases/drives the disease process) with r.Effect = 'positive'. Use the Regulation relation type specifically for this — it is this graph's general-purpose 'increases/decreases' statement type, distinct from the physical-interaction types (DirectRegulation/Binding/ProtModification) used in the mechanism-of-action examples elsewhere in this file. CRITICAL EXCLUSION — do not skip this: a Disease connected to the drug by a Regulation-positive edge is NOT necessarily a genuine adverse effect. Sometimes that same Disease is also the subject of a ClinicalTrial relation to the drug because it was studied as a SAFETY/TOLERABILITY endpoint — i.e. the trial specifically checked whether the drug does NOT worsen a pre-existing condition, and the disease shows up in the literature-derived Regulation statement as an artifact of that study design, not as an organically observed toxicity. Excluding any Disease that ALSO has a ClinicalTrial relation to the same drug (NOT (drug)-[:ClinicalTrial]-(dis), checked undirected since ClinicalTrial edges are not consistently oriented drug->disease in this graph) filters these confounded cases out, leaving genuine unstudied/incidental side-effect signals. Accepts one drug or a list — always use UNWIND for a batch of names rather than one MATCH per drug (see the general 'Look up several named entities at once' pattern in this file). Do NOT apply the PAINS/is_a drug-selection filter from 'Find drugs without PAINS compounds' here — that filter is for scanning ALL SmallMol nodes to decide which are genuine drugs; here the drug name(s) are already known/specified by the user, so it does not apply. WITH DISTINCT is required because multiple Regulation relations can connect the same drug/disease pair. Report results the same way as other drug-target list examples: state the total number of distinct diseases found per drug, and list the top ones — do not auto-visualize, follow the standard ask-first render convention.",
+    "tags": [
+      "side effects",
+      "side effect",
+      "adverse effect",
+      "adverse effects",
+      "toxicity",
+      "toxicities",
+      "drug safety",
+      "safety profile",
+      "downstream disease",
+      "Regulation",
+      "ClinicalTrial",
+      "drug induced",
+      "exacerbate",
+      "worsen",
+      "drugs",
+      "SmallMol"
+    ]
+  },
+  {
+    "question": "Classify a list of proteins by their ontology parent groups in Pathway Studio Ontology",
+    "cypher": "MATCH (p:Protein|FunctionalClass|Complex)\nWHERE toLower(p.Name) IN ['kdm1a', 'akt1', 'runx1']\nOPTIONAL MATCH (p)-[:is_a|part_of*1..]->(parent:FunctionalClass|SemanticConcept)\nWITH p.Name AS protein, collect(DISTINCT parent.Name) AS ontologyGroups\nRETURN protein, ontologyGroups\nORDER BY protein",
+    "notes": "IMPORTANT PATTERN — when the user asks to classify proteins by ontology, parent groups, or categories, ALWAYS use a SINGLE Cypher query that handles all proteins at once (not one query per protein). Replace the IN list with the actual protein names from the user's request. toLower() both sides. The result gives each protein and its list of parent ontology groups. Do NOT plan multi-step lookups one protein at a time — one query returns everything.",
+    "tags": [
+      "classify",
+      "categorize",
+      "perform ontology categorization"
+    ]
+  },
+  {
+    "question": "Default node labels to search when user says 'proteins' (label search convention)",
+    "cypher": "MATCH (n:Protein|FunctionalClass|Complex) WHERE toLower(n.Name) CONTAINS 'kinase' RETURN n LIMIT 50",
+    "notes": "PERMANENT USER PREFERENCE — label search rule: when the user says 'proteins' (or 'protein' generically), search nodes with labels Protein, FunctionalClass, OR Complex UNLESS the user explicitly says 'only Protein nodes' or 'labeled Protein'. Rationale: FunctionalClass covers protein families and enzyme classes (e.g. 'protein kinase'), Complex covers multi-protein assemblies. A query for 'proteins involved in X' should use MATCH (n:Protein|FunctionalClass|Complex). Only use MATCH (n:Protein) alone when the user explicitly restricts to 'Protein nodes only'.",
+    "tags": []
+  },
+  {
+    "question": "Find ontology children for a given FunctionalClass node",
+    "cypher": "MATCH (parent:FunctionalClass) OPTIONAL MATCH (child)-[:is_a|part_of*]->(parent) RETURN parent, collect(DISTINCT child) AS children",
+    "notes": "This query returns all children of a given FunctionalClass node. Use it as example, when you need to do ontology expansion in cypher query",
+    "tags": []
+  },
+  {
+    "question": "What pushes leukemic blasts out of a differentiation-arrested state / activate blast cell differentiation",
+    "cypher": "MATCH (activator:Protein|SmallMol)-[r]->(process:CellProcess|Disease) MATCH (process)-[:is_a|part_of*0..]->(parent:CellProcess|Disease) WHERE r.Effect = 'positive' AND toLower(parent.Name) CONTAINS 'blast cell differentiation' WITH DISTINCT activator, r, process RETURN activator, r, process",
+    "notes": "GRAPH-FIRST SEMANTIC TRANSLATION — when you see any of these user phrases, ALWAYS query the knowledge graph (do NOT answer from general LLM knowledge): 'pushes leukemic blast out of differentiation-arrested state', 'releases differentiation block', 'overcomes differentiation arrest', 'restores differentiation', 'promotes blast differentiation', 'activates blast cell differentiation', 'what actually pushes a leukemic blast'. All these phrases mean the same graph pattern: a node with a POSITIVE/activating relation (r.Effect = 'positive' or 'up-regulates') targeting a process or protein associated with myeloid/blast cell differentiation. The 'differentiation-arrested state' is a biological descriptor for leukemic blast cells — it is NOT a node in the graph. Translate it to: blast cell + differentiation process + positive regulatory relation.",
+    "tags": []
+  },
+  {
+    "question": "How to find node connectivity",
+    "cypher": "MATCH (n)-[r]-(m) WHERE toLower(n.Name) = toLower('NodeName') RETURN count(r) as RelationCount, count(m) as NeighborCount",
+    "notes": "When user asks about connectivity of a node show results of this query.  If user lists several nodes in comma-separated format build a table for each input node name",
+    "tags": []
+  },
+  {
+    "question": "Look up several named entities at once instead of querying one name at a time",
+    "cypher": "WITH ['AKT1', 'RUNX1', 'KDM1A'] AS names\nUNWIND names AS name\nMATCH (n:Protein|FunctionalClass|Complex) WHERE toLower(n.Name) = toLower(name)\nRETURN n",
+    "notes": "Adapted from the Python Cypher-builder's UNWIND-based batch lookup (match_nodes_byprop/match_psobjs). Whenever the user gives a list of names/terms, build ONE query with WITH [...] AS names / UNWIND names AS name — never issue one MATCH per name. Replace the literal list with the user's actual terms.",
+    "tags": []
+  },
+  {
+    "question": "How many relations does each of several entities have (connectivity/degree for a batch)",
+    "cypher": "WITH ['AKT1', 'RUNX1'] AS names\nUNWIND names AS name\nMATCH (n:Protein|FunctionalClass|Complex) WHERE toLower(n.Name) = toLower(name)\nRETURN n.Name AS name, COUNT{(n)-[]-()} AS connectivity",
+    "notes": "Adapted from the Python Cypher-builder's get_nodes(with_connectivity=True) / node_connectivity helpers. COUNT{(n)-[]-()} is Neo4j's counting-subquery syntax — it is the correct and efficient way to get a node's total relation count. Combine it with UNWIND for a batch of names rather than running a separate query per entity.",
+    "tags": [
+      "degree",
+      "how connected",
+      "number of relations",
+      "connectivity for multiple entities"
+    ]
+  },
+  {
+    "question": "Get ontology children of a term, but only if it doesn't have too many (avoid flooding the result for very broad terms)",
+    "cypher": "MATCH (p:CellProcess {Name:'blast cell differentiation'})\nOPTIONAL MATCH (child)-[:is_a*]->(p)\nWITH p, collect(DISTINCT child) AS allChildren\nRETURN size(allChildren) AS childCount,\n  CASE WHEN size(allChildren) > 0 AND size(allChildren) <= 50 THEN allChildren ELSE null END AS children",
+    "notes": "Adapted from the Python Cypher-builder's get_childs(max_childs=...). Use OPTIONAL MATCH + collect(DISTINCT child) so the parent is still returned (with childCount 0) even if it has no children. Wrap the returned list in a CASE so a very broad/generic term returns null for 'children' instead of dumping hundreds of nodes — report childCount to the user either way and ask if they want the full list.",
+    "tags": []
+  },
+  {
+    "question": "Only keep relations backed by at least a minimum number of literature references ('well-supported', 'strong evidence', 'at least N papers')",
+    "cypher": "MATCH (a:Protein|FunctionalClass|Complex)-[r]->(b:Disease)\nWHERE toLower(b.Name) = toLower('acute myeloid leukemia')\n  AND coalesce(r.RelationNumberOfReferences, 0) >= 3\nRETURN a, r, b",
+    "notes": "Adapted from the Python Cypher-builder's add_relProps REFCOUNT handling. The reference-count property on relations is 'RelationNumberOfReferences' (not 'RefCount'). ALWAYS wrap it in coalesce(r.RelationNumberOfReferences, 0) before comparing — the property can be missing on some edges, and a bare r.RelationNumberOfReferences >= N silently drops those rows instead of treating them as 0.",
+    "tags": []
+  },
+  {
+    "question": "Include relations whose regulatory direction (Effect) was never annotated, alongside clearly positive/negative ones",
+    "cypher": "MATCH (a:Protein|FunctionalClass|Complex)-[r]->(b:CellProcess)\nWHERE toLower(b.Name) = toLower('myeloid cell differentiation')\n  AND (r.Effect IN ['positive', 'negative'] OR coalesce(r.Effect, '_') IN ['unknown', '_'])\nRETURN a, r, b",
+    "notes": "Adapted from the Python Cypher-builder's add_relProps EFFECT handling. r.Effect can be the literal string 'positive', 'negative', 'unknown', or simply missing/null — a plain r.Effect = 'unknown' check misses the null case. Use this coalesce pattern whenever the user asks to include regulators/relations 'even without a clear direction' or 'regardless of effect'.",
+    "tags": []
+  },
+  {
+    "question": "Restrict results to specific relation types, e.g. only direct physical interactions",
+    "cypher": "MATCH (a:Protein|FunctionalClass|Complex)-[r:Binding|DirectRegulation|ProtModification]-(b:Protein|FunctionalClass|Complex)\nWHERE toLower(a.Name) = toLower('AKT1') AND coalesce(r.RelationNumberOfReferences, 0) >= 2\nRETURN a, r, b",
+    "notes": "Adapted from the Python Cypher-builder's PHYSICAL_INTERACTIONS filtering (ppi method). Combine multiple relation types directly inside the relationship pattern with '|' (e.g. [r:Binding|DirectRegulation|ProtModification]) rather than matching all types and filtering afterward with type(r) IN [...] — it's simpler and lets Neo4j use the relationship-type index. Direct/physical relation types in this schema include Binding, DirectRegulation, ProtModification, PromoterBinding, ChemicalReaction.",
+    "tags": []
+  },
+  {
+    "question": "Expand a set of seed nodes but only keep the ones with at least N connections to a specific neighbor type ('entities connected to at least 2 diseases', etc.)",
+    "cypher": "MATCH (s:Protein|FunctionalClass|Complex)-[r]-(n:Disease)\nWHERE toLower(s.Name) IN [toLower('AKT1'), toLower('RUNX1'), toLower('KDM1A')]\nWITH s, count(DISTINCT n) AS diseaseCount, collect({rel: r, neighbor: n}) AS connections\nWHERE diseaseCount >= 2\nUNWIND connections AS conn\nRETURN s, conn.rel AS r, conn.neighbor AS n",
+    "notes": "Adapted from the Python Cypher-builder's expand_with_cutoff. This is NOT a simple one-hop MATCH — it aggregates first (WITH s, count(DISTINCT n) AS ... ) to filter the SEED nodes by how many qualifying neighbors they have, then UNWINDs back out to return full edges only for seeds that passed the threshold. Use this pattern whenever the user's filter is about a MINIMUM COUNT of connections, not just their existence.",
+    "tags": [
+      "at least N",
+      "minimum connections",
+      "connected to multiple"
+    ]
+  },
+  {
+    "question": "Find how two specific groups of entities are connected, regardless of which side is the source/regulator in the stored relation",
+    "cypher": "MATCH (a:Protein|FunctionalClass|Complex) WHERE toLower(a.Name) IN [toLower('AKT1'), toLower('MTOR')]\nMATCH (b:Disease) WHERE toLower(b.Name) IN [toLower('acute myeloid leukemia'), toLower('breast cancer')]\nMATCH (a)-[r]-(b)\nRETURN startNode(r) AS Regulator, r AS Relation, endNode(r) AS Target",
+    "notes": "Adapted from the Python Cypher-builder's connect/connect_objs. When you don't know (or the user doesn't care) which side is upstream, match undirected (a)-[r]-(b) so no edges are missed, then recover the TRUE stored direction in the RETURN via startNode(r)/endNode(r) — do not assume direction from the order the node variables appear in the query.",
+    "tags": [
+      "how are these connected",
+      "relationship between groups",
+      "find relations between"
+    ]
+  },
+  {
+    "question": "Find entities that connect to BOTH of two given entities (shared regulators/targets, common neighbors)",
+    "cypher": "MATCH (d1:SmallMol) WHERE toLower(d1.Name) = toLower('imatinib')\nMATCH (d2:SmallMol) WHERE toLower(d2.Name) = toLower('dasatinib')\nMATCH (d1)-[r1]->(common:Protein|FunctionalClass|Complex)\nMATCH (d2)-[r2]->(common)\nWITH DISTINCT common, r1, d1, r2, d2\nRETURN d1, r1, common, r2, d2",
+    "notes": "Adapted from the Python Cypher-builder's common_neighbors. General pattern for 'what do A and B have in common': match each side to the SAME 'common' variable in two separate MATCH clauses, then WITH DISTINCT before RETURN to collapse duplicate paths. Works for any pair of node types/labels — swap in whatever entities and relation directions the user asked about.",
+    "tags": [
+      "common regulators",
+      "shared targets",
+      "both",
+      "activate both",
+      "regulate both",
+      "inhibit both",
+      "in common",
+      "intersection",
+      "common activators",
+      "common inhibitors"
+    ]
+  },
+  {
+    "question": "Awareness: some relation properties store the literal string '_' as a null/placeholder value instead of an actual null",
+    "cypher": "MATCH (a)-[r]->(b)\nWHERE r.Mechanism IS NOT NULL AND r.Mechanism <> '_' AND r.Mechanism <> ''\nRETURN a, r, b",
+    "notes": "Adapted from the Python Cypher/Postgres integration layer, which explicitly uses '_' as a placeholder for missing values on optional relation properties (e.g. Effect, Mechanism, ChangeType, BiomarkerType) — a leftover convention from how relations get merged. A bare 'r.Mechanism IS NOT NULL' check does NOT exclude these placeholder rows. Whenever filtering on an optional relation property, also exclude the literal '_' (and usually '') alongside the NULL check.",
+    "tags": []
+  },
+  {
+    "question": "How to find diseases genetically linked to input protein",
+    "cypher": "MATCH (source:Protein|FunctionalClass|Complex {Name:'NEXMIF'})-[relationship:GeneticChange]-(target:Disease|ClinicalParameter) \nRETURN source, relationship, target\n\nUNION\n\nMATCH (target:GeneticVariant)-[relationship:GeneticChange]-(source:Protein|FunctionalClass|Complex {Name:'NEXMIF'})\nRETURN source, relationship, target\n\nUNION\n\nMATCH (source:GeneticVariant)-[relationship]-(target:Disease|ClinicalParameter)\nWHERE (source)-[:GeneticChange]-(:Protein|FunctionalClass|Complex {Name:'NEXMIF'})\nRETURN source, relationship, target",
+    "notes": "MANDATORY — reproduce this EXACT 3-branch UNION structure VERBATIM for ANY 'X genetically linked to protein Y' question, no matter what X is (Disease, ClinicalParameter, CellProcess, or any other label) — only substitute the protein name and the target label(s) in all three branches. Do NOT consolidate, simplify, or 'optimize' the three branches into fewer MATCH clauses — they are NOT redundant with each other, each captures a genuinely different genetic-linkage path: (1) the protein directly linked to the target via GeneticChange; (2) a GeneticVariant OF the protein, returned AS the target itself — do not chain further through it; (3) a GeneticVariant that bridges to the target via ANY relation type, with the protein-link verified separately via a WHERE pattern-predicate (not by chaining a second MATCH through the variant in the same clause). A common mistake is merging branches 2 and 3 into a single two-hop MATCH through the variant — this silently drops all rows where the variant itself is the answer (branch 2) and changes branch 3's semantics. Keep all three MATCH...RETURN...UNION blocks separate and intact.",
+    "tags": [
+      "genetically linked",
+      "genetic links",
+      "genetic variant",
+      "gene variant",
+      "mutation linked",
+      "GeneticVariant",
+      "GeneticChange",
+      "diseases genetically linked",
+      "cell processes genetically linked",
+      "clinical parameters genetically linked"
+    ]
+  },
+  {
+    "question": "Connect a set of already-identified entities to a seed by the shortest path if possible, without dropping any entity that only connects indirectly",
+    "cypher": "MATCH (brca1:Protein|FunctionalClass|Complex {Name:'BRCA1'})\nMATCH (cp:CellProcess)\nWHERE EXISTS { (brca1)-[:GeneticChange]-(cp) }\n   OR EXISTS { (brca1)-[:GeneticChange]-(:GeneticVariant)-[]-(cp) }\nOPTIONAL MATCH (brca1)-[direct:GeneticChange]-(cp)\nWITH brca1, cp, direct\nOPTIONAL MATCH (brca1)-[:GeneticChange]-(gv:GeneticVariant)-[indirect]-(cp)\n  WHERE direct IS NULL\nRETURN brca1, cp, coalesce(direct, indirect) AS r, gv, (direct IS NULL) AS viaVariant",
+    "notes": "MANDATORY PATTERN for 'connect A to B in one step/directly if possible' requests about a set that was already established by a broader query (e.g. 'the 27 cell processes genetically linked to BRCA1'). 'If possible' is a PREFERENCE about how to render the connection, never a filter that removes entities — the WHERE EXISTS clause keeps every entity that qualifies EITHER way (direct or via a bridge node), so nothing from the original result set is silently dropped. Use OPTIONAL MATCH for the direct relationship first, then OPTIONAL MATCH the indirect (bridge-node) relationship ONLY for rows where no direct one was found (WHERE direct IS NULL) — coalesce() then picks whichever one actually exists. The 'viaVariant' flag tells you (and can tell the user) which entities needed the longer path. Do NOT replace this with a plain single-relationship MATCH — that only keeps the direct subset and silently loses everything reachable only through the bridge node, which is the most common mistake here. If the user ALSO insists the bridge node type must never appear in the visualization at all, that is incompatible with keeping indirectly-connected entities — explain the tradeoff instead of silently dropping them.",
+    "tags": [
+      "one step if possible",
+      "connect directly if possible",
+      "shortest path if possible",
+      "prefer direct connection",
+      "collapse path",
+      "do not lose entities",
+      "hide intermediate node"
+    ]
+  },
+  {
+    "question": "Match relations by a list of known RelationID values (e.g. RelationIDs from the Current Graph View State edge list)",
+    "cypher": "MATCH ()-[r]->()\nWHERE r.RelationID IS NOT NULL\nWITH r,\n     CASE WHEN apoc.meta.cypher.type(r.RelationID) CONTAINS 'LIST'\n          THEN [x IN r.RelationID | toString(x)]\n          ELSE [toString(r.RelationID)]\n     END AS relIdList\nWHERE ANY(rid IN relIdList WHERE rid IN ['12345', '-9007659472309382576'])\nRETURN r.RelationID AS relationId, startNode(r).Name AS regulator, endNode(r).Name AS target, type(r) AS relType",
+    "notes": "MANDATORY whenever matching relations by RelationID — e.g. from the Current Graph View State edge list, or any list of RelationIDs collected earlier in the conversation. RelationID is EITHER a scalar STRING or a LIST of strings — never a number. On MERGED relations (see 'Merge clones' / 'Merge Similar Relations') it becomes a list, one entry per original relation that got merged. A plain `WHERE r.RelationID IN ['12345', ...]` FAILS SILENTLY (0 rows, no error) for any relation where RelationID is a list, because Cypher's IN checks whether the whole list equals one of the given scalars, never whether it CONTAINS one of them. This app's Neo4j has the APOC plugin installed, so use `apoc.meta.cypher.type(value)` to detect the actual type directly (it returns a type name like 'STRING' or 'LIST OF STRING' and never throws, unlike calling a scalar function such as toString()/toInteger() on a list, which does throw) — check CONTAINS 'LIST' rather than an exact string match, since APOC's list-type naming can vary slightly by element type/version. Always build the comparison list as STRINGS: RelationIDs are large 64-bit values (e.g. -9007659472309382576) that must be carried as text end-to-end, never round-tripped through a JavaScript/JSON number, which loses precision above 2^53.",
+    "tags": [
+      "RelationID",
+      "match by RelationID",
+      "relation id list",
+      "0 results",
+      "no results found",
+      "query returned nothing",
+      "apoc"
+    ]
+  }
+]
