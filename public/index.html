@@ -69,14 +69,23 @@
             <div class="settings-item" onclick="openChangePassword();closeSettingsMenu()">Change Password</div>
             <div class="settings-item" id="settings-users-item" style="display:none" onclick="openUserManagement();closeSettingsMenu()">Users</div>
           </div>
-          <!-- DB connections (admin only) -->
+          <!-- My Connection — every role has their own DB credentials -->
           <div id="settings-db-section" style="display:none;padding:4px 0">
-            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">Database</div>
-            <div class="settings-item" onclick="openNeo4jSettings();closeSettingsMenu()">Neo4j</div>
-            <div class="settings-item" onclick="openPostgresSettings();closeSettingsMenu()">Postgres</div>
+            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">My Connection</div>
+            <div class="settings-item" onclick="openMyNeo4jSettings();closeSettingsMenu()">Neo4j</div>
+            <div class="settings-item" onclick="openMyPostgresSettings();closeSettingsMenu()">Postgres</div>
+            <div class="settings-item" id="settings-llm-item" onclick="openLLMSettings();closeSettingsMenu()">Agentic AI / LLM</div>
+          </div>
+          <!-- Database endpoints (admin only — sets the shared URL/host that every
+               user's personal "My Connection" credentials connect against) -->
+          <div id="settings-db-admin-section" style="display:none;padding:4px 0;border-top:1px solid #2a2f4a">
+            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">Database Endpoints</div>
+            <div class="settings-item" onclick="openNeo4jSettings();closeSettingsMenu()">Neo4j URL</div>
+            <div class="settings-item" onclick="openPostgresSettings();closeSettingsMenu()">Postgres Host</div>
           </div>
         </div>
       </div>
+      <button id="agentic-ai-btn" onclick="toggleAgenticPanel()" style="padding:5px 14px;background:linear-gradient(135deg,#2e7d52,#1a5c38);border:1px solid #3a9c66;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600;letter-spacing:0.02em;display:none">🤖 AI Agent</button>
       <button class="btn-danger-ghost" onclick="logout()">Sign Out</button>
     </div>
   </header>
@@ -116,7 +125,15 @@
         <div class="menu-item has-sub">Ontology
           <div class="menu-submenu">
             <div class="menu-item" onclick="findOntologyChildren();closeMenus()">Find ontology children</div>
-            <div class="menu-item" onclick="findOntologyParents();closeMenus()">Find ontology parents</div>
+            <div class="menu-item has-sub">Find ontology parents
+              <div class="menu-submenu">
+                <div class="menu-item" onclick="findOntologyParents(1);closeMenus()">1 level up</div>
+                <div class="menu-item" onclick="findOntologyParents(2);closeMenus()">2 levels up</div>
+                <div class="menu-item" onclick="findOntologyParents(3);closeMenus()">3 levels up</div>
+                <div class="menu-item" onclick="findOntologyParents(4);closeMenus()">4 levels up</div>
+                <div class="menu-item" onclick="findOntologyParents(5);closeMenus()">5 levels up</div>
+              </div>
+            </div>
             <div class="menu-separator"></div>
             <div class="menu-item" onclick="openOntologyAnalysis();closeMenus()">Ontology analysis…</div>
           </div>
@@ -139,6 +156,7 @@
             <div class="menu-item" onclick="connectSelectedNodes('indirect');closeMenus()">Indirect relations</div>
           </div>
         </div>
+        <div class="menu-item" onclick="openShortestPathDialog();closeMenus()">Shortest path…</div>
         <div class="menu-item has-sub">Expand Selected Nodes
           <div class="menu-submenu">
             <div class="menu-item" onclick="expandSelectedNodes('all');closeMenus()">Expand to all neighbors</div>
@@ -164,6 +182,11 @@
         <div class="menu-item has-sub" onclick="selectTableMode('reference')"><span class="menu-check" id="mc-view-reference"></span>References
           <div class="menu-submenu">
             <div class="menu-item" onclick="toggleFilterRows();closeMenus()"><span class="menu-check" id="mc-filter-rows-ref"></span>Filter rows</div>
+          </div>
+        </div>
+        <div class="menu-item has-sub" onclick="selectTableMode('node')"><span class="menu-check" id="mc-view-node"></span>Nodes
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="toggleFilterRows();closeMenus()"><span class="menu-check" id="mc-filter-rows-node"></span>Filter rows</div>
           </div>
         </div>
         <div id="view-graph-items">
@@ -229,6 +252,9 @@
           <div class="menu-submenu" id="select-by-label-submenu"><div class="menu-item" style="color:#7a8099;font-style:italic">Loading…</div></div>
         </div>
         <div class="menu-item" onclick="selectAllEdges();closeMenus()">Relations</div>
+        <div class="menu-item has-sub" onmouseenter="populateSelectByEdgeTypeMenu()">Relations by type
+          <div class="menu-submenu" id="select-by-edge-type-submenu"><div class="menu-item" style="color:#7a8099;font-style:italic">Loading…</div></div>
+        </div>
         <div class="menu-separator"></div>
         <div class="menu-item" onclick="addNeighborsToSelection();closeMenus()">Add neighbors to selection</div>
         <div class="menu-item" onclick="invertSelection();closeMenus()">Invert selection</div>
@@ -425,17 +451,45 @@
 </div>
 
 <!-- Cypher history modal -->
-<div id="cypher-history-modal" class="modal-backdrop" style="display:none" onclick="if(event.target===this)this.style.display='none'">
-  <div class="modal-box" style="min-width:700px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column">
+<style>
+  .ch-chip {
+    background: #1a1f35; border: 1px solid #3a4060; border-radius: 12px;
+    color: #a0aec0; font-size: 11px; padding: 3px 11px; cursor: pointer;
+  }
+  .ch-chip.active { background: #4f8ef7; border-color: #4f8ef7; color: #fff; font-weight: 600; }
+  .ch-chip:hover:not(.active) { border-color: #4f8ef7; color: #c8d8ff; }
+  mark.ch-hit { background: #4f8ef7; color: #fff; border-radius: 2px; padding: 0 1px; }
+</style>
+<div id="cypher-history-modal" class="modal-backdrop" style="display:none" onclick="if(event.target===this)_chCloseModal()">
+  <div class="modal-box" style="min-width:760px;max-width:92vw;max-height:85vh;display:flex;flex-direction:column">
     <h3 style="margin:0 0 12px">Cypher Query History</h3>
     <p style="margin:0 0 10px;font-size:12px;color:#a0aec0">Click a query row to load it, or choose a destination from the dropdown.</p>
+
+    <!-- Search + filters toolbar -->
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+      <input type="text" id="ch-search-input" placeholder="🔍 Search history…" oninput="_chRender()"
+        style="flex:1;min-width:200px;background:#1a1f35;border:1px solid #3a4060;border-radius:6px;color:#e2e8f0;font-size:13px;padding:6px 10px;outline:none">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#a0aec0;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="ch-dedupe" onchange="_chRender()"> Latest of each query only
+      </label>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px">
+      <span style="font-size:11px;color:#7a8099">When:</span>
+      <div id="ch-date-chips" style="display:flex;gap:5px">
+        <button class="ch-chip" data-range="all"   onclick="_chSetRange('all')">All time</button>
+        <button class="ch-chip" data-range="today" onclick="_chSetRange('today')">Today</button>
+        <button class="ch-chip" data-range="7d"    onclick="_chSetRange('7d')">Last 7 days</button>
+        <button class="ch-chip" data-range="30d"   onclick="_chSetRange('30d')">Last 30 days</button>
+      </div>
+    </div>
+
     <div id="cypher-history-status" style="color:#a0aec0;font-size:13px;margin-bottom:6px"></div>
-    <div style="overflow:auto;flex:1;border:1px solid #2a3050;border-radius:6px">
+    <div id="ch-scroll-container" style="overflow:auto;flex:1;min-height:0;border:1px solid #2a3050;border-radius:6px">
       <table style="width:100%;border-collapse:collapse">
         <thead>
           <tr style="background:#1a1f35;position:sticky;top:0">
-            <th style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050">Date</th>
-            <th style="padding:7px 10px;text-align:right;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050">Result Count</th>
+            <th id="ch-th-date" onclick="_chSetSort('date')" style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050;cursor:pointer;user-select:none">Date</th>
+            <th id="ch-th-count" onclick="_chSetSort('count')" style="padding:7px 10px;text-align:right;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050;cursor:pointer;user-select:none">Result Count</th>
             <th style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;border-bottom:1px solid #2a3050">Cypher Query</th>
             <th style="padding:7px 10px;text-align:center;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050">Open in</th>
           </tr>
@@ -444,7 +498,7 @@
       </table>
     </div>
     <div class="modal-actions" style="margin-top:12px">
-      <button class="btn-ghost" onclick="document.getElementById('cypher-history-modal').style.display='none'">Close</button>
+      <button class="btn-ghost" onclick="_chCloseModal()">Close</button>
     </div>
   </div>
 </div>
@@ -488,7 +542,7 @@
     <h3>Configure Columns</h3>
     <p style="color:#7a8099;font-size:12px;margin-bottom:14px">Check columns to show. Drag table headers to reorder.</p>
     <div style="overflow-y:auto;flex:1">
-      <div class="prop-section-title">graph columns (both views)</div>
+      <div class="prop-section-title" id="col-graph-title">graph columns (both views)</div>
       <div id="col-graph-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
       <div id="col-neo4j-section">
         <div class="prop-section-title">Neo4j edge properties (Relation view)</div>
@@ -507,6 +561,11 @@
         <div id="col-nodeprops-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:4px"></div>
         <div id="col-nodeprops-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
       </div>
+      <div id="col-nodecols-section" style="display:none">
+        <div class="prop-section-title" style="margin-top:12px">node properties (Node view)</div>
+        <div id="col-nodecols-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:4px"></div>
+        <div id="col-nodecols-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
+      </div>
     </div>
     <div class="modal-actions" style="margin-top:14px">
       <button class="btn-ghost" style="margin-right:auto;color:#e05560" onclick="resetColumnsToDefault()">Reset to defaults</button>
@@ -516,50 +575,515 @@
   </div>
 </div>
 
-<!-- Neo4j settings modal -->
+<!-- Neo4j endpoint modal (admin only — URL/host is shared infrastructure) -->
 <div id="neo4j-settings-modal" class="modal-backdrop" style="display:none" onclick="closeNeo4jSettingsModal(event)">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
-    <h3>Neo4j Connection</h3>
+    <h3>Neo4j Database Endpoint</h3>
+    <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
+      Admin-managed — the shared server every user connects to. Each user sets their own database name, username, and password under Settings → My Connection → Neo4j.
+    </p>
     <div id="neo4j-settings-error" class="error-msg" style="display:none"></div>
     <div id="neo4j-settings-success" class="success-msg" style="display:none"></div>
     <label style="font-size:12px;color:#7a8099">URL</label>
     <input type="text" id="ns-url" placeholder="bolt+ssc://host:7687" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Database name</label>
-    <input type="text" id="ns-database" placeholder="neo4j" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Username</label>
-    <input type="text" id="ns-username" placeholder="neo4j" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Password</label>
-    <input type="password" id="ns-password" placeholder="Leave blank to keep current" autocomplete="new-password">
-    <p style="font-size:11px;color:#7a8099;margin-top:6px">Connection is tested before saving. Server reconnects without restart.</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeNeo4jSettingsModal()">Cancel</button>
-      <button class="btn-primary" id="ns-save-btn" onclick="saveNeo4jSettings()">Test &amp; Save</button>
+      <button class="btn-primary" id="ns-save-btn" onclick="saveNeo4jSettings()">Save</button>
     </div>
   </div>
 </div>
 
-<!-- Postgres settings modal -->
+<!-- Postgres endpoint modal (admin only — host/port is shared infrastructure) -->
 <div id="postgres-settings-modal" class="modal-backdrop" style="display:none" onclick="closePostgresSettingsModal(event)">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
-    <h3>Postgres Connection</h3>
+    <h3>Postgres Database Endpoint</h3>
+    <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
+      Admin-managed — the shared server every user connects to. Each user sets their own database, schema, username, and password under Settings → My Connection → Postgres.
+    </p>
     <div id="pg-settings-error" class="error-msg" style="display:none"></div>
     <div id="pg-settings-success" class="success-msg" style="display:none"></div>
     <label style="font-size:12px;color:#7a8099">Host</label>
     <input type="text" id="pgs-host" placeholder="hostname or IP" autocomplete="off">
     <label style="font-size:12px;color:#7a8099">Port</label>
     <input type="number" id="pgs-port" placeholder="5432" value="5432" min="1" max="65535" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Database name</label>
-    <input type="text" id="pgs-database" placeholder="postgres" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Schema</label>
-    <input type="text" id="pgs-schema" placeholder="public" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Username</label>
-    <input type="text" id="pgs-username" placeholder="postgres" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Password</label>
-    <input type="password" id="pgs-password" placeholder="Leave blank to keep current" autocomplete="new-password">
-    <p style="font-size:11px;color:#7a8099;margin-top:6px">Connection is tested before saving. Server reconnects without restart.</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closePostgresSettingsModal()">Cancel</button>
-      <button class="btn-primary" id="pgs-save-btn" onclick="savePostgresSettings()">Test &amp; Save</button>
+      <button class="btn-primary" id="pgs-save-btn" onclick="savePostgresSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- My Neo4j Connection modal (every role — personal database/username/password) -->
+<div id="my-neo4j-modal" class="modal-backdrop" style="display:none" onclick="closeMyNeo4jSettingsModal(event)">
+  <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
+    <h3>My Neo4j Connection</h3>
+    <div id="my-neo4j-error" class="error-msg" style="display:none"></div>
+    <div id="my-neo4j-success" class="success-msg" style="display:none"></div>
+    <label style="font-size:12px;color:#7a8099">URL <span style="color:#5a6080">(set by admin)</span></label>
+    <input type="text" id="mns-url" disabled>
+    <label style="font-size:12px;color:#7a8099">Database name</label>
+    <input type="text" id="mns-database" placeholder="neo4j" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Username</label>
+    <input type="text" id="mns-username" placeholder="neo4j" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Password</label>
+    <input type="password" id="mns-password" placeholder="Leave blank to keep current" autocomplete="new-password">
+    <p style="font-size:11px;color:#7a8099;margin-top:6px">This is your own login — used to run queries and to attribute any database-level activity to you. Connection is tested before saving.</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeMyNeo4jSettingsModal()">Cancel</button>
+      <button class="btn-primary" id="mns-save-btn" onclick="saveMyNeo4jSettings()">Test &amp; Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- My Postgres Connection modal (every role — personal database/schema/username/password) -->
+<div id="my-postgres-modal" class="modal-backdrop" style="display:none" onclick="closeMyPostgresSettingsModal(event)">
+  <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
+    <h3>My Postgres Connection</h3>
+    <div id="my-pg-error" class="error-msg" style="display:none"></div>
+    <div id="my-pg-success" class="success-msg" style="display:none"></div>
+    <label style="font-size:12px;color:#7a8099">Host <span style="color:#5a6080">(set by admin)</span></label>
+    <input type="text" id="mpgs-host" disabled>
+    <label style="font-size:12px;color:#7a8099">Port <span style="color:#5a6080">(set by admin)</span></label>
+    <input type="text" id="mpgs-port" disabled>
+    <label style="font-size:12px;color:#7a8099">Database name</label>
+    <input type="text" id="mpgs-database" placeholder="postgres" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Schema</label>
+    <input type="text" id="mpgs-schema" placeholder="public" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Username</label>
+    <input type="text" id="mpgs-username" placeholder="postgres" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099">Password</label>
+    <input type="password" id="mpgs-password" placeholder="Leave blank to keep current" autocomplete="new-password">
+    <p style="font-size:11px;color:#7a8099;margin-top:6px">This is your own login — used to run reference lookups and to attribute any database-level activity to you. Connection is tested before saving.</p>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeMyPostgresSettingsModal()">Cancel</button>
+      <button class="btn-primary" id="mpgs-save-btn" onclick="saveMyPostgresSettings()">Test &amp; Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ LLM / Agentic AI Settings modal ══════════════ -->
+<div id="llm-settings-modal" class="modal-backdrop" style="display:none" onclick="closeLLMSettings(event)">
+  <div class="modal-box" style="min-width:520px;max-width:640px" onclick="event.stopPropagation()">
+    <h3>Agentic AI / LLM Settings</h3>
+    <div id="llm-settings-error"   class="error-msg"   style="display:none"></div>
+    <div id="llm-settings-success" class="success-msg" style="display:none"></div>
+
+    <!-- ── User section (all roles) ── -->
+    <div style="font-size:12px;color:#7a8099;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">My LLM Connection</div>
+    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px">
+      <div>
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Provider</label>
+        <select id="llms-user-provider" onchange="llmsUserProviderChanged()"
+          style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
+          <option value="">— Select provider —</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">API Key <span style="color:#5a6080;font-weight:400">(stored locally in your browser)</span></label>
+        <input type="password" id="llms-user-apikey" placeholder="Your personal API key"
+          style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none" autocomplete="new-password">
+      </div>
+      <div>
+        <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Model
+          <span id="llms-user-models-status" style="font-size:11px;color:#5a6080;font-weight:400;margin-left:6px"></span>
+          <button type="button" onclick="llmsUserFetchModels()" title="Fetch model list from provider"
+            style="margin-left:8px;padding:1px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:4px;color:#a0b0d0;font-size:11px;cursor:pointer">↻ Fetch</button>
+        </label>
+        <input type="text" id="llms-user-model" list="llms-user-model-list" placeholder="Type model name or click Fetch"
+          style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
+        <datalist id="llms-user-model-list"></datalist>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div>
+          <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Temperature</label>
+          <input type="number" id="llms-user-temperature" value="0.2" min="0" max="2" step="0.05"
+            style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
+        </div>
+        <div>
+          <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Top-p</label>
+          <input type="number" id="llms-user-top-p" value="0.9" min="0" max="1" step="0.05"
+            style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="llms-user-json-mode" style="margin:0">
+        <label for="llms-user-json-mode" style="font-size:12px;color:#c0c4d4;margin:0;cursor:pointer">Enable JSON mode</label>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <button type="button" onclick="llmsUserTestConnection()"
+          style="padding:5px 14px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">⚡ Test connection</button>
+        <span id="llms-user-ping-result" style="font-size:12px;color:#7a8099"></span>
+      </div>
+    </div>
+
+    <!-- ── Admin section (admin role only) ── -->
+    <div id="llms-admin-section" style="display:none;border-top:1px solid #2a3050;padding-top:14px">
+      <div style="font-size:12px;color:#7a8099;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px">Admin — Available Providers</div>
+      <div style="font-size:12px;color:#7a8099;margin-bottom:10px">
+        Define LLM providers available to all users (name + base URL).
+      </div>
+      <div id="llms-providers-list" style="display:flex;flex-direction:column;gap:8px;max-height:200px;overflow-y:auto;margin-bottom:10px"></div>
+      <button type="button" onclick="llmsAddProvider()" style="padding:5px 14px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">+ Add provider</button>
+      <div style="margin-top:14px">
+        <div style="font-size:12px;color:#7a8099;margin-bottom:8px">Global default parameters (used when user has not set their own)</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div>
+            <label style="font-size:12px;color:#7a8099">Temperature</label>
+            <input type="number" id="llms-temperature" value="0.2" min="0" max="2" step="0.05" style="width:100%">
+          </div>
+          <div>
+            <label style="font-size:12px;color:#7a8099">Top-p</label>
+            <input type="number" id="llms-top-p" value="0.9" min="0" max="1" step="0.05" style="width:100%">
+          </div>
+        </div>
+        <div style="margin-top:10px;display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="llms-json-mode" style="margin:0">
+          <label for="llms-json-mode" style="font-size:12px;color:#c0c4d4;margin:0;cursor:pointer">Enable JSON mode (global default)</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeLLMSettings()">Cancel</button>
+      <button class="btn-primary" id="llms-save-btn" onclick="saveLLMSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI side panel ══════════════ -->
+<div id="agentic-panel" style="
+  display:none;position:fixed;top:0;right:0;width:480px;max-width:96vw;height:100vh;
+  background:#161929;border-left:1px solid #2a3050;z-index:4000;
+  display:none;flex-direction:column;box-shadow:-4px 0 24px rgba(0,0,0,0.5)">
+
+  <!-- Panel header -->
+  <div style="background:#1e2235;border-bottom:1px solid #2a3050;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0">🤖 Agentic AI</span>
+      <span id="agent-status-dot" title="Agent service status" style="width:8px;height:8px;border-radius:50%;background:#888;display:inline-block"></span>
+      <span id="agent-status-label" style="font-size:11px;color:#7a8099">connecting…</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button onclick="openAgentLibrary()" title="Library and chat history" style="padding:4px 7px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer;display:inline-flex;align-items:center">
+        <svg width="16" height="14" viewBox="0 0 24 22" style="flex-shrink:0">
+          <rect x="2"  y="2" width="4" height="16" rx="1" fill="#f06292" stroke="#1e2235" stroke-width="1"/>
+          <rect x="7"  y="1" width="4" height="17" rx="1" fill="#ffd54f" stroke="#1e2235" stroke-width="1"/>
+          <rect x="12" y="3" width="4" height="15" rx="1" fill="#aed581" stroke="#1e2235" stroke-width="1"/>
+          <rect x="17" y="2" width="4" height="16" rx="1" fill="#4fc3f7" stroke="#1e2235" stroke-width="1"/>
+          <rect x="0"  y="18" width="24" height="2.5" rx="1" fill="#ffa726" stroke="#1e2235" stroke-width="1"/>
+        </svg>
+      </button>
+      <button onclick="openAgentVocabulary()" title="Vocabulary" style="padding:4px 7px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer;display:inline-flex;align-items:center">
+        <svg width="14" height="14" viewBox="0 0 16 16" style="flex-shrink:0"><rect x="1" y="1" width="14" height="14" rx="1.5" fill="#4f8ef7"/><rect x="1" y="1" width="3.2" height="14" rx="1.5" fill="#3a6fc4"/><text x="10" y="11.3" font-family="Arial, Helvetica, sans-serif" font-size="8" font-weight="700" fill="#fff" text-anchor="middle">V</text></svg>
+      </button>
+      <button onclick="openAgentExamples()" title="Show cypher examples" style="padding:4px 7px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">📚</button>
+      <button onclick="openAgentConfig()" title="Pipeline configuration" style="padding:4px 7px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">⚙</button>
+      <button onclick="toggleAgenticPanel()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+    </div>
+  </div>
+
+  <!-- Chat messages -->
+  <div id="agent-chat-messages" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px">
+    <div style="text-align:center;color:#5a6080;font-size:12px;padding:20px 0">
+      Ask anything about your graph — I can translate natural language to Cypher, run queries, and chain multi-step workflows.
+    </div>
+  </div>
+
+  <!-- Input row -->
+  <div style="border-top:1px solid #2a3050;padding:12px 14px;flex-shrink:0;background:#1e2235">
+    <div style="display:flex;gap:8px;align-items:flex-end">
+      <textarea id="agent-input" rows="2" placeholder="Ask a question or describe a task…"
+        style="flex:1;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:8px 10px;resize:none;outline:none;font-family:inherit;line-height:1.4"
+        onkeydown="agentInputKeydown(event)"></textarea>
+      <button onclick="agentSend()" id="agent-send-btn"
+        style="padding:8px 16px;background:#4f8ef7;border:none;border-radius:6px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;align-self:stretch">Send</button>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+      <button onclick="agentClearChat()" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">Clear chat</button>
+      <button onclick="agentSaveConversation()" title="Save this conversation to a local JSON file" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">💾 Save chat</button>
+      <button onclick="agentTriggerLoadConversation()" title="Load a previously saved conversation from a local JSON file" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">📂 Load chat</button>
+      <button id="agent-run-workflow-btn" onclick="agentRunWorkflow()" title="Run the workflow pipeline configured in Config → Active Workflow Pipeline" style="display:none;padding:3px 10px;background:transparent;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;font-size:11px;cursor:pointer">▶ Run workflow</button>
+      <span id="agent-thinking-indicator" style="display:none;font-size:11px;color:#4f8ef7">⏳ Thinking…</span>
+    </div>
+  </div>
+  <input type="file" id="agent-load-conv-input" accept=".json" style="display:none" onchange="agentLoadConversationFile(event)">
+</div>
+
+<!-- ══════════════ Agentic AI — Library browser modal ══════════════ -->
+<div id="agent-library-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:4500;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:640px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;gap:14px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0">📁 Agent Library</span>
+      <div style="display:flex;gap:8px">
+        <button onclick="agentLibraryRefresh()" style="padding:4px 12px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">↻ Refresh</button>
+        <button onclick="agentLibrarySaveNew()" style="padding:4px 12px;background:#2e7d52;border:none;border-radius:5px;color:#fff;font-size:12px;cursor:pointer;font-weight:600">+ Save current chat</button>
+        <button onclick="closeAgentLibrary()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1">×</button>
+      </div>
+    </div>
+    <input type="text" id="agent-library-search" placeholder="Filter by name or description…" oninput="agentLibraryFilter(this.value)"
+      style="background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
+    <div id="agent-library-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;min-height:160px">
+      <div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI — Cypher Examples browser modal ══════════════ -->
+<!-- Exposes cypher_examples.json — the file that seeds the "Cypher Query Examples"
+     section of the agent's system prompt — so users know it exists and can grow it
+     without hand-editing a file on disk. -->
+<style>
+  mark.aex-hit { background: #4f8ef7; color: #fff; border-radius: 2px; padding: 0 1px; }
+</style>
+<div id="agent-examples-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:4500;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:680px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;gap:12px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0;display:flex;align-items:center;gap:8px">
+        📚 Cypher Examples
+        <span id="agent-examples-count" style="font-size:11px;font-weight:600;color:#a0cfff;background:#0d1220;border:1px solid #2a4a7f;border-radius:10px;padding:2px 9px"></span>
+      </span>
+      <div style="display:flex;gap:8px">
+        <button onclick="agentExamplesRefresh()" style="padding:4px 12px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">↻ Refresh</button>
+        <button onclick="agentExampleAddNew()" style="padding:4px 12px;background:#2e7d52;border:none;border-radius:5px;color:#fff;font-size:12px;cursor:pointer;font-weight:600">+ Add example</button>
+        <button onclick="closeAgentExamples()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1">×</button>
+      </div>
+    </div>
+    <p style="margin:0;font-size:12px;color:#7a8099">
+      These examples teach the AI agent this graph's Cypher conventions — node label choices, property
+      naming, common patterns. Every example here is sent to the agent on every request, so add ones
+      that fix recurring mistakes or capture query patterns you rely on. Saved to
+      <code style="background:#0d1220;padding:1px 5px;border-radius:3px">cypher_examples.json</code> —
+      changes apply on your very next message, no restart needed.
+    </p>
+
+    <!-- Search + sort toolbar -->
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+      <input type="text" id="aex-search-input" placeholder="🔍 Search question, notes, cypher, tags…" oninput="_aexRender()"
+        style="flex:1;min-width:200px;background:#1a1f35;border:1px solid #3a4060;border-radius:6px;color:#e2e8f0;font-size:13px;padding:6px 10px;outline:none">
+      <select id="aex-sort-select" onchange="_aexRender()"
+        style="background:#1a1f35;border:1px solid #3a4060;border-radius:6px;color:#c8d0e8;font-size:12px;padding:6px 8px;cursor:pointer;outline:none">
+        <option value="rule">Sort: Rule #</option>
+        <option value="alpha">Sort: A–Z</option>
+      </select>
+    </div>
+
+    <div id="agent-examples-status" style="color:#a0aec0;font-size:12px"></div>
+    <div id="agent-examples-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:8px;min-height:160px">
+      <div style="color:#5a6080;font-size:12px;text-align:center;padding:20px">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI — Add/Edit Cypher Example dialog ══════════════ -->
+<div id="agent-example-edit-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:5000;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:560px;max-width:95vw;display:flex;flex-direction:column;gap:12px" onclick="event.stopPropagation()">
+    <div style="font-size:15px;font-weight:600;color:#e0e0e0" id="aex-modal-title">Add Cypher Example</div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Question / task this example demonstrates</label>
+      <input type="text" id="aex-question" placeholder="e.g. Find kinases that phosphorylate a target protein"
+        style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none;box-sizing:border-box">
+    </div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Cypher query <span style="color:#e57373">*</span></label>
+      <textarea id="aex-cypher" rows="6" placeholder="MATCH (n:Protein|FunctionalClass|Complex) WHERE ... RETURN n"
+        style="width:100%;background:#0d1220;border:1px solid #3a3f55;border-radius:6px;color:#a0cfff;font-size:12px;font-family:monospace;padding:8px 10px;outline:none;resize:vertical;box-sizing:border-box"></textarea>
+    </div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Notes — the rule or convention this example teaches</label>
+      <textarea id="aex-notes" rows="3" placeholder="e.g. Always use toLower() on both sides of a string comparison."
+        style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none;resize:vertical;font-family:inherit;box-sizing:border-box"></textarea>
+    </div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Tags (comma-separated, optional)</label>
+      <input type="text" id="aex-tags" placeholder="e.g. common regulators, shared targets, both, intersection"
+        style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none;box-sizing:border-box">
+      <div style="font-size:11px;color:#5a6080;margin-top:4px">
+        Only the AI agent uses this to decide when to include the example — not shown to you elsewhere.
+        Add trigger phrases the example's own wording won't naturally match — e.g. this is most useful for
+        generic/structural patterns (like "connects to both A and B") whose worked example uses placeholder
+        entities that share no words with a real question about it.
+      </div>
+    </div>
+    <div id="aex-error" style="display:none;color:#ff6b6b;font-size:12px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="closeAgentExampleEdit()" style="padding:6px 16px;background:transparent;border:1px solid #3a3f55;border-radius:6px;color:#7a8099;cursor:pointer">Cancel</button>
+      <button onclick="agentExampleSave()" id="aex-save-btn" style="padding:6px 16px;background:#2e7d52;border:none;border-radius:6px;color:#fff;cursor:pointer;font-weight:600">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI — Pipeline Config dialog ══════════════ -->
+<div id="agent-config-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:4500;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:480px;max-width:95vw;display:flex;flex-direction:column;gap:14px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0">⚙ Pipeline Configuration</span>
+      <button onclick="closeAgentConfig()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1">×</button>
+    </div>
+    <div style="font-size:12px;color:#5a6080">
+      Define a multi-step workflow pipeline. Each step runs in sequence, passing results to the next.
+      To configure your LLM provider, model and API key go to <a href="#" onclick="closeAgentConfig();openLLMSettings();return false;" style="color:#4f8ef7;text-decoration:none">Settings → Agentic AI / LLM</a>.
+    </div>
+    <div>
+      <div style="font-size:12px;color:#7a8099;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:10px">Active Workflow Pipeline</div>
+      <div id="acfg-workflow-steps" style="display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto"></div>
+      <button onclick="agentAddWorkflowStep()" style="margin-top:8px;padding:5px 12px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">+ Add step</button>
+    </div>
+    <div style="border-top:1px solid #2a3050;padding-top:12px;display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="closeAgentConfig()" style="padding:6px 16px;background:transparent;border:1px solid #3a3f55;border-radius:6px;color:#7a8099;cursor:pointer">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI — Save to library dialog ══════════════ -->
+<div id="agent-save-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:5000;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:420px;max-width:95vw;display:flex;flex-direction:column;gap:12px" onclick="event.stopPropagation()">
+    <div style="font-size:15px;font-weight:600;color:#e0e0e0">Save to Library</div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Name</label>
+      <input type="text" id="asave-name" placeholder="My workflow name"
+        style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
+    </div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Description</label>
+      <textarea id="asave-description" rows="2" placeholder="What does this workflow do?"
+        style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none;resize:vertical;font-family:inherit"></textarea>
+    </div>
+    <div>
+      <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Notes (optional)</label>
+      <textarea id="asave-notes" rows="2" placeholder="Usage notes, variable placeholders, etc."
+        style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none;resize:vertical;font-family:inherit"></textarea>
+    </div>
+    <div id="asave-error" style="display:none;color:#ff6b6b;font-size:12px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="closeAgentSave()" style="padding:6px 16px;background:transparent;border:1px solid #3a3f55;border-radius:6px;color:#7a8099;cursor:pointer">Cancel</button>
+      <button onclick="agentLibraryDoSave()" style="padding:6px 16px;background:#2e7d52;border:none;border-radius:6px;color:#fff;cursor:pointer;font-weight:600">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI — Write relation confirmation ══════════════ -->
+<div id="agent-write-rel-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:5500;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:28px 32px;width:560px;max-width:95vw;display:flex;flex-direction:column;gap:16px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span id="awr-modal-title" style="font-size:15px;font-weight:600;color:#e0e0e0">✍ Create New Relation</span>
+      <button onclick="_agentWriteRelCancel()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1">×</button>
+    </div>
+    <p style="margin:0;font-size:12px;color:#7a8099">Review the relation the AI agent wants to create. You can edit any field before saving.</p>
+    <div id="awr-mode-note" style="display:none;font-size:12px;color:#ffcc80;background:#3a2e0a;border-radius:5px;padding:8px 12px"></div>
+
+    <!-- Relation header -->
+    <div style="display:flex;align-items:center;gap:12px;background:#252a40;border-radius:8px;padding:14px 16px">
+      <div style="flex:1;text-align:center">
+        <div style="font-size:11px;color:#7a8099;margin-bottom:4px">Source (→)</div>
+        <div id="awr-src-name" style="font-size:13px;font-weight:600;color:#8ab4f8"></div>
+        <div id="awr-src-label" style="font-size:10px;color:#7a8099;margin-top:2px"></div>
+      </div>
+      <div style="font-size:22px;color:#aaa">→</div>
+      <div style="flex:1;text-align:center">
+        <div style="font-size:11px;color:#7a8099;margin-bottom:4px">Relation</div>
+        <div id="awr-rel-type" style="font-size:13px;font-weight:600;color:#ce93d8"></div>
+      </div>
+      <div style="font-size:22px;color:#aaa">→</div>
+      <div style="flex:1;text-align:center">
+        <div style="font-size:11px;color:#7a8099;margin-bottom:4px">Target (←)</div>
+        <div id="awr-tgt-name" style="font-size:13px;font-weight:600;color:#8ab4f8"></div>
+        <div id="awr-tgt-label" style="font-size:10px;color:#7a8099;margin-top:2px"></div>
+      </div>
+    </div>
+
+    <!-- Editable properties grid -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div>
+        <label style="font-size:11px;color:#7a8099;display:block;margin-bottom:4px">Effect</label>
+        <select id="awr-effect" style="width:100%;padding:6px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#e0e0e0;font-size:12px">
+          <option value="">—</option>
+          <option value="Positive">Positive</option>
+          <option value="Negative">Negative</option>
+          <option value="Unknown">Unknown</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:11px;color:#7a8099;display:block;margin-bottom:4px">Mechanism</label>
+        <input id="awr-mechanism" type="text" style="width:100%;padding:6px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#e0e0e0;font-size:12px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="font-size:11px;color:#7a8099;display:block;margin-bottom:4px">Ontology</label>
+        <input id="awr-ontology" type="text" style="width:100%;padding:6px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#e0e0e0;font-size:12px;box-sizing:border-box">
+      </div>
+      <div>
+        <label style="font-size:11px;color:#7a8099;display:block;margin-bottom:4px">Source (LLM)</label>
+        <input id="awr-source" type="text" readonly style="width:100%;padding:6px 8px;background:#1a1f33;border:1px solid #2a2f45;border-radius:5px;color:#7a8099;font-size:12px;box-sizing:border-box">
+      </div>
+    </div>
+
+    <!-- References list -->
+    <div id="awr-refs-section" style="display:none;flex-direction:column;gap:8px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:12px;font-weight:600;color:#c0c4d4">Supporting References</span>
+        <span id="awr-refs-count" style="font-size:11px;color:#7a8099"></span>
+      </div>
+      <div id="awr-refs-list" style="max-height:160px;overflow-y:auto;display:flex;flex-direction:column;gap:6px"></div>
+    </div>
+
+    <!-- RelationID -->
+    <div style="background:#141828;border-radius:6px;padding:10px 14px">
+      <span style="font-size:11px;color:#7a8099">RelationID: </span>
+      <span id="awr-relation-id" style="font-size:11px;color:#4caf50;font-family:monospace"></span>
+    </div>
+
+    <!-- Status + buttons -->
+    <div id="awr-status" style="display:none;font-size:12px;padding:8px 12px;border-radius:5px"></div>
+    <div style="display:flex;gap:10px;justify-content:flex-end">
+      <button onclick="_agentWriteRelCancel()" style="padding:7px 20px;background:transparent;border:1px solid #3a3f55;border-radius:6px;color:#7a8099;cursor:pointer;font-size:13px">Cancel</button>
+      <button id="awr-confirm-btn" onclick="_agentWriteRelConfirm()" style="padding:7px 20px;background:#1565c0;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600">Save to Database</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════ Agentic AI — Vocabulary manager modal ══════════════ -->
+<div id="agent-vocab-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:4500;align-items:center;justify-content:center" onclick="closeAgentVocabulary()">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:24px 28px;width:660px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;gap:14px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0">🧠 Vocabulary — Learned Concept Mappings</span>
+      <div style="display:flex;gap:8px">
+        <button onclick="agentVocabRefresh()" style="padding:4px 12px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;font-size:12px;cursor:pointer">↻ Refresh</button>
+        <button onclick="closeAgentVocabulary()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1">×</button>
+      </div>
+    </div>
+    <p style="margin:0;font-size:12px;color:#7a8099">
+      Terms the agent has learned during your sessions. <strong style="color:#c0c4d4">✓ Confirm</strong> entries you trust — confirmed mappings are weighted higher in the system prompt.
+    </p>
+    <div style="overflow-y:auto;flex:1;min-height:0">
+      <table style="width:100%;border-collapse:collapse;font-size:13px" id="agent-vocab-table">
+        <thead>
+          <tr style="border-bottom:1px solid #3a3f55;color:#7a8099;font-size:11px;text-align:left">
+            <th style="padding:6px 8px">Your term</th>
+            <th style="padding:6px 8px">Neo4j concept</th>
+            <th style="padding:6px 8px">Type</th>
+            <th style="padding:6px 8px;text-align:center">Used</th>
+            <th style="padding:6px 8px;text-align:center">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="agent-vocab-rows">
+          <tr><td colspan="5" style="padding:20px;text-align:center;color:#7a8099">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;border-top:1px solid #3a3f55;padding-top:12px">
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:12px;color:#7a8099;white-space:nowrap">Add manually:</span>
+        <input id="vocab-new-term"  placeholder="Your term" style="flex:1;padding:5px 9px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#e0e0e0;font-size:12px">
+        <input id="vocab-new-name"  placeholder="Neo4j name (or Label|Label for a category)" style="flex:1.4;padding:5px 9px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#e0e0e0;font-size:12px">
+        <input id="vocab-new-label" placeholder="Label (e.g. Disease) — leave blank for a category" style="flex:1.4;padding:5px 9px;background:#252a40;border:1px solid #3a3f55;border-radius:5px;color:#e0e0e0;font-size:12px">
+        <button onclick="agentVocabAdd()" style="padding:5px 14px;background:#2e7d52;border:none;border-radius:5px;color:#fff;font-size:12px;cursor:pointer;font-weight:600;white-space:nowrap">Add ✓</button>
+      </div>
+      <p style="margin:0;font-size:11px;color:#5a6080;line-height:1.5">
+        Two kinds of entries: (1) <strong style="color:#8a92ad">one specific node</strong> — fill in both
+        Name (its exact Name) and Label (e.g. "BRCA1" / "Protein"). (2) <strong style="color:#8a92ad">a whole
+        category of nodes</strong> — put the label(s) in the Name field instead (e.g. "SmallMol" or
+        "Protein|FunctionalClass|Complex") and leave Label blank. Use (2) for terms like "drugs" or
+        "therapeutic approach" that should match an entire node type, not one named entity.
+      </p>
     </div>
   </div>
 </div>
@@ -641,12 +1165,43 @@
     </div>
   </div>
 
+  <!-- ══════════════ Shortest Path dialog ══════════════ -->
+  <div id="shortest-path-modal" class="modal-backdrop" style="display:none" onclick="closeShortestPathDialog(event)">
+    <div class="modal-box" style="width:420px;max-width:90vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden" onclick="event.stopPropagation()">
+      <h3>Shortest Path</h3>
+      <p style="color:#7a8099;font-size:12px;margin-bottom:12px">
+        Finds the shortest path connecting the selected nodes, using only the checked relation types.
+      </p>
+
+      <label style="font-size:12px;color:#a0a8c4;display:block;margin-bottom:4px">Maximum path length</label>
+      <input type="number" id="sp-max-length" min="1" max="15" value="2" style="width:100%;margin-bottom:14px">
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <label style="font-size:12px;color:#a0a8c4">Select relation types for the path</label>
+        <div style="display:flex;gap:6px">
+          <button class="btn-ghost" onclick="_spSelectAll(true)">Select All</button>
+          <button class="btn-ghost" onclick="_spSelectAll(false)">Unselect All</button>
+        </div>
+      </div>
+      <div id="sp-reltype-list" style="overflow-y:auto;flex:1;min-height:60px;max-height:300px;display:flex;flex-direction:column;gap:4px;border:1px solid #2a3050;border-radius:6px;padding:8px;background:#141826">
+        <div style="color:#5a6080;font-size:12px;font-style:italic">Loading relation types…</div>
+      </div>
+
+      <div class="modal-actions" style="margin-top:14px;align-items:center">
+        <span id="sp-select-hint" style="display:none;color:#e05560;font-size:12px;flex:1">Check at least one relation type.</span>
+        <button class="btn-ghost" onclick="closeShortestPathDialog()">Cancel</button>
+        <button class="btn-primary" onclick="runShortestPath()">Run</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ══════════════ Ontology Analysis Dialog ══════════════ -->
   <div id="ontology-analysis-modal" style="display:none;position:fixed;inset:0;background:rgba(10,15,40,0.65);z-index:4000;align-items:center;justify-content:center">
     <div style="background:#1a2035;border:1px solid #2a3555;border-radius:10px;width:720px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px #000c">
       <!-- Header -->
       <div style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #2a3555;flex-shrink:0">
         <span style="font-size:14px;font-weight:600;color:#e8ecf3">Ontology Analysis</span>
+        <span id="ontology-scope-badge" style="font-size:11px;color:#7a8099;margin-left:10px"></span>
         <div style="display:flex;align-items:center;gap:18px">
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#7a8099;cursor:pointer">
             <input type="radio" name="ontology-layout" value="hierarchical" checked onchange="setOntologyLayout('hierarchical')" style="accent-color:#4f8ef7">
@@ -655,6 +1210,10 @@
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#7a8099;cursor:pointer">
             <input type="radio" name="ontology-layout" value="orthogonal" onchange="setOntologyLayout('orthogonal')" style="accent-color:#4f8ef7">
             Orthogonal
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#7a8099;cursor:pointer">
+            <input type="checkbox" id="ontology-hide-empty" checked onchange="toggleOntologyHideEmpty()" style="accent-color:#4f8ef7">
+            Hide empty branches
           </label>
           <button onclick="closeOntologyAnalysis()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;padding:0 2px;line-height:1;margin-left:4px">×</button>
         </div>
@@ -669,7 +1228,7 @@
   <!-- Ontology right-click context menu -->
   <div id="ontology-ctx-menu" style="display:none;position:fixed;background:#1a2035;border:1px solid #2a3555;border-radius:6px;z-index:5000;min-width:200px;box-shadow:0 4px 20px #000b;padding:4px 0">
     <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-children')">Copy children to clipboard</div>
-    <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-neighborhood')">Copy neighborhood to clipboard</div>
+    <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-tree')">Copy ontology tree</div>
   </div>
 
   <!-- ══════════════ Expansion results confirmation ══════════════ -->
