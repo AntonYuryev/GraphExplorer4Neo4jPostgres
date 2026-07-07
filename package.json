@@ -1,8 +1,23 @@
 {
   "name": "graph-explorer",
-  "version": "2.2.0",
-  "description": "Neo4j and PostgreSQL Graph Explorer",
+  "version": "2.3.0",
+  "description": "Web app for exploring, visualizing, and curating Neo4j biological knowledge graphs with PostgreSQL literature references and an integrated LLM chat agent that can query, visualize, and (with confirmation) write back to the graph.",
   "main": "server.js",
+  "keywords": [
+    "neo4j",
+    "postgresql",
+    "graph-visualization",
+    "cytoscape",
+    "knowledge-graph",
+    "llm-agent",
+    "cypher",
+    "biology"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elsevier-health/psg-graphexplorer-neo4j-postgres"
+  },
   "scripts": {
     "start": "node server.js"
   },
