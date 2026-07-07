@@ -11,6 +11,33 @@ const http = require('http');
 const rateLimit = require('express-rate-limit');
 const _crypto   = require('crypto');
 
+// ── Log injection hardening (CodeQL: js/log-injection, CWE-117) ───────────────
+// Many log calls throughout this file interpolate request-derived or
+// external-system-derived strings (err.message from Neo4j/Postgres drivers,
+// usernames, config values, URLs) without stripping newlines first. A value
+// containing \r/\n could forge what looks like a separate, fake log line —
+// e.g. a crafted username or error string that itself contains
+// '\n[INFO] User admin granted superuser access' would show up in the log
+// output as if it were a real, separate log entry. Rather than sanitizing
+// each of the 30+ call sites individually (easy to miss one, and easy for a
+// new call site added later to reintroduce the gap), every console.log/
+// warn/error/info call in this process is wrapped once, here, to strip
+// newline and other control characters from every string argument before
+// it reaches the terminal/log file.
+(function _hardenConsoleLogging() {
+  const CONTROL_CHARS_RE = /[\r\n\x00-\x08\x0B\x0C\x0E-\x1F]+/g;
+  function sanitizeArg(v) {
+    if (typeof v === 'string') return v.replace(CONTROL_CHARS_RE, ' ');
+    return v;
+  }
+  ['log', 'error', 'warn', 'info', 'debug'].forEach(function(method) {
+    const original = console[method].bind(console);
+    console[method] = function(...args) {
+      original(...args.map(sanitizeArg));
+    };
+  });
+})();
+
 let helmet;
 try { helmet = require('helmet'); } catch(e) {
   console.warn('[warn] helmet not installed — run `npm install` to enable security headers');
