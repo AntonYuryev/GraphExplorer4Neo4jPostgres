@@ -1295,18 +1295,17 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   }
 
   try {
-    // Note: sql originates from an authenticated admin request and has been
-    // validated above to be a read-only SELECT/WITH query with no stacked
-    // statements or comment injection.  Parameterised queries cannot be used
-    // here because the entire query text is the user-supplied value — this
-    // is the intentional design of an admin ad-hoc SQL runner, not an
-    // injection bug on top of it. If this alert is still open after the
-    // inline suppression below (GitHub's inline codeql[] suppression comments
-    // require a sufficiently recent CodeQL Action version / default-setup
-    // scanning — confirm your workflow supports it), dismiss it manually in
-    // the repo's Security tab with reason "Used in tests"/"Won't fix" and a
-    // note pointing back to this comment.
-    // codeql[js/sql-injection]
+    // ACCEPTED FINDING (CodeQL: js/sql-injection / "Database query built from
+    // user-controlled sources") — dismissed manually in the repo's Security
+    // tab, not via inline suppression comment (confirmed not honored by this
+    // repo's CodeQL Action setup after repeated testing with verified-correct
+    // syntax). Rationale for the dismissal: sql originates from an
+    // authenticated ADMIN-only request and has been validated above to be a
+    // read-only SELECT/WITH query with no stacked statements, no comments,
+    // and no write keywords. Parameterised queries cannot be used here
+    // because the entire query text — not just a value — is the user-supplied
+    // input; that is the intentional design of an admin ad-hoc SQL runner,
+    // not an injection bug layered on top of it.
     const result = await req.pg.pool.query(sql);
     res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
   } catch (err) {
