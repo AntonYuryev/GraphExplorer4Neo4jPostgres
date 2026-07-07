@@ -107,13 +107,86 @@ async def _attach_user_context(request: Request, call_next):
     finally:
         _current_username.reset(token)
 
+_CREDENTIAL_LIKE_RE = re.compile(
+    r'(password|passwd|pwd|apikey|api[_-]?key|secret|token|authorization)\s*[=:]\s*\S+',
+    re.IGNORECASE,
+)
+_URL_CREDENTIALS_RE = re.compile(r'://[^/\s@]+:[^/\s@]+@')
+
+def _safe_exc_str(exc: BaseException, max_len: int = 300) -> str:
+    """Render an exception as a short, user-facing string — CodeQL flags several
+    spots (py/stack-trace-exposure) where a raw exception's str() reaches an
+    HTTP response, because driver/library exceptions can incidentally embed a
+    password, API key, or full connection string. This is the single place
+    that sanitizes an exception before it's shown to a user: redact anything
+    that looks like embedded credentials, cap the length so a huge driver
+    stack-trace-like message never reaches the client, and drop file paths /
+    internal frame info that str(exc) alone won't include anyway. Every place
+    in this file that surfaces an exception to a chat reply or an API response
+    (tool_msg text, /ping-llm, /list-models, /workflow/execute, /batch-write)
+    should go through this instead of str(exc)/f"{exc}" directly — the goal is
+    to keep the message genuinely useful for debugging (e.g. a Neo4j syntax
+    error, a timeout notice) without the credential-leak risk of the raw
+    exception text."""
+    text = str(exc)
+    text = _URL_CREDENTIALS_RE.sub("://***:***@", text)
+    text = _CREDENTIAL_LIKE_RE.sub(lambda m: m.group(1) + "=***", text)
+    if len(text) > max_len:
+        text = text[:max_len] + "... (truncated)"
+    return f"{type(exc).__name__}: {text}"
+
 @app.exception_handler(Exception)
 async def _global_exception_handler(request: Request, exc: Exception):
     """Log full traceback for any unhandled exception — prevents silent socket hang-up."""
     log.error("Unhandled exception on %s %s:\n%s",
               request.method, request.url.path, traceback.format_exc())
     return JSONResponse(status_code=500,
-                        content={"error": f"{type(exc).__name__}: {exc}"})
+                        content={"error": _safe_exc_str(exc)})
+
+_ALLOWED_LLM_URL_SCHEMES = {"http", "https"}
+
+def _assert_safe_external_url(url: str) -> str:
+    """Validate a user-supplied LLM provider URL before it's ever passed to
+    urlopen() — CodeQL flags the /list-models route as SSRF-capable (Critical),
+    and correctly so: the LLM provider URL under Settings -> My Connection is a
+    genuinely user-editable value (by design — 'any OpenAI-compatible endpoint'
+    is a documented feature), so it must be treated the same as any other
+    externally-supplied URL, not implicitly trusted just because it's typically
+    set by an admin/user configuring their own account.
+
+    Enforces:
+      - scheme is http or https only (blocks file://, gopher://, etc.)
+      - the hostname does not resolve to a private/loopback/link-local/reserved/
+        multicast IP address (blocks SSRF against internal services, the
+        169.254.169.254 cloud-metadata endpoint, etc., via a URL that looks
+        like an ordinary http(s) address)
+
+    Returns the validated hostname (for exact-match provider routing — see
+    callers) or raises ValueError with a safe, user-facing message.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in _ALLOWED_LLM_URL_SCHEMES:
+        raise ValueError(f"Unsupported URL scheme '{parsed.scheme}' — only http/https are allowed")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no hostname")
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve host '{host}': {exc}")
+    for _family, _type, _proto, _canon, sockaddr in addrinfo:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(
+                f"URL host '{host}' resolves to a private/internal address "
+                f"({ip}) — not permitted for security reasons"
+            )
+    return host
 
 LIBRARY_DIR = Path(__file__).parent / "agent_library"
 LIBRARY_DIR.mkdir(exist_ok=True)
@@ -389,6 +462,17 @@ def _resolve_pg_cfg(username: str) -> Dict[str, Any]:
         "username": override.get("username") or base.get("username") or "",
         "password": override.get("password") or base.get("password") or "",
     }
+
+def _resolve_llm_cfg(username: str) -> Dict[str, Any]:
+    """Per-user LLM override, persisted server-side via server.js's
+    POST /api/settings/my-llm (stored in users.json) — mirrors
+    _resolve_neo4j_cfg/_resolve_pg_cfg above. This is what lets the frontend
+    stop caching the user's API key in localStorage: once saved, the browser
+    never needs to hold or resend the key again, because this function
+    resolves it here from the SAME trusted, server-side users.json file the
+    Neo4j/Postgres per-user credentials already come from."""
+    user = next((u for u in _load_users() if u.get("username") == username), None)
+    return (user or {}).get("llm") or {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Pydantic models
@@ -673,7 +757,18 @@ def run_postgres(sql: str, params: tuple = ()) -> List[Dict]:
     )
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, params or None)
+            # sql is the full, dynamic query TEXT generated by the LLM agent from a
+            # natural-language question — this is the intended feature (a
+            # text-to-SQL agent), not an injection bug, and is the same accepted
+            # pattern documented in the FRD/README's Security Considerations
+            # section. Mitigations already in place: only SELECT/WITH statements
+            # are allowed (checked above), the caller's own least-privilege-scoped
+            # DB credentials are used, and results are capped at 500 rows. `params`
+            # (actual bound values, when the LLM chooses to use them) IS passed
+            # through psycopg2's real parameter binding here, not string-formatted
+            # into `sql` — so this does not contain a traditional value-concatenation
+            # injection bug on top of the inherent dynamic-query-text design.
+            cur.execute(sql, params or None)  # codeql[py/sql-injection]
             rows = [dict(r) for r in cur.fetchmany(500)]   # cap at 500 rows
         return rows
     finally:
@@ -712,7 +807,7 @@ def run_pubmed_search(query: str, min_date: str = "", max_date: str = "",
         with urllib.request.urlopen(search_url, timeout=15) as r:
             search_data = json.loads(r.read())
     except Exception as exc:
-        raise RuntimeError(f"PubMed esearch failed: {exc}")
+        raise RuntimeError(f"PubMed esearch failed: {_safe_exc_str(exc)}")
 
     pmids = search_data.get("esearchresult", {}).get("idlist", [])
     if not pmids:
@@ -728,7 +823,7 @@ def run_pubmed_search(query: str, min_date: str = "", max_date: str = "",
         with urllib.request.urlopen(sum_url, timeout=15) as r:
             summary = json.loads(r.read())
     except Exception as exc:
-        raise RuntimeError(f"PubMed esummary failed: {exc}")
+        raise RuntimeError(f"PubMed esummary failed: {_safe_exc_str(exc)}")
 
     rows = []
     result_map = summary.get("result", {})
@@ -972,6 +1067,11 @@ def extract_terms_from_text(text: str) -> List[str]:
     import re
     terms: set = set()
 
+    # Defense in depth for every regex below: cap the input size so even a
+    # worst-case pathological input can only ever cost a bounded amount of
+    # backtracking work, independent of any single regex's own complexity.
+    text = (text or "")[:20_000]
+
     # 1. Bold markdown items (strip markdown markers)
     for m in re.finditer(r'\*\*([^*]{2,60})\*\*', text):
         phrase = re.sub(r'[,.:;)]+$', '', m.group(1)).strip()
@@ -1008,8 +1108,16 @@ def extract_terms_from_text(text: str) -> List[str]:
     # 7. Long-form names preceding a parenthesised abbreviation:
     #    "Granulocyte-Macrophage Colony-Stimulating Factor (GM-CSF)"
     #    "Granulocyte Colony-Stimulating Factor (G-CSF)"
+    # Word length is bounded ({1,30}, not unbounded +) specifically to avoid
+    # catastrophic/polynomial backtracking (CodeQL: py/polynomial-redos) — an
+    # unbounded inner quantifier nested inside the {1,6} outer repetition lets
+    # the engine try many different ways to split a long run of capitalized
+    # words across the 1-6 repetitions before giving up when the required
+    # "(ABBREV)" suffix never appears, which is exactly the shape a crafted
+    # chat message could exploit to hang this request. No real biological word
+    # is anywhere near 30 characters, so this bound doesn't affect matches.
     for m in re.finditer(
-            r'([A-Z][a-zA-Z-]+(?: [A-Z][a-zA-Z-]+){1,6})\s*\([A-Z][A-Z0-9-]{1,10}\)',
+            r'([A-Z][a-zA-Z-]{1,30}(?: [A-Z][a-zA-Z-]{1,30}){1,6})\s*\([A-Z][A-Z0-9-]{1,10}\)',
             text):
         phrase = m.group(1).strip()
         if 5 < len(phrase) < 80:
@@ -1111,10 +1219,21 @@ LIMIT 80
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _effective_llm(override: Optional[Dict]) -> Dict:
+    """Layers three sources, lowest to highest priority:
+      1. _state['llm']       — shared/admin-configured defaults
+      2. per-user server-side override — from users.json via _resolve_llm_cfg(),
+         saved through POST /api/settings/my-llm; this is what the browser's
+         API key now persists to instead of localStorage
+      3. request-level override — an explicit 'llm' field sent with THIS
+         request, e.g. the Settings dialog's 'Test connection' flow trying
+         out a new key the user hasn't clicked Save on yet
+    Empty-string / None values never clobber an already-set value from a
+    lower-priority source, so a request that omits apikey still resolves to
+    the per-user stored key rather than wiping it out."""
     base = dict(_state["llm"])
+    base.update({k: v for k, v in _resolve_llm_cfg(_current_username.get()).items()
+                 if v is not None and v != ""})
     if override:
-        # Skip None AND empty-string overrides so the frontend never clobbers
-        # a stored API key by sending an empty apikey field.
         base.update({k: v for k, v in override.items()
                      if v is not None and v != ""})
     return base
@@ -2382,7 +2501,7 @@ def ping_llm(req: PingRequest = None):
                 "reply": reply}
     except Exception as exc:
         log.warning("Ping failed: %s", exc)
-        return {"error": str(exc), "elapsed_s": round(time.time() - t0, 2), "model": model}
+        return {"error": _safe_exc_str(exc), "elapsed_s": round(time.time() - t0, 2), "model": model}
 
 @app.post("/schema")
 def update_schema(payload: SchemaPayload):
@@ -2601,7 +2720,7 @@ def chat(req: ChatRequest):
                     if is_timeout else ""
                 )
                 tool_msg = (
-                    f"Cypher query failed with error: {exc}\n"
+                    f"Cypher query failed with error: {_safe_exc_str(exc)}\n"
                     f"{timeout_hint}"
                     f"The EXACT query that failed:\n```cypher\n{generated_cypher}\n```\n"
                     "You MUST show this exact query to the user in a code block along with the "
@@ -2623,7 +2742,7 @@ def chat(req: ChatRequest):
                 )
             except Exception as exc:
                 tool_msg = (
-                    f"PostgreSQL query failed with error: {exc}\n"
+                    f"PostgreSQL query failed with error: {_safe_exc_str(exc)}\n"
                     f"The EXACT query that failed:\n```sql\n{query}\n```\n"
                     "You MUST show this exact query to the user in a code block along with the "
                     "error message — do not paraphrase or omit it."
@@ -2659,7 +2778,7 @@ def chat(req: ChatRequest):
                 )
             except Exception as exc:
                 tool_msg = (
-                    f"Ontology lookup failed: {exc}\n"
+                    f"Ontology lookup failed: {_safe_exc_str(exc)}\n"
                     "Try a different sub_action or term."
                 )
 
@@ -2682,7 +2801,7 @@ def chat(req: ChatRequest):
                 )
             except Exception as exc:
                 tool_msg = (
-                    f"PubMed search failed: {exc}\n"
+                    f"PubMed search failed: {_safe_exc_str(exc)}\n"
                     "Try simplifying the query or check network connectivity."
                 )
 
@@ -2983,8 +3102,26 @@ def list_models(req: ListModelsRequest):
     base_url = (req.url or "").rstrip("/")
     apikey   = req.apikey or ""
 
+    if not base_url:
+        return {"models": [], "error": "No URL provided"}
+    try:
+        # Validated ONCE, up front, for every branch below — including the two
+        # "known provider" branches whose actual request URL is a hardcoded
+        # literal regardless of base_url's value: validating unconditionally
+        # here (rather than only in the open-ended OpenAI-compatible branch)
+        # is what actually closes the SSRF/substring-sanitization findings,
+        # since it removes any code path where base_url is used — for routing
+        # OR for the request itself — before it has been checked.
+        host = _assert_safe_external_url(base_url)
+    except ValueError as exc:
+        return {"models": [], "error": str(exc)}
+
     # ── Gemini native REST ─────────────────────────────────────────────────────
-    if "generativelanguage.googleapis.com" in base_url:
+    # Exact hostname match — NOT a substring check — so a URL merely containing
+    # "generativelanguage.googleapis.com" somewhere (e.g. as a query parameter
+    # on an attacker-controlled host) can no longer be mistaken for the real
+    # provider host (CodeQL: py/incomplete-url-substring-sanitization).
+    if host == "generativelanguage.googleapis.com":
         if not apikey:
             return {"models": [], "error": "API key required for Gemini"}
         try:
@@ -3000,10 +3137,10 @@ def list_models(req: ListModelsRequest):
         except _urllib_err.HTTPError as he:
             return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
         except Exception as e:
-            return {"models": [], "error": str(e)}
+            return {"models": [], "error": _safe_exc_str(e)}
 
     # ── Anthropic ──────────────────────────────────────────────────────────────
-    if "anthropic.com" in base_url:
+    if host == "api.anthropic.com" or host.endswith(".anthropic.com"):
         try:
             http_req = _urllib_req.Request(
                 "https://api.anthropic.com/v1/models",
@@ -3016,11 +3153,13 @@ def list_models(req: ListModelsRequest):
         except _urllib_err.HTTPError as he:
             return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
         except Exception as e:
-            return {"models": [], "error": str(e)}
+            return {"models": [], "error": _safe_exc_str(e)}
 
     # ── OpenAI-compatible /models ──────────────────────────────────────────────
-    if not base_url:
-        return {"models": [], "error": "No URL provided"}
+    # base_url was already validated (scheme + not a private/internal IP) by
+    # _assert_safe_external_url() above, unconditionally, before we got here —
+    # this is the one branch where that validation actually gates the real
+    # outbound request URL, closing the Critical "Full SSRF" finding.
     try:
         http_req = _urllib_req.Request(
             base_url + "/models",
@@ -3033,7 +3172,7 @@ def list_models(req: ListModelsRequest):
     except _urllib_err.HTTPError as he:
         return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
     except Exception as e:
-        return {"models": [], "error": str(e)}
+        return {"models": [], "error": _safe_exc_str(e)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3057,12 +3196,28 @@ def list_library():
             pass
     return {"files": files}
 
+_LIBRARY_FILE_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
+
+def _safe_library_path(file_id: str) -> Path:
+    """Resolve file_id to a path strictly inside LIBRARY_DIR, or raise
+    HTTPException(400). CodeQL (py/path-injection) flags the three /library/
+    {file_id} routes below as 'uncontrolled data used in a path expression' —
+    the regex allowlist (alphanumeric/underscore/hyphen only, no '.' or '/')
+    already rules out '../' traversal, but this adds the canonical, always-
+    recognized belt-and-suspenders check on top: resolve the final path and
+    verify it is still inside LIBRARY_DIR before any file operation touches
+    it, rather than relying solely on the input pattern being safe."""
+    if not _LIBRARY_FILE_ID_RE.match(file_id or ""):
+        raise HTTPException(400, "Invalid file id")
+    candidate = (LIBRARY_DIR / f"{file_id}.json").resolve()
+    library_root = LIBRARY_DIR.resolve()
+    if library_root not in candidate.parents and candidate != library_root:
+        raise HTTPException(400, "Invalid file id")
+    return candidate
+
 @app.get("/library/{file_id}")
 def load_library_file(file_id: str):
-    # Sanitise file_id — alphanumeric + hyphens only
-    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', file_id):
-        raise HTTPException(400, "Invalid file id")
-    p = LIBRARY_DIR / f"{file_id}.json"
+    p = _safe_library_path(file_id)
     if not p.exists():
         raise HTTPException(404, "File not found")
     return json.loads(p.read_text("utf-8"))
@@ -3080,9 +3235,7 @@ def save_library_file(payload: LibraryFile):
 
 @app.put("/library/{file_id}")
 def update_library_file(file_id: str, payload: LibraryFile):
-    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', file_id):
-        raise HTTPException(400, "Invalid file id")
-    p = LIBRARY_DIR / f"{file_id}.json"
+    p = _safe_library_path(file_id)
     if not p.exists():
         raise HTTPException(404, "File not found")
     existing = json.loads(p.read_text("utf-8"))
@@ -3093,9 +3246,7 @@ def update_library_file(file_id: str, payload: LibraryFile):
 
 @app.delete("/library/{file_id}")
 def delete_library_file(file_id: str):
-    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', file_id):
-        raise HTTPException(400, "Invalid file id")
-    p = LIBRARY_DIR / f"{file_id}.json"
+    p = _safe_library_path(file_id)
     if not p.exists():
         raise HTTPException(404, "File not found")
     p.unlink()
@@ -3164,7 +3315,7 @@ async def execute_workflow(req: ExecuteWorkflowRequest):
                 step_res.update({"status": "unknown_step_type"})
 
         except Exception as exc:
-            step_res.update({"status": "error", "error": str(exc)})
+            step_res.update({"status": "error", "error": _safe_exc_str(exc)})
 
         step_results.append(step_res)
 
@@ -3272,7 +3423,7 @@ def batch_write(req: BatchWriteRequest):
         return {"ok": True, "updatedCount": total_updated, "requestedCount": len(clean)}
     except Exception as exc:
         log.warning("batch_write failed: %s", exc)
-        raise HTTPException(500, f"Batch write failed: {exc}")
+        raise HTTPException(500, f"Batch write failed: {_safe_exc_str(exc)}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Routes — Cypher examples (cypher_examples.json)
