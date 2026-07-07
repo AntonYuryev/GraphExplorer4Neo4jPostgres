@@ -1,0 +1,33 @@
+{
+  "neo4j": {
+    "url": "bolt+ssc://YOUR_NEO4J_HOST:7687",
+    "database": "YOUR_NEO4J_DATABASE",
+    "username": "YOUR_NEO4J_USER",
+    "password": "YOUR_NEO4J_PASSWORD"
+  },
+  "postgres": {
+    "host": "YOUR_PG_HOST",
+    "port": 5432,
+    "database": "YOUR_PG_DATABASE",
+    "schema": "YOUR_PG_SCHEMA",
+    "username": "YOUR_PG_USER",
+    "password": "YOUR_PG_PASSWORD"
+  },
+  "jwtSecret": "GENERATE_A_LONG_RANDOM_SECRET_HERE",
+  "llm": {
+    "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "apikey": "YOUR_LLM_API_KEY",
+    "username": "",
+    "password": "",
+    "model_name": "gemini-2.5-flash",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "json_mode": false,
+    "providers": [
+      {
+        "name": "Google Gemini",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai/"
+      }
+    ]
+  }
+}
