@@ -3097,25 +3097,67 @@ class ListModelsRequest(BaseModel):
     url:    str
     apikey: str = ""
 
+def _resolve_allowlisted_provider_url(base_url: str) -> str:
+    """Match base_url against the admin-configured provider list
+    (_state['llm']['providers'] — the same list shown in the Settings ->
+    Agentic AI / LLM dropdown) and return the exact, trusted URL string from
+    that list, or raise ValueError.
+
+    This is the CodeQL-recognized-safe SSRF pattern (per Copilot Autofix's
+    suggestion on this exact finding): compare a request-supplied value
+    against a maintained allowlist and use ONLY the matched allowlist literal
+    for the actual outbound request, rather than trusting the request-
+    supplied string itself even after other validation. It replaces relying
+    solely on _assert_safe_external_url()'s DNS/IP-range check, which is
+    real protection but — being a hand-written function — isn't something
+    CodeQL's static analysis can verify as a sanitizer.
+
+    This costs nothing functionally: the legitimate UI never sends a URL
+    outside this admin-managed list in the first place (users pick a
+    provider from a dropdown populated by it, they don't type a free-form
+    URL) — this only closes the gap where a raw API call bypassing that UI
+    could have sent an arbitrary URL the backend would previously have
+    accepted at face value. Admins can still add any custom/self-hosted
+    OpenAI-compatible endpoint they want via POST /api/settings/llm; nothing
+    about "any OpenAI-compatible provider" as a feature is removed, only
+    where that trust decision is enforced (admin-managed list, not a
+    per-request client-supplied string).
+    """
+    normalized = (base_url or "").rstrip("/").lower()
+    if not normalized:
+        raise ValueError("No URL provided")
+    for p in (_state.get("llm", {}).get("providers") or []):
+        allowed = (p.get("url") or "").rstrip("/").lower()
+        if allowed and allowed == normalized:
+            return (p.get("url") or "").rstrip("/")
+    # Gemini/Anthropic native REST always use a hardcoded literal URL
+    # regardless of what's passed in (see the two branches below) — allow
+    # those two hosts through even when not separately listed as a
+    # "provider" entry, since the real outbound request never actually
+    # depends on this value for those two.
+    from urllib.parse import urlparse as _urlparse
+    host = (_urlparse(normalized).hostname or "")
+    if host == "generativelanguage.googleapis.com" or host == "api.anthropic.com" or host.endswith(".anthropic.com"):
+        return normalized
+    raise ValueError(
+        "This provider URL is not in the configured provider list — ask an "
+        "admin to add it under Settings -> Agentic AI / LLM first."
+    )
+
 @app.post("/list-models")
 def list_models(req: ListModelsRequest):
     """Return model IDs available on the given provider URL."""
     import urllib.request as _urllib_req
     import urllib.error   as _urllib_err
 
-    base_url = (req.url or "").rstrip("/")
-    apikey   = req.apikey or ""
+    apikey = req.apikey or ""
 
-    if not base_url:
-        return {"models": [], "error": "No URL provided"}
     try:
-        # Validated ONCE, up front, for every branch below — including the two
-        # "known provider" branches whose actual request URL is a hardcoded
-        # literal regardless of base_url's value: validating unconditionally
-        # here (rather than only in the open-ended OpenAI-compatible branch)
-        # is what actually closes the SSRF/substring-sanitization findings,
-        # since it removes any code path where base_url is used — for routing
-        # OR for the request itself — before it has been checked.
+        # base_url is now the ALLOWLISTED literal (see
+        # _resolve_allowlisted_provider_url) — every branch below, including
+        # the open-ended OpenAI-compatible one, builds its request from this
+        # value, never from req.url directly.
+        base_url = _resolve_allowlisted_provider_url(req.url)
         host = _assert_safe_external_url(base_url)
     except ValueError as exc:
         return {"models": [], "error": str(exc)}
@@ -3129,18 +3171,15 @@ def list_models(req: ListModelsRequest):
         if not apikey:
             return {"models": [], "error": "API key required for Gemini"}
         try:
-            # Percent-encode the API key before interpolating it into the URL
-            # (CodeQL: py/partial-ssrf — "part of the URL depends on a
-            # user-provided value"). Without this, a key value containing a
-            # URL-structural character like '&' or '#' could inject extra
-            # query parameters or truncate the URL; urllib.parse.quote makes
-            # every character land as inert query-string data, regardless of
-            # content, closing this off properly rather than just papering
-            # over the alert.
-            from urllib.parse import quote as _urlquote
-            murl = (f"https://generativelanguage.googleapis.com/v1beta/models"
-                    f"?key={_urlquote(apikey, safe='')}&pageSize=100")
-            with _urllib_req.urlopen(_urllib_req.Request(murl), timeout=10) as r:
+            # The API key travels in the x-goog-api-key HEADER, not the URL
+            # (Gemini's REST API supports both; the header form is used here
+            # deliberately). Fixes CodeQL: py/partial-ssrf — "part of the URL
+            # depends on a user-provided value" — by removing tainted data
+            # from the URL string entirely, rather than just escaping it.
+            # The URL is now a fixed literal with no interpolation at all.
+            murl = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+            gemini_req = _urllib_req.Request(murl, headers={"x-goog-api-key": apikey})
+            with _urllib_req.urlopen(gemini_req, timeout=10) as r:
                 data = json.loads(r.read())
             models = sorted([
                 m["name"].split("/")[-1]
@@ -3170,17 +3209,14 @@ def list_models(req: ListModelsRequest):
             return {"models": [], "error": _safe_exc_str(e)}
 
     # ── OpenAI-compatible /models ──────────────────────────────────────────────
-    # ACCEPTED FINDING (CodeQL: py/full-ssrf) — dismiss manually in the repo's
-    # Security tab; inline suppression is not honored by this repo's CodeQL
-    # Action setup (confirmed after repeated testing with verified-correct
-    # syntax/query-ID). Rationale for the dismissal: base_url was already
-    # validated (scheme + DNS-resolved to reject any private/loopback/
-    # link-local/reserved IP) by _assert_safe_external_url() a few lines
-    # above, unconditionally, before this branch was ever reached. CodeQL
-    # cannot verify a hand-written Python validation function as a
-    # taint-clearing sanitizer — only a small set of recognized patterns
-    # (e.g. a literal hostname allowlist) — which isn't an option here since
-    # supporting "any OpenAI-compatible provider URL" is the actual feature.
+    # base_url here is the ALLOWLISTED literal returned by
+    # _resolve_allowlisted_provider_url() above — matched against the
+    # admin-configured provider list, not req.url directly — plus it has
+    # separately passed the DNS/IP-range check in _assert_safe_external_url().
+    # Two layers: the allowlist match is the CodeQL-recognized-safe SSRF
+    # pattern (a literal-collection comparison), the DNS check is defense in
+    # depth in case the allowlist itself is ever misconfigured with a
+    # hostname that later re-resolves somewhere unsafe.
     try:
         http_req = _urllib_req.Request(
             base_url + "/models",
@@ -3219,34 +3255,30 @@ def list_library():
 
 _LIBRARY_FILE_ID_RE = re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
 
-def _safe_library_path(file_id: str) -> Path:
-    """Resolve file_id to a path strictly inside LIBRARY_DIR, or raise
-    HTTPException(400). CodeQL (py/path-injection) flags the three /library/
-    {file_id} routes below as 'uncontrolled data used in a path expression' —
-    the regex allowlist (alphanumeric/underscore/hyphen only, no '.' or '/')
-    already rules out '../' traversal, but this adds the canonical, always-
-    recognized belt-and-suspenders check on top: resolve the final path and
-    verify it is still inside LIBRARY_DIR before any file operation touches
-    it, rather than relying solely on the input pattern being safe."""
+def _safe_library_path(file_id: str) -> Optional[Path]:
+    """Look up file_id against the files ALREADY PRESENT in LIBRARY_DIR,
+    rather than constructing a path by joining LIBRARY_DIR with file_id.
+    Returns the matching Path, or None if there is no match.
+
+    This is a deliberately different approach from a validate-then-join
+    pattern (regex-check file_id, then build LIBRARY_DIR / f"{file_id}.json"):
+    CodeQL's py/path-injection query kept flagging every downstream use of a
+    path built that way, because it cannot verify that a hand-written Python
+    validation function actually neutralizes the tainted string used to build
+    it. Here, file_id NEVER flows into a path-construction expression at all —
+    it is only compared against dict keys derived from LIBRARY_DIR.glob(),
+    which enumerates the real filesystem and is not influenced by the
+    request. There is no path expression for tainted data to reach, so
+    there is nothing for a path-injection sink to flag."""
     if not _LIBRARY_FILE_ID_RE.match(file_id or ""):
-        raise HTTPException(400, "Invalid file id")
-    candidate = (LIBRARY_DIR / f"{file_id}.json").resolve()
-    library_root = LIBRARY_DIR.resolve()
-    if library_root not in candidate.parents and candidate != library_root:
-        raise HTTPException(400, "Invalid file id")
-    return candidate
+        return None
+    existing = {p.stem: p for p in LIBRARY_DIR.glob("*.json")}
+    return existing.get(file_id)
 
 @app.get("/library/{file_id}")
 def load_library_file(file_id: str):
-    # ACCEPTED FINDING (CodeQL: py/path-injection) — dismiss manually in the
-    # repo's Security tab; inline suppression is not honored by this repo's
-    # CodeQL Action setup. _safe_library_path() (defined above) already
-    # regex-allowlists file_id to [a-zA-Z0-9_-]{1,64} (no '.' or '/', ruling
-    # out '../' traversal) AND resolves + verifies the final path is still
-    # inside LIBRARY_DIR before returning it — CodeQL just can't verify a
-    # custom Python function as a sanitizer.
     p = _safe_library_path(file_id)
-    if not p.exists():
+    if p is None:
         raise HTTPException(404, "File not found")
     return json.loads(p.read_text("utf-8"))
 
@@ -3263,15 +3295,8 @@ def save_library_file(payload: LibraryFile):
 
 @app.put("/library/{file_id}")
 def update_library_file(file_id: str, payload: LibraryFile):
-    # ACCEPTED FINDING (CodeQL: py/path-injection) — dismiss manually in the
-    # repo's Security tab; inline suppression is not honored by this repo's
-    # CodeQL Action setup. _safe_library_path() (defined above) already
-    # regex-allowlists file_id to [a-zA-Z0-9_-]{1,64} (no '.' or '/', ruling
-    # out '../' traversal) AND resolves + verifies the final path is still
-    # inside LIBRARY_DIR before returning it — CodeQL just can't verify a
-    # custom Python function as a sanitizer.
     p = _safe_library_path(file_id)
-    if not p.exists():
+    if p is None:
         raise HTTPException(404, "File not found")
     existing = json.loads(p.read_text("utf-8"))
     existing.update(payload.dict())
@@ -3281,15 +3306,8 @@ def update_library_file(file_id: str, payload: LibraryFile):
 
 @app.delete("/library/{file_id}")
 def delete_library_file(file_id: str):
-    # ACCEPTED FINDING (CodeQL: py/path-injection) — dismiss manually in the
-    # repo's Security tab; inline suppression is not honored by this repo's
-    # CodeQL Action setup. _safe_library_path() (defined above) already
-    # regex-allowlists file_id to [a-zA-Z0-9_-]{1,64} (no '.' or '/', ruling
-    # out '../' traversal) AND resolves + verifies the final path is still
-    # inside LIBRARY_DIR before returning it — CodeQL just can't verify a
-    # custom Python function as a sanitizer.
     p = _safe_library_path(file_id)
-    if not p.exists():
+    if p is None:
         raise HTTPException(404, "File not found")
     p.unlink()
     return {"ok": True}
