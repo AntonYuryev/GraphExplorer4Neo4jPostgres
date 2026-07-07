@@ -1,13 +1,13 @@
 [
   {
     "question": "Find all protein kinases that phosphorylate Notch1",
-    "cypher": "MATCH (kinase:Protein)-[r:ProtModification]->(notch1:Protein)\nMATCH (kinase)-[:is_a|part_of*1..]->(fc:FunctionalClass|SemanticConcept)\nWHERE toLower(notch1.Name) = 'notch1'\n  AND toLower(fc.Name) CONTAINS 'protein kinase'\nWITH DISTINCT kinase, r, notch1\nRETURN kinase, r, notch1",
+    "cypher": "MATCH (kinase:Protein)-[r:ProtModification]->(notch1:Protein)\nMATCH (kinase)-[:is_a|part_of*1..]->(fc:FunctionalClass|SemanticConcept)\nWHERE toLower(notch1.Name) = 'notch1'\n  AND (toLower(fc.Name) CONTAINS 'protein kinase' OR toLower(fc.Description) CONTAINS 'protein kinase')\nWITH DISTINCT kinase, r, notch1\nRETURN kinase, r, notch1",
     "notes": "Node property is always 'Name' (capital N). String matches always use toLower() on both sides. ALWAYS add WITH DISTINCT before RETURN when the query joins across an ontology hierarchy (is_a/part_of) — each kinase can match multiple ancestor nodes, producing duplicate rows without DISTINCT.",
     "tags": []
   },
   {
     "question": "Find kinases that phosphorylate AKT1 (generic: works for any enzyme class and any target)",
-    "cypher": "MATCH (kinase:Protein)-[r:ProtModification]->(target:Protein)\nMATCH (kinase)-[:is_a|part_of*1..]->(fc:FunctionalClass|SemanticConcept)\nWHERE toLower(target.Name) = toLower('AKT1')\n  AND toLower(fc.Name) CONTAINS 'kinase'\nWITH DISTINCT kinase, r, target\nRETURN kinase, r, target",
+    "cypher": "MATCH (kinase:Protein)-[r:ProtModification]->(target:Protein)\nMATCH (kinase)-[:is_a|part_of*1..]->(fc:FunctionalClass|SemanticConcept)\nWHERE toLower(target.Name) = toLower('AKT1')\n  AND (toLower(fc.Name) CONTAINS 'kinase' OR OR toLower(fc.Description) CONTAINS 'protein kinase')\nWITH DISTINCT kinase, r, target\nRETURN kinase, r, target",
     "notes": "CONTAINS search must use the SINGULAR root form: 'kinase' not 'kinases'. 'kinase' matches protein kinase, receptor tyrosine kinase, serine/threonine kinase, and every other kinase subtype — all ontological children. Strip trailing plural 's' or 'es' from any term before putting it in a CONTAINS clause. Always use WITH DISTINCT to collapse duplicate rows from multiple ontology paths.",
     "tags": []
   },
