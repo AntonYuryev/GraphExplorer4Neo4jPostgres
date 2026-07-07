@@ -1,0 +1,3308 @@
+"""
+Graph Explorer — Agentic AI Service
+FastAPI microservice wrapping Anthropic Claude + neo4j-graphrag concepts + LangGraph.
+
+Start automatically by server.js, or manually:
+    python agent_service.py
+
+Port: 3001 (override with AGENT_PORT env var)
+"""
+
+import os
+import re
+import json
+import uuid
+import struct
+import hashlib
+import logging
+import time
+import threading
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+
+import traceback
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import uvicorn
+
+# ── Optional heavy deps — imported lazily so the service starts even if missing ──
+try:
+    import anthropic as _anthropic_mod
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+try:
+    import openai as _openai_mod
+    HAS_OPENAI = True
+except ImportError:
+    HAS_OPENAI = False
+
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+try:
+    from neo4j import GraphDatabase as _Neo4jDriver
+    from neo4j.graph import Node as _Neo4jNode
+    from neo4j.graph import Path as _Neo4jPath
+    from neo4j import Query as _Neo4jQuery
+    HAS_NEO4J = True
+except ImportError:
+    HAS_NEO4J = False
+
+# Hard server-side timeout (seconds) applied to every agent-issued Cypher query.
+# Without this, a runaway query (e.g. an unbounded variable-length path) can hang
+# indefinitely — Neo4j has no default per-query timeout of its own. Wrapping the
+# query text in neo4j.Query(..., timeout=N) asks the SERVER to abort the query
+# after N seconds with a clean, catchable error instead of hanging the request.
+CYPHER_QUERY_TIMEOUT_SECONDS = 25
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PG = True
+except ImportError:
+    HAS_PG = False
+
+# ── LangGraph (optional — used for structured multi-step workflows) ────────────
+try:
+    from langgraph.graph import StateGraph, END
+    from typing import TypedDict
+    HAS_LANGGRAPH = True
+except ImportError:
+    HAS_LANGGRAPH = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [agent] %(message)s")
+log = logging.getLogger("agent")
+
+app = FastAPI(title="Graph Explorer Agent Service", version="1.0.0")
+# This service is only ever called by server.js's own reverse proxy
+# (127.0.0.1, see the AGENT_PORT/uvicorn.run() setup at the bottom of this
+# file) — no browser talks to it directly, so a wide-open CORS policy serves
+# no legitimate purpose here and only widens the blast radius if the port
+# were ever accidentally exposed. allow_origins=["*"] combined with
+# allow_credentials=True is also individually flagged by CodeQL
+# (py/insecure-cors-policy): browsers reject wildcard-origin + credentials in
+# practice, but the pattern is still worth avoiding outright.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1", "http://localhost"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def _attach_user_context(request: Request, call_next):
+    """Carries the trusted `x-ge-username` header (set only by server.js's
+    /api/agent/* proxy, never the client directly) through to run_cypher() /
+    run_postgres() via a request-scoped context var, so those helpers can
+    resolve the CALLING user's own Neo4j/Postgres credentials — see
+    _resolve_neo4j_cfg / _resolve_pg_cfg below."""
+    token = _current_username.set(request.headers.get("x-ge-username", ""))
+    try:
+        return await call_next(request)
+    finally:
+        _current_username.reset(token)
+
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    """Log full traceback for any unhandled exception — prevents silent socket hang-up."""
+    log.error("Unhandled exception on %s %s:\n%s",
+              request.method, request.url.path, traceback.format_exc())
+    return JSONResponse(status_code=500,
+                        content={"error": f"{type(exc).__name__}: {exc}"})
+
+LIBRARY_DIR = Path(__file__).parent / "agent_library"
+LIBRARY_DIR.mkdir(exist_ok=True)
+
+VOCAB_FILE     = LIBRARY_DIR / "user_vocabulary.json"
+EXAMPLES_FILE  = Path(__file__).parent / "cypher_examples.json"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Cypher examples (user-editable few-shot examples injected into system prompt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_examples() -> List[Dict]:
+    """Load user-provided Cypher examples from cypher_examples.json."""
+    if EXAMPLES_FILE.exists():
+        try:
+            with open(EXAMPLES_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            log.warning("Could not load cypher_examples.json: %s", e)
+    return []
+
+def _save_examples(examples: List[Dict]) -> None:
+    """Overwrite cypher_examples.json with the given list. Read fresh on every
+    prompt build (_load_examples has no cache), so edits take effect on the very
+    next chat request — no service restart needed."""
+    EXAMPLES_FILE.write_text(json.dumps(examples, indent=2, ensure_ascii=False), "utf-8")
+
+_STOPWORDS = frozenset("""
+a an the of to for in on with and or but is are was were be been being this that these those
+find all any some what which who how many much show get list return does do can i want need
+me my you your it its we our them their a's about above after again against as at because
+before below between by could did down during each few from further has have having
+he her here hers him himself his if into itself just more most no nor not now once only other
+ought over own same she should so than then there through too under until up very will
+""".split())
+# NOTE: "both" is deliberately NOT a stopword — for this app it's a strong signal word
+# ("find X that does BOTH A and B") pointing at common-neighbor/intersection-style
+# queries, not a low-content function word.
+
+def _stem(word: str) -> str:
+    """Crude plural stripping so 'approach'/'approaches', 'drug'/'drugs',
+    'compound'/'compounds' etc. count as the same token for relevance scoring.
+    _tokenize() is used ONLY for fuzzy example-matching (never exact lookups),
+    so a lightweight heuristic here is safe — no risk of breaking a real query."""
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith("es"):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+def _tokenize(text: str) -> set:
+    """Lowercase, alphanumeric-only tokens with common stopwords removed."""
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9]{2,}", (text or "").lower())
+    return {_stem(w) for w in words if w not in _STOPWORDS}
+
+def _select_relevant_examples(user_message: str, examples: List[Dict],
+                               max_examples: int = 8, min_fallback: int = 2) -> List[tuple]:
+    """Rank examples by keyword overlap with the user's message and return the
+    top matches as (original_1based_index, example) tuples — the index matches
+    the "Rule #N" numbering shown in the Cypher Examples UI, so users and the
+    LLM can refer to the same example by the same number.
+
+    Purely lexical (no embeddings/network calls) — negligible latency, and keeps
+    the system prompt from growing linearly with the size of cypher_examples.json.
+    The MANDATORY numbered rules elsewhere in the prompt are NOT affected by this
+    filtering — this only trims the illustrative worked examples appended at the
+    end, so core conventions (label unions, coalesce(), etc.) are never at risk
+    of being dropped even if no example scores above zero.
+    """
+    if not examples:
+        return []
+
+    query_tokens = _tokenize(user_message)
+    scored = []
+    for idx, ex in enumerate(examples, 1):
+        if not (ex.get("cypher") or "").strip():
+            continue
+        # Question words count double — they're the clearest signal of what the
+        # example is *for*; notes/cypher contribute supporting matches (e.g. a
+        # label or relation-type name mentioned in the query itself). Tags count
+        # triple: they exist specifically to catch STRUCTURAL patterns (e.g. "find
+        # X connected to BOTH A and B") whose worked example may use placeholder
+        # entities (drug names, etc.) that share no vocabulary at all with a real,
+        # domain-specific question — the tags are hand-picked trigger phrases that
+        # bridge that gap on purpose.
+        q_tokens  = _tokenize(ex.get("question", ""))
+        n_tokens  = _tokenize(ex.get("notes", ""))
+        c_tokens  = _tokenize(ex.get("cypher", ""))
+        t_tokens  = _tokenize(" ".join(ex.get("tags") or []))
+        score = (2 * len(query_tokens & q_tokens)
+                 + len(query_tokens & n_tokens)
+                 + len(query_tokens & c_tokens)
+                 + 3 * len(query_tokens & t_tokens))
+        scored.append((idx, ex, score))
+
+    scored.sort(key=lambda t: (-t[2], t[0]))  # highest score first, stable by original order
+    matched = [(idx, ex) for idx, ex, score in scored if score > 0][:max_examples]
+
+    # Safety net: a totally novel/generic question can score 0 against every example.
+    # Rather than send none at all, fall back to the first couple of examples in the
+    # file so the model still sees at least one worked pattern to imitate the style of.
+    if len(matched) < min_fallback:
+        seen = {idx for idx, _ in matched}
+        for idx, ex, _score in scored:
+            if idx not in seen:
+                matched.append((idx, ex))
+                seen.add(idx)
+            if len(matched) >= min_fallback:
+                break
+
+    return matched
+
+def _examples_prompt_section(user_message: str = "") -> str:
+    """Format the most relevant Cypher examples as a system-prompt section.
+
+    Only the top-scoring examples (by keyword overlap with `user_message`) are
+    included instead of the full file — with cypher_examples.json now holding
+    ~20 entries and growing, sending every one on every request was inflating
+    the prompt (and latency/cost) regardless of relevance to the current question.
+    """
+    examples = _load_examples()
+    if not examples:
+        return ""
+
+    selected = _select_relevant_examples(user_message, examples)
+    if not selected:
+        return ""
+
+    log.info("Examples: selected %d of %d (Rule #%s) for message %.60r",
+              len(selected), len(examples), ",".join(str(i) for i, _ in selected), user_message)
+
+    lines = ["\n\n## Cypher Query Examples (authoritative patterns for this graph)"]
+    lines.append("These examples show correct Cypher for common task types. Follow their patterns exactly. "
+                 "Each is numbered to match its \"Rule #N\" label in the app's Cypher Examples dialog — "
+                 "refer to that number if you mention a specific example to the user.")
+    for i, ex in selected:
+        question = ex.get("question", "").strip()
+        cypher   = ex.get("cypher", "").strip()
+        notes    = ex.get("notes", "").strip()
+        lines.append(f"\n### Rule #{i}" + (f": {question}" if question else ""))
+        lines.append(f"```cypher\n{cypher}\n```")
+        if notes:
+            lines.append(f"*Note: {notes}*")
+    return "\n".join(lines)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Cross-session vocabulary (user term → Neo4j concept mappings)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_vocabulary() -> List[Dict]:
+    """Load persisted user-term → Neo4j concept mappings."""
+    if VOCAB_FILE.exists():
+        try:
+            return json.loads(VOCAB_FILE.read_text("utf-8")).get("mappings", [])
+        except Exception:
+            pass
+    return []
+
+def _save_vocabulary(mappings: List[Dict]) -> None:
+    VOCAB_FILE.write_text(
+        json.dumps({"mappings": mappings}, indent=2, ensure_ascii=False), "utf-8"
+    )
+
+def _upsert_vocabulary(user_term: str, neo4j_name: str, neo4j_label: str,
+                       confirmed: bool = False) -> None:
+    """Add or increment a term mapping. Existing entries are updated in place."""
+    if not user_term or not neo4j_name:
+        return
+    mappings = _load_vocabulary()
+    today = datetime.utcnow().date().isoformat()
+    for m in mappings:
+        if m["user_term"].lower() == user_term.lower() and m["neo4j_name"] == neo4j_name:
+            m["use_count"] = m.get("use_count", 0) + 1
+            m["last_used"] = today
+            if confirmed:
+                m["confirmed"] = True
+            _save_vocabulary(mappings)
+            return
+    mappings.append({
+        "user_term":   user_term,
+        "neo4j_name":  neo4j_name,
+        "neo4j_label": neo4j_label,
+        "use_count":   1,
+        "confirmed":   confirmed,
+        "last_used":   today,
+    })
+    _save_vocabulary(mappings)
+    log.info("Vocabulary: new mapping '%s' → %s (%s)", user_term, neo4j_name, neo4j_label)
+
+def _vocabulary_prompt_section() -> str:
+    """Format the vocabulary as a system-prompt section, sorted by use count."""
+    mappings = _load_vocabulary()
+    if not mappings:
+        return ""
+    lines = [
+        "\n## User Vocabulary (learned from previous sessions)",
+        "Map these user terms before writing any Cypher query. Each entry is tagged [entity] or "
+        "[category] — they mean very different things, read the tag, don't guess from the words alone:",
+        "- **[entity]** (a single real Neo4j label): the term refers to ONE particular NAMED node — "
+        "match it with `toLower(n.Name) = toLower('<name>')` under that label.",
+        "- **[category]** (label field is blank; the name field holds one or more labels separated by "
+        "`|`, e.g. `SmallMol` or `Protein|FunctionalClass|Complex`): the term refers to a whole TYPE of "
+        "entity, not one named node. Use that value directly as the node label(s) in your MATCH, e.g. "
+        "`(x:SmallMol)` — never try to match a node whose Name property equals the category string, and "
+        "never substitute a different label that merely sounds plausible (e.g. using `Treatment` when "
+        "the user's vocabulary says `SmallMol` for 'drugs'/'therapeutic approach') — the user has "
+        "explicitly told you which label(s) they mean and that overrides your own judgment.\n",
+    ]
+    for m in sorted(mappings, key=lambda x: -x.get("use_count", 0)):
+        tick = " ✓" if m.get("confirmed") else ""
+        is_category = not m.get("neo4j_label")
+        kind = "category" if is_category else "entity"
+        label_display = m["neo4j_label"] if not is_category else "(none)"
+        lines.append(
+            f'- "{m["user_term"]}" → [{kind}] label=`{label_display}` name=**{m["neo4j_name"]}**{tick}'
+            f'  (used {m.get("use_count", 1)}×)'
+        )
+    return "\n".join(lines)
+
+# ── Runtime state (updated via /schema endpoint from Node.js) ─────────────────
+_state: Dict[str, Any] = {
+    "neo4j":       {},   # url, database, username, password — LEGACY/FALLBACK values
+    "postgres":    {},   # host, port, database, schema, username, password — LEGACY/FALLBACK
+    "llm":         {},   # apikey, url, model_name, temperature, top_p, json_mode
+    "schema_text": "",   # human-readable schema for LLM system prompt
+}
+
+# ── Per-user Neo4j/Postgres credentials ────────────────────────────────────────
+# Mirrors server.js: the connection ENDPOINT (Neo4j url / Postgres host+port) is
+# admin-managed and lives in _state["neo4j"/"postgres"] above (pushed via
+# /schema). WHICH database/schema and WHICH login a request uses is each Graph
+# Explorer user's OWN setting, stored on their account in users.json — read
+# directly here since agent_service.py runs alongside server.js on the same
+# filesystem. server.js's /api/agent/* proxy stamps a trusted `x-ge-username`
+# header (never taken from the client) on every forwarded request; a request
+# context var carries it from that header through to run_cypher()/run_postgres()
+# without threading a parameter through every helper function.
+import contextvars
+
+USERS_FILE = Path(__file__).parent / "users.json"
+_current_username: contextvars.ContextVar[str] = contextvars.ContextVar("current_username", default="")
+
+def _load_users() -> List[Dict]:
+    try:
+        return json.loads(USERS_FILE.read_text("utf-8"))
+    except Exception:
+        return []
+
+def _resolve_neo4j_cfg(username: str) -> Dict[str, str]:
+    base     = _state.get("neo4j") or {}
+    user     = next((u for u in _load_users() if u.get("username") == username), None)
+    override = (user or {}).get("neo4j") or {}
+    return {
+        "url":      base.get("url", ""),
+        "database": override.get("database") or base.get("database") or "neo4j",
+        "username": override.get("username") or base.get("username") or "",
+        "password": override.get("password") or base.get("password") or "",
+    }
+
+def _resolve_pg_cfg(username: str) -> Dict[str, Any]:
+    base     = _state.get("postgres") or {}
+    user     = next((u for u in _load_users() if u.get("username") == username), None)
+    override = (user or {}).get("postgres") or {}
+    return {
+        "host":     base.get("host", ""),
+        "port":     base.get("port", 5432),
+        "database": override.get("database") or base.get("database") or "",
+        "schema":   override.get("schema")   or base.get("schema")   or "public",
+        "username": override.get("username") or base.get("username") or "",
+        "password": override.get("password") or base.get("password") or "",
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Pydantic models
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SchemaPayload(BaseModel):
+    neo4j: Dict[str, Any]
+    schema_text: str
+    llm: Optional[Dict[str, Any]] = None
+    postgres: Optional[Dict[str, Any]] = None
+
+class ChatMessage(BaseModel):
+    role: str    # "user" | "assistant"
+    content: str
+    # The exact Cypher this turn executed/rendered, if any (frontend tracks this
+    # per-turn already for its own "reload into query bar" feature). Folded back
+    # into that turn's content below so the LLM can literally copy it on a later
+    # turn instead of reconstructing it from memory — see the "reusing a query"
+    # rule in the system prompt, which depends on this actually being visible.
+    cypher: Optional[str] = None
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage] = []
+    llm: Optional[Dict[str, Any]] = None  # overrides stored config
+    # Snapshot of what's actually on the user's screen right now (graphData from the
+    # frontend) — the ONLY way the agent can know this without guessing/hallucinating
+    # from conversation history. See _current_graph_prompt_section().
+    current_graph: Optional[Dict[str, Any]] = None
+
+class LibraryFile(BaseModel):
+    name: str
+    description: str = ""
+    llm_config: Dict[str, Any] = {}
+    workflow: List[Dict[str, Any]] = []
+    notes: str = ""
+
+class ExecuteWorkflowRequest(BaseModel):
+    workflow: List[Dict[str, Any]]
+    input: str = ""
+    llm: Optional[Dict[str, Any]] = None
+
+class LLMConfigPayload(BaseModel):
+    url:        Optional[str] = None
+    apikey:     Optional[str] = None
+    username:   Optional[str] = None
+    password:   Optional[str] = None
+    model_name: Optional[str] = None
+    temperature: float = 0.2
+    top_p:       float = 0.9
+    json_mode:   bool = False
+
+class VocabEntry(BaseModel):
+    user_term:   str
+    neo4j_name:  str
+    neo4j_label: str = ""
+    confirmed:   bool = False
+
+class BatchUpdateItem(BaseModel):
+    relationId:   Any          # RelationID as stored in Neo4j — string or numeric, matched as text
+    value:        str          # new property value, e.g. "Positive" / "Negative" / "Unknown"
+    relationType: str = ""     # optional — lets the write scope its MATCH to one rel type instead
+                                # of scanning every relationship in the database
+
+class BatchWriteRequest(BaseModel):
+    property: str = "Effect"
+    updates:  List[BatchUpdateItem] = []
+    username: str = ""   # logged-in Graph Explorer user, stamped onto r.updatedBy
+
+class CypherExampleItem(BaseModel):
+    question: str = ""
+    cypher:   str = ""
+    notes:    str = ""
+    tags:     List[str] = []  # optional trigger phrases boosting relevance-selection score
+
+class ExamplesPayload(BaseModel):
+    examples: List[CypherExampleItem]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Neo4j helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _neo4j_driver():
+    if not HAS_NEO4J:
+        raise RuntimeError("neo4j Python package not installed — run: pip install neo4j")
+    cfg = _resolve_neo4j_cfg(_current_username.get())
+    if not cfg.get("url"):
+        raise RuntimeError("Neo4j not configured — connect via Graph Explorer Settings first")
+    return _Neo4jDriver.driver(
+        cfg["url"],
+        auth=(cfg.get("username", ""), cfg.get("password", "")),
+    )
+
+def run_cypher(cypher: str, params: dict = {}) -> List[Dict]:
+    driver = _neo4j_driver()
+    db = _resolve_neo4j_cfg(_current_username.get()).get("database", "neo4j")
+    query = (_Neo4jQuery(cypher, timeout=CYPHER_QUERY_TIMEOUT_SECONDS)
+             if HAS_NEO4J else cypher)
+    try:
+        with driver.session(database=db) as session:
+            result = session.run(query, params)
+            rows = []
+            for r in result:
+                rows.append(_row_from_record(r))
+            return rows
+    finally:
+        driver.close()
+
+def _serialize_record(obj: Any) -> Any:
+    """Recursively make a Neo4j record JSON-serialisable."""
+    if isinstance(obj, dict):
+        return {k: _serialize_record(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_serialize_record(i) for i in obj]
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+def _serialize_path(path) -> Dict:
+    """Compact, LLM-friendly summary of a Neo4j Path.
+
+    Backend safety net for a recurring failure: the LLM is repeatedly told (via
+    cypher_examples.json) to RETURN lean node-name/relation-type lists instead of
+    a raw path object for ranked-path questions, but keeps writing 'RETURN p'
+    anyway. A raw Path's default serialization dumps every property of every
+    node/relationship on it, which routinely blows past the tool result's
+    ~8 000-character sample budget and truncates mid-object — the LLM then
+    reports garbled/incomplete rows verbatim to the user. This compacts ANY
+    Path-typed column to just names/labels/relationship types/reference counts
+    regardless of what RETURN clause the LLM actually wrote, so truncation
+    cannot happen here no matter how the query is shaped.
+    """
+    nodes = list(path.nodes)
+    rels  = list(path.relationships)
+    return {
+        "path_node_names": [n.get("Name") or "" for n in nodes],
+        "path_node_labels": [sorted(lbl for lbl in n.labels if lbl != "__Entity__") for n in nodes],
+        "path_relationship_types": [r.type for r in rels],
+        "path_relationship_references": [r.get("RelationNumberOfReferences") for r in rels],
+        "path_hop_count": len(rels),
+    }
+
+def _path_signature(path) -> tuple:
+    """Hashable identity for a path based on its node-name and relationship-type
+    sequence (ignoring internal element IDs). Two separate relationship records
+    between the same node pair otherwise show up as visually-identical duplicate
+    rows in a ranked path list — this lets callers drop the repeats."""
+    node_names = tuple((n.get("Name") or "") for n in path.nodes)
+    rel_types  = tuple(r.type for r in path.relationships)
+    return (node_names, rel_types)
+
+def _row_from_record(record) -> Dict:
+    """Build a JSON-safe row dict from a driver Record, compacting any
+    Path-typed column via _serialize_path(). All non-Path columns are
+    serialized exactly as before (via record.data()) — zero behavior change
+    for the many existing queries that RETURN plain nodes/relationships."""
+    data = record.data()
+    if HAS_NEO4J:
+        for key, value in zip(record.keys(), record.values()):
+            if isinstance(value, _Neo4jPath):
+                data[key] = _serialize_path(value)
+    return _serialize_record(data)
+
+def _format_label_breakdown(counts: Dict[str, int]) -> str:
+    """'{634: GeneticVariant, 100: Disease}' -> '634 GeneticVariant and 100 Disease'."""
+    items = [f"{cnt} {label}" for label, cnt in sorted(counts.items(), key=lambda kv: -kv[1])]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+def _run_cypher_analyzed(cypher: str, params: dict = {}) -> tuple:
+    """Run a Cypher query once and return
+    (serialized_rows, total_count, neighbor_count, neighbor_by_label).
+
+    - serialized_rows / total_count: same as run_cypher() + a separate COUNT(*) would
+      have given, but derived from a single pass instead of executing the query twice.
+    - neighbor_count / neighbor_by_label: best-effort "neighbor" breakdown, by label.
+      Every distinct node seen anywhere in the result is scored by how many ROWS it
+      appears in (not how many times — a node counts once per row even if it shows up
+      in two columns of that row). Whichever node(s) appear in at least HALF as many
+      rows as the single most-frequent node are treated as the SEED/input side — e.g.
+      'BRCA1' typically shows up in every row, so it's the max, and anything else that
+      frequent is presumably another named seed (like a second entity in a "common to
+      both A and B" query). Everything else is a "neighbor", grouped by its primary
+      (first, alphabetically) label. This row-frequency approach (rather than picking
+      the column with fewest distinct values) is what correctly handles queries that
+      UNION branches with swapped source/target roles — a fixed seed entity, dominant
+      but not literally 100% column-consistent, still stands out by frequency.
+      Requires raw driver Node values (not run_cypher()'s already-serialized output,
+      which loses type info — hence this re-implements the fetch instead of calling
+      run_cypher()). Returns (None, {}) when fewer than two distinct nodes appear at
+      all, or nothing stands out as dominant — callers must treat None as "not
+      applicable", not zero.
+    """
+    driver = _neo4j_driver()
+    db = _resolve_neo4j_cfg(_current_username.get()).get("database", "neo4j")
+    query = (_Neo4jQuery(cypher, timeout=CYPHER_QUERY_TIMEOUT_SECONDS)
+             if HAS_NEO4J else cypher)
+    rows: List[Dict] = []
+    row_count_per_node: Dict[str, int] = {}
+    label_per_node: Dict[str, str] = {}
+    seen_path_signatures: set = set()
+    try:
+        with driver.session(database=db) as session:
+            result = session.run(query, params)
+            for record in result:
+                # Drop rows that are a duplicate LOGICAL path (same node-name +
+                # relationship-type sequence) — e.g. two separate relationship
+                # records between the same two nodes otherwise show up as
+                # visually-identical repeated rows in a ranked path list, even
+                # though the query has no DISTINCT on the path shape itself.
+                # Only ever applies to rows that actually contain a Path column;
+                # every other query shape is completely unaffected.
+                if HAS_NEO4J:
+                    row_path_sigs = [
+                        _path_signature(value) for value in record.values()
+                        if isinstance(value, _Neo4jPath)
+                    ]
+                    if row_path_sigs:
+                        combined_sig = tuple(row_path_sigs)
+                        if combined_sig in seen_path_signatures:
+                            continue
+                        seen_path_signatures.add(combined_sig)
+
+                rows.append(_row_from_record(record))
+                if HAS_NEO4J:
+                    nodes_this_row = set()
+                    for value in record.values():
+                        if isinstance(value, _Neo4jNode):
+                            nodes_this_row.add(value.element_id)
+                            if value.element_id not in label_per_node:
+                                labels = sorted(value.labels) if value.labels else ["Unknown"]
+                                label_per_node[value.element_id] = labels[0]
+                    for nid in nodes_this_row:
+                        row_count_per_node[nid] = row_count_per_node.get(nid, 0) + 1
+    finally:
+        driver.close()
+
+    neighbor_count, neighbor_by_label = None, {}
+    if len(row_count_per_node) >= 2:
+        max_freq       = max(row_count_per_node.values())
+        seed_threshold = max_freq / 2.0
+        neighbor_ids   = [nid for nid, cnt in row_count_per_node.items() if cnt < seed_threshold]
+        if neighbor_ids:
+            neighbor_count = len(neighbor_ids)
+            for nid in neighbor_ids:
+                label = label_per_node.get(nid, "Unknown")
+                neighbor_by_label[label] = neighbor_by_label.get(label, 0) + 1
+
+    return rows, len(rows), neighbor_count, neighbor_by_label
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PostgreSQL helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_postgres(sql: str, params: tuple = ()) -> List[Dict]:
+    """Execute a read-only SQL query against the configured PostgreSQL database."""
+    if not HAS_PG:
+        raise RuntimeError("psycopg2 not installed — run: pip install psycopg2-binary")
+    cfg = _resolve_pg_cfg(_current_username.get())
+    if not cfg.get("host"):
+        raise RuntimeError("PostgreSQL not configured — connect via Graph Explorer Settings first")
+
+    # Safety: only allow SELECT / WITH statements
+    stripped = sql.strip().lstrip("(").upper()
+    if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):
+        raise RuntimeError("Only SELECT/WITH queries are permitted from the agent")
+
+    schema = cfg.get("schema", "public")
+    conn = psycopg2.connect(
+        host=cfg["host"],
+        port=int(cfg.get("port", 5432)),
+        dbname=cfg["database"],
+        user=cfg["username"],
+        password=cfg.get("password", ""),
+        options=f"-c search_path={schema}",
+        connect_timeout=10,
+    )
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params or None)
+            rows = [dict(r) for r in cur.fetchmany(500)]   # cap at 500 rows
+        return rows
+    finally:
+        conn.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PubMed search helper (NCBI E-utilities — free, no API key required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pubmed_search(query: str, min_date: str = "", max_date: str = "",
+                      max_results: int = 10) -> Dict[str, Any]:
+    """Search PubMed via NCBI E-utilities and return structured reference rows."""
+    import urllib.request
+    import urllib.parse
+
+    max_results = max(1, min(int(max_results), 50))
+
+    # Step 1 — esearch: get matching PMIDs
+    params: Dict[str, str] = {
+        "db":      "pubmed",
+        "term":    query,
+        "retmax":  str(max_results),
+        "retmode": "json",
+        "sort":    "relevance",
+    }
+    if min_date or max_date:
+        params["datetype"] = "pdat"
+        if min_date:
+            params["mindate"] = min_date
+        if max_date:
+            params["maxdate"] = max_date
+
+    search_url = ("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?"
+                  + urllib.parse.urlencode(params))
+    try:
+        with urllib.request.urlopen(search_url, timeout=15) as r:
+            search_data = json.loads(r.read())
+    except Exception as exc:
+        raise RuntimeError(f"PubMed esearch failed: {exc}")
+
+    pmids = search_data.get("esearchresult", {}).get("idlist", [])
+    if not pmids:
+        return {"rows": [], "count": 0, "total": int(
+            search_data.get("esearchresult", {}).get("count", 0))}
+
+    # Step 2 — esummary: fetch title / authors / journal / year
+    sum_url = (
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?"
+        f"db=pubmed&id={','.join(pmids)}&retmode=json"
+    )
+    try:
+        with urllib.request.urlopen(sum_url, timeout=15) as r:
+            summary = json.loads(r.read())
+    except Exception as exc:
+        raise RuntimeError(f"PubMed esummary failed: {exc}")
+
+    rows = []
+    result_map = summary.get("result", {})
+    for pmid in pmids:
+        doc = result_map.get(pmid)
+        if not doc or "error" in doc:
+            continue
+        auths = doc.get("authors", [])
+        author_str = ", ".join(a.get("name", "") for a in auths[:5])
+        if len(auths) > 5:
+            author_str += " et al."
+        # pubdate can be "2024 Jan 15" or "2024"
+        pub_year = str(doc.get("pubdate", ""))[:4]
+        rows.append({
+            "pmid":    pmid,
+            "title":   doc.get("title", ""),
+            "authors": author_str,
+            "pubyear": pub_year,
+            "journal": doc.get("source", ""),
+        })
+
+    total = int(search_data.get("esearchresult", {}).get("count", len(rows)))
+    return {"rows": rows, "count": len(rows), "total": total}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Ontology lookup helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+def _sanitize_rel_types(via: str) -> str:
+    """
+    Accept only pipe-separated valid Neo4j relationship-type identifiers.
+    Any token that isn't a clean identifier is dropped; falls back to 'is_a|part_of'.
+    This prevents Cypher injection via the 'via' parameter.
+    """
+    tokens = [t.strip() for t in via.split("|")]
+    safe   = [t for t in tokens if _REL_TOKEN_RE.match(t)]
+    return "|".join(safe) if safe else "is_a|part_of"
+
+def run_ontology_lookup(sub_action: str, term: str = "", concept: str = "",
+                        via: str = "is_a|part_of", depth: int = 2) -> Dict[str, Any]:
+    """
+    Execute an ontology navigation query against Neo4j.
+    sub_action: 'alias_search' | 'broaden' | 'narrow'
+    """
+    safe_via = _sanitize_rel_types(via)
+    depth    = min(max(int(depth), 1), 5)   # clamp 1–5
+
+    if sub_action == "alias_search":
+        # Search nodes by Alias string OR Name, return ranked matches
+        cypher = """
+MATCH (n)
+WHERE toLower(coalesce(n.Name,  '')) CONTAINS toLower($term)
+   OR toLower(coalesce(n.Alias, '')) CONTAINS toLower($term)
+RETURN labels(n)[0]          AS label,
+       n.Name                AS name,
+       n.Alias               AS aliases
+ORDER BY
+  CASE
+    WHEN toLower(coalesce(n.Name,'')) = toLower($term)            THEN 0
+    WHEN toLower(coalesce(n.Name,'')) STARTS WITH toLower($term)  THEN 1
+    WHEN toLower(coalesce(n.Alias,'')) = toLower($term)           THEN 2
+    WHEN toLower(coalesce(n.Alias,'')) CONTAINS toLower($term)    THEN 3
+    ELSE 4
+  END
+LIMIT 15
+"""
+        rows = run_cypher(cypher, {"term": term})
+        return {"sub_action": "alias_search", "term": term, "matches": rows}
+
+    elif sub_action == "broaden":
+        # Navigate UP the ontology (towards parent / broader concepts)
+        cypher = f"""
+MATCH (n)-[:{safe_via}*1..{depth}]->(parent)
+WHERE n.Name = $concept
+   OR toLower(coalesce(n.Alias,'')) CONTAINS toLower($concept)
+RETURN DISTINCT
+       labels(parent)[0] AS label,
+       parent.Name       AS name,
+       parent.Alias      AS aliases
+LIMIT 25
+"""
+        rows = run_cypher(cypher, {"concept": concept})
+        return {"sub_action": "broaden", "concept": concept, "direction": "up",
+                "via": safe_via, "depth": depth, "parents": rows}
+
+    elif sub_action == "narrow":
+        # Navigate DOWN the ontology (towards child / more specific concepts)
+        cypher = f"""
+MATCH (parent)<-[:{safe_via}*1..{depth}]-(child)
+WHERE parent.Name = $concept
+   OR toLower(coalesce(parent.Alias,'')) CONTAINS toLower($concept)
+RETURN DISTINCT
+       labels(child)[0] AS label,
+       child.Name       AS name,
+       child.Alias      AS aliases
+LIMIT 25
+"""
+        rows = run_cypher(cypher, {"concept": concept})
+        return {"sub_action": "narrow", "concept": concept, "direction": "down",
+                "via": safe_via, "depth": depth, "children": rows}
+
+    else:
+        raise ValueError(f"Unknown ontology sub_action: {sub_action!r}. "
+                         "Use 'alias_search', 'broaden', or 'narrow'.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  RelationID calculation  (mirrors server.js calcRelationId / _myhash exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rid_py_repr(val) -> str:
+    """Matches server.js _pyRepr — Python str()-style repr of a list or scalar."""
+    if isinstance(val, list):
+        if not val:
+            return '[]'
+        parts = []
+        for v in val:
+            s = str(v)
+            if re.match(r'^-?\d+$', s):
+                parts.append(s)
+            else:
+                parts.append("'" + s.replace('\\', '\\\\').replace("'", "\\'") + "'")
+        return '[' + ', '.join(parts) + ']'
+    s = str(val)
+    return "'" + s.replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+def _rid_myhash(text: str) -> str:
+    """MD5-based hash matching server.js _myhash."""
+    d = hashlib.md5(text.encode('utf-8')).digest()
+    high, = struct.unpack_from('>Q', d, 0)   # bytes 0-7 as unsigned 64-bit BE
+    low,  = struct.unpack_from('>Q', d, 8)   # bytes 8-15
+    MASK  = 0x7FFFFFFFFFFFFFFF
+    r     = high ^ low
+    if r > MASK:
+        r = -(r & MASK)
+    return str(r)
+
+def calc_relation_id(inref=None, inoutref=None, outref=None,
+                     control_type: str = '', ontology: str = '',
+                     relationship: str = '', effect: str = '',
+                     mechanism: str = '') -> str:
+    """
+    Calculate RelationID — identical to server.js calcRelationId.
+    inref    : NodeID values of source nodes  (direction →), sorted desc
+    inoutref : NodeID values of bidirectional nodes
+    outref   : NodeID values of target nodes  (direction ←), sorted desc
+    """
+    def _desc(lst):
+        """Sort list descending by integer value, matching JS BigInt sort."""
+        try:
+            return sorted(lst or [], key=lambda x: -int(str(x)))
+        except (ValueError, TypeError):
+            return sorted(lst or [], reverse=True)
+
+    inref    = _desc(inref)
+    inoutref = _desc(inoutref)
+    outref   = _desc(outref)
+
+    s = '(' + ', '.join([
+        _rid_py_repr(inref),
+        _rid_py_repr(inoutref),
+        _rid_py_repr(outref),
+        _rid_py_repr(control_type),
+        _rid_py_repr(ontology),
+        _rid_py_repr(relationship),
+        _rid_py_repr(str(effect).lower()),
+        _rid_py_repr(mechanism),
+    ]) + ')'
+    return _rid_myhash(s)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Entity annotation helper — batch-match terms to Neo4j nodes
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Colours that mirror the Cytoscape stylesheet gradient-bottom stops (used by frontend chips)
+NODE_TYPE_COLORS: Dict[str, str] = {
+    "Protein":           "#d32f2f",
+    "SmallMol":          "#00C853",
+    "Treatment":         "#1565c0",
+    "Disease":           "#CC5500",
+    "CellProcess":       "#f9a825",
+    "FunctionalClass":   "#e65100",
+    "Complex":           "#7f0000",
+    "CellObject":        "#757575",
+    "Tissue":            "#6d4c41",
+    "Organ":             "#4a148c",
+    "CellType":          "#29b6f6",
+    "Cell":              "#29b6f6",
+    "GeneticVariant":    "#FF6D00",
+    "ClinicalParameter": "#5C6BC0",
+    "MedicalProcedure":  "#5dd6c5",
+    "Pathogen":          "#61DE2A",
+    "Virus":             "#B5BF50",
+}
+
+_CONCEPTS_PREFIX = "GRAPH-CONCEPTS:"
+
+def extract_concepts_line(text: str) -> tuple:
+    """
+    Scan the last few lines of *text* for a GRAPH-CONCEPTS annotation.
+    Returns (clean_text, [term, ...]).
+    """
+    lines = text.split("\n")
+    clean, terms = [], []
+    for line in lines:
+        if _CONCEPTS_PREFIX in line:
+            raw = line.split(_CONCEPTS_PREFIX, 1)[-1]
+            terms = [t.strip() for t in raw.split("|") if t.strip()]
+        else:
+            clean.append(line)
+    return "\n".join(clean).strip(), terms
+
+
+# Common English stop-words to exclude from auto-extracted gene symbols
+_STOP_SYMS = frozenset({
+    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL", "CAN", "HER", "WAS",
+    "ONE", "OUR", "OUT", "GET", "HAS", "HIM", "HIS", "HOW", "ITS", "WHO", "DID",
+    "LET", "MAY", "PUT", "SAY", "SHE", "TOO", "USE", "VIA", "NEW", "NOW", "OLD",
+    "THAT", "FROM", "THEY", "KNOW", "WILL", "BACK", "THEN", "THAN", "LIKE", "WHEN",
+    "COME", "SOME", "ALSO", "BEEN", "HAVE", "EACH", "MAKE", "MANY", "MORE", "INTO",
+    "TIME", "VERY", "WHAT", "WITH", "SUCH", "UPON", "EVEN", "ONLY", "BOTH", "WELL",
+    "MOST", "TAKE", "GENE", "THIS", "CELL", "ROLE", "BONE", "TYPE", "DRUG", "FORM",
+    "RATE", "SHOW", "LEAD", "THUS", "STEP", "PLAY", "LOSS", "GAIN", "HIGH", "WILD",
+    "THUS", "DOES", "WHEN", "THAN", "THESE", "THOSE", "THEIR", "WHICH", "WHILE",
+    "OFTEN", "COULD", "WOULD", "SHOULD", "BLOCK", "THESE", "OTHER", "BEING", "SINCE",
+    "FIRST", "AFTER", "AMONG", "ABOVE", "BELOW", "UNDER", "BETWEEN",
+})
+
+def extract_terms_from_text(text: str) -> List[str]:
+    """
+    Fallback: extract candidate biological entity names from plain text when
+    the LLM did not append a GRAPH-CONCEPTS line.
+
+    Captures:
+    - Gene/protein symbols: all-caps 2-8 chars, optionally hyphenated (FLT3, G-CSF, PML-RARA)
+    - Slash fusions: IDH1/2 → IDH1 and IDH2
+    - Multi-word biological phrases: "DNA methylation", "myeloid differentiation", etc.
+    - Bold markdown content: **term**
+    """
+    import re
+    terms: set = set()
+
+    # 1. Bold markdown items (strip markdown markers)
+    for m in re.finditer(r'\*\*([^*]{2,60})\*\*', text):
+        phrase = re.sub(r'[,.:;)]+$', '', m.group(1)).strip()
+        if 2 < len(phrase) < 60:
+            terms.add(phrase)
+
+    # 2. All-caps gene symbols: 2–8 uppercase letters+digits, optionally hyphenated
+    #    Matches: FLT3, TET2, RUNX1, G-CSF, GM-CSF, PML-RARA, IDH1, IDH2, MAPK
+    for m in re.finditer(r'\b([A-Z][A-Z0-9]{1,7}(?:-[A-Z][A-Z0-9]{0,7})?)\b', text):
+        sym = m.group(1)
+        if sym not in _STOP_SYMS and len(sym) >= 3:
+            terms.add(sym)
+
+    # 3. Slash-variants: IDH1/2 → IDH1, IDH2;  Wnt/β-catenin → Wnt
+    for m in re.finditer(r'\b([A-Z][A-Z0-9]{1,6})/(\d+)', text):
+        terms.add(m.group(1) + m.group(2))          # e.g. IDH2
+        terms.add(m.group(1) + "1")                  # e.g. IDH1 if IDH1/2
+
+    # 4. FLT3-ITD → also add base gene FLT3
+    for m in re.finditer(r'\b([A-Z][A-Z0-9]{1,7})-(?:ITD|TKD|mut|wt|WT)\b', text):
+        terms.add(m.group(1))
+
+    # 5. Multi-word biological phrases (2–4 words)
+    bio_starters = r'(?:DNA|RNA|mRNA|histone|epigenetic|myeloid|lymphoid|stem|blast|bone|acute|chronic|hematopoietic|transcription|signaling|signalling)'
+    for m in re.finditer(rf'\b({bio_starters}\s+\w+(?:\s+\w+(?:\s+\w+)?)?)\b', text, re.IGNORECASE):
+        phrase = m.group(1).strip()
+        if 5 < len(phrase) < 60:
+            terms.add(phrase)
+
+    # 6. Mixed-case symbols: C/EBPα, PU.1
+    for m in re.finditer(r'\b(C/EBP\S{0,4}|PU\.\d)\b', text):
+        terms.add(m.group(1))
+
+    # 7. Long-form names preceding a parenthesised abbreviation:
+    #    "Granulocyte-Macrophage Colony-Stimulating Factor (GM-CSF)"
+    #    "Granulocyte Colony-Stimulating Factor (G-CSF)"
+    for m in re.finditer(
+            r'([A-Z][a-zA-Z-]+(?: [A-Z][a-zA-Z-]+){1,6})\s*\([A-Z][A-Z0-9-]{1,10}\)',
+            text):
+        phrase = m.group(1).strip()
+        if 5 < len(phrase) < 80:
+            terms.add(phrase)
+
+    return sorted(terms)[:80]   # cap to avoid Neo4j overload
+
+def run_entity_lookup(terms: List[str]) -> List[Dict[str, str]]:
+    """
+    Batch-match biological term names against Neo4j nodes (name + Alias).
+    Returns [{term, matched_name, node_type, node_id, color}] — one entry per
+    matched term, best match wins (exact > case-insensitive > alias substring).
+    """
+    if not terms or not _state["neo4j"].get("url"):
+        return []
+    clean = list(dict.fromkeys(t.strip() for t in terms if len(t.strip()) > 2))[:50]
+    if not clean:
+        return []
+
+    # Single UNWIND query — finds best match per term in one round-trip.
+    # Alias is stored as a plain string ("term1;term2;...") so we use CONTAINS.
+    cypher = """
+WITH $terms AS terms
+MATCH (n)
+WHERE ANY(t IN terms WHERE
+      n.Name = t
+      OR toLower(n.Name) = toLower(t)
+      OR (n.Alias IS NOT NULL AND toLower(n.Alias) CONTAINS toLower(t)))
+WITH n, terms,
+     [t IN terms WHERE n.Name = t]                                                  AS exact_m,
+     [t IN terms WHERE n.Name <> t AND toLower(n.Name) = toLower(t)]               AS iexact_m,
+     [t IN terms WHERE n.Name <> t AND toLower(n.Name) <> toLower(t)
+                   AND n.Alias IS NOT NULL AND toLower(n.Alias) CONTAINS toLower(t)] AS alias_m
+WITH n, exact_m + iexact_m + alias_m AS all_terms
+WHERE size(all_terms) > 0
+UNWIND all_terms AS term
+RETURN term,
+       n.Name    AS matched_name,
+       n.URN     AS node_id,
+       [lbl IN labels(n) WHERE lbl <> '__Entity__'][0] AS node_type
+ORDER BY
+  CASE WHEN n.Name = term THEN 0
+       WHEN toLower(n.Name) = toLower(term) THEN 1
+       ELSE 2 END ASC,
+  size(n.Name) ASC
+LIMIT 80
+"""
+    # Run the Cypher in a thread with a hard 8-second timeout so a slow/unindexed
+    # graph never blocks the chat response.
+    result_holder: List = []
+    error_holder:  List = []
+
+    # contextvars aren't inherited by a plain threading.Thread (unlike asyncio
+    # tasks), so capture the calling user's identity here and re-set it inside
+    # the new thread — otherwise run_cypher() would silently fall back to the
+    # base/shared Neo4j config instead of this user's own credentials.
+    _calling_user = _current_username.get()
+
+    def _do_lookup():
+        _current_username.set(_calling_user)
+        try:
+            result_holder.extend(run_cypher(cypher, {"terms": clean}))
+        except Exception as exc:
+            error_holder.append(exc)
+
+    t0 = time.time()
+    thread = threading.Thread(target=_do_lookup, daemon=True)
+    thread.start()
+    thread.join(timeout=8)
+    elapsed = time.time() - t0
+
+    if thread.is_alive():
+        log.warning("Entity lookup timed out after %.1f s — skipping annotation", elapsed)
+        return []
+    if error_holder:
+        log.warning("Entity lookup failed (%.1f s): %s", elapsed, error_holder[0])
+        return []
+
+    rows = result_holder
+    log.info("Entity lookup: %d terms → %d rows in %.1f s", len(clean), len(rows), elapsed)
+
+    # Keep first (best-ranked) match per term
+    seen: Dict[str, Dict] = {}
+    for row in rows:
+        t = (row.get("term") or "").strip()
+        if t and t not in seen:
+            nt = row.get("node_type") or "Unknown"
+            seen[t] = {
+                "term":         t,
+                "matched_name": row.get("matched_name") or t,
+                "node_type":    nt,
+                "node_id":      str(row.get("node_id") or ""),
+                "color":        NODE_TYPE_COLORS.get(nt, "#8ab4f8"),
+            }
+    return list(seen.values())
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LLM helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _effective_llm(override: Optional[Dict]) -> Dict:
+    base = dict(_state["llm"])
+    if override:
+        # Skip None AND empty-string overrides so the frontend never clobbers
+        # a stored API key by sending an empty apikey field.
+        base.update({k: v for k, v in override.items()
+                     if v is not None and v != ""})
+    return base
+
+def _is_gemini_model(model: str) -> bool:
+    return (model or "").lower().startswith("gemini")
+
+def _anthropic_client(llm: Dict):
+    if not HAS_ANTHROPIC:
+        raise RuntimeError("anthropic package not installed — run: pip install anthropic")
+    api_key = llm.get("apikey") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("Anthropic API key not set — configure in Settings → Agentic AI")
+    base_url = llm.get("url") or None
+    kwargs = {"api_key": api_key}
+    if base_url and "anthropic.com" not in (base_url or ""):
+        kwargs["base_url"] = base_url
+    return _anthropic_mod.Anthropic(**kwargs)
+
+def _openai_client(llm: Dict):
+    """OpenAI-compatible client — used for Gemini and any OpenAI-compatible endpoint."""
+    if not HAS_OPENAI:
+        raise RuntimeError("openai package not installed — run: pip install openai")
+    model = llm.get("model_name", "")
+    # Auto-select Gemini base URL when model is gemini-* and no custom URL was set
+    default_url = GEMINI_BASE_URL if _is_gemini_model(model) else None
+    base_url = llm.get("url") or default_url
+    env_key   = "GEMINI_API_KEY" if _is_gemini_model(model) else "OPENAI_API_KEY"
+    api_key   = llm.get("apikey") or os.environ.get(env_key, "")
+    if not api_key:
+        raise RuntimeError(f"API key not set — configure in Settings → Agentic AI (env: {env_key})")
+    kwargs: Dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return _openai_mod.OpenAI(**kwargs)
+
+CYPHER_BLOCK_RE = re.compile(
+    r'```json\s*(\{[^`]*?"action"\s*:\s*"cypher"[^`]*?\})\s*```',
+    re.DOTALL,
+)
+
+POSTGRES_BLOCK_RE = re.compile(
+    r'```json\s*(\{[^`]*?"action"\s*:\s*"postgres"[^`]*?\})\s*```',
+    re.DOTALL,
+)
+
+ACTION_BLOCK_RE = re.compile(
+    r'```json\s*(\{[^`]*?"action"\s*:\s*"(?:cypher|postgres|ontology_lookup|pubmed_search|render|write_relation|batch_update|save_vocabulary)"[^`]*?\})\s*```',
+    re.DOTALL,
+)
+
+# Strips ALL action blocks from chat reply text (fenced form only — bare JSON
+# is handled separately in _strip_actions_from_reply using the already-parsed action).
+ACTION_STRIP_RE = re.compile(
+    r'```json\s*\{[^`]*?"action"\s*:\s*"(?:cypher|postgres|ontology_lookup|pubmed_search|render|write_relation|batch_update|save_vocabulary)"[^`]*?\}\s*```',
+    re.DOTALL,
+)
+
+_KNOWN_ACTIONS = frozenset(
+    {"cypher", "postgres", "ontology_lookup", "pubmed_search", "render", "write_relation",
+     "batch_update", "save_vocabulary"}
+)
+
+def _strip_actions_from_reply(text: str) -> str:
+    """Remove all action JSON blocks (fenced or bare) from reply text for display."""
+    # Pass 1: fenced blocks (fast, handled by regex)
+    result = ACTION_STRIP_RE.sub("", text)
+    # Pass 2: bare JSON objects with a known "action" key
+    out, i = [], 0
+    while i < len(result):
+        if result[i] != '{':
+            out.append(result[i])
+            i += 1
+            continue
+        # Try to find matching closing brace using depth tracking
+        depth, j = 0, i
+        while j < len(result):
+            if result[j] == '{':   depth += 1
+            elif result[j] == '}': depth -= 1
+            if depth == 0:
+                candidate = result[i:j + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and parsed.get("action") in _KNOWN_ACTIONS:
+                        i = j + 1  # skip this block entirely
+                        break
+                except Exception:
+                    pass
+                # Not a valid action block — keep the opening brace and move on
+                out.append(result[i])
+                i += 1
+                break
+            j += 1
+        else:
+            # Reached end without closing brace — keep as-is
+            out.append(result[i])
+            i += 1
+    return "".join(out).strip()
+
+
+def _extract_action(text: str) -> Optional[Dict]:
+    """Return the first action block found in text.
+
+    Tries two strategies in order:
+    1. Fenced code block  ```json { "action": "..." } ```  (preferred)
+    2. Bare JSON object anywhere in the text (fallback for LLMs that omit fences)
+    """
+    # Strategy 1 — fenced block (fast path)
+    m = ACTION_BLOCK_RE.search(text)
+    if m:
+        try:
+            parsed = json.loads(m.group(1))
+            if parsed.get("action") in _KNOWN_ACTIONS:
+                return parsed
+        except Exception:
+            pass
+
+    # Strategy 2 — bare JSON object (LLM forgot the code fence)
+    # Scan for every { ... } span and try to parse each as an action dict.
+    for start in range(len(text)):
+        if text[start] != '{':
+            continue
+        # Scan for balanced closing brace
+        depth = 0
+        for end in range(start, len(text)):
+            if text[end] == '{':
+                depth += 1
+            elif text[end] == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:end + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict) and parsed.get("action") in _KNOWN_ACTIONS:
+                            log.info("_extract_action: matched bare JSON action=%s", parsed.get("action"))
+                            return parsed
+                    except Exception:
+                        pass
+                    break
+
+    return None
+
+# Keep backward-compat alias
+def _extract_cypher_action(text: str) -> Optional[Dict]:
+    return _extract_action(text)
+
+def _current_graph_prompt_section(current_graph: Optional[Dict[str, Any]]) -> str:
+    """Ground-truth snapshot of what's actually rendered in the user's graph viewer
+    right now, sent fresh by the frontend on every chat request. Without this, the
+    model has no way to know whether an entity is already visualized and can only
+    guess from conversation history — which is how it can confidently state
+    something false ("BRCA1 already exists in the graph") when the graph view is
+    actually empty. Always included (not filtered like the Cypher examples) because
+    it changes every turn and getting it wrong causes visible, easily-noticed errors.
+
+    Includes both nodes AND edges. An earlier version sent only node names, which
+    caused a distinct, subtler bug: the agent inferred "both endpoints are visible
+    nodes" to mean "this relation is part of the graph view" and analyzed/updated
+    a database relation (e.g. AURKA→AKT1) that was never actually rendered — AURKA
+    and AKT1 were both on screen for unrelated reasons, with no edge between them
+    shown. Two nodes being visible does NOT mean every relation between them is
+    part of the current view — only the explicit edge list below is ground truth
+    for that.
+    """
+    if not current_graph:
+        return ("\n\n## Current Graph View State — GROUND TRUTH, do not guess\n"
+                "No graph-state snapshot was provided with this message — treat the graph view's "
+                "contents as UNKNOWN rather than assuming anything about what is or isn't shown.")
+
+    node_count = current_graph.get("nodeCount", 0)
+    edge_count = current_graph.get("edgeCount", 0)
+    nodes      = current_graph.get("nodes") or []
+    edges      = current_graph.get("edges") or []
+
+    if node_count == 0:
+        body = "The graph viewer is currently EMPTY — 0 nodes, 0 edges. Nothing has been visualized yet in this tab."
+    else:
+        node_listing = ", ".join(f"{n.get('name','?')} ({n.get('label','?')})" for n in nodes if n.get("name"))
+        if current_graph.get("nodesTruncated"):
+            node_listing += f", … and {node_count - len(nodes)} more"
+
+        if edge_count == 0:
+            edge_listing = "(none — the nodes above have no edges between them in the current view)"
+        else:
+            edge_parts = []
+            for e in edges:
+                effect_str = e["effect"] if e.get("effect") else "MISSING"
+                part = (f"{e.get('source','?')} -[{e.get('type','?')}, Effect={effect_str}]-> "
+                        f"{e.get('target','?')} (RelationID {e.get('relationId','?')})")
+                sentences = e.get("sentences")
+                if sentences:
+                    quoted = " | ".join(f"\"{s}\"" for s in sentences)
+                    part += f" [already-loaded sentence(s), reuse — do not re-fetch: {quoted}]"
+                edge_parts.append(part)
+            edge_listing = "; ".join(edge_parts)
+            if current_graph.get("edgesTruncated"):
+                edge_listing += f"; … and {edge_count - len(edges)} more"
+
+        body = (f"The graph viewer currently shows {node_count} node(s) and {edge_count} edge(s).\n"
+                f"Nodes currently displayed (name (label)): {node_listing}\n"
+                f"Edges currently displayed (source -[type, Effect]-> target (RelationID)): {edge_listing}")
+
+    return (
+        "\n\n## Current Graph View State — GROUND TRUTH, do not guess\n"
+        f"{body}\n"
+        "This reflects the ACTUAL current state of the user's graph viewer at the moment of this "
+        "message — NEVER claim an entity or relation is already in the graph (or that the graph is "
+        "non-empty) based on conversation history, prior queries you ran, or general knowledge alone. "
+        "CRITICALLY: two nodes both appearing in the node list does NOT mean a relation between them "
+        "is shown — only rely on the EDGE list for which specific relations are actually part of the "
+        "current view. A relation can exist in the database (and even appear in an earlier query's "
+        "results) without being part of what's currently rendered. Any task scoped to \"the graph\" / "
+        "\"edges in the graph\" / \"relations shown\" (e.g. inferring missing Effect signs) must use "
+        "the RelationIDs from the edge list above — e.g. `WHERE r.RelationID IN [...]` — never a "
+        "node-name-based join like `WHERE a.Name IN [...] AND b.Name IN [...]`, which matches any "
+        "database relation between two visible nodes whether or not that edge is actually displayed. "
+        "The user may have cleared the view, switched tabs, or never actually rendered anything — "
+        "always defer to this section. If the user asks to 'add X to the graph', check here first: if "
+        "X is already listed, tell them so instead of re-adding it; if it is not listed (including "
+        "when the graph is empty), run the query and emit a render action with `\"mode\": \"add\"` "
+        "(see Visualization section) so it's added to whatever is already there instead of replacing it. "
+        "Some edges above are tagged '[already-loaded sentence(s), reuse — do not re-fetch: ...]' — "
+        "the app already fetched these from PostgreSQL earlier (e.g. from a tooltip hover or sentence "
+        "coloring) and they are sitting in the browser's cache right now. USE THAT TEXT as your "
+        "starting point instead of querying PostgreSQL from scratch for that RelationID. IMPORTANT: "
+        "this cached sample is capped at 2 sentences per edge and a relation can have many more — if "
+        "the cached sentence(s) don't give you a clear answer (e.g. for inferring Effect), that means "
+        "check the REST of that RelationID's sentences from PostgreSQL, it does NOT mean the answer is "
+        "'unknown'. Only skip PostgreSQL entirely for an edge when the cached text ALREADY gives you a "
+        "clear, usable answer."
+    )
+
+def _system_prompt(user_message: str = "", current_graph: Optional[Dict[str, Any]] = None) -> str:
+    """Build the system prompt. `user_message` (the current turn's user text, when
+    available) is used only to select which Cypher examples are relevant enough
+    to include — see _examples_prompt_section. `current_graph` grounds the model in
+    what's actually on screen right now — see _current_graph_prompt_section.
+    Everything else in the prompt is unconditional and always included."""
+    schema_section = ""
+    if _state["schema_text"]:
+        schema_section = f"\n\n## Neo4j Database Schema\n{_state['schema_text']}"
+
+    examples_section     = _examples_prompt_section(user_message)
+    current_graph_section = _current_graph_prompt_section(current_graph)
+
+    # pg_schema must be defined unconditionally — it's used in the main f-string below.
+    # Resolved per-user (each user's own Postgres database/schema/credentials),
+    # falling back to the legacy shared _state["postgres"] values.
+    _pg_cfg_for_prompt = _resolve_pg_cfg(_current_username.get())
+    pg_schema = _pg_cfg_for_prompt.get("schema", "public") if _pg_cfg_for_prompt.get("host") else "public"
+
+    pg_section = ""
+    if _pg_cfg_for_prompt.get("host"):
+        pg_section = f"""
+
+## PostgreSQL — Supporting References
+Schema: **{pg_schema}**. Stores literature evidence behind graph edges. Query it with:
+
+```json
+{{"action": "postgres", "query": "SELECT ...", "description": "reason"}}
+```
+
+### Reference table: `{pg_schema}.reference`
+Key columns (always available): `id` (bigint = RelationID FK), `unique_id` (PK), `title`, \
+`authors`, `pubyear`, `journal`, `pmid`, `abstract`, `msrc` (the extracted MedScan sentence/snippet \
+text — this is what the app's edge tooltip actually displays as "the reference", not the abstract).
+Additional columns vary — query `information_schema.columns` to discover them.
+
+### RelationID is a STRING (or list of strings) in Neo4j but an INTEGER in PostgreSQL
+`reference.id` (the PostgreSQL column matching Neo4j's `RelationID`) is a `bigint` — a real integer \
+column, unlike its Neo4j counterpart. Whenever you carry a RelationID from Neo4j/the Current Graph \
+View State edge list over into a PostgreSQL query, write it as a BARE, UNQUOTED integer literal in \
+the SQL text (e.g. `ANY(ARRAY[12345, -9007659472309382576])`), never as a quoted string \
+(`'12345'`) — a quoted string compared against a bigint column is a type mismatch and will not match. \
+Also note: the `postgres` action executes ONE literal SQL string with no separate parameter \
+binding — there is no `$1`/`$2` placeholder mechanism here (unlike the SQL snippets you may have \
+seen written that way for illustration elsewhere) — every value, including RelationID lists, must be \
+inlined directly into the query text you emit, exactly like Cypher queries.
+
+### Finding references by biological concept
+To find references supporting a relation between concept A and concept B:
+1. Get RelationIDs for A-related edges from Neo4j:
+   ```cypher
+   MATCH (a)-[r]-(b) WHERE toLower(a.Name) = toLower('conceptA') RETURN r.RelationID AS rid
+   ```
+2. Search those references for B in title/abstract, inlining the RelationIDs as bare integers:
+   ```sql
+   SELECT id, unique_id, title, authors, pubyear, journal, pmid, abstract
+   FROM {pg_schema}.reference
+   WHERE id = ANY(ARRAY[12345, 67890])
+     AND (LOWER(COALESCE(title,'')) LIKE '%concept_b%' OR LOWER(COALESCE(abstract,'')) LIKE '%concept_b%')
+   ORDER BY pubyear DESC NULLS LAST
+   LIMIT 30
+   ```
+3. Rank returned rows by biological relevance and summarise for the user.
+4. If the database returns no matches, supplement with references you know from training \
+   data — provide PMID, title, authors, year, and journal for each; note they are from \
+   training knowledge and should be verified.
+
+### Sentence mining — keyword search filtered straight into the graph viewer's tooltips
+When the user asks to find relations/edges whose literature evidence *mentions specific keywords* \
+("find references that mention X", "sentence mining for X", "show me relations where the sentence \
+talks about X") — and especially when they also ask to visualize the result — use this workflow \
+instead of the general concept-lookup one above:
+
+1. Search the sentence text (and title/abstract as a fallback) for the keyword(s):
+   ```sql
+   SELECT id, title, authors, pubyear, journal, pmid, msrc
+   FROM {pg_schema}.reference
+   WHERE LOWER(COALESCE(msrc,''))     LIKE '%keyword%'
+      OR LOWER(COALESCE(title,''))    LIKE '%keyword%'
+      OR LOWER(COALESCE(abstract,'')) LIKE '%keyword%'
+   LIMIT 300
+   ```
+   If the user also named specific entities/concepts, narrow this further with \
+   `AND id = ANY(ARRAY[12345, 67890])` (bare integers — see above) using RelationIDs resolved from \
+   Neo4j first (see the concept-lookup steps above) — a fully unscoped keyword search over the whole \
+   reference table can be slow and can match far more relations than are useful to visualize.
+2. Group the returned rows by `id` (RelationID) into an object: `{{"<id>": [row, row, ...], ...}}`. \
+   Do this yourself from the rows already in the tool result — do not re-query per RelationID.
+3. Emit ONE render block with `"tool": "graph"`:
+   - `"cypher"`: `MATCH (u)-[r]->(t) WHERE r.RelationID IN [<the distinct ids from step 1, as strings>] RETURN u,r,t`
+   - `"edge_references"`: the grouped object from step 2
+   ```json
+   {{"action": "render", "tool": "graph",
+     "cypher": "MATCH (u)-[r]->(t) WHERE r.RelationID IN ['10021','10088'] RETURN u,r,t",
+     "edge_references": {{"10021": [{{"title": "...", "msrc": "...", "pmid": "..."}}],
+                          "10088": [{{"title": "...", "msrc": "...", "pmid": "..."}}]}},
+     "description": "Relations whose evidence mentions 'apoptosis'"}}
+   ```
+   The frontend uses `edge_references` to pre-load each edge's tooltip with ONLY the keyword-matched \
+   sentence(s) you found, instead of the edge's full (unfiltered) reference list — this is the whole \
+   point of sentence mining: the tooltip shows why THIS keyword search matched, not everything ever \
+   published about that relation.
+4. If no RelationIDs matched, say so — do not emit a render block with an empty `RelationID IN []` list.
+
+### Multi-turn "find articles → create relation" workflow
+When a user first asks you to find supporting references and later asks to create a relation:
+- Look back through the conversation history and extract the full reference rows (JSON) \
+  you returned from previous postgres queries
+- Include those rows in the `references` array of your `write_relation` block
+- Do NOT re-query — the data is already in the conversation context
+- The user will review and can remove individual references in the confirmation dialog \
+  before saving
+
+Rules: SELECT/WITH only. Cap 500 rows. Rank by biological relevance, not just recency."""
+
+    vocab_section = _vocabulary_prompt_section()
+
+    return f"""You are an AI assistant for Graph Explorer — a biological knowledge-graph application \
+backed by Neo4j (graph data) and PostgreSQL (literature evidence).
+{current_graph_section}
+
+## When to use database tools vs. answer directly
+**Use the knowledge graph FIRST** for any question that asks what specific proteins, genes, \
+drugs, or other entities are involved in a biological process or relationship — even if the \
+question sounds like a general science question. Examples that MUST go to the graph:
+- "What activates / inhibits / regulates X?"
+- "What pushes / drives / promotes / blocks Y?"
+- "Which proteins / genes / drugs are involved in Z?"
+- "What causes / triggers / reverses [biological state]?"
+- Any question where the Cypher Examples section below contains a matching semantic translation.
+
+## Node label convention for "protein(s)" — MANDATORY, applies to every query
+Whenever a query needs to match a node representing "a protein" or "proteins" in ANY role \
+(subject, regulator, target, activator, inhibitor, cause, etc.), use all three labels:
+```
+MATCH (n:Protein|FunctionalClass|Complex)
+```
+Never write `MATCH (n:Protein)` alone for a generic "protein" mention. `FunctionalClass` covers \
+protein families and enzyme classes (e.g. "kinase", "phosphatase", "transcription factor"); \
+`Complex` covers multi-protein assemblies. Only match `Protein` alone when the user explicitly \
+restricts scope with wording like "only Protein nodes" or "labeled Protein".
+This rule is NOT optional and does not depend on which example most closely matches the \
+question — apply it to every node variable that stands for "protein(s)" in every Cypher query, \
+including new/negative-regulator/arrest-type questions that have no exact matching example below.
+
+**Answer directly from training knowledge** ONLY for purely conceptual or definitional questions \
+where no graph query could add value — e.g. "What is the mechanism of action of kinases in \
+general?", "Explain what myeloid differentiation is", "What does AKT signalling pathway do?". \
+These are background education questions, not data retrieval questions.
+
+**When in doubt, query the graph.** A data-backed answer from this knowledge graph is always \
+more valuable than a general LLM answer for questions about specific biological entities or \
+relationships.
+
+## CRITICAL — No planning text without an action block
+NEVER output planning or intent text ("First, let me find...", "I'll start by looking up...", \
+"Let's begin by querying...") as your ONLY output. That wastes a turn and breaks the loop. \
+Two valid patterns:
+- **Preferred:** Skip the planning text entirely — emit ONLY the action block.
+- **Acceptable:** Write one sentence of context, then IMMEDIATELY follow it in the SAME response \
+  with the action block.
+
+If you need to run a query, the action block MUST appear in your response. A response that \
+describes what you are about to do but contains no action block will be treated as a final \
+answer and the loop will stop — no query will execute.
+
+**Keep pre-action narration short, especially for `render` blocks with a long or multi-part \
+Cypher query** (e.g. queries comparing/intersecting several concepts and their ontological \
+children). A long explanation followed by a long query can together exceed the response length \
+limit, cutting the action block off mid-JSON — it will then neither execute nor display correctly. \
+One short sentence before the block is enough; save fuller explanations for AFTER the action runs \
+and results come back (you get another turn to elaborate then). If a query itself is very long, \
+prefer simplifying it (narrower scope, fewer chained clauses) over a long explanation.
+
+## Concept resolution — only for database queries
+When (and only when) you need to query the graph, resolve every biological term to an exact \
+node name first. Use the three-step process below.
+
+### Step 1 — Check the User Vocabulary
+Look in the "User Vocabulary" section below. If the user's term already has a confirmed mapping, \
+use that Neo4j name directly and skip Steps 2–3.
+
+### Step 2 — Alias lookup
+If the term is not in the vocabulary (or you are unsure), search the graph's Alias attributes:
+
+```json
+{{"action": "ontology_lookup", "sub_action": "alias_search", "term": "<user term>", "description": "Find Neo4j nodes matching this term"}}
+```
+
+The graph stores synonyms/aliases in a node property called `Alias`. The lookup searches both \
+`n.Alias` and `n.Name`. Use the returned node name(s) in subsequent Cypher queries.
+
+**After an alias search returns results**, write ONE conversational sentence summarising what you \
+found (e.g. "I found that 'myeloid differentiation' maps to the graph concept \
+'myeloid blood cell differentiation' — now running the Cypher query.") and then IMMEDIATELY \
+emit the next action block in the same response.
+
+### Step 3 — Ontology navigation
+After resolving a concept, you may need to adjust scope using the `is_a` and `part_of` \
+relationship types that encode the ontology hierarchy:
+
+**Broaden** (user term too specific / no results found) — navigate UP to parent concepts:
+```json
+{{"action": "ontology_lookup", "sub_action": "broaden", "concept": "<resolved name>", "via": "is_a|part_of", "depth": 2, "description": "Find broader parent concepts"}}
+```
+
+**Narrow** (user term too general / too many results) — navigate DOWN to child concepts:
+```json
+{{"action": "ontology_lookup", "sub_action": "narrow", "concept": "<resolved name>", "via": "is_a|part_of", "depth": 1, "description": "Find more specific child concepts"}}
+```
+
+Offer the user a choice when multiple candidates exist at the same level. Always briefly explain \
+which concept you are using and why.
+
+## Neo4j property naming and case rules — MANDATORY
+These rules apply to **every** Cypher query you write. Violating them returns empty results silently.
+
+1. **Property `Name` is always capital-N.** The primary node identifier is `n.Name` — never `n.name`.
+   All other standard properties also use PascalCase: `n.Alias`, `n.URN`, `n.NodeID`, `r.RelationID`, etc.
+2. **All string comparisons must be case-insensitive** using `toLower()` on both sides:
+   - ✅ `toLower(n.Name) = toLower($term)`
+   - ✅ `toLower(n.Name) CONTAINS toLower($fragment)`
+   - ❌ `n.Name = $term` — fails on any case mismatch
+   - ❌ `n.name = $term` — property does not exist; always returns empty
+3. **Exact lookup pattern** (single node by name):
+   `MATCH (n) WHERE toLower(n.Name) = toLower($name)`
+4. **Node ID lookup** (when you need NodeID / URN):
+   `MATCH (n) WHERE toLower(n.Name) = toLower($name) RETURN n.NodeID AS nodeId, n.URN AS urn, labels(n)[0] AS label`
+5. **Ontology joins always require `WITH DISTINCT`** — when a query joins across `is_a` or `part_of` \
+   relationships (ontology hierarchy), each node can match multiple ancestor paths, producing \
+   duplicate rows in the result. Always add `WITH DISTINCT <nodes, rels>` before `RETURN`:
+   - ✅ `MATCH (a)-[r]->(b) MATCH (a)-[:is_a*1..]->(fc) WHERE ... WITH DISTINCT a, r, b RETURN a, r, b`
+   - ❌ `MATCH (a)-[r]->(b) MATCH (a)-[:is_a*1..]->(fc) WHERE ... RETURN a, r, b` — inflates row count
+   When reporting result counts, count distinct nodes, not rows.
+6. **CONTAINS searches: always use the singular root form of the term.** \
+   `CONTAINS 'kinase'` matches "protein kinase", "receptor tyrosine kinase", "serine/threonine kinase", etc. \
+   `CONTAINS 'kinases'` (plural) does NOT match any of those — it finds nothing. \
+   Strip trailing plural 's' or 'es' before using a term in a CONTAINS filter. \
+   - ✅ `toLower(fc.Name) CONTAINS 'kinase'`  — finds all kinase subtypes
+   - ❌ `toLower(fc.Name) CONTAINS 'kinases'` — finds nothing
+   This also means that when a user asks for "kinases", the query should filter by `'kinase'` (singular), \
+   which naturally returns all kinase subtypes including protein kinases (the ontological children). \
+   Never add a trailing 's' to the search term in a CONTAINS clause.
+7. **"Protein(s)" always means three labels, not one** — see the MANDATORY node label convention \
+   section above. `MATCH (n:Protein|FunctionalClass|Complex)`, never `MATCH (n:Protein)` alone, \
+   unless the user explicitly says "only Protein nodes" / "labeled Protein".
+8. **Reference-count comparisons must use `coalesce()`.** The property is `RelationNumberOfReferences` \
+   (not `RefCount`) and can be missing on some edges. Always write \
+   `coalesce(r.RelationNumberOfReferences, 0) >= N` — a bare `r.RelationNumberOfReferences >= N` \
+   silently drops edges where the property is null instead of treating them as 0.
+9. **Node degree/connectivity uses the `COUNT{{}}` subquery form**, not a second MATCH + count(*). \
+   `RETURN n.Name, COUNT{{(n)-[]-()}} AS connectivity` — this is the efficient, correct way to count \
+   a node's total relations, and composes safely with other MATCH clauses in the same query.
+10. **When direction doesn't matter (or isn't known), match undirected and recover it in RETURN.** \
+   Use `(a)-[r]-(b)` (no arrow) so no edges are missed, then return `startNode(r)` / `endNode(r)` \
+   to report the relation's true stored direction — never assume direction from the order node \
+   variables appear in the query.
+11. **`IS NOT NULL` alone is not enough for optional relation properties.** Properties like \
+   `Effect`, `Mechanism`, `ChangeType`, `BiomarkerType` sometimes store the literal string `'_'` as \
+   an explicit placeholder for "no value" instead of a real null (a leftover from how relations get \
+   merged). When filtering on any of these, exclude BOTH: \
+   `WHERE r.Mechanism IS NOT NULL AND r.Mechanism <> '_' AND r.Mechanism <> ''`.
+12. **Soft/conditional phrasing ("if possible", "when available", "prefer X") must NEVER silently \
+   narrow an already-established result set.** If the user (or you, earlier in this conversation) \
+   already established a specific set of entities — e.g. "27 cell processes genetically linked to \
+   BRCA1" — and the user then asks to visualize/connect that same set with a preference like \
+   "connect by one step if possible", do NOT replace the correct underlying query with a stricter \
+   one that only keeps entities matching the preferred condition (e.g. switching to a plain \
+   one-hop-only MATCH). Keep ALL previously-established entities in the result — apply the \
+   preference only to path length/shape where it doesn't cost you any of them (e.g. a direct edge \
+   when one exists, falling back to the same multi-branch pattern you used before for entities that \
+   only connect indirectly). "One step if possible" means "use one step when available, not \
+   'require one step'" — it is not license to drop entities that need more than one step. If \
+   honoring the literal preference for every entity is genuinely not possible without losing some of \
+   them (e.g. the user also demands hiding an intermediary node type that some entities need to \
+   connect through at all), say so explicitly and ask how they'd like to proceed — never silently \
+   pick the incomplete interpretation and present it as if it were the full answer.
+13. **The APOC plugin IS installed on this Neo4j instance — you may use `apoc.*` procedures and \
+   functions freely.** For example, `apoc.meta.cypher.type(value)` safely reports a value's actual \
+   Cypher type (e.g. `'STRING'`, `'LIST OF STRING'`) without ever throwing, which is the right tool \
+   for properties like `RelationID` that can be a scalar OR a list — see the "Match relations by a \
+   list of known RelationID values" Cypher example. Do not assume APOC is unavailable and avoid it \
+   out of caution.
+
+## How to query Neo4j (after concept resolution)
+```json
+{{"action": "cypher", "query": "MATCH (n) WHERE toLower(n.Name) = toLower($name) RETURN n LIMIT 5", "description": "reason"}}
+```
+
+After results arrive, synthesise a clear natural-language answer. Warn before MERGE/SET/DELETE/CREATE.
+{pg_section}
+
+## PubMed Literature Search
+To find recent scientific papers (especially those not yet in the knowledge graph database), \
+use the pubmed_search action:
+
+```json
+{{"action": "pubmed_search", "query": "AKT1 scleroderma fibrosis kinase", "min_date": "2023/01/01", "max_date": "2026/12/31", "max_results": 10, "description": "Find recent AKT1+scleroderma papers"}}
+```
+
+Parameters:
+- `query`: PubMed search string — use gene names, MeSH terms, Boolean operators (AND/OR/NOT)
+- `min_date` / `max_date`: optional, format `YYYY/MM/DD` (e.g. `"2024/01/01"`)
+- `max_results`: 1–50, default 10
+
+Returns: pmid, title, authors, pubyear, journal for each article.
+The returned rows can be included directly in a `write_relation` references array.
+Use this when: the user asks for "recent papers", "last N years", papers published after a date, \
+or when the knowledge-graph database has no relevant references for the relationship being discussed.
+
+## Creating New Relations
+To create a new biological relation and persist it to the knowledge graph, emit a write_relation \
+action. The user will be shown a confirmation dialog before anything is written.
+
+**Required preparation (always do these steps first):**
+1. Resolve both nodes via ontology_lookup or the user vocabulary
+2. Fetch their `NodeID` property with a Cypher query:
+   `MATCH (n {{Name: $name}}) RETURN n.NodeID AS nodeId, labels(n)[0] AS label`
+   NodeID is the biological identifier used as the relation key — do NOT use the Neo4j internal id()
+
+**write_relation block (new relation):**
+```json
+{{
+  "action": "write_relation",
+  "mode": "create",
+  "source_node": {{"node_id": "<n.NodeID value>", "node_label": "<primary label>", "name": "<display name>"}},
+  "target_node": {{"node_id": "<n.NodeID value>", "node_label": "<primary label>", "name": "<display name>"}},
+  "relation_type": "<Neo4j relationship type e.g. DirectRegulation>",
+  "properties": {{
+    "Effect":       "<Positive | Negative | Unknown>",
+    "Mechanism":    "<e.g. Phosphorylation | Binding>",
+    "Ontology":     "<optional>",
+    "Relationship": "<optional>"
+  }},
+  "description": "Brief human-readable description of this relation"
+}}
+```
+
+The backend will automatically:
+- Calculate RelationID using the same deterministic algorithm as the curation dialog
+- Add a `source` property set to the configured LLM model name
+
+**Including supporting references** — add a `references` array when you have literature evidence:
+```json
+{{
+  "action": "write_relation",
+  "mode": "create",
+  ...,
+  "references": [
+    {{
+      "title":   "Phosphorylation of KRAS activates MAPK signalling",
+      "authors": "Smith J, Doe A",
+      "pubyear": "2022",
+      "pmid":    "35000001",
+      "journal": "Nature Cell Biology",
+      "abstract": "We show that ..."
+    }}
+  ]
+}}
+```
+
+Reference rules:
+- **Never** include `id`, `unique_id`, or `_deleted` — the server assigns `id = RelationID` automatically
+- If you fetched reference rows from PostgreSQL earlier in the conversation, include them as-is \
+  (the backend strips `id`/`unique_id` before inserting)
+- You may also cite references you know from training data — provide as many fields as you know \
+  (at minimum `title` or `pmid`)
+- The user can review and remove individual references in the confirmation dialog before saving
+- Include only references that genuinely support the specific relation being created
+
+## Adding References to an Existing Relation
+When the user wants to add new references to a relation **that already exists** in the graph \
+(e.g. the relation was created earlier but new papers have been published):
+
+1. Resolve both nodes and fetch NodeIDs (as above)
+2. Check whether the relation exists and get its current RelationID:
+   ```cypher
+   MATCH (a {{NodeID: $srcId}})-[r:RelationType]->(b {{NodeID: $tgtId}})
+   RETURN r.RelationID AS existingId
+   ```
+3. Fetch existing reference PMIDs for that RelationID from PostgreSQL to avoid duplicates:
+   ```sql
+   SELECT pmid FROM {pg_schema}.reference WHERE id = <existingId> AND pmid IS NOT NULL
+   ```
+4. Search for NEW references — use `pubmed_search` for recent papers, or `postgres` to find \
+   related references already in the database. Exclude any PMID already in the existing list.
+5. Emit write_relation with `"mode": "add_references"` and **only** the new (non-duplicate) refs:
+
+```json
+{{
+  "action": "write_relation",
+  "mode": "add_references",
+  "source_node": {{"node_id": "...", "node_label": "...", "name": "..."}},
+  "target_node": {{"node_id": "...", "node_label": "...", "name": "..."}},
+  "relation_type": "RelationType",
+  "properties": {{}},
+  "references": [ /* only new references not already in the database */ ],
+  "description": "Adding N new references to existing AKT1→scleroderma relation"
+}}
+```
+
+The backend will MERGE the relation (no graph change) and INSERT only the provided references. \
+The server also deduplicates by PMID as a safety net, so duplicates are never created. \
+The confirmation modal will show "Add References to Existing Relation" to make the intent clear.
+
+Rules:
+- `source_node` is the upstream / regulator (direction →), `target_node` is downstream / regulated (←)
+- Always ask the user to confirm intent **before** emitting write_relation
+- If you cannot determine NodeID for either node, fetch it first with a cypher query
+- One write_relation block per action — do not batch multiple relation writes in one block
+
+## Inferring missing properties from evidence text (e.g. Effect sign) — YOU CAN DO THIS
+You have full reading comprehension of any text placed in your context — including the literature \
+sentences (`msrc`) stored in PostgreSQL. Reading a sentence like "AKT1 phosphorylation activates \
+mTOR signaling" and judging that it describes a POSITIVE effect is not a separate "NLP" capability \
+you lack — it is ordinary language understanding, exactly what you already do to answer every other \
+question. NEVER tell the user you "can't perform NLP" or "can't infer meaning from text" — you can, \
+and this is a supported workflow. If the user asks you to infer a missing property (most commonly \
+Effect: positive/negative/unknown) from supporting sentences, follow this workflow instead of \
+refusing:
+
+1. Find candidate edges missing the property. Default to the edges currently shown in the graph \
+   viewer UNLESS the user specifies a different scope. Get these directly from the RelationIDs \
+   already listed in the "Current Graph View State" edge list — DO NOT re-derive "the graph's \
+   edges" by matching on node names (`WHERE a.Name IN [...] AND b.Name IN [...]`), which finds ANY \
+   database relation between two visible nodes even if that specific edge was never rendered — the \
+   most common way this task goes wrong. From the edge list above, collect the RelationIDs already \
+   marked `Effect=MISSING`, then confirm against the database using the type-safe RelationID-match \
+   pattern (see the "Match relations by a list of known RelationID values" Cypher example — a plain \
+   `WHERE r.RelationID IN [...]` silently returns 0 rows for any relation where RelationID happens \
+   to be stored as a list, which happens for merged relations):
+   ```cypher
+   MATCH ()-[r]->()
+   WHERE r.RelationID IS NOT NULL
+   WITH r,
+        CASE WHEN apoc.meta.cypher.type(r.RelationID) CONTAINS 'LIST'
+             THEN [x IN r.RelationID | toString(x)]
+             ELSE [toString(r.RelationID)]
+        END AS relIdList
+   WHERE ANY(rid IN relIdList WHERE rid IN [/* RelationIDs from the edge list marked Effect=MISSING */])
+   RETURN r.RelationID AS relationId, startNode(r).Name AS regulator, endNode(r).Name AS target, type(r) AS relType
+   ```
+   If this still returns fewer rows than expected, do not assume the edges don't exist — say so and \
+   offer to double-check by fetching one of the missing RelationIDs directly instead of silently \
+   giving up.
+   If the user's request isn't scoped to the current view at all (e.g. "check the whole database" or \
+   a specific node's relations regardless of what's shown), ASK what scope they want rather than \
+   guessing — an unscoped search can be a very large, expensive set.
+2. Before querying anything, check the Current Graph View State edge list for edges already tagged \
+   `[already-loaded sentence(s), reuse — do not re-fetch: ...]` — the app fetches sentences into the \
+   browser's cache as soon as the user hovers a tooltip or colors sentences, so many edges may \
+   already have this text available with zero extra round-trips. This cached sample is capped at 2 \
+   sentences and a relation can have many more (real examples have had 5-10+). \
+   **HARD GATE — apply this test to every edge before you're allowed to write down its Effect:** \
+   does the cached sample (or a sentence you already fetched) contain EXPLICIT directional/functional \
+   language per the word lists in step 3 below? \
+   - YES → use it, no query needed for this edge. \
+   - NO (cache is empty, OR the cached sentence(s) only describe a bare mechanism like \
+     "phosphorylates"/"binds"/"methylates" with no stated outcome, OR they're vague/unrelated) → you \
+     are REQUIRED to query PostgreSQL for that RelationID's FULL sentence list before you may write \
+     anything for that edge, even "unknown". Mechanism-only cached text is precisely the case that \
+     triggers a query — it is never grounds to stop. \
+   Work through edges in batches of roughly 10-20 at a time (not hundreds in one turn):
+   ```sql
+   SELECT id, msrc FROM {pg_schema}.reference WHERE id = ANY(ARRAY[12345, 67890]) AND msrc IS NOT NULL
+   ```
+   (RelationIDs inlined as bare integers, not quoted strings — see the RelationID type note above. \
+   This returns EVERY sentence for those RelationIDs, not just the capped cached sample — for edges \
+   hitting the NO branch above, treat anything less than this full result set as incomplete evidence.)
+3. **A relation is usually backed by MULTIPLE sentences, and Effect=unknown is not the goal of this \
+   task — it means "I checked and found no signal anywhere," never "the first sentence I looked at \
+   didn't say."** For EACH edge, read EVERY one of its available sentences (from step 2, both cached \
+   and freshly-queried) before drawing a conclusion — do not stop at the first sentence. Scan each \
+   one for explicit DIRECTIONAL/FUNCTIONAL language: "activates", "induces", "increases", \
+   "upregulates", "promotes", "enhances", "stabilizes" → positive; "inhibits", "suppresses", \
+   "decreases", "downregulates", "blocks", "reduces", "degrades", "destabilizes" → negative. \
+   **CRITICAL — do not confuse a biochemical MECHANISM with a regulatory DIRECTION.** Verbs like \
+   "phosphorylates", "methylates", "acetylates", "ubiquitinates", "binds", "interacts with", \
+   "associates with", "cleaves" describe HOW two molecules interact, not whether the effect is \
+   positive or negative — phosphorylation in particular can be either activating or inhibitory \
+   depending on the specific site and context, so "X phosphorylates Y" alone is NOT evidence of \
+   "positive" and must not be scored as one. Only treat a mechanism verb as directional when the \
+   SAME sentence also states the functional outcome (e.g. "phosphorylates and activates", \
+   "phosphorylates BRCA1, leading to its degradation", "ubiquitinates BRCA1 for degradation") — in \
+   that case the outcome word, not the mechanism verb, is what you cite. A sentence that reports \
+   only the bare mechanism with no stated outcome carries no signal and must be treated the same as \
+   an uninformative sentence — move on to the relation's other sentences before concluding unknown. \
+   If EVEN ONE sentence out of several gives a clear directional signal, use it — a mix of one clear \
+   sentence and several mechanism-only/vague sentences is a resolved case, not an ambiguous one. \
+   Only record unknown for an edge once ALL of its available sentences have been read and genuinely \
+   NONE of them state a direction — do not default to unknown just because the sentence you happened \
+   to check first was mechanism-only or uninformative. Concretely: before writing "unknown" for any \
+   edge, verify you actually triggered the HARD GATE query in step 2 for it (unless the cache alone \
+   already gave you a clear signal) — "unknown" backed only by 1-2 cached, mechanism-only sentences \
+   is a process violation, not a valid conclusion.
+   **CONTRADICTORY EVIDENCE IS A DIFFERENT OUTCOME FROM "UNKNOWN" — NEVER PICK A SIDE.** If, after \
+   reading every sentence, you find genuine directional language on BOTH sides for the SAME edge \
+   (e.g. one sentence says "inhibits", another says "activates") — as opposed to one clear sentence \
+   plus several merely uninformative ones, which is NOT a conflict — do not average them, do not go \
+   with the majority, and do not pick whichever sounds more recent or more specific. This is a real \
+   scientific disagreement in the literature and it is not your call to resolve silently. Treat this \
+   edge as a CONFLICT (see the `conflicts` array in step 4), never as "Positive", "Negative", or \
+   "Unknown" — "Unknown" means no signal was found anywhere, which is a different situation from \
+   "signal was found pointing in two different directions."
+4. Once you've worked through every edge, emit a single `batch_update` action instead of asking in \
+   plain text — the app renders one checkbox per proposed edge directly in the chat (checked by \
+   default) so the user can uncheck any inference they disagree with before anything is written. \
+   Do NOT also ask a yes/no question in your text — the checkbox card IS the confirmation step, and \
+   do NOT emit a `cypher`/write action yourself for this — the app writes the checked subset when \
+   the user clicks Apply, using its own parameterized query. Your job stops at proposing the batch. \
+   Edges with contradictory evidence (see step 3) go in a SEPARATE `conflicts` array, not `updates` \
+   — they carry no `value` and are never checked/written, only shown to the user so they can judge \
+   the evidence themselves (e.g. via Edit Properties, once they've decided):
+   ```json
+   {{"action": "batch_update",
+     "property": "Effect",
+     "updates": [
+       {{"relationId": "12345", "source": "AURKA", "target": "BRCA1", "relationType": "DirectRegulation",
+        "value": "Negative",
+        "sentence": "Furthermore, phosphorylation of BRCA1 by AURKA is known to inhibit BRCA1 activity."}},
+       {{"relationId": "67890", "source": "ATM", "target": "BRCA1", "relationType": "DirectRegulation",
+        "value": "Positive",
+        "sentence": "ATM phosphorylates and activates BRCA1 in response to DNA damage."}}
+     ],
+     "conflicts": [
+       {{"relationId": "24680", "source": "PRKCA", "target": "BRCA1", "relationType": "DirectRegulation",
+        "sentences": [
+          {{"direction": "Positive", "text": "PKC-alpha phosphorylates BRCA1 and enhances its stability."}},
+          {{"direction": "Negative", "text": "PRKCA-mediated phosphorylation was shown to suppress BRCA1 transcriptional activity."}}
+        ]}}
+     ],
+     "description": "Inferred Effect sign for 2 relations; 1 relation has conflicting evidence"}}
+   ```
+   Rules for this block:
+   - `relationId` — the exact RelationID value (as a string) you matched the edge on
+   - `value` (updates only) — exactly `"Positive"`, `"Negative"`, or `"Unknown"` (title case)
+   - `sentence` / `sentences[].text` — the VERBATIM supporting sentence (quoted exactly as it appears \
+     in `msrc`, not a paraphrase) — this is what the user reviews to judge whether they agree with \
+     you, so never substitute your own description of the sentence for the sentence itself
+   - `conflicts[].sentences` — do not stop at the first positive sentence and the first negative \
+     sentence you happen to find. Include EVERY sentence you read for that edge that showed a clear \
+     directional signal, on both sides — if 3 sentences said positive and 2 said negative, all 5 go \
+     in this array, each tagged with which direction IT points to. The user is relying on this list \
+     to weigh the evidence themselves, so under-reporting it (e.g. showing only one pair as a token \
+     example) defeats the purpose — leave out only sentences that were mechanism-only/uninformative, \
+     never ones that carried a signal
+   - Skip edges you couldn't resolve (genuinely "Unknown" after exhausting all sentences) unless the \
+     user specifically asked to also record "Unknown" explicitly — there's usually no value in \
+     writing a property to a value that means "we don't know". Conflicted edges go in `conflicts`, \
+     not skipped and not in `updates` — the user asked to see these, not have them silently dropped
+   - Omit `conflicts` entirely (or leave it an empty array) when nothing conflicted
+   - One `batch_update` block per turn covering everything you've analysed so far — do not split one \
+     batch across multiple messages
+5. The frontend calls a dedicated batch-write endpoint (not a `cypher` action) for the edges the \
+   user leaves checked when they click Apply — this happens entirely client-side after your turn \
+   ends. If the user asks you to keep going on more edges afterward, repeat steps 1-4 for the next \
+   scope.
+
+## Visualization & Export — Render Actions
+After completing your analysis, if the user asked to visualize or export, emit ONE render block \
+as your **last output**. A render block triggers the app's built-in viewer — the agent does NOT \
+execute it.
+
+**Never auto-visualize — rendering is opt-in, never an automatic next step.** After running a \
+`cypher` action for an analytical/counting question ("how many X", "find Y that Z", "which proteins \
+activate...") your job stops at reporting the statistics: the exact TOTAL RESULTS count, the \
+neighbor/label breakdown when one is given, and a plain-language summary. Do NOT also emit a render \
+block in that same turn unless the user's message ALREADY explicitly asked for a specific output — \
+"visualize this", "show me a graph/sankey/table", "open in Sankey", "export to Excel/CSV", etc. \
+Choosing a visualization tool and scope for the user, without being asked, takes a decision away from \
+them that's usually better made once they've actually seen the numbers — 4827 relations might call \
+for a Sankey overview, or a narrower re-query with an extra filter, or a CSV export instead, or \
+nothing further at all, and only the user knows which. When you've reported statistics and the \
+request didn't specify a format, end your turn there — ALWAYS close by offering the concrete set of \
+options the user can choose from next, not a vague "let me know what you'd like":
+- Visualize in a **new Graph view** (replaces whatever is currently shown — best for smaller/focused \
+  result sets — mention if this one likely exceeds the ~1 000-edge comfort zone)
+- **Add the results to the current Graph view** (merges the new nodes/edges into whatever is already \
+  open instead of replacing it) — only offer this choice when the Current Graph View State section \
+  shows the graph is non-empty; skip it when the graph is empty since it would be identical to the \
+  "new Graph view" option
+- Visualize as a **Sankey diagram** (aggregated flow view — good for large sets like this one)
+- Open as a **Nodes table**, **Relations table**, or **References table** (sortable/filterable rows \
+  — References table includes literature sentences, Relations does not)
+- **Narrow the results down** with an additional filter (e.g. restrict to a specific node type, \
+  relation type, effect sign, or add another condition)
+- **Broaden the scope** by removing a constraint (e.g. drop a filter, widen the ontology match, \
+  increase a path-length limit)
+Tailor which of these you actually mention to what makes sense for the result (e.g. don't suggest \
+"narrow down" for a 3-row result), but default to listing the visualization formats plus whichever of \
+narrow/broaden is relevant, rather than picking one yourself and rendering it. This applies even when \
+the result size would technically "suggest" a particular tool (e.g. large sets suiting Sankey) — \
+naming that suggestion in your own text is fine, silently acting on it is not. NEVER pick "new Graph \
+view" vs "add to current Graph view" on the user's behalf — if they just say "graph" or "visualize \
+this" without saying new vs. add, ask which of the two they mean rather than defaulting to replacing \
+an existing view: overwriting a graph the user has been building through several prior turns without \
+being asked is a serious usability failure, not a minor inconvenience.
+
+**CRITICAL — reusing a query the user already ran or that you already generated.** If the user asks \
+to visualize/open/export "this query", "that query", "the query you just created/ran", "the query \
+that returned N results/relations/neighbors", or explicitly says "copy the query" — you MUST reuse \
+the EXACT Cypher text from that earlier turn, character-for-character, as the `"cypher"` field of the \
+render block. Do NOT regenerate, rephrase, "clean up", or reconstruct it from your own memory of what \
+it was doing. This matters because you WILL silently drop pieces when reconstructing a long query \
+from memory instead of literally copying it — a whole `OR` branch, a `toLower()` wrapper, half a \
+`WHERE` clause — and the user gets truncated/wrong results with no error to signal it happened. This \
+is not a hypothetical: asked to "just copy the query that returns 4827 relations into Sankey," a \
+prior version of this exact prompt still reconstructed the query from scratch and silently dropped \
+one whole branch of an `OR` condition, cutting the real result set roughly in half. To do this \
+correctly: find the query in your OWN conversation history (the `cypher` field of your own prior \
+`render`/`cypher` action, or the "Cypher executed successfully" tool result that followed it), copy \
+that exact string, and paste it — untouched — into the new render block. Only actually edit the query \
+when the user's new message asks for a real, specific change (e.g. "also include ontology children," \
+"add a LIMIT," "change the effect to negative") — and even then, start from that exact prior text and \
+apply only the specific delta requested, rather than rewriting the whole query fresh from your own \
+understanding of it. If you're not sure which prior query the user means, ask them to confirm which \
+turn it was rather than guessing/reconstructing one.
+
+**This verbatim-reuse rule applies ONLY to a query that was already EXECUTED earlier in this \
+conversation (i.e. you already ran it via a `cypher` action and already reported its row/neighbor \
+count to the user) — it is not a general license to skip execution for a brand-new query.** For any \
+query you have NOT already run in this conversation — including one you just wrote this turn to \
+answer the user's current request — the normal two-step workflow from "How to query Neo4j" above \
+still applies first: emit it as a `cypher` action, let the real TOTAL RESULTS / neighbor-count come \
+back, and report that to the user in your text. Only emit a `render` block once a query has actually \
+been executed and verified this way (either just now, or earlier in the conversation) — never jump \
+straight to `render` for a query that has never been run, since that skips verification entirely and \
+the user gets no count/confirmation that the query even does what they asked, just whatever the graph \
+viewer happens to draw. "Visualize X" on a brand-new question is still: run the `cypher` action first, \
+report the count, THEN render — the only shortcut this section grants is for re-opening/re-exporting a \
+query that's already been through that check.
+
+**New tab / new window** — Graph Explorer has no separate browser window for results; "new tab" \
+IS its equivalent of "new window". If the user says anything like "new window", "new tab", \
+"new view", "another tab", "separate graph", "don't replace what's on screen", or "open a new one", \
+add `"new_tab": true` to the render block so the frontend opens a fresh tab before loading the \
+result instead of overwriting the currently active one. Omit the field (or set it `false`) when \
+the user does not ask for a new tab/window — the default is to reuse the current tab.
+
+**Layout** — `tool: "graph"` only (tables/Sankey have no layout concept). If the user asks for a \
+specific arrangement of the graph, add a `"layout"` field with ONE of these exact values:
+- `"dagre"` — hierarchical / tree / top-down / layered arrangement. Use this for "hierarchical \
+layout", "tree layout", "top-down", "layered", "organize by hierarchy/parent-child" — dagre is \
+this app's hierarchical layout, there is no separate "hierarchical" value.
+- `"circle"` — nodes arranged in a circle
+- `"concentric"` — concentric rings (e.g. grouped by importance/degree)
+- `"grid"` — grid arrangement
+- `"cose"` — force-directed layout (this is also the default — omit the field entirely rather \
+than setting it to `"cose"` explicitly, unless the user is asking to switch BACK to it)
+Omit `"layout"` entirely if the user didn't ask for a specific arrangement — don't guess one.
+
+**Add vs. replace** — `tool: "graph"` only. By DEFAULT a render block REPLACES whatever is \
+currently in the graph viewer. If the user says "add X to the graph", "also show Y", "include Z \
+in the current view", "put X in there too" — i.e. anything that means ADD to what's already there \
+rather than starting over — set `"mode": "add"` in the render block. Check the "Current Graph View \
+State" section above first: if the requested entity is already listed there, tell the user it's \
+already in the graph instead of emitting a render block at all; if the graph is empty, `"mode": \
+"add"` behaves the same as a normal render (nothing to preserve). Omit `"mode"` (or set it to \
+`"replace"`) for ordinary "visualize X" / "show me X" requests that aren't about an existing view.
+
+**Adding an OPEN-ENDED expansion — ask before you add new nodes.** A request like "add BRCA1 to \
+the graph" names one specific, already-known entity — there's nothing to ask, it's either already \
+there or it isn't. But a request like "add kinases phosphorylating BRCA1", "add diseases linked to \
+X", "also show proteins that interact with Y" is an EXPANSION — a plural/generic category whose \
+members you don't know yet until you query, and the count could be anywhere from zero to hundreds. \
+For this kind of add request, do NOT immediately run the query and render. Instead, reply with a \
+short clarifying question (plain text, no action block — this is a normal conversational turn).
+
+FIRST, check the Current Graph View State section for whether any node of the category being \
+expanded (e.g. any node labeled Protein/FunctionalClass/Complex that could plausibly be a "kinase") \
+is already present:
+- If NONE are present (including when the graph is empty), say so explicitly and offer only TWO \
+  options — do not offer "connect to existing ones" as if it were a real choice when it would \
+  add nothing:
+  1. Add the new nodes and their connections to BRCA1 (the full expansion), or
+  2. Add only the new nodes, with no connecting edges yet (you can connect them later)
+- If some ARE already present, offer the full THREE-way choice:
+  1. Add all matching entities and their connections (the full expansion)
+  2. Add only NEW EDGES connecting to entities already in your graph (skip any brand-new node that \
+     isn't already shown)
+  3. Add only the new nodes, with no connecting edges yet
+
+Wait for the user's answer before emitting any render block. Once they answer:
+- "Full expansion" → run the normal, unrestricted query with `"mode": "add"` as usual, \
+  `RETURN kinase, r, brca1` (or equivalent — complete triples).
+- "Only edges to existing" → restrict the query so the OTHER endpoint's name must already be in \
+  the Current Graph View State node list, e.g. add `AND toLower(kinase.Name) IN ['name1','name2',...]` \
+  (lowercased, from the current node list) to the WHERE clause, keep `RETURN kinase, r, brca1`, \
+  render with `"mode": "add"` — every returned node already exists, so only edges actually get added.
+- "Nodes only, no edges" → change the RETURN clause to return ONLY the new-entity node and nothing \
+  else, e.g. `RETURN DISTINCT kinase` — omit the relationship variable and the other endpoint \
+  entirely. The render pipeline populates an empty edge list whenever no relationships are returned, \
+  so this adds the nodes with no connecting edges. Still use `"mode": "add"`.
+
+Skip asking (just add directly) when the request already makes the scope unambiguous — e.g. the \
+user names specific entities ("add AKT1 and MTOR to the graph"), says "add ALL of them", explicitly \
+says "with/without edges" or "connected/unconnected" up front, or has already answered this question \
+earlier in the conversation for the same kind of request.
+
+**Graph view** — nodes + relationships, best for < 200 edges:
+```json
+{{"action": "render", "tool": "graph", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b LIMIT 200", "layout": "dagre", "mode": "add", "new_tab": false, "description": "what this shows"}}
+```
+Optional `"edge_references"` field — `{{"<RelationID>": [refRow, ...], ...}}` — pre-loads specific \
+edges' tooltips with an exact set of reference rows instead of letting the tooltip fetch the edge's \
+full reference list on hover. Use this for sentence-mining / keyword-filtered results (see the \
+"Sentence mining" section under PostgreSQL below) — omit it for ordinary graph renders.
+
+**Sankey diagram** — hub-and-spoke influence/flow from a central node:
+```json
+{{"action": "render", "tool": "sankey", "cypher": "MATCH (hub) WHERE toLower(hub.Name) = toLower($hub) MATCH (hub)-[r]-(n) RETURN hub,r,n", "description": "..."}}
+```
+
+**Relations table** — flat edge list with Neo4j properties (no literature):
+```json
+{{"action": "render", "tool": "relations_table", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
+```
+
+**References table** — edges + PostgreSQL literature (requires edges with RelationID/RelationIDs):
+```json
+{{"action": "render", "tool": "references_table", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
+```
+
+**Export Excel — relations** (large result sets, no Postgres join):
+```json
+{{"action": "render", "tool": "export_excel_relations", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
+```
+
+**Export Excel — references** (large sets with Postgres literature join):
+```json
+{{"action": "render", "tool": "export_excel_references", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
+```
+
+**Export CSV — relations**:
+```json
+{{"action": "render", "tool": "export_csv_relations", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
+```
+
+**Export CSV — references**:
+```json
+{{"action": "render", "tool": "export_csv_references", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
+```
+
+Render rules (all of these assume the user has already asked for SOME visualization/export — per the \
+"Never auto-visualize" rule above, don't reach this section at all for a plain analytical question):
+- Always return complete nodes and edges: `RETURN a, r, b` — not just scalar properties
+- Do NOT add a `LIMIT` unless the user specifically requested a count
+- If the user asked to visualize/export but didn't say which format (e.g. "show me the results," \
+  "let's see this"), THEN use result size/shape to pick the tool — the heuristics below are for \
+  choosing AMONG formats once some visualization was requested, not for deciding whether to visualize:
+  - **graph** — best for focused queries returning < 1 000 edges (the graph viewer enforces \
+a hard limit at 1 000 and will warn the user if exceeded)
+  - **sankey** — no edge limit; it aggregates ALL edges into groups by entity label × relation \
+type × effect sign regardless of how many individual edges are returned, making it the best \
+choice for large relationship sets where the user wants a high-level overview
+  - **relations_table / references_table** — suitable for any result size up to tens of thousands \
+of rows; the table supports sorting and filtering
+  - **export_excel / export_csv** — use for very large sets (hundreds of thousands of rows)
+- References table and reference exports require edges that carry `RelationID` or `RelationIDs` \
+  properties in Neo4j (these link to the PostgreSQL `reference.id` column)
+- Set `"new_tab": true` whenever the user asked for a new tab/window/view instead of updating the \
+  current one — this is a distinct instruction from which `tool` to use, so check for it every time
+- Set `"layout"` (graph tool only) whenever the user asked for a specific arrangement in the SAME \
+  request that asked to visualize — e.g. "visualize X and perform hierarchical layout" needs BOTH \
+  `"tool": "graph"` AND `"layout": "dagre"` in that one render block. This is also a distinct \
+  instruction from `tool`/`new_tab` — check for it independently every time, don't drop it just \
+  because the request also asked for something else.
+- Set `"mode": "add"` whenever the user's wording means adding to the current graph rather than \
+  replacing it (see "Add vs. replace" above) — and check the Current Graph View State section first \
+  so you can tell the user "X is already there" instead of pointlessly re-adding it.
+
+## Teaching the agent new term mappings (save_vocabulary)
+When the user tells you that one of their terms maps to a specific concept — e.g. \
+"'hematopoietic differentiation' means 'hematopoietic cell differentiation'" — you MUST \
+emit a save_vocabulary action block. Saying you saved something WITHOUT emitting the block \
+does nothing — the mapping will NOT be stored. The block is the only mechanism that persists \
+a mapping; text alone has no effect.
+
+Emit the block FIRST (it is terminal — the loop stops after it), then your confirmation text:
+
+```json
+{{"action": "save_vocabulary", "mappings": [
+  {{"user_term": "hematopoietic differentiation", "neo4j_name": "hematopoietic cell differentiation", "neo4j_label": "CellProcess"}}
+]}}
+```
+
+Multiple mappings can go in one block. Triggers:
+- User states "X means Y", "X refers to Y", "remember that X is Y", "learn: X → Y"
+- User confirms an alias_search result is correct
+- User asks you to "remember" or "learn" a term
+
+**Two different mapping shapes — pick the right one, this is not optional:**
+- **[entity]** — the user's term names ONE specific, individually-named node (a gene, a disease, a \
+  specific concept). `neo4j_name` = that node's exact Name; `neo4j_label` = its one real Neo4j label \
+  (e.g. `"CellProcess"`, `"Protein"`).
+- **[category]** — the user's term refers to a whole TYPE of node, not one named entity (e.g. "drugs", \
+  "therapeutic approach" → the SmallMol label itself; "proteins" → Protein/FunctionalClass/Complex). \
+  For this shape, put the label(s) themselves in `neo4j_name` — pipe-separated if more than one, e.g. \
+  `"SmallMol"` or `"Protein|FunctionalClass|Complex"` — and set `neo4j_label` to an EMPTY STRING `""`. \
+  Never invent a fake "entity name" like `"drugs"` for `neo4j_name` when what the user actually means is \
+  the SmallMol label — that produces a mapping nobody can use correctly (there is no node literally \
+  named "drugs" to match against).
+If you're not sure which shape applies, ask the user "should this match one specific node, or a whole \
+category of nodes?" rather than guessing — an empty `neo4j_label` is a deliberate signal for the \
+category shape, not a generic "I don't know" fallback.
+
+CRITICAL: Never confirm a save in text without also emitting the action block.
+
+## Safety rules
+- Confirm before any write Cypher (MERGE, SET, DELETE, CREATE, REMOVE) unless user explicitly requested it.
+- Exception: bulk property inference (e.g. Effect-sign inference) uses `batch_update`, not a `cypher` \
+  write action — its checkbox card in the chat IS the confirmation, so do not also emit a `cypher` \
+  SET/MERGE for the same edges.
+- Never expose credentials.
+- PostgreSQL: SELECT/WITH only — never INSERT/UPDATE/DELETE/DDL.
+- Cap result interpretation at 200 rows; note if more were returned.
+
+## Biological concept annotation (knowledge answers only)
+When you answer a general knowledge question **without** using any database tool actions \
+(no cypher / postgres / ontology_lookup blocks emitted), append ONE line at the very end of \
+your response in this exact format — nothing after it:
+
+GRAPH-CONCEPTS: <term1> | <term2> | ...
+
+List every specific biological entity you mentioned: proteins and genes (use gene-symbol style: \
+AKT1, RUNX1, C/EBPα), diseases (acute myeloid leukemia), cell types (myeloid progenitor), \
+cell processes (myeloid differentiation), molecular complexes (SCF complex), small molecules, \
+genetic variants, treatments.
+- Canonical database-style names only — not abbreviations (write "acute myeloid leukemia", not "AML")
+- Exclude purely generic terms (kinase, receptor, pathway, signaling, process)
+- Limit to 20 terms separated by " | "
+- **Omit this line entirely** if you used any database tool (cypher / postgres / ontology_lookup){vocab_section}{examples_section}{schema_section}"""
+
+def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple:
+    """Call the configured LLM and return (text_reply, was_truncated).
+
+    Routes to Anthropic SDK for claude-* models and OpenAI-compatible SDK for gemini-* / others.
+
+    `was_truncated` is True when the provider stopped generating because it hit the
+    max-tokens cap (Anthropic `stop_reason == "max_tokens"` / OpenAI-compatible
+    `finish_reason == "length"`) rather than finishing naturally. A truncated reply
+    can leave an action block (```json {"action": ...}```) unterminated — invalid JSON
+    that neither executes nor gets stripped from the visible text — so callers use this
+    flag to retry instead of showing broken JSON to the user.
+    """
+    model        = llm.get("model_name") or "claude-sonnet-4-6"
+    temperature  = float(llm.get("temperature", 0.2))
+    top_p        = float(llm.get("top_p", 0.9))
+    call_timeout = float(llm.get("call_timeout", 90))
+    # Cypher queries for multi-concept ontology questions (e.g. "common regulators of
+    # X and Y, including ontological children") plus a narrative explanation can run
+    # long — 4096 was cutting off complex render/cypher blocks mid-JSON. 8192 gives
+    # much more headroom while still bounding worst-case latency/cost.
+    max_tokens   = int(llm.get("max_tokens", 8192))
+
+    if system_prompt:
+        sp = system_prompt
+    else:
+        # Fallback path (e.g. workflow steps that don't pre-build a system prompt):
+        # use the most recent user message for example-relevance scoring.
+        _last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+        sp = _system_prompt(_last_user)
+    log.info("LLM call → model=%s prompt_tokens≈%d msg_turns=%d timeout=%ss",
+             model, len(sp) // 4, len(messages), int(call_timeout))
+
+    t0 = time.time()
+    truncated = False
+
+    if _is_gemini_model(model):
+        # ── OpenAI-compatible path (Gemini, or any custom OpenAI endpoint) ────
+        # Run in a daemon thread so the synchronous httpx call can't freeze
+        # uvicorn's async event loop — mirrors the entity-lookup timeout pattern.
+        client = _openai_client(llm)
+        oai_messages = [{"role": "system", "content": sp}] + messages
+        kwargs_oai: Dict[str, Any] = dict(
+            model=model,
+            messages=oai_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=call_timeout,
+        )
+        if top_p < 1.0:
+            kwargs_oai["top_p"] = top_p
+
+        result_holder: List = []
+        error_holder:  List = []
+
+        def _do_oai_call():
+            try:
+                resp = client.chat.completions.create(**kwargs_oai)
+                result_holder.append(resp)
+            except Exception as _e:
+                error_holder.append(_e)
+
+        oai_thread = threading.Thread(target=_do_oai_call, daemon=True)
+        oai_thread.start()
+        oai_thread.join(timeout=call_timeout + 10)   # +10s buffer over SDK timeout
+        if oai_thread.is_alive():
+            raise RuntimeError(
+                f"LLM call timed out after {int(call_timeout)}s — "
+                "model may be unavailable or the endpoint is not responding"
+            )
+        if error_holder:
+            raise error_holder[0]
+        resp  = result_holder[0] if result_holder else None
+        text  = (resp.choices[0].message.content or "") if resp else ""
+        truncated = bool(resp) and getattr(resp.choices[0], "finish_reason", "") == "length"
+    else:
+        # ── Anthropic SDK path (Claude models) ────────────────────────────────
+        client = _anthropic_client(llm)
+        kwargs = dict(
+            model=model,
+            max_tokens=max_tokens,
+            system=sp,
+            messages=messages,
+            temperature=temperature,
+            timeout=call_timeout,
+        )
+        if top_p < 1.0:
+            kwargs["top_p"] = top_p
+        response  = client.messages.create(**kwargs)
+        text      = response.content[0].text
+        truncated = getattr(response, "stop_reason", "") == "max_tokens"
+
+    log.info("LLM call ← %.1f s  reply_tokens≈%d  truncated=%s", time.time() - t0, len(text) // 4, truncated)
+    return text, truncated
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes — health & schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {
+        "status":        "ok",
+        "schema_loaded": bool(_state["schema_text"]),
+        "schema_chars":  len(_state["schema_text"]),
+        "neo4j_url":     _state["neo4j"].get("url", ""),
+        "postgres_host": _state["postgres"].get("host", ""),
+        "llm_model":     _state["llm"].get("model_name", "claude-sonnet-4-6"),
+        "has_anthropic": HAS_ANTHROPIC,
+        "has_openai":    HAS_OPENAI,
+        "has_neo4j":     HAS_NEO4J,
+        "has_postgres":  HAS_PG,
+        "has_langgraph": HAS_LANGGRAPH,
+    }
+
+class PingRequest(BaseModel):
+    llm: Optional[Dict[str, Any]] = None   # frontend passes its current _agentConfig
+
+@app.post("/ping-llm")
+def ping_llm(req: PingRequest = None):
+    """Minimal LLM round-trip — returns model name, provider, and wall-clock time."""
+    import urllib.request as _urllib_req
+    import urllib.error  as _urllib_err
+
+    llm   = _effective_llm(req.llm if req else None)
+    model = llm.get("model_name") or "claude-sonnet-4-6"
+    sp    = _system_prompt()
+    t0    = time.time()
+    try:
+        if _is_gemini_model(model):
+            api_key = llm.get("apikey") or os.environ.get("GEMINI_API_KEY", "")
+            if not api_key:
+                return {"error": "Gemini API key not set — configure in Settings → Agentic AI"}
+            ping_url  = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+                         f"{model}:generateContent")
+            ping_body = json.dumps({
+                "contents": [{"parts": [{"text": "Reply with only the word PONG."}]}],
+                "generationConfig": {"maxOutputTokens": 16},
+            }).encode()
+            http_req = _urllib_req.Request(
+                ping_url, data=ping_body,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            )
+            log.info("Gemini ping → %s", ping_url)
+
+            HARD_TIMEOUT = 15
+            ping_result: List = []
+            ping_error:  List = []
+
+            def _do_gemini_ping():
+                import socket as _sock
+                _sock.setdefaulttimeout(HARD_TIMEOUT)
+                try:
+                    with _urllib_req.urlopen(http_req, timeout=HARD_TIMEOUT) as r:
+                        ping_result.append(json.loads(r.read()))
+                except _urllib_err.HTTPError as he:
+                    body = he.read().decode("utf-8", errors="replace")[:400]
+                    ping_error.append(("http", he.code, body))
+                except Exception as _e:
+                    ping_error.append(("err", 0, str(_e)))
+
+            pt = threading.Thread(target=_do_gemini_ping, daemon=True)
+            pt.start()
+            pt.join(timeout=HARD_TIMEOUT + 2)
+
+            if pt.is_alive():
+                return {"error": (f"Gemini API did not respond within {HARD_TIMEOUT}s. "
+                                  "Possible causes: corporate firewall blocking outbound HTTPS, "
+                                  "API key not activated, or model name incorrect."),
+                        "elapsed_s": round(time.time() - t0, 2), "model": model}
+
+            if ping_error:
+                kind, code, msg = ping_error[0]
+                if kind == "http":
+                    return {"error": f"HTTP {code}: {msg}",
+                            "elapsed_s": round(time.time() - t0, 2), "model": model}
+                return {"error": msg, "elapsed_s": round(time.time() - t0, 2), "model": model}
+
+            resp_body = ping_result[0] if ping_result else {}
+            reply = (resp_body.get("candidates", [{}])[0]
+                              .get("content", {})
+                              .get("parts", [{}])[0]
+                              .get("text", "PONG"))
+        else:
+            if not HAS_ANTHROPIC:
+                return {"error": "anthropic package not installed — run: pip install anthropic"}
+            client   = _anthropic_client(llm)
+            response = client.messages.create(
+                model=model, max_tokens=16,
+                system="Reply with only the word PONG.",
+                messages=[{"role": "user", "content": "ping"}],
+                timeout=30,
+            )
+            reply = response.content[0].text.strip()
+        elapsed  = time.time() - t0
+        provider = "gemini" if _is_gemini_model(model) else "anthropic"
+        log.info("Ping OK: model=%s elapsed=%.1fs reply=%r", model, elapsed, reply)
+        return {"model": model, "provider": provider,
+                "elapsed_s": round(elapsed, 2),
+                "system_prompt_tokens": len(sp) // 4,
+                "reply": reply}
+    except Exception as exc:
+        log.warning("Ping failed: %s", exc)
+        return {"error": str(exc), "elapsed_s": round(time.time() - t0, 2), "model": model}
+
+@app.post("/schema")
+def update_schema(payload: SchemaPayload):
+    _state["neo4j"]       = payload.neo4j
+    _state["schema_text"] = payload.schema_text
+    if payload.llm:
+        _state["llm"].update({k: v for k, v in payload.llm.items() if v is not None})
+    if payload.postgres:
+        _state["postgres"] = payload.postgres
+        log.info("PostgreSQL config received: host=%s db=%s", payload.postgres.get("host"), payload.postgres.get("database"))
+    log.info("Schema updated — %d chars", len(payload.schema_text))
+    return {"ok": True}
+
+@app.post("/llm-config")
+def update_llm_config(payload: LLMConfigPayload):
+    data = payload.dict(exclude_none=True)
+    _state["llm"].update(data)
+    log.info("LLM config updated: model=%s", _state["llm"].get("model_name"))
+    return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes — chat (agentic loop)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Total context budget (input + output) assumed safe across all supported providers.
+# Claude models offer ~200K tokens; this stays well under the smallest common OpenAI-
+# compatible context (e.g. 128K) so a restored conversation never blows any of them up.
+_HISTORY_TOKEN_BUDGET = 100_000
+
+def _trim_history_to_budget(messages: List[Dict], system_prompt: str, max_tokens: int,
+                             total_budget: int = _HISTORY_TOKEN_BUDGET) -> tuple:
+    """Keep only as many of the most recent messages as fit in the token budget,
+    dropping the OLDEST turns first (a restored conversation's newest turns matter
+    most for continuing the discussion). Always keeps at least the final message
+    (the current user turn), even if it alone would exceed the budget.
+
+    Uses the same chars/4 token estimate already used elsewhere in this file —
+    approximate, but consistent, and errs on the conservative side.
+
+    Returns (trimmed_messages, dropped_count).
+    """
+    sp_tokens = len(system_prompt) // 4
+    available = total_budget - sp_tokens - max_tokens - 2_000  # safety margin
+    if available <= 0:
+        available = 4_000  # degenerate fallback — still send *something*
+
+    kept, used = [], 0
+    for m in reversed(messages):
+        t = len(m.get("content", "") or "") // 4
+        if kept and used + t > available:
+            break
+        kept.append(m)
+        used += t
+    kept.reverse()
+    return kept, len(messages) - len(kept)
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    llm = _effective_llm(req.llm)
+
+    # Build message list from history + new user message. When a past turn's
+    # cypher was stripped out of its display text (see _strip_actions_from_reply),
+    # append the literal query back in here so it's still visible to the model —
+    # otherwise a later "open that query in Sankey" request has nothing to copy
+    # from and the model silently reconstructs (and truncates) it from memory.
+    messages: List[Dict] = []
+    for m in req.history:
+        content = m.content
+        if m.cypher:
+            content = f"{content}\n\n[Cypher executed/rendered this turn — reuse this EXACT text verbatim if a later request refers back to this query:\n{m.cypher}\n]"
+        messages.append({"role": m.role, "content": content})
+    messages.append({"role": "user", "content": req.message})
+
+    generated_cypher:      Optional[str]  = None
+    cypher_results:        Optional[List] = None
+    postgres_results:      Optional[List] = None
+    render_action:         Optional[Dict] = None
+    write_relation_action: Optional[Dict] = None
+    batch_update_action:   Optional[Dict] = None
+
+    # Build system prompt once — avoids rebuilding it (and loading vocabulary) on every turn.
+    # req.message (this turn's actual question) drives which Cypher examples get included —
+    # see _select_relevant_examples — so the example set stays relevant to what's being asked
+    # even as cypher_examples.json grows, instead of shipping every example every time.
+    # req.current_graph grounds the model in what's actually rendered on screen right now.
+    system_prompt = _system_prompt(req.message, req.current_graph)
+
+    # A restored (or very long-running) conversation can exceed what's safe to send
+    # to the LLM in one call. Trim from the oldest turns rather than sending the
+    # whole thing and letting the provider reject it with an opaque context-length
+    # error. This only affects what goes out on THIS request — the client keeps
+    # (and can re-save) the full, untrimmed history.
+    messages, dropped_history_turns = _trim_history_to_budget(messages, system_prompt, max_tokens=8192)
+    if dropped_history_turns:
+        log.warning("Chat request: trimmed %d oldest history turn(s) to fit the context budget",
+                    dropped_history_turns)
+
+    request_start = time.time()
+    log.info("Chat request: %d history turns, system_prompt≈%d tokens",
+             len(req.history), len(system_prompt) // 4)
+
+    # Agentic loop — allow up to 8 LLM↔tool round-trips
+    truncation_retries = 0
+    for _turn in range(8):
+        log.info("Agentic loop turn %d", _turn)
+        # A single failed LLM call (network blip, provider momentarily overloaded,
+        # transient timeout, etc.) used to surface immediately as a bare "HTTP 502"
+        # with no retry — easy to mistake for the model being unable to handle the
+        # message itself (e.g. a typo), when it's really an infrastructure hiccup
+        # unrelated to what was typed. Retry a couple of times with a short backoff
+        # before giving up, and give a clearer explanation if it still fails.
+        _last_llm_exc = None
+        for _attempt in range(3):
+            try:
+                reply_text, was_truncated = _call_llm(messages, llm, system_prompt)
+                _last_llm_exc = None
+                break
+            except Exception as exc:
+                _last_llm_exc = exc
+                if _attempt < 2:
+                    log.warning("LLM call failed (attempt %d/3): %s — retrying", _attempt + 1, exc)
+                    time.sleep(1.5 * (_attempt + 1))
+        if _last_llm_exc is not None:
+            log.error("LLM call failed after 3 attempts: %s", _last_llm_exc)
+            raise HTTPException(
+                status_code=502,
+                detail=(f"The AI provider didn't respond after 3 attempts ({_last_llm_exc}). "
+                        "This is usually a temporary network or provider issue, not a problem with "
+                        "your message — please try again in a moment.")
+            )
+
+        messages.append({"role": "assistant", "content": reply_text})
+
+        action = _extract_action(reply_text)
+        if not action:
+            # A response cut off by the token limit can leave an action block
+            # (```json {"action": ...}```) unterminated — invalid JSON that won't
+            # execute and won't get stripped from the visible reply either. Instead
+            # of showing the user broken JSON, ask the model to redo it concisely.
+            if was_truncated and truncation_retries < 2:
+                truncation_retries += 1
+                log.warning("Turn %d: reply was cut off by the token limit before completing "
+                            "(retry %d/2)", _turn, truncation_retries)
+                messages.append({"role": "user", "content": (
+                    "Your previous response was cut off by the token limit before the action "
+                    "block finished, so nothing executed and the incomplete JSON must not be "
+                    "shown to the user. Please redo it: keep any explanation before the action "
+                    "block to at most one short sentence, then emit the COMPLETE action block. "
+                    "If the query itself is very long, simplify it so the whole block fits."
+                )})
+                continue
+            break  # LLM gave a final answer — done
+
+        action_type = action.get("action", "cypher")
+
+        # render, write_relation, and save_vocabulary are terminal — no "query" field needed.
+        # ontology_lookup uses "term"/"concept" fields (not "query"), so skip the query check.
+        # pubmed_search also uses "query" but it's not mandatory — handled in its own block.
+        if action_type in ("render", "write_relation", "batch_update", "save_vocabulary", "ontology_lookup", "pubmed_search"):
+            query = action.get("query", "")  # may be empty; each handler uses its own fields
+        else:
+            query = action.get("query", "").strip()
+            if not query:
+                break
+
+        if action_type == "cypher":
+            generated_cypher = query
+            log.info("Agent executing Cypher: %s", query[:120])
+            try:
+                # One pass gets rows, an accurate total (no separate COUNT(*) round-trip
+                # needed), and — when the query has a clear seed/neighbor shape — a
+                # distinct-neighbor-node count broken down by label. See
+                # _run_cypher_analyzed for the frequency-based heuristic.
+                rows, total_count, neighbor_count, neighbor_by_label = _run_cypher_analyzed(query)
+                cypher_results = rows[:200]
+
+                # Send only a compact sample (first 30 rows, max 8 000 chars) so
+                # the JSON is never truncated mid-entry, which confuses the LLM count.
+                sample = cypher_results[:30]
+                result_json = json.dumps(sample, indent=2)
+                if len(result_json) > 8_000:
+                    result_json = result_json[:8_000] + "\n  ... (truncated)"
+
+                neighbor_line = ""
+                if neighbor_count is not None:
+                    breakdown = _format_label_breakdown(neighbor_by_label)
+                    neighbor_line = (
+                        f" Of the nodes involved, {neighbor_count} are distinct NEIGHBOR nodes "
+                        f"({breakdown} nodes) — this excludes the seed/input node(s) you searched from "
+                        f"(e.g. 'BRCA1' itself is not a neighbor of BRCA1).\n"
+                        f"IMPORTANT — report the neighbor count WITH its label breakdown when summarising, "
+                        f"using this pattern: \"The query found {neighbor_count} neighbors ({breakdown} nodes) "
+                        f"linked by {total_count} <relation-type description> between <input> and <what they "
+                        f"connect to>.\" Never state only the relation/row count alone when a neighbor "
+                        f"breakdown is given here."
+                    )
+
+                tool_msg = (
+                    f"Cypher executed successfully. TOTAL RESULTS: {total_count} row(s)."
+                    f"{neighbor_line}\n"
+                    f"Sample (first {len(sample)} of {total_count}):\n```json\n{result_json}\n```\n"
+                    f"IMPORTANT: The exact total is {total_count} — always state this number. "
+                    f"Do NOT count the sample rows. Summarise the results for the user."
+                )
+            except Exception as exc:
+                err_text = str(exc)
+                is_timeout = "timeout" in err_text.lower() or "timed out" in err_text.lower()
+                timeout_hint = (
+                    f"\nThis looks like a TIMEOUT — the query ran longer than "
+                    f"{CYPHER_QUERY_TIMEOUT_SECONDS}s and the server aborted it. Common causes: "
+                    "a variable-length relationship pattern used WITHOUT shortestPath()/"
+                    "allShortestPaths() (forces Neo4j to enumerate every matching path instead of "
+                    "a fast bidirectional search), a missing label/index-backed filter on a "
+                    "high-degree node, or too large a hop range. See the 'Find the shortest path "
+                    "between two entities' example for the fast pattern.\n"
+                    if is_timeout else ""
+                )
+                tool_msg = (
+                    f"Cypher query failed with error: {exc}\n"
+                    f"{timeout_hint}"
+                    f"The EXACT query that failed:\n```cypher\n{generated_cypher}\n```\n"
+                    "You MUST show this exact query to the user in a code block along with the "
+                    "error message — do not paraphrase, summarize, or omit it, and do not "
+                    "silently rewrite or retry it yourself unless the user asks you to. They "
+                    "need to see the real query text to debug or improve it themselves."
+                )
+
+        elif action_type == "postgres":
+            log.info("Agent executing PostgreSQL: %s", query[:120])
+            try:
+                rows = run_postgres(query)
+                postgres_results = rows[:200]
+                result_json = json.dumps(postgres_results, indent=2)[:10_000]
+                tool_msg = (
+                    f"PostgreSQL query executed successfully ({len(rows)} row(s) returned).\n"
+                    f"Results:\n```json\n{result_json}\n```\n"
+                    "Please analyse these references and answer the user's question."
+                )
+            except Exception as exc:
+                tool_msg = (
+                    f"PostgreSQL query failed with error: {exc}\n"
+                    f"The EXACT query that failed:\n```sql\n{query}\n```\n"
+                    "You MUST show this exact query to the user in a code block along with the "
+                    "error message — do not paraphrase or omit it."
+                )
+
+        elif action_type == "ontology_lookup":
+            sub_action = action.get("sub_action", "alias_search")
+            term       = action.get("term", "")
+            concept    = action.get("concept", "")
+            via        = action.get("via", "is_a|part_of")
+            depth      = action.get("depth", 2)
+            log.info("Agent ontology_lookup: sub=%s term=%s concept=%s", sub_action, term, concept)
+            try:
+                result     = run_ontology_lookup(sub_action, term=term, concept=concept,
+                                                 via=via, depth=depth)
+                result_json = json.dumps(result, indent=2)[:8_000]
+
+                # ── Auto-update cross-session vocabulary from alias searches ──
+                if sub_action == "alias_search" and term and result.get("matches"):
+                    for match in result["matches"][:5]:
+                        if match.get("name") and match.get("label"):
+                            _upsert_vocabulary(term, match["name"], match["label"])
+
+                # Build a human-readable count for the tool feedback
+                hits = (result.get("matches") or
+                        result.get("parents") or
+                        result.get("children") or [])
+                tool_msg = (
+                    f"Ontology lookup ({sub_action}) returned {len(hits)} result(s).\n"
+                    f"Results:\n```json\n{result_json}\n```\n"
+                    "Use these results to resolve the concept, then continue with a cypher or "
+                    "postgres action, or present the options to the user if disambiguation is needed."
+                )
+            except Exception as exc:
+                tool_msg = (
+                    f"Ontology lookup failed: {exc}\n"
+                    "Try a different sub_action or term."
+                )
+
+        elif action_type == "pubmed_search":
+            pm_query    = action.get("query", "").strip()
+            pm_min_date = action.get("min_date", "")
+            pm_max_date = action.get("max_date", "")
+            pm_max     = action.get("max_results", 10)
+            log.info("Agent pubmed_search: %s [%s..%s] max=%s",
+                     pm_query, pm_min_date, pm_max_date, pm_max)
+            try:
+                pm_result   = run_pubmed_search(pm_query, pm_min_date, pm_max_date, pm_max)
+                result_json = json.dumps(pm_result["rows"], indent=2)[:10_000]
+                tool_msg = (
+                    f"PubMed search returned {pm_result['count']} article(s) "
+                    f"(total matching: {pm_result.get('total', pm_result['count'])}).\n"
+                    f"Results:\n```json\n{result_json}\n```\n"
+                    "These references can be included in a write_relation block. "
+                    "Summarise the most relevant ones for the user."
+                )
+            except Exception as exc:
+                tool_msg = (
+                    f"PubMed search failed: {exc}\n"
+                    "Try simplifying the query or check network connectivity."
+                )
+
+        elif action_type == "render":
+            # Terminal visualization instruction — pass through to frontend, stop loop
+            render_action = action
+            log.info("Agent render: tool=%s cypher=%.80s",
+                     action.get("tool"), action.get("cypher", ""))
+            break
+
+        elif action_type == "write_relation":
+            # Terminal write action — compute RelationID server-side, return to frontend for confirmation
+            src  = action.get("source_node", {})
+            tgt  = action.get("target_node", {})
+            props = dict(action.get("properties", {}))
+
+            # Calculate RelationID using the same algorithm as the curation dialog
+            relation_id = calc_relation_id(
+                inref        = [src.get("node_id")] if src.get("node_id") else [],
+                outref       = [tgt.get("node_id")] if tgt.get("node_id") else [],
+                control_type = action.get("relation_type", ""),
+                ontology     = props.get("Ontology", ""),
+                relationship = props.get("Relationship", ""),
+                effect       = props.get("Effect", ""),
+                mechanism    = props.get("Mechanism", ""),
+            )
+
+            # Stamp source = LLM model name
+            llm_model = _state["llm"].get("model_name") or "claude-sonnet-4-6"
+            props["source"] = llm_model
+
+            # Clean references: strip id/unique_id so server does fresh INSERTs
+            # linked to the new RelationID, not the source relation's ID
+            raw_refs = action.get("references") or []
+            clean_refs = []
+            for ref in raw_refs:
+                if not isinstance(ref, dict):
+                    continue
+                cleaned = {
+                    k: v for k, v in ref.items()
+                    if k not in ("id", "unique_id", "_deleted")
+                    and v is not None and str(v).strip() != ""
+                }
+                if cleaned:
+                    clean_refs.append(cleaned)
+
+            write_relation_action = {
+                "source_node":    src,
+                "target_node":    tgt,
+                "relation_type":  action.get("relation_type", ""),
+                "properties":     props,
+                "relation_id":    relation_id,
+                "references":     clean_refs,
+                "description":    action.get("description", ""),
+                # "add_references" = append to existing relation; "create" = new relation
+                "mode":           action.get("mode", "create"),
+            }
+            log.info("Agent write_relation: %s→%s type=%s rid=%s",
+                     src.get("name"), tgt.get("name"),
+                     action.get("relation_type"), relation_id)
+            break
+
+        elif action_type == "batch_update":
+            # Terminal action — hand a list of proposed property updates to the frontend.
+            # The frontend renders one checkbox per update (checked by default) directly in
+            # the chat transcript and lets the user uncheck any it disagrees with before
+            # writing; the actual write happens via POST /batch-write (real Neo4j param
+            # binding + type-safe RelationID match), NOT here — the agent never writes
+            # bulk property updates itself.
+            raw_updates = action.get("updates", [])
+            clean_updates = []
+            for u in raw_updates if isinstance(raw_updates, list) else []:
+                if not isinstance(u, dict):
+                    continue
+                rid = u.get("relationId", u.get("relation_id"))
+                val = u.get("value")
+                if rid is None or val is None or str(val).strip() == "":
+                    continue
+                clean_updates.append({
+                    "relationId":   rid,
+                    "source":       u.get("source", ""),
+                    "target":       u.get("target", ""),
+                    "relationType": u.get("relationType", u.get("relation_type", "")),
+                    "value":        val,
+                    "sentence":     u.get("sentence", ""),
+                })
+
+            # Edges with contradictory evidence (some sentences say positive, others
+            # negative) — the agent never picks a side for these. They're shown to
+            # the user for their own judgment call, with no checkbox/value to write.
+            raw_conflicts = action.get("conflicts", [])
+            clean_conflicts = []
+            for c in raw_conflicts if isinstance(raw_conflicts, list) else []:
+                if not isinstance(c, dict):
+                    continue
+                rid = c.get("relationId", c.get("relation_id"))
+                if rid is None:
+                    continue
+                raw_sentences = c.get("sentences", [])
+                clean_sentences = []
+                for s in raw_sentences if isinstance(raw_sentences, list) else []:
+                    if not isinstance(s, dict):
+                        continue
+                    text = s.get("text", "")
+                    if not str(text).strip():
+                        continue
+                    clean_sentences.append({
+                        "direction": s.get("direction", ""),
+                        "text":      text,
+                    })
+                if not clean_sentences:
+                    continue
+                clean_conflicts.append({
+                    "relationId":   rid,
+                    "source":       c.get("source", ""),
+                    "target":       c.get("target", ""),
+                    "relationType": c.get("relationType", c.get("relation_type", "")),
+                    "sentences":    clean_sentences,
+                })
+
+            batch_update_action = {
+                "property":    action.get("property", "Effect"),
+                "updates":     clean_updates,
+                "conflicts":   clean_conflicts,
+                "description": action.get("description", ""),
+            }
+            log.info("Agent batch_update: property=%s updates=%d conflicts=%d",
+                     batch_update_action["property"], len(clean_updates), len(clean_conflicts))
+            break
+
+        elif action_type == "save_vocabulary":
+            # Terminal action — persist a user-term → Neo4j-concept mapping and stop the loop
+            mappings_to_save = action.get("mappings", [])
+            if isinstance(mappings_to_save, dict):
+                mappings_to_save = [mappings_to_save]
+            saved = []
+            for entry in mappings_to_save:
+                user_term   = str(entry.get("user_term",   "")).strip()
+                neo4j_name  = str(entry.get("neo4j_name",  "")).strip()
+                neo4j_label = str(entry.get("neo4j_label", "")).strip()
+                if user_term and neo4j_name:
+                    _upsert_vocabulary(user_term, neo4j_name, neo4j_label, confirmed=True)
+                    saved.append(f'"{user_term}" → {neo4j_label} {neo4j_name}')
+                    log.info("save_vocabulary: %s → %s (%s)", user_term, neo4j_name, neo4j_label)
+            if saved:
+                log.info("Agent saved %d vocabulary mapping(s)", len(saved))
+            break
+
+        else:
+            tool_msg = (f"Unknown action type '{action_type}' — "
+                        "use 'cypher', 'postgres', 'ontology_lookup', 'pubmed_search', "
+                        "'render', 'write_relation', 'batch_update', or 'save_vocabulary'.")
+
+        messages.append({"role": "user", "content": tool_msg})
+
+    raw_reply = next(
+        (m["content"] for m in reversed(messages) if m["role"] == "assistant"),
+        "No response generated."
+    )
+
+    # Strip ALL action JSON blocks from the reply text so they never appear
+    # verbatim in the chat bubble (covers fenced and bare JSON, all action types).
+    cleaned_reply = _strip_actions_from_reply(raw_reply)
+
+    # Safety net: _strip_actions_from_reply only removes complete, well-formed
+    # blocks. If the truncation-retry budget above got exhausted (or the model
+    # emitted an action without proper ```json fencing), a dangling
+    # `{"action": ...` fragment can still leak straight into the chat bubble as
+    # raw JSON. Never show that — swap in a clear, actionable message instead.
+    if re.search(r'\{[^{}]{0,60}"action"\s*:\s*"', cleaned_reply):
+        log.warning("Dangling/unterminated action block detected in reply — replacing with a clear message")
+        cleaned_reply = ("My response was cut off before finishing, so nothing was executed. "
+                          "Please try again — if it keeps happening, try a narrower or simpler request.")
+
+    # ── Vocabulary save safety net ────────────────────────────────────────────
+    # If the LLM confirmed saving a vocabulary mapping in its text reply but did
+    # NOT emit a save_vocabulary action block (hallucination), detect the pattern
+    # from the user's message and save it anyway.
+    _vocab_save_attempted = any(
+        p in raw_reply.lower()
+        for p in ("i've saved", "i have saved", "mapping saved", "i'll remember",
+                  "vocabulary saved", "saved the mapping", "added to vocabulary")
+    )
+    if _vocab_save_attempted:
+        # Check user message for "X means Y" / "X refers to Y" patterns
+        _user_msg_lower = req.message.lower()
+        _vocab_patterns = [
+            r'["\']?(.+?)["\']?\s+means?\s+["\']?(.+?)["\']?\s*$',
+            r'["\']?(.+?)["\']?\s+refers?\s+to\s+["\']?(.+?)["\']?\s*$',
+            r'["\']?(.+?)["\']?\s+is\s+["\']?(.+?)["\']?\s*$',
+            r'remember\s+that\s+["\']?(.+?)["\']?\s+(?:means?|is|refers?\s+to)\s+["\']?(.+?)["\']?\s*$',
+            r'["\']?(.+?)["\']?\s*[=→]\s*["\']?(.+?)["\']?\s*$',
+        ]
+        import re as _re
+        for _pat in _vocab_patterns:
+            _m = _re.search(_pat, req.message.strip(), _re.IGNORECASE)
+            if _m:
+                _uterm = _m.group(1).strip().strip('"\'')
+                _nname = _m.group(2).strip().strip('"\'')
+                if _uterm and _nname and len(_uterm) > 2 and len(_nname) > 2:
+                    existing = [v for v in _load_vocabulary()
+                                if v["user_term"].lower() == _uterm.lower()
+                                and v["neo4j_name"].lower() == _nname.lower()]
+                    if not existing:
+                        _upsert_vocabulary(_uterm, _nname, "", confirmed=True)
+                        log.warning("Vocabulary safety-net: saved '%s' → '%s' (LLM confirmed but missed action block)",
+                                    _uterm, _nname)
+                break
+    log.info("Chat reply: raw=%d chars, cleaned=%d chars, render_action=%s",
+             len(raw_reply), len(cleaned_reply), bool(render_action))
+
+    # If the LLM emitted only a render block (no narrative text), use the
+    # description from the render action as the chat bubble text.
+    if not cleaned_reply:
+        if render_action:
+            desc = render_action.get("description", "")
+            tool = render_action.get("tool", "graph")
+            cleaned_reply = f"Displaying {desc or 'results'} in {tool} view."
+        else:
+            # The LLM emitted only an action block with no surrounding text.
+            # Never show raw JSON — use a neutral placeholder.
+            cleaned_reply = "Query complete — see results below."
+
+    # Strip the GRAPH-CONCEPTS annotation line from the reply (if present) so it
+    # never shows in the chat bubble. Entity lookup is now done client-side via
+    # the separate POST /highlights endpoint — so the chat reply is returned
+    # immediately without waiting for the Neo4j scan.
+    db_tools_used   = generated_cypher is not None or postgres_results is not None
+    concept_terms: List[str] = []
+    if not db_tools_used:
+        final_reply, concept_terms = extract_concepts_line(cleaned_reply)
+        # Always augment with fallback text extraction so terms the LLM omitted
+        # from GRAPH-CONCEPTS (e.g. section 5+ in long Gemini responses) still
+        # get annotated.  GRAPH-CONCEPTS terms take priority (listed first for
+        # dedup), fallback fills the gaps.
+        fallback = extract_terms_from_text(final_reply)
+        if fallback:
+            combined = list(dict.fromkeys(concept_terms + fallback))
+            if len(combined) > len(concept_terms):
+                log.info("Entity terms: %d from GRAPH-CONCEPTS + %d fallback → %d unique",
+                         len(concept_terms), len(fallback), len(combined))
+            concept_terms = combined
+    else:
+        final_reply = cleaned_reply
+
+    log.info("Chat request complete: total=%.1f s  concept_terms=%d", time.time() - request_start, len(concept_terms))
+
+    return {
+        "reply":              final_reply,
+        "concept_terms":      concept_terms,  # frontend passes these to POST /highlights
+        "generated_cypher":   generated_cypher,
+        "cypher_results":     cypher_results,
+        "postgres_results":   postgres_results,
+        "entity_highlights":  [],        # highlights now fetched separately via POST /highlights
+        "render":           render_action,
+        "write_relation":   write_relation_action,
+        "batch_update":     batch_update_action,
+        "messages":         messages,
+        "dropped_history_turns": dropped_history_turns,  # >0 if oldest turns were trimmed to fit context
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Route — entity highlights (called by frontend after chat reply is displayed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HighlightsRequest(BaseModel):
+    terms: List[str]   # concept_terms from the /chat response
+
+@app.post("/highlights")
+def highlights(req: HighlightsRequest):
+    """
+    Match concept terms against Neo4j nodes and return entity_highlights.
+    Called by the frontend after the chat bubble is already displayed so the LLM
+    response is shown immediately without waiting for the Neo4j scan.
+    """
+    if not req.terms:
+        return {"entity_highlights": []}
+    highlights_list = run_entity_lookup(req.terms)
+    log.info("POST /highlights: %d terms → %d matched", len(req.terms), len(highlights_list))
+    return {"entity_highlights": highlights_list}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Route — list available models from a provider
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ListModelsRequest(BaseModel):
+    url:    str
+    apikey: str = ""
+
+@app.post("/list-models")
+def list_models(req: ListModelsRequest):
+    """Return model IDs available on the given provider URL."""
+    import urllib.request as _urllib_req
+    import urllib.error   as _urllib_err
+
+    base_url = (req.url or "").rstrip("/")
+    apikey   = req.apikey or ""
+
+    # ── Gemini native REST ─────────────────────────────────────────────────────
+    if "generativelanguage.googleapis.com" in base_url:
+        if not apikey:
+            return {"models": [], "error": "API key required for Gemini"}
+        try:
+            murl = f"https://generativelanguage.googleapis.com/v1beta/models?key={apikey}&pageSize=100"
+            with _urllib_req.urlopen(_urllib_req.Request(murl), timeout=10) as r:
+                data = json.loads(r.read())
+            models = sorted([
+                m["name"].split("/")[-1]
+                for m in data.get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ])
+            return {"models": models}
+        except _urllib_err.HTTPError as he:
+            return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
+        except Exception as e:
+            return {"models": [], "error": str(e)}
+
+    # ── Anthropic ──────────────────────────────────────────────────────────────
+    if "anthropic.com" in base_url:
+        try:
+            http_req = _urllib_req.Request(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": apikey, "anthropic-version": "2023-06-01"}
+            )
+            with _urllib_req.urlopen(http_req, timeout=10) as r:
+                data = json.loads(r.read())
+            models = sorted([m["id"] for m in data.get("data", [])], reverse=True)
+            return {"models": models}
+        except _urllib_err.HTTPError as he:
+            return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
+        except Exception as e:
+            return {"models": [], "error": str(e)}
+
+    # ── OpenAI-compatible /models ──────────────────────────────────────────────
+    if not base_url:
+        return {"models": [], "error": "No URL provided"}
+    try:
+        http_req = _urllib_req.Request(
+            base_url + "/models",
+            headers={"Authorization": f"Bearer {apikey}"}
+        )
+        with _urllib_req.urlopen(http_req, timeout=10) as r:
+            data = json.loads(r.read())
+        models = sorted([m["id"] for m in data.get("data", [])])
+        return {"models": models}
+    except _urllib_err.HTTPError as he:
+        return {"models": [], "error": f"HTTP {he.code}: {he.read().decode()[:200]}"}
+    except Exception as e:
+        return {"models": [], "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes — library (local .json files in agent_library/)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/library")
+def list_library():
+    files = []
+    for p in sorted(LIBRARY_DIR.glob("*.json")):
+        try:
+            data = json.loads(p.read_text("utf-8"))
+            files.append({
+                "id":          p.stem,
+                "name":        data.get("name", p.stem),
+                "description": data.get("description", ""),
+                "created":     data.get("created", ""),
+                "steps":       len(data.get("workflow", [])),
+            })
+        except Exception:
+            pass
+    return {"files": files}
+
+@app.get("/library/{file_id}")
+def load_library_file(file_id: str):
+    # Sanitise file_id — alphanumeric + hyphens only
+    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', file_id):
+        raise HTTPException(400, "Invalid file id")
+    p = LIBRARY_DIR / f"{file_id}.json"
+    if not p.exists():
+        raise HTTPException(404, "File not found")
+    return json.loads(p.read_text("utf-8"))
+
+@app.post("/library")
+def save_library_file(payload: LibraryFile):
+    file_id = str(uuid.uuid4())[:8]
+    data = payload.dict()
+    data["id"]      = file_id
+    data["created"] = datetime.utcnow().isoformat() + "Z"
+    p = LIBRARY_DIR / f"{file_id}.json"
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+    log.info("Library file saved: %s (%s)", file_id, payload.name)
+    return {"id": file_id, "ok": True}
+
+@app.put("/library/{file_id}")
+def update_library_file(file_id: str, payload: LibraryFile):
+    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', file_id):
+        raise HTTPException(400, "Invalid file id")
+    p = LIBRARY_DIR / f"{file_id}.json"
+    if not p.exists():
+        raise HTTPException(404, "File not found")
+    existing = json.loads(p.read_text("utf-8"))
+    existing.update(payload.dict())
+    existing["id"] = file_id
+    p.write_text(json.dumps(existing, indent=2, ensure_ascii=False), "utf-8")
+    return {"ok": True}
+
+@app.delete("/library/{file_id}")
+def delete_library_file(file_id: str):
+    if not re.match(r'^[a-zA-Z0-9_\-]{1,64}$', file_id):
+        raise HTTPException(400, "Invalid file id")
+    p = LIBRARY_DIR / f"{file_id}.json"
+    if not p.exists():
+        raise HTTPException(404, "File not found")
+    p.unlink()
+    return {"ok": True}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes — workflow execution (multi-step)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/workflow/execute")
+async def execute_workflow(req: ExecuteWorkflowRequest):
+    llm = _effective_llm(req.llm)
+    context: Dict[str, Any] = {"input": req.input}
+    step_results = []
+
+    for step in req.workflow:
+        step_num  = step.get("step", len(step_results) + 1)
+        step_type = step.get("type", "llm")
+        step_res  = {"step": step_num, "type": step_type}
+
+        try:
+            if step_type == "text2cypher":
+                # Ask LLM to translate the prompt into Cypher, then execute
+                template = step.get("prompt_template", "{input}")
+                prompt   = template.format(**context)
+                messages = [{"role": "user",
+                             "content": f"Generate a Cypher query to answer: {prompt}"}]
+                reply, _ = _call_llm(messages, llm)
+                action   = _extract_cypher_action(reply)
+                if action and action.get("query"):
+                    cypher = action["query"]
+                    rows   = run_cypher(cypher)
+                    context.update({"last_cypher": cypher, "last_results": rows})
+                    step_res.update({"cypher": cypher, "rows": rows[:100],
+                                     "row_count": len(rows), "status": "ok"})
+                else:
+                    step_res.update({"reply": reply, "status": "no_cypher_generated"})
+
+            elif step_type == "write_back":
+                # Execute a pre-written Cypher template (may reference context vars)
+                template = step.get("cypher_template", "")
+                cypher   = template.format(**context)
+                rows     = run_cypher(cypher)
+                context.update({"last_cypher": cypher, "last_results": rows})
+                step_res.update({"cypher": cypher, "rows": rows[:20], "status": "ok"})
+
+            elif step_type == "postgres":
+                # Execute a SQL query against the PostgreSQL reference database
+                template = step.get("sql_template", "")
+                sql      = template.format(**context)
+                rows     = run_postgres(sql)
+                context.update({"last_sql": sql, "last_pg_results": rows})
+                step_res.update({"sql": sql, "rows": rows[:100],
+                                 "row_count": len(rows), "status": "ok"})
+
+            elif step_type == "llm":
+                # Pure LLM reasoning step (no DB call)
+                template = step.get("prompt_template", "{input}")
+                prompt   = template.format(**context)
+                messages = [{"role": "user", "content": prompt}]
+                reply, _ = _call_llm(messages, llm)
+                context["last_reply"] = reply
+                step_res.update({"reply": reply, "status": "ok"})
+
+            else:
+                step_res.update({"status": "unknown_step_type"})
+
+        except Exception as exc:
+            step_res.update({"status": "error", "error": str(exc)})
+
+        step_results.append(step_res)
+
+    safe_context = {k: v for k, v in context.items() if k not in ("last_results", "last_pg_results")}
+    return {"steps": step_results, "context": safe_context}
+
+@app.get("/vocabulary")
+def list_vocabulary():
+    mappings = _load_vocabulary()
+    return {"mappings": mappings}
+
+@app.post("/vocabulary")
+def add_vocabulary(entry: VocabEntry):
+    _upsert_vocabulary(entry.user_term, entry.neo4j_name, entry.neo4j_label, confirmed=entry.confirmed)
+    return {"ok": True}
+
+@app.put("/vocabulary/confirm")
+@app.put("/vocabulary/confirm")
+def confirm_vocabulary(entry: VocabEntry):
+    mappings = _load_vocabulary()
+    for m in mappings:
+        if m["user_term"].lower() == entry.user_term.lower() and m["neo4j_name"] == entry.neo4j_name:
+            m["confirmed"] = True
+            m["use_count"] = m.get("use_count", 0) + 1
+            _save_vocabulary(mappings)
+            return {"ok": True, "updated": True}
+    _upsert_vocabulary(entry.user_term, entry.neo4j_name, entry.neo4j_label, confirmed=True)
+    return {"ok": True, "created": True}
+
+@app.delete("/vocabulary")
+def delete_vocabulary(user_term: str):
+    mappings = _load_vocabulary()
+    new_mappings = [m for m in mappings if m["user_term"].lower() != user_term.lower()]
+    _save_vocabulary(new_mappings)
+    return {"ok": True, "deleted": len(mappings) - len(new_mappings)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Route — batch property write (chat checkbox-card "Apply selected" action)
+#  The agent only ever PROPOSES a batch_update (see system prompt); it never
+#  writes bulk property changes itself. The frontend renders one checkbox per
+#  proposed edge, and this endpoint is called with just the subset the user
+#  left checked. One parameterized query, real Neo4j param binding (unlike the
+#  Postgres helper, run_cypher's session.run() genuinely uses $params), and the
+#  same type-safe RelationID (string-or-list) match used everywhere else so
+#  merged relations are matched correctly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BATCH_WRITABLE_PROPERTIES = frozenset({"Effect", "Mechanism", "Ontology", "Relationship"})
+_REL_TYPE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+# Shared WHERE fragment: safely resolves RelationID (string OR list-of-strings,
+# per this database's schema) to a list of strings, then checks membership.
+_RELID_MATCH_CYPHER = """
+        WITH r, u,
+             CASE WHEN apoc.meta.cypher.type(r.RelationID) CONTAINS 'LIST'
+                  THEN [x IN r.RelationID | toString(x)]
+                  ELSE [toString(r.RelationID)]
+             END AS relIdList
+        WHERE u.relationId IN relIdList
+"""
+
+@app.post("/batch-write")
+def batch_write(req: BatchWriteRequest):
+    prop = req.property.strip()
+    if prop not in _BATCH_WRITABLE_PROPERTIES:
+        raise HTTPException(400, f"Property '{prop}' is not writable via batch-write "
+                                  f"(allowed: {', '.join(sorted(_BATCH_WRITABLE_PROPERTIES))})")
+    clean = [{"relationId": str(u.relationId), "value": u.value, "relationType": (u.relationType or "").strip()}
+              for u in req.updates if u.value is not None and str(u.value).strip() != ""]
+    if not clean:
+        return {"ok": True, "updatedCount": 0}
+
+    # Group by relation type so each query can MATCH ()-[r:Type]->() instead of
+    # scanning every relationship in the database — with only a handful of
+    # updates per batch, an untyped scan was the dominant cost on large graphs.
+    # Updates with no (or an unsafe) relationType fall back to one untyped group.
+    groups: Dict[str, List[Dict[str, str]]] = {}
+    for u in clean:
+        key = u["relationType"] if _REL_TYPE_RE.match(u["relationType"] or "") else ""
+        groups.setdefault(key, []).append({"relationId": u["relationId"], "value": u["value"]})
+
+    # prop is validated against a fixed allow-list above, so this f-string
+    # interpolation of the property name (not the values) is safe.
+    total_updated = 0
+    try:
+        for rel_type, group_updates in groups.items():
+            match_clause = f"MATCH ()-[r:`{rel_type}`]->()" if rel_type else "MATCH ()-[r]->()"
+            cypher = f"""
+                UNWIND $updates AS u
+                {match_clause}
+                WHERE r.RelationID IS NOT NULL
+                {_RELID_MATCH_CYPHER}
+                SET r.{prop} = u.value,
+                    r.updatedAt = timestamp(),
+                    r.updatedBy = $username
+                RETURN count(r) AS updatedCount
+            """
+            # Prefer the trusted x-ge-username context (set by server.js's proxy)
+            # over the client-supplied body field, which is kept only as a fallback.
+            updated_by = _current_username.get() or req.username or "agent"
+            rows = run_cypher(cypher, {"updates": group_updates, "username": updated_by})
+            total_updated += rows[0]["updatedCount"] if rows else 0
+        log.info("batch_write: property=%s requested=%d matched=%s groups=%s",
+                  prop, len(clean), total_updated, list(groups.keys()))
+        return {"ok": True, "updatedCount": total_updated, "requestedCount": len(clean)}
+    except Exception as exc:
+        log.warning("batch_write failed: %s", exc)
+        raise HTTPException(500, f"Batch write failed: {exc}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes — Cypher examples (cypher_examples.json)
+#  Exposes the file that seeds the "## Cypher Query Examples" system-prompt
+#  section, so users can see and grow it from the app instead of hand-editing
+#  a file on disk. Saved as a full replace (the frontend edits a local copy of
+#  the list and PUTs it back whole) — simplest correct semantics for a small,
+#  single-user-curated list with no need for per-row concurrency control.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/examples")
+def list_examples():
+    return {"examples": _load_examples()}
+
+@app.put("/examples")
+def save_examples(payload: ExamplesPayload):
+    cleaned = [e.dict() for e in payload.examples if e.cypher.strip()]
+    _save_examples(cleaned)
+    log.info("Cypher examples updated: %d example(s) saved", len(cleaned))
+    return {"ok": True, "count": len(cleaned)}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("AGENT_PORT", 7071))
+    log.info("Graph Explorer Agent Service starting on port %d", port)
+    # 127.0.0.1 only — this service is an internal sidecar for server.js's own
+    # reverse proxy (which always connects via 127.0.0.1; see server.js's
+    # AGENT_PORT usage). It has no independent auth of its own beyond trusting
+    # the x-ge-username header that ONLY server.js's proxy sets, so it must
+    # never be reachable from outside localhost — binding to 0.0.0.0 would let
+    # any other process/user on the host (or the network, depending on the
+    # firewall) impersonate any Graph Explorer user and run arbitrary
+    # Cypher/SQL with that user's stored database credentials.
+    uvicorn.run(app, host="127.0.0.1", port=port)
