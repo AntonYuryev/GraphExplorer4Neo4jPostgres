@@ -1,0 +1,27 @@
+# Graph Explorer — Agentic AI Python dependencies
+# Install with:  pip install -r requirements_agent.txt
+
+# FastAPI web framework
+fastapi>=0.111.0
+uvicorn>=0.29.0
+
+# Anthropic Claude SDK (default LLM)
+anthropic>=0.28.0
+
+# OpenAI-compatible SDK — used for Gemini and any other OpenAI-compatible endpoint
+openai>=1.30.0
+
+# Neo4j Python driver (for Cypher execution inside the agent service)
+neo4j>=5.20.0
+
+# neo4j-graphrag — official Neo4j GenAI toolkit (Text2Cypher, GraphRAG)
+neo4j-graphrag>=0.6.0
+
+# LangGraph — stateful multi-step agent workflows
+langgraph>=0.1.0
+
+# PostgreSQL driver (for fetching references from the Postgres backend)
+psycopg2-binary>=2.9.9
+
+# Utility
+python-multipart>=0.0.9   # for FastAPI form uploads (library file imports)
