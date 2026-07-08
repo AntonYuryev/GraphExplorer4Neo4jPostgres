@@ -14537,6 +14537,7 @@ var _RENDER_LABELS = {
   'export_excel_references':'Excel export (references)',
   'export_csv_relations':   'CSV export (relations)',
   'export_csv_references':  'CSV export (references)',
+  'save_subgraph':          'Save subgraph',
 };
 
 async function _agentRenderResult(action) {
@@ -14639,6 +14640,32 @@ async function _agentRenderResult(action) {
     if (cypher) exportQueryRelations(cypher);
   } else if (tool === 'export_excel_references' || tool === 'export_csv_references') {
     if (cypher) exportQueryReferences(cypher);
+  } else if (tool === 'save_subgraph') {
+    // The user's own "File → Save subgraph" action, triggered from chat — e.g.
+    // "save the current graph to a file". Deliberately does NOT take a cypher
+    // field: it operates on whatever is already on the canvas right now, not
+    // on a fresh query, so the exact current view (including manual node
+    // positions and layout) is what gets saved. This opens the app's real
+    // Save dialog — a browser file-download flow the agent cannot complete
+    // unattended.
+    //
+    // Any "name" the agent supplies is deliberately IGNORED here — the agent
+    // has no real visibility into the current tab/subgraph's actual name, so
+    // any name it invents is a guess, not a fact, and this was hit twice in
+    // production with two different invented placeholders ("Graph Explorer
+    // Subgraph", then "current_graph") silently overwriting the correct name
+    // of a pathway the user had loaded from file ("Scleroderma-
+    // RaymondSyndrome"), despite explicit prompt instructions telling the
+    // agent not to do this. promptSaveSubgraph() already resolves the correct
+    // current name entirely on its own (from the active tab/loaded-file
+    // state) — that default is always used, full stop; the dialog remains
+    // fully editable if the user wants to type a different name.
+    if (!cy || !cy.nodes().length) {
+      _agentAppendMessage('assistant', 'There is nothing in the graph to save right now.');
+    } else {
+      promptSaveSubgraph();
+      _agentAppendMessage('assistant', 'Opened the Save dialog — confirm or edit the name, then click Save.');
+    }
   } else {
     _agentAppendMessage('assistant', 'Render tool "' + label + '" is not yet supported.');
   }
