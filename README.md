@@ -46,7 +46,7 @@ graph-explorer/
 pip install -r requirements_agent.txt
 ```
 
-**An LLM API key** — the agent supports Anthropic Claude (native), Google Gemini (via an OpenAI-compatible endpoint), or any other OpenAI-compatible provider. You'll enter this through the Settings UI (or `settings.json`) after first login; no key is required just to browse the graph without the AI agent.
+**An LLM API key** — the agent supports Anthropic Claude (native), Google Gemini (via an OpenAI-compatible endpoint), or any other OpenAI-compatible provider. An admin sets up the provider **URL** once (Settings → Agentic AI / LLM — admin-managed the same way as the Neo4j/Postgres connection URLs under URL Connections for Database Endpoints); each user then picks that provider and enters their own **API key** under My Connection after first login. No key is required just to browse the graph without the AI agent.
 
 The machine also needs network access to:
 - Neo4j at your configured host
@@ -69,16 +69,16 @@ pip install -r requirements_agent.txt
 
 Credentials are **never hardcoded in source**. There are two tiers:
 
-- **Admin-level (shared) settings** — the Neo4j bolt URL and the PostgreSQL host/port, set once by an admin under **⚙ Settings ▾ → Database Endpoints**.
-- **Per-user settings** — every user (including admins) configures their *own* database name/schema/username/password and their *own* LLM provider/API key under **⚙ Settings ▾ → My Connection**. Each save is tested against the live service before it's stored, so a bad credential never silently persists.
+- **Admin-level (shared) settings** — the Neo4j bolt URL and the PostgreSQL host/port are set once by an admin under **⚙ Settings ▾ → URL Connections for Database Endpoints**. The list of approved **LLM provider URLs** (e.g. Google Gemini, Anthropic Claude, or any self-hosted/OpenAI-compatible endpoint) is managed the same way — admin-configured once, shared by everyone — but lives in its own **⚙ Settings ▾ → Agentic AI / LLM** admin section rather than that same menu. Either way, the backend only ever calls out to an LLM URL already on the admin's list; a request naming an unlisted URL is rejected.
+- **Per-user settings** — every user (including admins) configures their *own* database name/schema/username/password for both Neo4j and Postgres, plus picks a provider from the admin's list and supplies their *own* API key/model/temperature, under **⚙ Settings ▾ → My Connection**. Each save is tested against the live service before it's stored, so a bad credential never silently persists.
 
 ### First-time setup
 
 1. Copy `settings.example.json` to `settings.json` and adjust the placeholder values, or leave `settings.json` absent — the app will create one automatically on first save from the UI.
 2. Start the server (see below).
 3. Log in as `admin` (default password: `admin123`) and change the password immediately.
-4. Open **⚙ Settings ▾ → Database Endpoints** and enter the shared Neo4j URL and Postgres host/port.
-5. Open **⚙ Settings ▾ → My Connection** and enter your own Neo4j database/username/password, Postgres database/schema/username/password, and LLM provider/API key.
+4. Open **⚙ Settings ▾ → URL Connections for Database Endpoints** and enter the shared Neo4j URL and Postgres host/port. Separately, open **⚙ Settings ▾ → Agentic AI / LLM** and add the LLM provider URL(s) you want available (e.g. Google Gemini's endpoint, Anthropic's endpoint, or a self-hosted OpenAI-compatible one) — admin-managed the same way as the database endpoints, not something individual users type in freely.
+5. Open **⚙ Settings ▾ → My Connection** and enter your own Neo4j database/username/password, Postgres database/schema/username/password, and pick an LLM provider from the admin's list plus your own API key.
 
 `settings.json` and `users.json` are listed in `.gitignore` — **never commit them**. The `agent_library/` folder is also gitignored: saved agent workflow snapshots can embed your LLM API key in their stored configuration, so it must stay local too.
 
@@ -137,7 +137,7 @@ Click **🤖 AI Agent** to open the chat panel. The agent can:
 - Follow curated query patterns via **Cypher Examples** (chat panel → 📚) — a shared, editable library (`cypher_examples.json`) of worked Cypher patterns and house conventions (label unions, `coalesce()` usage, ontology-aware filters, shortest-path pitfalls, etc.) that the agent consults per question so it doesn't have to rediscover them from scratch each time.
 - Save and reload named chat/workflow sessions via **Library** (chat panel → 📁), and run configurable multi-step pipelines via **Pipeline Configuration** (chat panel → ⚙).
 
-Supported LLM providers: Anthropic Claude (native SDK), Google Gemini (OpenAI-compatible endpoint), and any other OpenAI-compatible API. Each user configures their own provider/model/API key independently.
+Supported LLM providers: Anthropic Claude (native SDK), Google Gemini (OpenAI-compatible endpoint), and any other OpenAI-compatible API. The provider **URL** is set up by an admin (⚙ Settings ▾ → Agentic AI / LLM) the same way the Neo4j and Postgres connection URLs are set up under URL Connections for Database Endpoints — admin-managed once, shared by everyone — and each user then picks a provider from that admin-approved list and supplies their own API key/model/temperature under My Connection. A user cannot point the agent at an arbitrary, unlisted URL.
 
 ---
 
@@ -212,6 +212,7 @@ Colleagues connect at: `http://<server-ip>:3000`
 - Credentials live only in `settings.json`/`users.json`, both gitignored; `settings.example.json` is the committed template. **Never commit real credentials.**
 - The agent service (`agent_service.py`) binds to `127.0.0.1` only and is reachable exclusively through `server.js`'s own reverse proxy, which stamps a trusted username header the browser cannot forge.
 - `/api/sql-query` and the agent's `postgres` action both enforce `SELECT`/`WITH`-only — no INSERT/UPDATE/DELETE/DDL.
+- The agent's LLM provider URL is resolved against the admin-managed allowlist (the `providers` list set up under Agentic AI / LLM, conceptually the same admin-only tier as the URL Connections for Database Endpoints setting) — a request naming a URL not on that list is rejected, so a user cannot redirect the agent's outbound API calls to an arbitrary host.
 - The agent's free-form `cypher` action currently has **no code-level restriction** against write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`) — it relies on a system-prompt instruction asking the model to confirm with you first. Structured writes (`write_relation`, `batch_update`) always require an explicit UI confirmation regardless. If you want a hard code-level read-only enforcement on the free-form `cypher` action as well, that's a straightforward follow-up change.
 - JWT tokens expire after 12 hours; passwords are bcrypt-hashed; login is rate-limited.
 - HTTP security headers (CSP, HSTS, X-Frame-Options, etc.) are set by `helmet`.
