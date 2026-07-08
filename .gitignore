@@ -27,3 +27,12 @@ gemini-2.5-flash.txt
 __pycache__/
 *.pyc
 cypher_history.tsv
+
+# Large test/output data — not application source, and pushes involving these
+# have hit HTTP 408 timeouts (125+ MiB) over slow/proxied connections.
+TestData/
+Output/
+Screenshots/
+DatabasePowerRelease.zip
+*.rnef
+*.zip
