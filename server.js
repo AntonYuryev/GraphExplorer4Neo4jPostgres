@@ -24,10 +24,23 @@ const _crypto   = require('crypto');
 // warn/error/info call in this process is wrapped once, here, to strip
 // newline and other control characters from every string argument before
 // it reaches the terminal/log file.
+const _LOG_CONTROL_CHARS_RE = /[\r\n\x00-\x08\x0B\x0C\x0E-\x1F]+/g;
+
+// NOTE ON STYLE: there used to be a _logSafe(value) helper function meant to
+// be called inline at each flagged log site — e.g.
+// console.log(`... ${_logSafe(value)} ...`). It was removed: CodeQL's
+// js/log-injection check does not recognize a call to a separately-defined
+// function as a sanitizer, confirmed empirically in this file (the
+// [agent proxy] error log below was flagged by CodeQL even with this exact
+// pattern). Every specific log call CodeQL has flagged now sanitizes with a
+// literal .replace() chain written directly inline in that call's own
+// arguments instead — see each site below. The console.*-wrapping IIFE
+// immediately below is unrelated, real, independent defense-in-depth (it
+// catches every call site including ones added later) but is a runtime
+// safety net, not what satisfies the static analyzer.
 (function _hardenConsoleLogging() {
-  const CONTROL_CHARS_RE = /[\r\n\x00-\x08\x0B\x0C\x0E-\x1F]+/g;
   function sanitizeArg(v) {
-    if (typeof v === 'string') return v.replace(CONTROL_CHARS_RE, ' ');
+    if (typeof v === 'string') return v.replace(_LOG_CONTROL_CHARS_RE, ' ');
     return v;
   }
   ['log', 'error', 'warn', 'info', 'debug'].forEach(function(method) {
@@ -180,7 +193,11 @@ let appSettings = loadAppSettings();
     llm.providers = [{ name, url: llm.url }];
     appSettings.llm = llm;
     saveAppSettings(appSettings);
-    console.log(`[INFO] Migrated LLM config: created providers array from url "${llm.url}"`);
+    // Sanitized inline, directly in the template literal, with a regex
+    // literal (not a named function/constant reference) — the only form
+    // that has actually held up against CodeQL's js/log-injection check
+    // in this file.
+    console.log(`[INFO] Migrated LLM config: created providers array from url "${String(llm.url).replace(/[\r\n]+/g, ' ')}"`);
   }
 })();
 
@@ -2138,7 +2155,14 @@ function _pushSchemaToAgent(schema) {
   const req = http.request(opts, r => {
     if (r.statusCode === 200) console.log('[agent] schema pushed (' + schemaText.length + ' chars, pg=' + !!pgCfg + ')');
   });
-  req.on('error', e => console.warn('[agent] schema push failed:', e.message));
+  req.on('error', e => {
+    // Sanitized INLINE, directly as the console.warn() argument — not via an
+    // intermediate variable one line above. CodeQL's static analysis for
+    // this check does not reliably trace a sanitizing transformation across
+    // a statement boundary, even one line earlier; it needs to see the
+    // .replace() happening inline within the sink call's own arguments.
+    console.warn('[agent] schema push failed:', String((e && e.message) || 'unknown error').replace(/[\r\n]+/g, ' '));
+  });
   // `body` includes credentials read from settings.json (neo4jCfg/pgCfg/llmCfg
   // above) — CodeQL flags this as "file data in outbound network request"
   // (js/file-access-to-http), which is the right thing to flag in general,
@@ -2227,7 +2251,12 @@ app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
       res.status(504).json({ error: 'AI Agent timed out — the LLM took too long to respond. Please retry.' });
   });
   proxy.on('error', (e) => {
-    console.error('[agent proxy] error:', e.message);
+    // Sanitized inline at the call site, no intermediate variable — CodeQL's
+    // check did not trace a sanitizing transformation across a statement
+    // boundary even one line earlier (confirmed empirically at this exact
+    // spot), so the literal .replace() chain has to live directly in the
+    // console.error() argument list itself.
+    console.error('[agent proxy] error:', String(e && e.message).replace(/[\r\n]+/g, ' '));
     if (!res.headersSent)
       res.status(502).json({ error: 'Agent service unavailable' });
   });
