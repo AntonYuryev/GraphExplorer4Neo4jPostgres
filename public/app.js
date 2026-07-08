@@ -6493,7 +6493,7 @@ function confirmSave() {
   var url = URL.createObjectURL(blob);
   var a = document.createElement('a');
   a.href = url;
-  a.download = name.replace(/[^a-z0-9_\-]/gi, '_') + '.json';
+  a.download = name.replace(/[^a-z0-9_\-]/gi, '_') + '.graph.json';
   a.click();
   URL.revokeObjectURL(url);
 
@@ -13587,7 +13587,7 @@ function agentSaveConversation() {
   var a    = document.createElement('a');
   var stamp = saveData.savedAt.replace(/[:.]/g, '-').slice(0, 19);
   a.href = url;
-  a.download = 'agent-conversation_' + stamp + '.json';
+  a.download = 'agent-conversation_' + stamp + '.chat.json';
   a.click();
   URL.revokeObjectURL(url);
 }
