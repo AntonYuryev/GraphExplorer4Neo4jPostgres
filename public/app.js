@@ -998,6 +998,94 @@ function cypherAutoResize(ta) {
   ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
 }
 
+// ── Cypher syntax-error position marker ─────────────────────────────────────
+// Neo4j error text sometimes names an exact character offset, e.g.
+// "Unmatched ']' at position 244" or the EXPLAIN-lint format
+// "(line 3, column 12 (offset: 244))". Extract that offset so the failing
+// character can be pointed to directly instead of leaving the user to count
+// characters by hand.
+function _parseCypherErrorOffset(msg) {
+  if (!msg) return null;
+  var m = msg.match(/\(line\s+\d+,\s*column\s+\d+\s*\(offset:\s*(\d+)\)\)/i);
+  if (m) return parseInt(m[1], 10);
+  m = msg.match(/at position\s+(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+
+// A plain <textarea> has no per-character DOM nodes to measure, so the
+// standard technique is a hidden "mirror" <div> that copies every style
+// property affecting text layout (font, padding, border, wrapping) and
+// contains the same text up to the target offset plus a marker <span> —
+// the marker's measured position is then exactly where that character
+// renders inside the real textarea.
+function _cypherTextareaCaretPixelPos(ta, offset) {
+  var style  = window.getComputedStyle(ta);
+  var mirror = document.createElement('div');
+  var propsToCopy = [
+    'boxSizing', 'width', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+    'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing',
+    'lineHeight', 'textTransform', 'wordSpacing', 'tabSize'
+  ];
+  propsToCopy.forEach(function(p) { mirror.style[p] = style[p]; });
+  mirror.style.position   = 'absolute';
+  mirror.style.top        = '0px';
+  mirror.style.left       = '-9999px';
+  mirror.style.visibility = 'hidden';
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.wordWrap   = 'break-word';
+  mirror.style.overflow   = 'hidden';
+  mirror.style.height     = 'auto';
+
+  var text    = ta.value;
+  var clamped = Math.max(0, Math.min(offset, text.length));
+  mirror.appendChild(document.createTextNode(text.substring(0, clamped)));
+  var marker = document.createElement('span');
+  marker.textContent = '​'; // zero-width space so the span has a measurable box
+  mirror.appendChild(marker);
+  mirror.appendChild(document.createTextNode(text.substring(clamped) || ' '));
+
+  document.body.appendChild(mirror);
+  var mirrorRect = mirror.getBoundingClientRect();
+  var markerRect = marker.getBoundingClientRect();
+  var left = markerRect.left - mirrorRect.left;
+  var top  = markerRect.top  - mirrorRect.top;
+  document.body.removeChild(mirror);
+
+  return {
+    left:       ta.offsetLeft + left - ta.scrollLeft,
+    top:        ta.offsetTop  + top  - ta.scrollTop,
+    lineHeight: parseFloat(style.lineHeight) || (parseFloat(style.fontSize) * 1.2)
+  };
+}
+
+// Show the marker at the character position named in a Cypher error message,
+// with the full error text as its native hover tooltip. No-op (and hides any
+// existing marker) if the message doesn't name a position.
+function showCypherErrorMarker(errMsg) {
+  var ta   = document.getElementById('cypher-input');
+  var wrap = ta && ta.parentElement; // the position:relative div holding textarea + autocomplete
+  if (!ta || !wrap) return;
+  var offset = _parseCypherErrorOffset(errMsg);
+  if (offset === null) { hideCypherErrorMarker(); return; }
+
+  var pos    = _cypherTextareaCaretPixelPos(ta, offset);
+  var marker = document.getElementById('cypher-error-marker');
+  if (!marker) return;
+  if (marker.parentElement !== wrap) wrap.appendChild(marker);
+  marker.title         = errMsg;
+  marker.style.left    = pos.left + 'px';
+  marker.style.top     = pos.top + 'px';
+  marker.style.height  = pos.lineHeight + 'px';
+  marker.style.display = 'block';
+}
+
+function hideCypherErrorMarker() {
+  var marker = document.getElementById('cypher-error-marker');
+  if (marker) marker.style.display = 'none';
+}
+
 // Called on every keystroke (oninput handler in HTML).
 var _lintDebounce = null;
 
@@ -1223,6 +1311,7 @@ function onCypherInput(ta) {
   _acBoxId = 'cypher-autocomplete';
   _lintPanelId = 'cypher-lint-panel';
   cypherAutoResize(ta);
+  hideCypherErrorMarker(); // the old error position is no longer meaningful once the text changes
   // Autocomplete
   _acTrigger(ta);
   // Immediate structural check (brackets / quotes)
@@ -2674,6 +2763,13 @@ function _buildCyEdgeData(e, srcCyId, tgtCyId) {
  * Returns { addedNodes, addedEdges } counts.
  */
 function mergeGraphData(newData) {
+  // Snapshot the pre-merge state so this is undoable via the standard Undo
+  // button, same as every other graph-mutating operation in the app. Without
+  // this, "add to graph" (including the agent's mode:"add" render, e.g. "add
+  // these ontology ancestors to the graph") left no way to revert other than
+  // manually deleting the added nodes or clearing and re-running from scratch.
+  pushUndo();
+
   var newNodes = newData.nodes || [];
   var newEdges = newData.edges || [];
 
@@ -4025,6 +4121,7 @@ async function runQuery(mergeIntoExisting) {
   var query = getCypherQuery().trim();
   if (!query) return;
   currentQuery = query;
+  hideCypherErrorMarker(); // clear any marker from a previous failed run
 
   // ── Pre-execution count check ──────────────────────────────
   var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
@@ -4114,6 +4211,7 @@ async function runQuery(mergeIntoExisting) {
     var startTabIdx = tabs.findIndex(function(t) { return t.id === startTabId; });
     if (startTabIdx === activeTabIdx) {
       alert('Query error: ' + err.message);
+      showCypherErrorMarker(err.message); // points at the offending character, if the error names one
     } else if (startTabIdx >= 0) {
       tabs[startTabIdx].snapshot.pendingQueryError = err.message;
     }
@@ -4411,25 +4509,94 @@ function _chRender() {
   });
 }
 
+// Balanced-bracket/quote auto-insertion for the Cypher editor: (), [], {},
+// '' and "". Quotes get one extra guard brackets don't need — auto-close is
+// skipped when the character right before the cursor is a word character,
+// since Cypher entity names routinely contain a bare apostrophe ("Raynaud's
+// phenomenon") and auto-closing on every such apostrophe would fight normal
+// typing instead of helping. Typing a quote at the start of a token — after
+// "(", ",", "=", whitespace, or the start of the query — still auto-closes;
+// typing one right after a letter/digit (the "'s" case) does not.
+var _autoPairOpenToClose = { '(': ')', '[': ']', '{': '}', "'": "'", '"': '"' };
+var _autoPairCloseToOpen = { ')': '(', ']': '[', '}': '{', "'": "'", '"': '"' };
+var _wordCharRe = /[A-Za-z0-9_]/;
+
 function handleQueryKeydown(e) {
   var ta = e.target;
 
   // Autocomplete keyboard navigation
   if (_acHandleKey(e)) return;
 
-  // Wrap selected text in quotes/backticks when a quote key is pressed with an active selection.
-  // e.g. double-click "BRCA1" then press ' → 'BRCA1'
-  if (e.key === "'" || e.key === '"' || e.key === '`') {
+  // Wrap selected text in backticks when pressed with an active selection.
+  // e.g. double-click "some name" then press ` → `some name`
+  // (quotes with a selection are handled by the unified pair logic below.)
+  if (e.key === '`') {
     var start = ta.selectionStart, end = ta.selectionEnd;
     if (start !== end) {
       e.preventDefault();
-      var q = e.key;
       var selected = ta.value.substring(start, end);
-      ta.setRangeText(q + selected + q, start, end, 'end');
-      // Keep just the inner word selected (cursor sits after closing quote
-      // but the word itself remains highlighted so the user can re-quote or retype).
+      ta.setRangeText('`' + selected + '`', start, end, 'end');
       ta.selectionStart = start + 1;
       ta.selectionEnd   = start + 1 + selected.length;
+      onCypherInput(ta);
+      return;
+    }
+  }
+
+  // Typing a closer/quote that's already sitting immediately ahead of the
+  // cursor (almost certainly one just auto-inserted below) steps past it
+  // instead of inserting a redundant duplicate — covers both distinct pairs
+  // like "(x|)" + ")" and self-pairing quotes like "'BRCA1|'" + "'".
+  // Checked BEFORE the auto-open logic below since quotes are the same
+  // character on both sides — without this, closing a quote you just opened
+  // would otherwise be mistaken for opening a brand-new pair.
+  if (_autoPairCloseToOpen[e.key] && ta.selectionStart === ta.selectionEnd) {
+    var cPos = ta.selectionStart;
+    if (ta.value[cPos] === e.key) {
+      e.preventDefault();
+      ta.selectionStart = ta.selectionEnd = cPos + 1;
+      return;
+    }
+  }
+
+  // Typing an opening bracket or quote auto-inserts its matching closer, with
+  // the cursor landing between the pair. With an active selection, wraps the
+  // selection instead — e.g. select n:CellProcess then press ( → (n:CellProcess),
+  // or select BRCA1 then press ' → 'BRCA1'.
+  if (_autoPairOpenToClose[e.key]) {
+    var bStart = ta.selectionStart, bEnd = ta.selectionEnd;
+    var open  = e.key, close = _autoPairOpenToClose[open];
+    var isQuote = (open === "'" || open === '"');
+    if (bStart === bEnd && isQuote) {
+      var prevForQuote = ta.value[bStart - 1];
+      if (prevForQuote && _wordCharRe.test(prevForQuote)) {
+        return; // mid-word apostrophe/quote (e.g. "Raynaud's") — insert plainly, no auto-close
+      }
+    }
+    e.preventDefault();
+    if (bStart !== bEnd) {
+      var bSelected = ta.value.substring(bStart, bEnd);
+      ta.setRangeText(open + bSelected + close, bStart, bEnd, 'end');
+      ta.selectionStart = bStart + 1;
+      ta.selectionEnd   = bStart + 1 + bSelected.length;
+    } else {
+      ta.setRangeText(open + close, bStart, bEnd, 'end');
+      ta.selectionStart = ta.selectionEnd = bStart + 1; // cursor lands between the pair
+    }
+    onCypherInput(ta);
+    return;
+  }
+
+  // Backspace immediately inside an empty auto-closed pair — e.g. "(|)" or
+  // "'|'" with nothing typed between — removes both characters together
+  // instead of leaving the closer stranded.
+  if (e.key === 'Backspace' && ta.selectionStart === ta.selectionEnd) {
+    var delPos    = ta.selectionStart;
+    var prevChar  = ta.value[delPos - 1];
+    var nextChar  = ta.value[delPos];
+    if (prevChar !== undefined && _autoPairOpenToClose[prevChar] === nextChar) {
+      e.preventDefault();
+      ta.setRangeText('', delPos - 1, delPos + 1, 'end');
       onCypherInput(ta);
       return;
     }
@@ -12872,9 +13039,14 @@ function _agentNoteHistoryTrim(result) {
 // explicit edge list below tells the agent which relations truly are on screen.
 //
 // Both lists are capped so a huge graph doesn't bloat every chat request — the
-// agent is told explicitly when either has been truncated.
-var _AGENT_GRAPH_STATE_NODE_CAP = 300;
-var _AGENT_GRAPH_STATE_EDGE_CAP = 300;
+// agent is told explicitly when either has been truncated. The cap is set to
+// match the app's own hard rendering limit (see the "> 1,000 edges cannot be
+// displayed" check before loading a query into the graph view) rather than an
+// arbitrary smaller number — the graph view itself can never hold more than
+// this many edges, so at this cap the agent always sees the FULL current
+// graph, never a partial view of what the user is actually looking at.
+var _AGENT_GRAPH_STATE_NODE_CAP = 1000;
+var _AGENT_GRAPH_STATE_EDGE_CAP = 1000;
 function _currentGraphSummary() {
   var nodes = (graphData && graphData.nodes) || [];
   var edges = (graphData && graphData.edges) || [];
@@ -13006,11 +13178,6 @@ async function agentSend() {
       _agentShowBatchUpdateCard(result.batch_update);
     }
 
-    // ── Entity matching button — user-triggered, not automatic ───────────────
-    var conceptTerms = result.concept_terms;
-    if (bubble && conceptTerms && conceptTerms.length) {
-      _agentAddMatchButton(bubble, reply, conceptTerms);
-    }
   } catch(err) {
     var errMsg = err.name === 'AbortError'
       ? 'Request timed out after 130 seconds. The LLM may be overloaded — please retry.'
@@ -13022,108 +13189,6 @@ async function agentSend() {
     sendBtn.disabled = false;
     if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'none'; }
   }
-}
-
-// Annotates plain text with inline colored spans for Neo4j-matched concepts.
-// Returns an HTML string (safe — unmatched portions are escHtml'd).
-function _agentHighlightConcepts(text, highlights) {
-  if (!highlights || !highlights.length) return escHtml(text);
-
-  // Sort longest term first so multi-word matches win over sub-terms
-  var sorted = highlights.slice().sort(function(a, b) { return b.term.length - a.term.length; });
-
-  var ranges = [];
-  sorted.forEach(function(h) {
-    // Search for both the original term and the matched DB name (they may differ
-    // in case or one may be an abbreviation of the other — color both in text).
-    var searchTerms = [h.term];
-    if (h.matched_name && h.matched_name.toLowerCase() !== (h.term || '').toLowerCase()) {
-      searchTerms.push(h.matched_name);
-    }
-    searchTerms.forEach(function(term) {
-      if (!term) return;
-      var re = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-      var m;
-      while ((m = re.exec(text)) !== null) {
-        var s = m.index, e = m.index + m[0].length;
-        // Skip if embedded inside a longer word
-        var before = s > 0 ? text[s - 1] : ' ';
-        var after  = e < text.length ? text[e] : ' ';
-        if (/\w/.test(before) || /\w/.test(after)) continue;
-        // Skip overlapping matches
-        if (ranges.some(function(r) { return s < r.end && e > r.start; })) continue;
-        ranges.push({ start: s, end: e, highlight: h });
-      }
-    });
-  });
-  ranges.sort(function(a, b) { return a.start - b.start; });
-
-  var html = '', pos = 0;
-  ranges.forEach(function(r) {
-    if (r.start > pos) html += escHtml(text.slice(pos, r.start));
-    var h = r.highlight;
-    var color = NODE_TYPE_COLORS[h.node_type] || '#8ab4f8';
-    var tipLabel = (h.matched_name && h.matched_name !== h.term ? h.matched_name + ' · ' : '') + h.node_type + ' (in graph)';
-    html += '<span style="border-bottom:2px solid ' + color + ';color:' + color +
-            ';font-weight:500;cursor:default" title="' + escHtml(tipLabel) + '">' +
-            escHtml(text.slice(r.start, r.end)) + '</span>';
-    pos = r.end;
-  });
-  if (pos < text.length) html += escHtml(text.slice(pos));
-  return html;
-}
-
-// Add a "Find concepts" button to an assistant bubble that triggers entity highlighting on demand.
-function _agentAddMatchButton(bubble, content, conceptTerms) {
-  if (!bubble || !conceptTerms || !conceptTerms.length) return;
-  var btn = document.createElement('button');
-  btn.className = 'agent-match-btn';
-  btn.textContent = '🔍 Find concepts';
-  btn.title = 'Search graph for entities mentioned in this response';
-  btn.onclick = function() {
-    btn.disabled = true;
-    btn.textContent = '⏳ Searching…';
-    fetch('/api/agent/highlights', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
-      body:    JSON.stringify({ terms: conceptTerms }),
-    })
-    .then(function(hr) { return hr.ok ? hr.json() : Promise.resolve({}); })
-    .then(function(hdata) {
-      var hits = hdata.entity_highlights && hdata.entity_highlights.length;
-      if (hits) {
-        _agentApplyHighlights(bubble, content, hdata.entity_highlights);
-        btn.textContent = '✓ ' + hdata.entity_highlights.length + ' concept' + (hdata.entity_highlights.length === 1 ? '' : 's') + ' found';
-      } else {
-        btn.textContent = '— No concepts found';
-      }
-      btn.disabled = true;
-    })
-    .catch(function(e) {
-      console.warn('Entity highlight fetch failed:', e);
-      btn.textContent = '✗ Error — retry?';
-      btn.disabled = false;
-    });
-  };
-  bubble.appendChild(btn);
-}
-
-// Apply entity highlights to an already-displayed bubble (called after /highlights returns).
-function _agentApplyHighlights(bubble, content, highlights) {
-  if (!bubble || !highlights || !highlights.length) return;
-  bubble.style.whiteSpace = 'normal';
-  // Re-render only the text node part (first child text), preserving appended cypher/result boxes
-  var htmlContent = _agentHighlightConcepts(content, highlights).replace(/\n/g, '<br>');
-  // Insert highlighted HTML before any appended child elements (cypher box, result count)
-  var tempDiv = document.createElement('div');
-  tempDiv.innerHTML = htmlContent;
-  // Move existing appended children (cypher box etc.) to a temp holder
-  var extras = [];
-  while (bubble.firstChild) { extras.push(bubble.removeChild(bubble.firstChild)); }
-  // Re-add highlighted content nodes
-  while (tempDiv.firstChild) { bubble.appendChild(tempDiv.removeChild(tempDiv.firstChild)); }
-  // Re-add extras (cypher box, result count)
-  extras.forEach(function(el) { bubble.appendChild(el); });
 }
 
 function _agentAppendMessage(role, content, cypher, results) {
@@ -14505,6 +14570,19 @@ async function _agentRenderResult(action) {
       // tables always just show the query's own results.
       var _wantsAdd = tool === 'graph' && action.mode === 'add';
       await runQuery(_wantsAdd);
+
+      // Show the actual query that populated the graph as its own visible,
+      // clickable code box in the chat log. Without this, a turn that runs a
+      // separate "cypher" action first (for the chat-text report) and then a
+      // "render" action (for the graph itself) only ever shows the FIRST
+      // query's box (see result.generated_cypher in the main chat handler) —
+      // the render action's own cypher is used to populate the Query Bar and
+      // run silently, with no visible record of what it actually was. That
+      // made a real render-query bug (a discovery-shaped query mistakenly
+      // reused for rendering, producing far fewer nodes/edges than expected)
+      // impossible for the user to diagnose, since the only cypher visible in
+      // the chat was the earlier, unrelated discovery query.
+      _agentAppendMessage('assistant', 'Rendered the graph using this query:', cypher);
 
       // Optional "layout" hint on the render block — e.g. the user asked for a
       // hierarchical/tree/circular arrangement instead of the default force-directed
