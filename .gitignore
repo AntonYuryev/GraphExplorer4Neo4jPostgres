@@ -6,6 +6,7 @@ public/INDEX~1.zip
 github-upload.js
 settings.json
 users.json
+GithubToken.txt
 backup/
 
 # Runtime/user-specific agent state — saved workflow snapshots under
