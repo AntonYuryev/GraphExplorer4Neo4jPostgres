@@ -79,7 +79,7 @@
           <!-- Database endpoints (admin only — sets the shared URL/host that every
                user's personal "My Connection" credentials connect against) -->
           <div id="settings-db-admin-section" style="display:none;padding:4px 0;border-top:1px solid #2a2f4a">
-            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">Database Endpoints</div>
+            <div style="padding:2px 12px;font-size:10px;color:#5a6080;letter-spacing:0.08em;text-transform:uppercase">URL Connections for Database Endpoints</div>
             <div class="settings-item" onclick="openNeo4jSettings();closeSettingsMenu()">Neo4j URL</div>
             <div class="settings-item" onclick="openPostgresSettings();closeSettingsMenu()">Postgres Host</div>
           </div>
@@ -296,6 +296,7 @@
           onkeydown="handleQueryKeydown(event)"
           oninput="onCypherInput(this)"></textarea>
         <div id="cypher-autocomplete" style="display:none;position:absolute;left:0;top:100%;z-index:9999;min-width:220px;max-width:420px;max-height:220px;overflow-y:auto;background:#1a1f35;border:1px solid #4f8ef7;border-radius:6px;box-shadow:0 4px 18px rgba(0,0,0,0.5);font-size:13px;font-family:monospace"></div>
+        <div id="cypher-error-marker" title="" style="display:none"></div>
       </div>
       <div id="cypher-lint-panel" style="display:none"></div>
     </div>
