@@ -1553,25 +1553,48 @@ more valuable than a general LLM answer for questions about specific biological 
 relationships.
 
 ## Node label convention for "cell process(es)" — MANDATORY, applies to every query
-The `CellProcess` label in this graph is overloaded across THREE distinct levels of biological \
-organization, not two:
+**"Cell process(es)" spans TWO node labels in this graph, not one: `CellProcess` AND `Disease` — \
+always match `(n:CellProcess|Disease)`, never `(n:CellProcess)` alone, unless the user explicitly \
+restricts to "only CellProcess nodes".** Some pathophysiological/malignant processes — abnormal \
+biological PROCESSES rather than diagnosable conditions in their own right — are modeled under the \
+`Disease` label purely for historical/curation reasons, e.g. "fibrosis", "insulin resistance", \
+"neurodegeneration", "intima-media thickening", "atherosclerosis", "tumor growth". These belong in a \
+"cell processes" answer exactly as much as any `CellProcess`-labeled node does; searching `CellProcess` \
+alone silently misses them.
+
+**Because `Disease` is shared with genuine diseases/diagnoses (scleroderma, diabetes, Raynaud's \
+phenomenon, etc.), every `Disease`-labeled candidate needs an EXTRA judgment step CellProcess-labeled \
+candidates don't: is this actually a pathophysiological/malignant PROCESS, or is it a genuine \
+disease/diagnosis entity?** There is no graph attribute for this distinction either — judge it from \
+general biomedical knowledge, the same way as the level classification below. A genuine disease/ \
+diagnosis (e.g. scleroderma itself, diabetes as a diagnosis) does NOT belong in a "cell processes" \
+answer at all and must be excluded outright, regardless of level. A genuine pathophysiological process \
+(fibrosis, insulin resistance, neurodegeneration, intima-media thickening, etc.) DOES belong, and then \
+proceeds to the same three-level classification below as any `CellProcess`-labeled candidate. \
+`CellProcess`-labeled candidates skip this extra step — that label doesn't carry the same ambiguity.
+
+Once "is this actually a process" is settled, every surviving candidate — from either label — is \
+overloaded across THREE distinct levels of biological organization, not two:
 - **Cellular-level** — happens within or at the level of a single cell, e.g. "cell proliferation", \
   "apoptosis", "oxidative stress", "DNA repair".
 - **Tissue-level** — happens at the level of a tissue or organ, involving multiple cells acting \
   together locally, but not the whole organism, e.g. "vasoconstriction", "blood flow", "nerve \
-  outgrowth", "cell tissue invasion".
+  outgrowth", "cell tissue invasion", "fibrosis", "intima-media thickening".
 - **Systemic-level** — happens at the level of the whole organism, typically spanning multiple organ \
   systems or a whole-body state, e.g. "pregnancy", "breast-feeding", "memory", "learning", "visual \
-  process".
+  process", "insulin resistance", "neurodegeneration" (these last two are commonly systemic, but \
+  judge the specific candidate on its own merits — some pathophysiological processes are genuinely \
+  tissue-level instead, e.g. localized fibrosis).
 
 **There is no graph attribute that distinguishes these three categories — the label alone cannot tell \
-you which is which. You must classify each candidate yourself using your own general biomedical \
-knowledge**, since the database has nothing to filter on for this.
+you which is which, for EITHER `CellProcess` or `Disease`-labeled process candidates. You must classify \
+each candidate yourself using your own general biomedical knowledge**, since the database has nothing \
+to filter on for this.
 
 **Default interpretation — "cell process(es)" without further qualification means CELLULAR-level \
-processes only.** Exclude BOTH tissue-level and systemic-level `CellProcess` nodes from what you \
-report by default. **Only widen the scope when the user's message explicitly asks for it**, and match \
-the specific category(ies) they name:
+processes only.** Exclude BOTH tissue-level and systemic-level candidates from what you report by \
+default. **Only widen the scope when the user's message explicitly asks for it**, and match the \
+specific category(ies) they name:
 - "tissue-level processes" / "tissue processes" → include tissue-level (still exclude systemic unless \
   also requested)
 - "systemic processes" / "system-level processes" / "whole-body processes" → include systemic-level \
@@ -1580,24 +1603,30 @@ the specific category(ies) they name:
   an umbrella covering BOTH tissue-level and systemic-level together
 - "cell processes AND tissue/systemic/physiological processes" → cellular plus whichever of the other \
   categories was named
+- "pathophysiological processes" / "malignant processes" mentioned explicitly → signals the user is \
+  specifically interested in the Disease-labeled process candidates; still apply the same default- \
+  cellular-only level filter to them unless a level is also named
 Without one of these explicit signals, apply the cellular-only filter even though the user's literal \
 words were just "cell processes" — that phrase means the narrower, cellular sense by default in this app.
 
 **How to apply this in practice** — there's no Cypher-level property to filter on, so run the query \
-unfiltered against `CellProcess` as normal, then classify each returned name yourself as a reasoning \
-step AFTER execution into one of the three levels, and drop whichever level(s) weren't asked for from \
-the default answer. State briefly how many were excluded this way and at which level(s) (e.g. "N \
-further results were excluded — M tissue-level, K systemic-level — say 'include tissue-level \
-processes' or 'include systemic processes' to see them") so the exclusion is visible and reversible, \
-never silent. When the user DOES ask for more than one category together, mark each non-cellular \
+unfiltered against `CellProcess|Disease` as normal, then for every `Disease`-labeled result classify \
+first whether it's a genuine process at all (excluding real diseases/diagnoses entirely), then classify \
+every surviving candidate (from either label) into one of the three levels as a reasoning step AFTER \
+execution, and drop whichever level(s) weren't asked for from the default answer. State briefly how \
+many were excluded this way and why (e.g. "N further results were excluded — M tissue-level, K \
+systemic-level, J were diseases/diagnoses rather than processes — say 'include tissue-level processes' \
+or 'include systemic processes' to see the rest") so the exclusion is visible and reversible, never \
+silent. When the user DOES ask for more than one level category together, mark each non-cellular \
 item's line with a tag identifying which level it is — `(tissue-level — classified by general \
 knowledge, not a database attribute)` or `(systemic-level — classified by general knowledge, not a \
 database attribute)` as appropriate — the same standard-tag pattern used for the symptom/complication \
 directional judgment above — so all three categories stay easy to tell apart in a combined list. \
 Unambiguous examples: cellular — "cell proliferation", "oxidative stress"; tissue-level — \
-"vasoconstriction", "blood flow", "nerve outgrowth", "cell tissue invasion"; systemic — "pregnancy", \
-"breast-feeding", "memory", "learning", "visual process". For genuinely borderline names, use your \
-best biomedical judgment and say so rather than guessing silently either way.
+"vasoconstriction", "blood flow", "nerve outgrowth", "cell tissue invasion", "fibrosis", "intima-media \
+thickening"; systemic — "pregnancy", "breast-feeding", "memory", "learning", "visual process", "insulin \
+resistance", "neurodegeneration". For genuinely borderline names, use your best biomedical judgment and \
+say so rather than guessing silently either way.
 
 **When the user asks to VISUALIZE/RENDER only specific categories — "only tissue-level processes", \
 "only cellular ones", "exclude systemic processes", etc. — the render's own query must actually be \
