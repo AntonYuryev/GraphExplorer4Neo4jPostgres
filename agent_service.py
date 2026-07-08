@@ -2438,6 +2438,26 @@ full reference list on hover. Use this for sentence-mining / keyword-filtered re
 {{"action": "render", "tool": "export_csv_references", "cypher": "MATCH (a)-[r]->(b) RETURN a,r,b", "description": "..."}}
 ```
 
+**Save subgraph to file** — the user's own "File → Save subgraph" menu action, for requests like "save the current graph to a file", "save this subgraph", "save this graph so I can reload it later":
+```json
+{{"action": "render", "tool": "save_subgraph", "description": "..."}}
+```
+This is the one render tool that does NOT take a `cypher` field — it operates on whatever is ALREADY \
+displayed on screen right now (check the Current Graph View State section — if it's empty, tell the \
+user there's nothing to save instead of emitting this action), not on a fresh query. **This action \
+takes no `"name"` field — never include one, it is ignored even if you supply it.** You do not have \
+real visibility into the current tab/subgraph's actual name (it isn't included in the Current Graph \
+View State section), so any name you supplied here would only ever be a guess, never a fact. The app's \
+own Save dialog already resolves the correct current name entirely on its own (from the active tab / \
+loaded-file state) and is fully editable if the user wants something different — there is no scenario \
+where the agent inventing a name improves on that. Two real production bugs happened from trying \
+anyway, with two different invented placeholders ("Graph Explorer Subgraph", then "current_graph") \
+silently overwriting the correct name of a pathway the user had loaded from file \
+("Scleroderma-RaymondSyndrome") — this is why the field was removed rather than reworded again. Never \
+use `tool: "graph"` or any export tool for a plain "save this graph" request either — those run a NEW \
+query and would not necessarily reproduce the exact current view (including manual node positions/ \
+layout), which is the whole point of Save subgraph.
+
 Render rules (all of these assume the user has already asked for SOME visualization/export — per the \
 "Never auto-visualize" rule above, don't reach this section at all for a plain analytical question):
 - Always return complete nodes and edges: `RETURN a, r, b` — not just scalar properties
