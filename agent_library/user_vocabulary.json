@@ -383,6 +383,86 @@
       "use_count": 1,
       "confirmed": false,
       "last_used": "2026-07-06"
+    },
+    {
+      "user_term": "scleroderma",
+      "neo4j_name": "scleroderma",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "scleroderma",
+      "neo4j_name": "scleroderma renal crisis",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "scleroderma",
+      "neo4j_name": "scleroderma disease activity index",
+      "neo4j_label": "ClinicalParameter",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "scleroderma",
+      "neo4j_name": "EXOSC10",
+      "neo4j_label": "Protein",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "scleroderma",
+      "neo4j_name": "limited cutaneous systemic sclerosis",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "Raynaud's phenomenon",
+      "neo4j_name": "Raynaud's phenomenon",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "Raynaud's phenomenon",
+      "neo4j_name": "CRST syndrome",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "Raynaud's phenomenon",
+      "neo4j_name": "CREST syndrome",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "Raynaud's phenomenon",
+      "neo4j_name": "secondary Raynaud phenomenon",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "Raynaud's phenomenon",
+      "neo4j_name": "primary Raynaud phenomenon",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-07"
     }
   ]
 }
