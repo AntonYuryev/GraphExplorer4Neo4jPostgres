@@ -104,6 +104,23 @@ body {
 #cypher-editor-wrap { flex: 1; min-width: 0; }
 #query-actions { display: flex; flex-direction: column; gap: 6px; }
 
+/* Marker overlaid on the textarea at the exact character offset a Neo4j
+   syntax error points to (e.g. "Unmatched ']' at position 244") — hover it
+   to see the error message via its native title tooltip. Positioned via JS
+   (showCypherErrorMarker in app.js) using a hidden mirror <div> since a plain
+   textarea has no per-character DOM anchors to attach to directly. */
+#cypher-error-marker {
+  position: absolute;
+  width: 3px;
+  margin-left: -1px;
+  background: #ff5252;
+  box-shadow: 0 0 4px 1px rgba(255, 82, 82, 0.7);
+  border-radius: 1px;
+  cursor: help;
+  pointer-events: auto;
+  z-index: 20;
+}
+
 /* Lint error/warning panel below the textarea */
 #cypher-lint-panel {
   margin-top: 4px;
@@ -712,25 +729,3 @@ body.col-resizing * { cursor: col-resize !important; user-select: none; }
   pointer-events: auto;
 }
 
-/* ── Agent "Find concepts" button ─────────────────────────────────────────── */
-.agent-match-btn {
-  display: inline-block;
-  margin-top: 10px;
-  padding: 4px 12px;
-  font-size: 12px;
-  color: #8ab4f8;
-  background: transparent;
-  border: 1px solid #3a4a70;
-  border-radius: 12px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.agent-match-btn:hover:not(:disabled) {
-  background: #1e2a48;
-  border-color: #8ab4f8;
-  color: #c8d8ff;
-}
-.agent-match-btn:disabled {
-  cursor: default;
-  opacity: 0.75;
-}
