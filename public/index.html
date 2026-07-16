@@ -75,6 +75,7 @@
             <div class="settings-item" onclick="openMyNeo4jSettings();closeSettingsMenu()">Neo4j</div>
             <div class="settings-item" onclick="openMyPostgresSettings();closeSettingsMenu()">Postgres</div>
             <div class="settings-item" id="settings-llm-item" onclick="openLLMSettings();closeSettingsMenu()">Agentic AI / LLM</div>
+            <div class="settings-item" onclick="openMyPathwayCollectionSettings();closeSettingsMenu()">Pathway Collection</div>
           </div>
           <!-- Database endpoints (admin only — sets the shared URL/host that every
                user's personal "My Connection" credentials connect against) -->
@@ -100,72 +101,45 @@
         <div class="menu-item" onclick="document.getElementById('load-file-input').click();closeMenus()">Load subgraph</div>
         <div class="menu-item" onclick="promptSaveSubgraph();closeMenus()">Save subgraph</div>
         <div class="menu-separator"></div>
-        <div class="menu-item" onclick="exportTableCSV();closeMenus()">Export CSV</div>
-        <div class="menu-item" onclick="exportTableExcel();closeMenus()">Export Excel</div>
+        <div class="menu-item has-sub">Export Relations
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="exportTableModeAs('relation','csv');closeMenus()">to CSV</div>
+            <div class="menu-item" onclick="exportTableModeAs('relation','excel');closeMenus()">to Excel</div>
+          </div>
+        </div>
+        <div class="menu-item has-sub">Export References
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="exportTableModeAs('reference','csv');closeMenus()">to CSV</div>
+            <div class="menu-item" onclick="exportTableModeAs('reference','excel');closeMenus()">to Excel</div>
+          </div>
+        </div>
+        <div class="menu-item has-sub">Export Nodes
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="exportTableModeAs('node','csv');closeMenus()">to CSV</div>
+            <div class="menu-item" onclick="exportTableModeAs('node','excel');closeMenus()">to Excel</div>
+          </div>
+        </div>
       </div>
     </div>
 
-    <!-- Database -->
-    <div class="menu-entry" id="me-database">
-      <div class="menu-label" onclick="toggleMenu('me-database')" onmouseenter="hoverMenu('me-database')">Database</div>
+    <!-- Pathways -->
+    <div class="menu-entry" id="me-pathways">
+      <div class="menu-label" onclick="_updatePathwaySaveMenuState();toggleMenu('me-pathways')" onmouseenter="_updatePathwaySaveMenuState();hoverMenu('me-pathways')">Pathways</div>
       <div class="menu-dropdown">
-        <div class="menu-item has-sub">Neo4j Cypher
-          <div class="menu-submenu">
-            <div class="menu-item" onclick="focusCypherInput();closeMenus()">Open Cypher editor</div>
-            <div class="menu-item" onclick="openSankeyDialog();closeMenus()">Sankey diagram</div>
-            <div class="menu-item" onclick="openCypherHistory();closeMenus()">Cypher history</div>
-          </div>
-        </div>
-        <div class="menu-item" onclick="openSqlDialog();closeMenus()">Postgres SQL</div>
+        <div class="menu-item" id="mi-pathway-save" onclick="savePathwayInPlace();closeMenus()">Save</div>
+        <div class="menu-item" id="mi-pathway-save-as" onclick="openPathwaySaveAsDialog();closeMenus()">Save As…</div>
         <div class="menu-separator"></div>
-        <div class="menu-item" onclick="openLoadNodePropertiesDialog();closeMenus()">Load node properties</div>
-        <div class="menu-item" onclick="loadSimilarRelations();closeMenus()">Load similar relations</div>
-        <div class="menu-item" onclick="mergeSimilarRelations();closeMenus()">Merge similar relations</div>
+        <div class="menu-item" onclick="openPathwayTextSearch();closeMenus()">Text Search</div>
+        <div class="menu-item" id="mi-pathway-entity-search" style="color:#3a4060;pointer-events:none" title="Select one or more nodes in the graph first">Entity Search</div>
+        <div class="menu-item" id="mi-pathway-combined-search" style="color:#3a4060;pointer-events:none" title="Select one or more nodes in the graph first">Combined Search</div>
         <div class="menu-separator"></div>
-        <div class="menu-item has-sub">Ontology
-          <div class="menu-submenu">
-            <div class="menu-item" onclick="findOntologyChildren();closeMenus()">Find ontology children</div>
-            <div class="menu-item has-sub">Find ontology parents
-              <div class="menu-submenu">
-                <div class="menu-item" onclick="findOntologyParents(1);closeMenus()">1 level up</div>
-                <div class="menu-item" onclick="findOntologyParents(2);closeMenus()">2 levels up</div>
-                <div class="menu-item" onclick="findOntologyParents(3);closeMenus()">3 levels up</div>
-                <div class="menu-item" onclick="findOntologyParents(4);closeMenus()">4 levels up</div>
-                <div class="menu-item" onclick="findOntologyParents(5);closeMenus()">5 levels up</div>
-              </div>
-            </div>
-            <div class="menu-separator"></div>
-            <div class="menu-item" onclick="openOntologyAnalysis();closeMenus()">Ontology analysis…</div>
-          </div>
-        </div>
+        <div class="menu-item" onclick="openPathwayBrowse();closeMenus()">Browse…</div>
+        <div class="menu-item" onclick="openPathwayAnatomyIndex();closeMenus()">Anatomy Index</div>
+        <div class="menu-item" onclick="openPathwayAlphaIndex();closeMenus()">Alphabetical Index</div>
         <div class="menu-separator"></div>
-        <div class="menu-item" id="me-create-relation" style="display:none;color:#3a4060;pointer-events:none" onclick="openRelationCurationDialog();closeMenus()">Create/Edit relation</div>
-        <div class="menu-item has-sub">Find relations between Selected and Unselected
-          <div class="menu-submenu">
-            <div class="menu-item" onclick="findRelationsBetweenGroups('all');closeMenus()">All relations</div>
-            <div class="menu-item" onclick="findRelationsBetweenGroups('direct');closeMenus()">Direct physical interactions</div>
-            <div class="menu-item" onclick="findRelationsBetweenGroups('biomarker');closeMenus()">Biomarker relations</div>
-            <div class="menu-item" onclick="findRelationsBetweenGroups('indirect');closeMenus()">Indirect relations</div>
-          </div>
-        </div>
-        <div class="menu-item has-sub">Connect Selected Nodes
-          <div class="menu-submenu">
-            <div class="menu-item" onclick="connectSelectedNodes('all');closeMenus()">All relations</div>
-            <div class="menu-item" onclick="connectSelectedNodes('direct');closeMenus()">Direct physical interactions</div>
-            <div class="menu-item" onclick="connectSelectedNodes('biomarker');closeMenus()">Biomarker relations</div>
-            <div class="menu-item" onclick="connectSelectedNodes('indirect');closeMenus()">Indirect relations</div>
-          </div>
-        </div>
-        <div class="menu-item" onclick="openShortestPathDialog();closeMenus()">Shortest path…</div>
-        <div class="menu-item has-sub">Expand Selected Nodes
-          <div class="menu-submenu">
-            <div class="menu-item" onclick="expandSelectedNodes('all');closeMenus()">Expand to all neighbors</div>
-            <div class="menu-item" onclick="expandSelectedNodes('direct');closeMenus()">Expand by Direct physical interactions</div>
-            <div class="menu-item" onclick="expandSelectedNodes('biomarker');closeMenus()">Expand by Biomarker relations</div>
-            <div class="menu-item" onclick="expandSelectedNodes('indirect');closeMenus()">Expand by Indirect relations</div>
-            <div class="menu-item" onclick="expandSelectedNodes('to');closeMenus()">Expand To…</div>
-          </div>
-        </div>
+        <div class="menu-item" onclick="openPathwayStatistics();closeMenus()">Statistics</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="openPathwayAnnotation();closeMenus()">View Annotation</div>
       </div>
     </div>
 
@@ -189,6 +163,8 @@
             <div class="menu-item" onclick="toggleFilterRows();closeMenus()"><span class="menu-check" id="mc-filter-rows-node"></span>Filter rows</div>
           </div>
         </div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="openSankeyDialog();closeMenus()">Sankey diagram</div>
         <div id="view-graph-items">
           <div class="menu-separator"></div>
           <div class="menu-item has-sub">Zoom
@@ -246,6 +222,8 @@
     <div class="menu-entry" id="me-select">
       <div class="menu-label" onclick="toggleMenu('me-select')" onmouseenter="hoverMenu('me-select')">Select</div>
       <div class="menu-dropdown">
+        <div class="menu-item" onclick="selectAllInActiveView();closeMenus()">Select All<span style="margin-left:auto;color:#7a8099;font-size:11px;padding-left:16px">Ctrl+A</span></div>
+        <div class="menu-separator"></div>
         <div class="menu-item" id="me-select-area" onclick="toggleBoxSelect();closeMenus()">By area</div>
         <div class="menu-item" onclick="selectAllNodes();closeMenus()">Nodes</div>
         <div class="menu-item has-sub" onmouseenter="populateSelectByLabelMenu()">Nodes by label
@@ -263,6 +241,94 @@
       </div>
     </div>
 
+    <!-- Explore -->
+    <div class="menu-entry" id="me-explore">
+      <div class="menu-label" onclick="toggleMenu('me-explore')" onmouseenter="hoverMenu('me-explore')">Explore</div>
+      <div class="menu-dropdown">
+        <div class="menu-item has-sub">Find relations between Selected and Unselected
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="openFindBetweenAllDialog();closeMenus()">All relations</div>
+            <div class="menu-item" onclick="findRelationsBetweenGroups('direct');closeMenus()">Direct physical interactions</div>
+            <div class="menu-item" onclick="findRelationsBetweenGroups('biomarker');closeMenus()">Biomarker relations</div>
+            <div class="menu-item" onclick="findRelationsBetweenGroups('indirect');closeMenus()">Indirect relations</div>
+          </div>
+        </div>
+        <div class="menu-item has-sub" id="me-connect-selected">Connect Selected Nodes
+          <div class="menu-submenu">
+            <div class="menu-item" id="mi-connect-all" onclick="openConnectSelectedAllDialog();closeMenus()">All relations</div>
+            <div class="menu-item" id="mi-connect-direct" onclick="connectSelectedNodes('direct');closeMenus()">Direct physical interactions</div>
+            <div class="menu-item" id="mi-connect-biomarker" onclick="connectSelectedNodes('biomarker');closeMenus()">Biomarker relations</div>
+            <div class="menu-item" id="mi-connect-indirect" onclick="connectSelectedNodes('indirect');closeMenus()">Indirect relations</div>
+          </div>
+        </div>
+        <div class="menu-item" id="mi-shortest-path" onclick="openShortestPathDialog();closeMenus()">Shortest path…</div>
+        <div class="menu-item has-sub">Expand Selected Nodes
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="openExpandAllDialog();closeMenus()">Expand to all neighbors</div>
+            <div class="menu-item" onclick="expandSelectedNodes('direct');closeMenus()">Expand by Direct physical interactions</div>
+            <div class="menu-item" onclick="expandSelectedNodes('biomarker');closeMenus()">Expand by Biomarker relations</div>
+            <div class="menu-item" onclick="expandSelectedNodes('indirect');closeMenus()">Expand by Indirect relations</div>
+          </div>
+        </div>
+        <div class="menu-item has-sub" id="me-common-neighbors">Find common neighbors
+          <div class="menu-submenu">
+            <div class="menu-item" id="mi-cn-any" onclick="openCommonNeighborsConfigDialog('any');closeMenus()">All relations</div>
+            <div class="menu-item" id="mi-cn-in" onclick="openCommonNeighborsConfigDialog('in');closeMenus()">Find regulators</div>
+            <div class="menu-item" id="mi-cn-out" onclick="openCommonNeighborsConfigDialog('out');closeMenus()">Find targets</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Ontology -->
+    <div class="menu-entry" id="me-ontology">
+      <div class="menu-label" onclick="toggleMenu('me-ontology')" onmouseenter="hoverMenu('me-ontology')">Ontology</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" onclick="findOntologyChildren();closeMenus()">Find ontology children</div>
+        <div class="menu-item has-sub">Find ontology parents
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="findOntologyParents(1);closeMenus()">1 level up</div>
+            <div class="menu-item" onclick="findOntologyParents(2);closeMenus()">2 levels up</div>
+            <div class="menu-item" onclick="findOntologyParents(3);closeMenus()">3 levels up</div>
+            <div class="menu-item" onclick="findOntologyParents(4);closeMenus()">4 levels up</div>
+            <div class="menu-item" onclick="findOntologyParents(5);closeMenus()">5 levels up</div>
+          </div>
+        </div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="openOntologyAnalysis();closeMenus()">Ontology analysis…</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item has-sub">Find drugs upstream
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="findDrugs(null, null);closeMenus()">All relations</div>
+            <div class="menu-separator"></div>
+            <div class="menu-item" onclick="findDrugs(['DirectRegulation'], 'negative');closeMenus()">Find direct antagonists</div>
+            <div class="menu-item" onclick="findDrugs(['DirectRegulation'], 'positive');closeMenus()">Find direct agonists</div>
+            <div class="menu-item" onclick="findDrugs(['Regulation','Expression','MolTransport'], 'negative');closeMenus()">Find indirect antagonists</div>
+            <div class="menu-item" onclick="findDrugs(['Regulation','Expression','MolTransport'], 'positive');closeMenus()">Find indirect agonists</div>
+            <div class="menu-item" onclick="findDrugs(['Expression'], null);closeMenus()">Find expression modulators</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Database -->
+    <div class="menu-entry" id="me-database">
+      <div class="menu-label" onclick="toggleMenu('me-database')" onmouseenter="hoverMenu('me-database')">Database</div>
+      <div class="menu-dropdown">
+        <div class="menu-item has-sub">Neo4j Cypher
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="focusCypherInput();closeMenus()">Open Cypher editor</div>
+            <div class="menu-item" onclick="openCypherHistory();closeMenus()">Cypher history</div>
+          </div>
+        </div>
+        <div class="menu-item" onclick="openSqlDialog();closeMenus()">Postgres SQL</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="openLoadNodePropertiesDialog();closeMenus()">Load node properties</div>
+        <div class="menu-item" onclick="loadSimilarRelations();closeMenus()">Load similar relations</div>
+        <div class="menu-item" onclick="mergeSimilarRelations();closeMenus()">Merge similar relations</div>
+      </div>
+    </div>
+
     <!-- Edit -->
     <div class="menu-entry" id="me-edit">
       <div class="menu-label" onclick="toggleMenu('me-edit')" onmouseenter="hoverMenu('me-edit')">Edit</div>
@@ -271,6 +337,8 @@
         <div class="menu-item" id="mi-paste" onclick="pasteClipboard();closeMenus()">Paste</div>
         <div class="menu-separator"></div>
         <div class="menu-item" onclick="deleteSelection();closeMenus()">Delete selected</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" id="me-create-relation" style="display:none;color:#3a4060;pointer-events:none" onclick="openRelationCurationDialog();closeMenus()">Create/Edit relation</div>
       </div>
     </div>
 
@@ -614,6 +682,271 @@
   </div>
 </div>
 
+<!-- Pathway Collection settings modal (admin only) -->
+<div id="pathway-collection-modal" class="modal-backdrop" style="display:none" onclick="closeMyPathwayCollectionModal(event)">
+  <div class="modal-box" style="min-width:460px" onclick="event.stopPropagation()">
+    <h3>My Pathway Collection</h3>
+    <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
+      Your own local directory of RNEF / .graph.json pathway files, indexed for File → Pathways search commands. This is personal to your account — each user points at (and indexes) their own collection. Indexing walks the directory recursively and can take a while for a large collection — it runs in the background; the app remains usable while it works.
+    </p>
+    <div id="pwc-error" class="error-msg" style="display:none"></div>
+    <div id="pwc-success" class="success-msg" style="display:none"></div>
+    <label style="font-size:12px;color:#7a8099">Directory path (as seen by the server)</label>
+    <input type="text" id="pwc-directory" placeholder="e.g. C:\GraphExplorer\CuratedPathways" autocomplete="off">
+    <div id="pwc-status" style="font-size:11px;color:#7a8099;margin:8px 0;white-space:pre-line;line-height:1.6"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closeMyPathwayCollectionModal()">Cancel</button>
+      <button class="btn-ghost" id="pwc-save-btn" onclick="saveMyPathwayCollectionDirectory()">Save Directory</button>
+      <button class="btn-primary" id="pwc-index-btn" onclick="runMyPathwayIndex()">Index</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Text Search dialog -->
+<div id="pathway-search-modal" class="modal-backdrop" style="display:none" onclick="closePathwaySearchModal(event)">
+  <div class="modal-box" style="min-width:1150px;max-width:95vw" onclick="event.stopPropagation()">
+    <h3>Pathway Text Search</h3>
+    <div id="pws-error" class="error-msg" style="display:none"></div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input type="text" id="pws-keywords" placeholder="Keywords (e.g. insulin resistance skeletal muscle)" autocomplete="off" style="flex:1" onkeydown="if(event.key==='Enter')runPathwayTextSearch()">
+      <button class="btn-primary" onclick="runPathwayTextSearch()">Search</button>
+    </div>
+    <div style="font-size:11px;color:#7a8099;margin-bottom:6px">Click a row to open that pathway in the graph viewer.</div>
+    <div id="pws-summary" style="font-size:12px;color:#9aa0c0;margin-bottom:6px"></div>
+    <div style="max-height:50vh;overflow:auto;border:1px solid #2a2f4a;border-radius:5px">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="position:sticky;top:0;background:#1e2235">
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('name')">Pathway Name</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('subfolder')">Subfolder</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('sourceFile')">Full File Path</th>
+            <th data-anatomy-col="Organ" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('anatomy:Organ')">Organ</th>
+            <th data-anatomy-col="Organ System" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('anatomy:Organ System')">Organ System</th>
+            <th data-anatomy-col="Organelle" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('anatomy:Organelle')">Organelle</th>
+            <th data-anatomy-col="Tissue" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('anatomy:Tissue')">Tissue</th>
+            <th data-anatomy-col="CellType" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwaySearchResults('anatomy:CellType')">CellType</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="sortPathwaySearchResults('relevanceScore')">Relevance</th>
+          </tr>
+        </thead>
+        <tbody id="pws-results-body"></tbody>
+      </table>
+      <div id="pws-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">No results yet — enter keywords and click Search.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwaySearchModal()">Close</button>
+      <button class="btn-ghost" onclick="savePathwaySearchResultsTSV()">Save Results (TSV)</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Entity Search dialog — REQ-3.21-3.24. Runs immediately on the
+     current graph selection (no keyword input needed), results only. -->
+<div id="pathway-entity-search-modal" class="modal-backdrop" style="display:none" onclick="closePathwayEntitySearchModal(event)">
+  <div class="modal-box" style="min-width:1200px;max-width:95vw" onclick="event.stopPropagation()">
+    <h3>Pathway Entity Search</h3>
+    <div id="pes-error" class="error-msg" style="display:none"></div>
+    <div id="pes-summary" style="font-size:11px;color:#7a8099;margin-bottom:6px"></div>
+    <div style="max-height:50vh;overflow:auto;border:1px solid #2a2f4a;border-radius:5px">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="position:sticky;top:0;background:#1e2235">
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('name')">Pathway Name</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('subfolder')">Subfolder</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('sourceFile')">Full File Path</th>
+            <th data-anatomy-col="Organ" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('anatomy:Organ')">Organ</th>
+            <th data-anatomy-col="Organ System" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('anatomy:Organ System')">Organ System</th>
+            <th data-anatomy-col="Organelle" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('anatomy:Organelle')">Organelle</th>
+            <th data-anatomy-col="Tissue" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('anatomy:Tissue')">Tissue</th>
+            <th data-anatomy-col="CellType" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('anatomy:CellType')">CellType</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="sortPathwayEntityResults('overlapCount')">Overlap</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayEntityResults('commonEntities')">Common Entities</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="sortPathwayEntityResults('zScore')">Z-score</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="sortPathwayEntityResults('pValue')">p-value</th>
+          </tr>
+        </thead>
+        <tbody id="pes-results-body"></tbody>
+      </table>
+      <div id="pes-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">No pathways in your collection contain any of the selected entities.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwayEntitySearchModal()">Close</button>
+      <button class="btn-ghost" onclick="savePathwayEntityResultsTSV()">Save Results (TSV)</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Combined Search dialog — REQ-3.31-3.34. Prompts for keywords,
+     then filters by the current graph selection's Entity Overlap before
+     ranking the filtered subset by Text Search relevance. -->
+<div id="pathway-combined-search-modal" class="modal-backdrop" style="display:none" onclick="closePathwayCombinedSearchModal(event)">
+  <div class="modal-box" style="min-width:960px;max-width:95vw" onclick="event.stopPropagation()">
+    <h3>Pathway Combined Search</h3>
+    <div id="pcs-error" class="error-msg" style="display:none"></div>
+    <div id="pcs-summary" style="font-size:11px;color:#7a8099;margin-bottom:6px"></div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input type="text" id="pcs-keywords" placeholder="Keywords (e.g. insulin resistance skeletal muscle)" autocomplete="off" style="flex:1" onkeydown="if(event.key==='Enter')runPathwayCombinedSearch()">
+      <button class="btn-primary" onclick="runPathwayCombinedSearch()">Search</button>
+    </div>
+    <div style="font-size:11px;color:#7a8099;margin-bottom:6px">Click a row to open that pathway in the graph viewer.</div>
+    <div style="max-height:50vh;overflow:auto;border:1px solid #2a2f4a;border-radius:5px">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="position:sticky;top:0;background:#1e2235">
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayCombinedResults('name')">Pathway Name</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayCombinedResults('subfolder')">Subfolder</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayCombinedResults('sourceFile')">Full File Path</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="sortPathwayCombinedResults('overlapCount')">Overlap</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:left" onclick="sortPathwayCombinedResults('commonEntities')">Common Entities</th>
+            <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="sortPathwayCombinedResults('relevanceScore')">Relevance</th>
+          </tr>
+        </thead>
+        <tbody id="pcs-results-body"></tbody>
+      </table>
+      <div id="pcs-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">No results yet — enter keywords and click Search.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwayCombinedSearchModal()">Close</button>
+      <button class="btn-ghost" onclick="savePathwayCombinedResultsTSV()">Save Results (TSV)</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Statistics dialog — REQ-3.71-3.73, sourced from the last Index
+     run (persisted server-side, no re-computation needed on open). -->
+<div id="pathway-statistics-modal" class="modal-backdrop" style="display:none" onclick="closePathwayStatisticsModal(event)">
+  <div class="modal-box" style="min-width:520px;max-width:90vw" onclick="event.stopPropagation()">
+    <h3>Pathway Collection Statistics</h3>
+    <div id="pst-error" class="error-msg" style="display:none"></div>
+    <div id="pst-body" style="font-size:13px"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwayStatisticsModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Annotation viewer — shows the non-empty <properties> fields
+     (Description, Notes, etc.) for whatever pathway is open in the current
+     tab, if it was opened from an RNEF source. -->
+<!-- Pathway "Save As" (File → Pathways → Save As…) — always writes a NEW
+     .graph.json under a user-chosen name, defaulting to the currently open
+     pathway's own name and folder; the folder field can be changed to save
+     into a different subfolder of the same collection. -->
+<div id="pathway-saveas-modal" class="modal-backdrop" style="display:none" onclick="closePathwaySaveAsModal(event)">
+  <div class="modal-box" style="min-width:460px" onclick="event.stopPropagation()">
+    <h3>Save Pathway As</h3>
+    <div id="pwsa-error" class="error-msg" style="display:none"></div>
+    <label style="font-size:12px;color:#7a8099">Save as</label>
+    <div style="display:flex;gap:16px;margin:4px 0 10px">
+      <label style="font-size:12px;display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="radio" name="pwsa-mode" id="pwsa-mode-copy" value="copy" checked onchange="_pathwaySaveAsModeChanged()"> Full copy
+      </label>
+      <label style="font-size:12px;display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="radio" name="pwsa-mode" id="pwsa-mode-alias" value="alias" onchange="_pathwaySaveAsModeChanged()"> Alias (reference only)
+      </label>
+    </div>
+    <label style="font-size:12px;color:#7a8099">Pathway name</label>
+    <input type="text" id="pwsa-name" autocomplete="off">
+    <label style="font-size:12px;color:#7a8099;margin-top:10px;display:block">Folder (relative to your pathway collection root — leave blank for the root folder)</label>
+    <div style="display:flex;gap:6px">
+      <input type="text" id="pwsa-subfolder" list="pwsa-subfolder-list" placeholder="e.g. Biological Process/Eye physiology" autocomplete="off" style="flex:1">
+      <button type="button" class="btn-ghost" onclick="_pathwaySaveAsBrowseFolders()" title="Pick an existing folder">Browse…</button>
+    </div>
+    <datalist id="pwsa-subfolder-list"></datalist>
+    <div id="pwsa-mode-hint" style="font-size:11px;color:#7a8099;margin-top:6px">Saves a new file — the pathway you have open now (and its original file, if any) is left untouched. Typing a folder name that doesn't exist yet will create it.</div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwaySaveAsModal()">Cancel</button>
+      <button class="btn-primary" id="pwsa-save-btn" onclick="savePathwayAs()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="pathway-annotation-modal" class="modal-backdrop" style="display:none" onclick="closePathwayAnnotationModal(event)">
+  <!-- Wider default (720px vs. the shared .modal-box's normal min-width) and
+       user-resizable (native browser resize handle, bottom-right corner) --
+       Notes in particular can be long enough that the old fixed size made it
+       cramped to edit comfortably. resize:both needs overflow other than
+       "visible" to actually show a handle, hence overflow:auto here; the
+       flex column layout lets #pan-body (flex:1) grow into whatever extra
+       height the user drags in, rather than staying capped at a fixed vh
+       while the rest of the box grows around it. -->
+  <div class="modal-box" style="width:720px;min-width:480px;max-width:95vw;max-height:85vh;resize:both;overflow:auto;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+    <h3 id="pan-title">Pathway Annotation</h3>
+    <div id="pan-body" style="font-size:13px;flex:1;overflow:auto;min-height:120px"></div>
+    <div id="pan-error" style="display:none;color:#e05560;font-size:12px;margin-top:8px"></div>
+    <div class="modal-actions">
+      <button id="pan-edit-btn" class="btn-ghost" style="display:none;margin-right:auto" onclick="openPathwayAnnotationEdit()">Edit</button>
+      <button id="pan-cancel-btn" class="btn-ghost" style="display:none" onclick="cancelPathwayAnnotationEdit()">Cancel</button>
+      <button id="pan-save-btn" class="btn-primary" style="display:none" onclick="savePathwayAnnotationEdit()">Save</button>
+      <button id="pan-close-btn" class="btn-ghost" onclick="closePathwayAnnotationModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shared across every annotation-edit row's Field name input (via list=) --
+     suggests field names already used elsewhere in this user's pathway
+     collection (Description, Organ, Tissue, CellType, PMID, etc.), populated
+     from GET /api/settings/my-pathway-collection/annotation-fields, so a new
+     or renamed field is easy to match to an existing one instead of
+     accidentally typing a near-duplicate. A <datalist> still lets the user
+     type anything, including a genuinely new field name. -->
+<datalist id="pan-field-datalist"></datalist>
+
+<!-- Pathway Alphabetical Index — REQ-3.51-3.53, sourced from this user's own
+     already-indexed pathway list (same data as Browse). -->
+<div id="pathway-alpha-index-modal" class="modal-backdrop" style="display:none" onclick="closePathwayAlphaIndexModal(event)">
+  <div class="modal-box" style="min-width:480px;max-width:90vw" onclick="event.stopPropagation()">
+    <h3>Alphabetical Pathway Index</h3>
+    <div id="pai-error" class="error-msg" style="display:none"></div>
+    <input type="text" id="pai-filter" placeholder="Type to filter (matches the start of the name)…" autocomplete="off" style="margin-bottom:8px" oninput="_renderPathwayAlphaIndex()">
+    <div id="pai-summary" style="font-size:11px;color:#7a8099;margin-bottom:6px"></div>
+    <div id="pai-list" style="max-height:55vh;overflow:auto;border:1px solid #2a2f4a;border-radius:5px;font-size:12px"></div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwayAlphaIndexModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Anatomy Index (File → Pathway → Anatomy Index, Phase 3) — drills
+     down Category (Organ/Organ System/Organelle/Tissue/CellType) -> Term ->
+     Pathways, same up/breadcrumb pattern as Browse. -->
+<div id="pathway-anatomy-index-modal" class="modal-backdrop" style="display:none" onclick="closePathwayAnatomyIndexModal(event)">
+  <div class="modal-box" style="min-width:520px;max-width:90vw" onclick="event.stopPropagation()">
+    <h3>Anatomy Index</h3>
+    <div id="pan-error" class="error-msg" style="display:none"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px">
+      <button class="btn-ghost" id="pan-up-btn" onclick="pathwayAnatomyGoUp()" style="padding:3px 10px">↑ Up</button>
+      <div id="pan-breadcrumb" style="color:#9aa0c0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+    </div>
+    <div style="font-size:11px;color:#7a8099;margin-bottom:6px">Click a category, then a term, to see pathways annotated with it; click a pathway to open it in the graph viewer.</div>
+    <div id="pan-list" style="max-height:50vh;overflow:auto;border:1px solid #2a2f4a;border-radius:5px;font-size:12px"></div>
+    <div id="pan-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">Nothing here — no pathways are annotated at this level.</div>
+    <div class="modal-actions">
+      <button class="btn-ghost" onclick="closePathwayAnatomyIndexModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pathway Browse dialog — REQ-3.41-3.42, sourced from this user's own
+     indexed collection only (see openPathwayBrowse() in app.js for why: a
+     native file picker can't be pointed at, or restricted to, a directory). -->
+<div id="pathway-browse-modal" class="modal-backdrop" style="display:none" onclick="closePathwayBrowseModal(event)">
+  <div class="modal-box" style="min-width:520px;max-width:90vw" onclick="event.stopPropagation()">
+    <h3 id="pwb-title">Browse Pathways</h3>
+    <div id="pwb-error" class="error-msg" style="display:none"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:12px">
+      <button class="btn-ghost" id="pwb-up-btn" onclick="pathwayBrowseGoUp()" style="padding:3px 10px">↑ Up</button>
+      <div id="pwb-breadcrumb" style="color:#9aa0c0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+    </div>
+    <div id="pwb-hint" style="font-size:11px;color:#7a8099;margin-bottom:6px">Click a folder to open it, or click a pathway to open it in the graph viewer.</div>
+    <div id="pwb-list" style="max-height:50vh;overflow:auto;border:1px solid #2a2f4a;border-radius:5px;font-size:12px"></div>
+    <div id="pwb-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">This folder has no subfolders or pathways.</div>
+    <div class="modal-actions">
+      <button class="btn-primary" id="pwb-select-btn" style="display:none" onclick="_pathwayBrowseConfirmPick()">Select This Folder</button>
+      <button class="btn-ghost" onclick="closePathwayBrowseModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- My Neo4j Connection modal (every role — personal database/username/password) -->
 <div id="my-neo4j-modal" class="modal-backdrop" style="display:none" onclick="closeMyNeo4jSettingsModal(event)">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
@@ -622,13 +955,18 @@
     <div id="my-neo4j-success" class="success-msg" style="display:none"></div>
     <label style="font-size:12px;color:#7a8099">URL <span style="color:#5a6080">(set by admin)</span></label>
     <input type="text" id="mns-url" disabled>
-    <label style="font-size:12px;color:#7a8099">Database name</label>
-    <input type="text" id="mns-database" placeholder="neo4j" autocomplete="off">
     <label style="font-size:12px;color:#7a8099">Username</label>
     <input type="text" id="mns-username" placeholder="neo4j" autocomplete="off">
     <label style="font-size:12px;color:#7a8099">Password</label>
     <input type="password" id="mns-password" placeholder="Leave blank to keep current" autocomplete="new-password">
-    <p style="font-size:11px;color:#7a8099;margin-top:6px">This is your own login — used to run queries and to attribute any database-level activity to you. Connection is tested before saving.</p>
+    <label style="font-size:12px;color:#7a8099">Database name
+      <span id="mns-db-list-status" style="font-size:11px;color:#5a6080;font-weight:400;margin-left:6px"></span>
+      <button type="button" onclick="fetchNeo4jDatabaseList()" title="List databases this login can see, using the username/password above"
+        style="margin-left:8px;padding:1px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:4px;color:#a0b0d0;font-size:11px;cursor:pointer">↻ Fetch</button>
+    </label>
+    <input type="text" id="mns-database" list="mns-database-list" placeholder="neo4j — type or click Fetch to list available databases" autocomplete="off">
+    <datalist id="mns-database-list"></datalist>
+    <p style="font-size:11px;color:#7a8099;margin-top:6px">This is your own login — used to run queries and to attribute any database-level activity to you. Connection is tested before saving. Which databases you can see and use is controlled by your Neo4j administrator, not by this app.</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeMyNeo4jSettingsModal()">Cancel</button>
       <button class="btn-primary" id="mns-save-btn" onclick="saveMyNeo4jSettings()">Test &amp; Save</button>
@@ -648,13 +986,18 @@
     <input type="text" id="mpgs-port" disabled>
     <label style="font-size:12px;color:#7a8099">Database name</label>
     <input type="text" id="mpgs-database" placeholder="postgres" autocomplete="off">
-    <label style="font-size:12px;color:#7a8099">Schema</label>
-    <input type="text" id="mpgs-schema" placeholder="public" autocomplete="off">
     <label style="font-size:12px;color:#7a8099">Username</label>
     <input type="text" id="mpgs-username" placeholder="postgres" autocomplete="off">
     <label style="font-size:12px;color:#7a8099">Password</label>
     <input type="password" id="mpgs-password" placeholder="Leave blank to keep current" autocomplete="new-password">
-    <p style="font-size:11px;color:#7a8099;margin-top:6px">This is your own login — used to run reference lookups and to attribute any database-level activity to you. Connection is tested before saving.</p>
+    <label style="font-size:12px;color:#7a8099">Schema
+      <span id="mpgs-schema-list-status" style="font-size:11px;color:#5a6080;font-weight:400;margin-left:6px"></span>
+      <button type="button" onclick="fetchPgSchemaList()" title="List schemas this login can see in the database above"
+        style="margin-left:8px;padding:1px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:4px;color:#a0b0d0;font-size:11px;cursor:pointer">↻ Fetch</button>
+    </label>
+    <input type="text" id="mpgs-schema" list="mpgs-schema-list" placeholder="public — type or click Fetch to list available schemas" autocomplete="off">
+    <datalist id="mpgs-schema-list"></datalist>
+    <p style="font-size:11px;color:#7a8099;margin-top:6px">This is your own login — used to run reference lookups and to attribute any database-level activity to you. Connection is tested before saving. Which schemas you can see and use is controlled by your PostgreSQL administrator, not by this app.</p>
     <div class="modal-actions">
       <button class="btn-ghost" onclick="closeMyPostgresSettingsModal()">Cancel</button>
       <button class="btn-primary" id="mpgs-save-btn" onclick="saveMyPostgresSettings()">Test &amp; Save</button>
@@ -803,11 +1146,26 @@
       <button onclick="agentClearChat()" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">Clear chat</button>
       <button onclick="agentSaveConversation()" title="Save this conversation to a local JSON file" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">💾 Save chat</button>
       <button onclick="agentTriggerLoadConversation()" title="Load a previously saved conversation from a local JSON file" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">📂 Load chat</button>
+      <button onclick="openAgentActionHistory()" title="See everything the agent has actually done in this conversation — graphs built, dialogs opened, relations written — not just what it said" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">🕘 History</button>
       <button id="agent-run-workflow-btn" onclick="agentRunWorkflow()" title="Run the workflow pipeline configured in Config → Active Workflow Pipeline" style="display:none;padding:3px 10px;background:transparent;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;font-size:11px;cursor:pointer">▶ Run workflow</button>
       <span id="agent-thinking-indicator" style="display:none;font-size:11px;color:#4f8ef7">⏳ Thinking…</span>
     </div>
   </div>
   <input type="file" id="agent-load-conv-input" accept=".json" style="display:none" onchange="agentLoadConversationFile(event)">
+</div>
+
+<!-- ══════════════ Agentic AI — Action History panel ══════════════ -->
+<div id="agent-action-history-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:4500;align-items:center;justify-content:center">
+  <div style="background:#1e2235;border:1px solid #3a3f55;border-radius:10px;padding:20px 24px;width:640px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;gap:12px" onclick="event.stopPropagation()">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:15px;font-weight:600;color:#e0e0e0">🕘 Action History</span>
+      <button onclick="closeAgentActionHistory()" style="background:none;border:none;color:#7a8099;font-size:20px;cursor:pointer;line-height:1">×</button>
+    </div>
+    <div style="font-size:12px;color:#5a6080">
+      Everything the agent has actually <b>done</b> in this conversation — graphs built, dialogs opened, relations written — not just what it said. Entries marked <b>Restore</b> can be re-opened directly; write actions are shown for reference only, since re-running them could create a duplicate.
+    </div>
+    <div id="agent-action-history-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px"></div>
+  </div>
 </div>
 
 <!-- ══════════════ Agentic AI — Library browser modal ══════════════ -->
@@ -1166,41 +1524,18 @@
     </div>
   </div>
 
-  <!-- ══════════════ Shortest Path dialog ══════════════ -->
-  <div id="shortest-path-modal" class="modal-backdrop" style="display:none" onclick="closeShortestPathDialog(event)">
-    <div class="modal-box" style="width:420px;max-width:90vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden" onclick="event.stopPropagation()">
-      <h3>Shortest Path</h3>
-      <p style="color:#7a8099;font-size:12px;margin-bottom:12px">
-        Finds the shortest path connecting the selected nodes, using only the checked relation types.
-      </p>
-
-      <label style="font-size:12px;color:#a0a8c4;display:block;margin-bottom:4px">Maximum path length</label>
-      <input type="number" id="sp-max-length" min="1" max="15" value="2" style="width:100%;margin-bottom:14px">
-
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <label style="font-size:12px;color:#a0a8c4">Select relation types for the path</label>
-        <div style="display:flex;gap:6px">
-          <button class="btn-ghost" onclick="_spSelectAll(true)">Select All</button>
-          <button class="btn-ghost" onclick="_spSelectAll(false)">Unselect All</button>
-        </div>
-      </div>
-      <div id="sp-reltype-list" style="overflow-y:auto;flex:1;min-height:60px;max-height:300px;display:flex;flex-direction:column;gap:4px;border:1px solid #2a3050;border-radius:6px;padding:8px;background:#141826">
-        <div style="color:#5a6080;font-size:12px;font-style:italic">Loading relation types…</div>
-      </div>
-
-      <div class="modal-actions" style="margin-top:14px;align-items:center">
-        <span id="sp-select-hint" style="display:none;color:#e05560;font-size:12px;flex:1">Check at least one relation type.</span>
-        <button class="btn-ghost" onclick="closeShortestPathDialog()">Cancel</button>
-        <button class="btn-primary" onclick="runShortestPath()">Run</button>
-      </div>
-    </div>
-  </div>
-
   <!-- ══════════════ Ontology Analysis Dialog ══════════════ -->
-  <div id="ontology-analysis-modal" style="display:none;position:fixed;inset:0;background:rgba(10,15,40,0.65);z-index:4000;align-items:center;justify-content:center">
-    <div style="background:#1a2035;border:1px solid #2a3555;border-radius:10px;width:720px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px #000c">
-      <!-- Header -->
-      <div style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #2a3555;flex-shrink:0">
+  <!-- Deliberately NOT a full dimming modal like every other dialog in the app —
+       this one needs to stay usable at the same time as the AI agent chat panel,
+       since the agent opens it to guide the user through a follow-up workflow.
+       background:transparent + pointer-events:none on the backdrop (with
+       pointer-events:auto restored on the box itself below) means the rest of
+       the page, including the chat panel, stays fully visible AND interactive
+       underneath — the backdrop only exists to host the (draggable) box. -->
+  <div id="ontology-analysis-modal" style="display:none;position:fixed;inset:0;background:transparent;z-index:4000;pointer-events:none">
+    <div id="ontology-analysis-box" style="position:fixed;left:24px;top:70px;background:#1a2035;border:1px solid #2a3555;border-radius:10px;width:640px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px #000c;pointer-events:auto">
+      <!-- Header — also the drag handle (see _makeDialogDraggable in app.js) -->
+      <div id="ontology-analysis-draghandle" style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #2a3555;flex-shrink:0;cursor:move" title="Drag to move this dialog">
         <span style="font-size:14px;font-weight:600;color:#e8ecf3">Ontology Analysis</span>
         <span id="ontology-scope-badge" style="font-size:11px;color:#7a8099;margin-left:10px"></span>
         <div style="display:flex;align-items:center;gap:18px">
@@ -1227,9 +1562,12 @@
   </div>
 
   <!-- Ontology right-click context menu -->
-  <div id="ontology-ctx-menu" style="display:none;position:fixed;background:#1a2035;border:1px solid #2a3555;border-radius:6px;z-index:5000;min-width:200px;box-shadow:0 4px 20px #000b;padding:4px 0">
+  <div id="ontology-ctx-menu" style="display:none;position:fixed;background:#1a2035;border:1px solid #2a3555;border-radius:6px;z-index:5000;min-width:220px;box-shadow:0 4px 20px #000b;padding:4px 0">
     <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-children')">Copy children to clipboard</div>
     <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('copy-tree')">Copy ontology tree</div>
+    <div style="height:1px;background:#2a3555;margin:4px 0"></div>
+    <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('add-children')" title="Combines with anything already copied from another ontology group, instead of replacing it">Add children to clipboard</div>
+    <div style="padding:8px 16px;font-size:12px;color:#c8d0e0;cursor:pointer" onmouseenter="this.style.background='#1e3060'" onmouseleave="this.style.background=''" onclick="ontologyCtxAction('add-tree')" title="Combines with anything already copied from another ontology group, instead of replacing it">Add ontology tree to clipboard</div>
   </div>
 
   <!-- ══════════════ Expansion results confirmation ══════════════ -->
@@ -1241,6 +1579,132 @@
         <button onclick="_expandCancel()" style="padding:6px 18px;background:transparent;border:1px solid #3a3f55;border-radius:6px;color:#7a8099;cursor:pointer">Cancel</button>
         <button onclick="_expandCommitNewTab()" style="padding:6px 18px;background:#2e7d52;border:none;border-radius:6px;color:#fff;cursor:pointer;font-weight:600">OK — New Graph</button>
         <button onclick="_expandCommit()" style="padding:6px 18px;background:#4f8ef7;border:none;border-radius:6px;color:#fff;cursor:pointer;font-weight:600">OK — Add to Graph</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ Explore — universal "All relations" configuration ══════════════
+       Opened by every "All relations" / "Expand to all neighbors" entry
+       across the Explore menu (Find relations between Selected and
+       Unselected, Connect Selected Nodes, Expand Selected Nodes, Find Common
+       Neighbors — the other preset items in those submenus, Direct/
+       Biomarker/Indirect/Find regulators/Find targets, are unaffected and
+       still run immediately as before). Node types and
+       relation types are each broken into subsections (Molecular/Anatomical/
+       Organisms/Clinical/Other for nodes; Direct physical/Indirect
+       regulation/Biomarker relations/Ontology/Other for relations), each
+       with its own Select All and its own "+ Add filter" (relation
+       subsections filter by relation property; node subsections filter by
+       node property, loaded from Postgres node+attr — see
+       /api/nodes/property-names-all). A single master checkbox at the top
+       can select/deselect every relation subsection at once. Results feed
+       into the same Connectivity Report dialog "Find drugs upstream" uses. -->
+  <div id="common-neighbors-config-modal" class="modal-backdrop" style="display:none" onclick="closeCommonNeighborsConfigModal(event)">
+    <div class="modal-box" style="min-width:640px;max-width:92vw;max-height:88vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+      <h3 id="cnc-title">Find Common Neighbors</h3>
+      <div id="cnc-error" class="error-msg" style="display:none"></div>
+      <div id="cnc-summary" style="font-size:11px;color:#7a8099;margin-bottom:10px"></div>
+
+      <!-- Shown only for Shortest Path (the other 3 actions don't need a hop
+           limit) — see _cncOpenDialog(), which toggles this row's display. -->
+      <div id="cnc-sp-maxlen-row" style="display:none;align-items:center;gap:8px;margin-bottom:12px">
+        <label style="font-size:12px;color:#a0a8c4;white-space:nowrap">Maximum path length</label>
+        <input type="number" id="cnc-sp-maxlen" min="1" max="15" value="2"
+          style="width:70px;background:#1a1e33;border:1px solid #2a2f4a;color:#c8ccdc;padding:5px 7px;border-radius:4px;font-size:12px">
+      </div>
+
+      <!-- Node types / Relation types as tabs, not one long scrolling page —
+           having both visible as tabs up front is what makes it obvious
+           relation filtering exists at all, not just node filtering. -->
+      <div style="display:flex;gap:2px;border-bottom:1px solid #232840;margin-bottom:12px;flex-shrink:0">
+        <button id="cnc-tab-btn-node" onclick="_cncSwitchTab('node')"
+          style="background:none;border:none;border-bottom:2px solid #4f8ef7;color:#fff;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer">Node Types</button>
+        <button id="cnc-tab-btn-rel" onclick="_cncSwitchTab('rel')"
+          style="background:none;border:none;border-bottom:2px solid transparent;color:#7a8099;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer">Relation Types</button>
+      </div>
+
+      <div style="overflow:auto;flex:1">
+
+        <div id="cnc-tab-node">
+          <div style="display:flex;align-items:center;gap:8px;margin:0 0 10px 0;padding:7px 10px;background:#12162a;border:1px solid #232840;border-radius:6px">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600;font-size:12px;margin:0;white-space:nowrap">
+              <input type="checkbox" id="cnc-master-nodetypes-all" checked onchange="_cncMasterSetAllNodeTypes(this.checked)">Select All Node Types (every subsection below)</label>
+          </div>
+          <div id="cnc-nodetypes-groups" style="margin-bottom:6px"></div>
+        </div>
+
+        <div id="cnc-tab-rel" style="display:none">
+          <div style="display:flex;align-items:center;gap:8px;margin:0 0 10px 0;padding:7px 10px;background:#12162a;border:1px solid #232840;border-radius:6px">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600;font-size:12px;margin:0;white-space:nowrap">
+              <input type="checkbox" id="cnc-master-relations-all" checked onchange="_cncMasterSetAllRelations(this.checked)">Select All Relations (every subsection below)</label>
+          </div>
+          <div id="cnc-reltypes-groups" style="margin-bottom:6px"></div>
+        </div>
+
+      </div>
+      <div class="modal-actions">
+        <button class="btn-ghost" onclick="closeCommonNeighborsConfigModal()">Cancel</button>
+        <button class="btn-primary" id="cnc-ok-btn" onclick="runExploreConfigQuery()">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shared by every RELATION filter row's Property input (via list=) —
+       suggests relation property names already used in this database
+       (Effect, Mechanism, Tissue, CellType, RelationNumberOfReferences,
+       etc.), populated from GET /api/graph/schema when the dialog opens. -->
+  <datalist id="cnc-propkey-datalist"></datalist>
+  <!-- Shared by every NODE filter row's Property input — suggests node
+       property names from Postgres (node+attr tables), DB-wide, populated
+       from GET /api/nodes/property-names-all when the dialog opens. -->
+  <datalist id="cnc-nodepropkey-datalist"></datalist>
+
+  <!-- ══════════════ Connectivity Report ══════════════
+       Reusable across "Find drugs upstream" (>2 selected inputs) and, later,
+       "Find common regulators" / "Find common targets" — one row per grouped
+       entity (drug, regulator, or target depending on which feature opened
+       it), ranked by how many of the input entities it connects to. -->
+  <!-- No backdrop-click-to-close here (deliberately, unlike most other
+       modal-backdrop dialogs): this modal shows the results of a query the
+       user may have waited a long time for (Expand, Find common neighbors,
+       Connect Selected, Find relations between, Find drugs). An accidental
+       click anywhere outside the dialog box used to discard those results
+       instantly with no way to get them back short of re-running the query.
+       It can now only be closed via the × button or the Cancel button below. -->
+  <div id="connectivity-report-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-box" style="min-width:760px;max-width:95vw;max-height:85vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3 id="cr-title" style="margin:0">Connectivity Report</h3>
+        <button onclick="closeConnectivityReportModal()" title="Close" style="background:none;border:none;color:#7a8099;font-size:22px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+      </div>
+      <div id="cr-error" class="error-msg" style="display:none"></div>
+      <div id="cr-summary" style="font-size:11px;color:#7a8099;margin-bottom:2px"></div>
+      <!-- Node-type / relation-type tallies across the whole result set — lets
+           the user see e.g. "mostly Protein/SmallMol, connected mostly via
+           Binding/Regulation" before deciding what to add, rather than only
+           finding that out after sorting through every row. -->
+      <div id="cr-breakdown" style="font-size:11px;color:#7a8099;margin-bottom:6px;display:none"></div>
+      <div style="overflow:auto;border:1px solid #2a2f4a;border-radius:5px;flex:1">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead>
+            <tr style="position:sticky;top:0;background:#1e2235">
+              <th style="padding:6px 8px;width:26px"><input type="checkbox" id="cr-select-all" onclick="_crToggleAllCheckboxes(this)"></th>
+              <th style="padding:6px 8px;width:18px"></th>
+              <th id="cr-col-name" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="_crSort('name')">Drug name</th>
+              <th id="cr-col-nodetype" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="_crSort('nodeType')">Node type</th>
+              <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="_crSort('targetCount')">Number of targets</th>
+              <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="_crSort('referenceCount')"># references</th>
+              <th style="cursor:pointer;padding:6px 8px;text-align:right" onclick="_crSort('snippetCount')">#snippets</th>
+            </tr>
+          </thead>
+          <tbody id="cr-body"></tbody>
+        </table>
+        <div id="cr-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">No results found.</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-ghost" onclick="closeConnectivityReportModal()">Cancel</button>
+        <button class="btn-ghost" onclick="_crCommitNewTab()">Open in another graph</button>
+        <button class="btn-primary" onclick="_crCommit()">Add to current graph</button>
       </div>
     </div>
   </div>
@@ -1298,8 +1762,27 @@
           <button id="rc-nav-prev"  onclick="rcNavRef('prev')"  title="Previous" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">‹</button>
           <button id="rc-nav-next"  onclick="rcNavRef('next')"  title="Next" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">›</button>
           <button id="rc-nav-last"  onclick="rcNavRef('last')"  title="Last" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">»</button>
+          <input type="number" id="rc-ref-jump" min="1" placeholder="#" title="Jump to reference number"
+            style="width:52px;background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 6px;font-size:12px"
+            onkeydown="if(event.key==='Enter'){rcJumpToRef(this.value);}">
+          <button onclick="rcJumpToRef(document.getElementById('rc-ref-jump').value)" title="Jump to reference number" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:12px;cursor:pointer">Go</button>
           <button onclick="rcAddNewRef()" title="New reference" style="background:#0e2040;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;padding:3px 10px;font-size:12px;cursor:pointer">+ New</button>
         </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+        <select id="rc-find-field" title="Identifier to search by" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 6px;font-size:12px">
+          <option value="doi">DOI</option>
+          <option value="pmid">PMID</option>
+          <option value="pii">PII</option>
+          <option value="pui">PUI</option>
+          <option value="embase">EMBASE</option>
+          <option value="nct_id">NCT ID</option>
+        </select>
+        <input type="text" id="rc-find-value" placeholder="value" title="Reference identifier value"
+          style="flex:1;min-width:120px;background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 6px;font-size:12px"
+          onkeydown="if(event.key==='Enter'){rcFindRef();}">
+        <button onclick="rcFindRef()" title="Find reference by identifier" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 10px;font-size:12px;cursor:pointer">Find</button>
+        <span id="rc-find-status" style="font-size:11px;color:#7a8099"></span>
       </div>
       <div id="rc-ref-card" style="min-height:80px"></div>
     </div>
@@ -1361,8 +1844,27 @@
               <button id="rcp-nav-prev"  onclick="rcPairNavRef('prev')"  title="Previous" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">‹</button>
               <button id="rcp-nav-next"  onclick="rcPairNavRef('next')"  title="Next" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">›</button>
               <button id="rcp-nav-last"  onclick="rcPairNavRef('last')"  title="Last" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:13px;cursor:pointer">»</button>
+              <input type="number" id="rcp-ref-jump" min="1" placeholder="#" title="Jump to reference number"
+                style="width:52px;background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 6px;font-size:12px"
+                onkeydown="if(event.key==='Enter'){rcPairJumpToRef(this.value);}">
+              <button onclick="rcPairJumpToRef(document.getElementById('rcp-ref-jump').value)" title="Jump to reference number" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 8px;font-size:12px;cursor:pointer">Go</button>
               <button onclick="rcPairAddNewRef()" title="New reference" style="background:#0e2040;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;padding:3px 10px;font-size:12px;cursor:pointer">+ New</button>
             </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+            <select id="rcp-find-field" title="Identifier to search by" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 6px;font-size:12px">
+              <option value="doi">DOI</option>
+              <option value="pmid">PMID</option>
+              <option value="pii">PII</option>
+              <option value="pui">PUI</option>
+              <option value="embase">EMBASE</option>
+              <option value="nct_id">NCT ID</option>
+            </select>
+            <input type="text" id="rcp-find-value" placeholder="value" title="Reference identifier value"
+              style="flex:1;min-width:120px;background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 6px;font-size:12px"
+              onkeydown="if(event.key==='Enter'){rcPairFindRef();}">
+            <button onclick="rcPairFindRef()" title="Find reference by identifier" style="background:#1a2040;border:1px solid #2a3050;border-radius:4px;color:#c0c4d4;padding:3px 10px;font-size:12px;cursor:pointer">Find</button>
+            <span id="rcp-find-status" style="font-size:11px;color:#7a8099"></span>
           </div>
           <div id="rcp-ref-card" style="min-height:80px"></div>
         </div>
