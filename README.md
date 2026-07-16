@@ -17,7 +17,10 @@ graph-explorer/
   requirements_agent.txt          Python dependencies for the agent service
   cypher_examples.json            Curated few-shot Cypher examples the agent learns this graph's conventions from
   agentic_ai_block.js             Standalone/legacy agent UI fragment (see note below)
-  rnef_to_json.py                 RNEF → JSON converter (invoked by server.js)
+  rnef_to_json.py                 RNEF → JSON converter for a single pathway (invoked by server.js per-file)
+  rnef_index.py                   Walks an entire pathway collection directory once, building the lightweight
+                                   index that powers Pathway Collection Browse/Search/Statistics/Anatomy Index
+                                   and Pathway Alias resolution (invoked by server.js, separate from rnef_to_json.py)
   package.json                    Node dependency list
   settings.example.json           Template for settings.json (copy and fill in your own credentials)
   settings.json                   Real DB/LLM credentials — created locally, never committed
@@ -27,8 +30,10 @@ graph-explorer/
                                    key) is per-installation state and never committed
   public/
     index.html                    App HTML, dialogs, and menus
-    app.js                        All frontend logic (~12 700 lines)
+    app.js                        All frontend logic
     app.css                       Styles
+    vendor/                       Bundled third-party JS libraries (Cytoscape.js + its dagre/klay layout
+                                   extensions, D3 + d3-sankey, ExcelJS, JSZip) — loaded locally, not from a CDN
   Graph_Explorer_User_Manual.docx End-user guide
   Graph_Explorer_FRD.docx         Functional requirements document
 ```
@@ -118,10 +123,12 @@ Open **http://localhost:3000** in your browser. Stop the server with **Ctrl+C**.
 | **Sankey diagram** | Hub-and-spoke flow view aggregating edges by entity label × relation type × effect sign; own Cypher editor with autocomplete/lint, SVG export, round-trip back into Graph view |
 | **Ontology Analysis** | Standalone tree viewer rooted at `SemanticConcept` nodes, Hierarchical/Orthogonal layout, per-term entity counts in the current graph, "hide empty branches" toggle, copy-to-clipboard |
 | **Cypher History** | Searchable/sortable log of every query run, with date-range filters and "reopen in..." |
-| **Shortest Path** | Dialog to find shortest paths (1–15 hops) between up to 10 selected nodes over a chosen set of relation types |
-| **Import/Export** | RNEF pathway import (single or multi-pathway), JSON subgraph save/load, Excel/CSV export (with automatic file-splitting for very large result sets), Sankey SVG export |
-| **Curation** | Create/Edit Relation dialogs (general multi-node, and a streamlined 2-node pair dialog), reference management, live RelationID preview — restricted to the `user` role, not `admin` |
-| **Batch operations** | Find/connect relations between selected and unselected nodes (All / Direct physical / Biomarker / Indirect), expand-selected-nodes workflows, merge duplicate/similar relations |
+| **Explore menu** | Find relations between Selected/Unselected, Connect Selected Nodes, Expand Selected Nodes, Find Common Neighbors, and Shortest Path all share one configuration dialog — per-node-type and per-relation-type checkboxes (grouped into subsections), plus arbitrary "+ Add filter" node/relation property filters; your last-used type selections and filters are remembered per subsection across sessions. Menu items that need 2+ selected nodes dim automatically when fewer are selected |
+| **Connectivity Report** | Shared results dialog for the batch/Explore actions above and Find Drugs — sortable by name, node type, target count, reference/snippet count; select rows (including shift-click ranges) to add to the current graph or a new tab; only closes via its own × or Cancel, never an accidental outside click |
+| **RNEF pathway import** | Single- or multi-pathway `.rnef`/`.xml` files, saved node positions honored, custom node shapes/colors/gradients from Pathway Studio's own `style_ref` reproduced faithfully (not just the default shape palette) for the handful of node types that use them |
+| **Pathway Collection** | Point the app at a curated pathway directory (⚙ Settings → Pathway Collection) and it builds a searchable index: **Browse** (folder tree with recursive pathway counts, including **Pathway Alias** entries — lightweight references to a pathway that lives in a different folder, shown with a 🔗 icon, opening the real pathway on click), **Text/Entity/Combined Search**, **Alphabetical Index**, **Anatomy Index**, and collection-wide **Statistics** |
+| **Import/Export** | JSON subgraph save/load, **Save / Save As** for a pathway back into your collection (as a full copy, or as a Pathway Alias pointing at the currently open pathway), Excel/CSV export (with automatic file-splitting for very large result sets), Sankey SVG export |
+| **Curation** | Create/Edit Relation dialogs (general multi-node, and a streamlined 2-node pair dialog) — reference management with jump-to-reference-number, Find-by-identifier (DOI/PMID/etc.) with Find-Next cycling through repeat matches, live RelationID preview — restricted to the `user` role, not `admin` |
 | **Admin tools** | User management, shared DB endpoint configuration, read-only ad-hoc SQL runner (`SELECT`/`WITH` only) |
 
 ### AI Agent
