@@ -30,6 +30,11 @@ __pycache__/
 *.pyc
 cypher_history.tsv
 
+# Per-user Pathway Collection Search indexes — derived/rebuildable from each
+# user's own local directory (via Settings → Pathway Collection → Index),
+# and can be large for a real-world collection; not application source.
+pathway_indexes/
+
 # Large test/output data — not application source, and pushes involving these
 # have hit HTTP 408 timeouts (125+ MiB) over slow/proxied connections.
 TestData/
