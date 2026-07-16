@@ -1638,16 +1638,17 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
   }
 
-  const lower = String(sourceFile).toLowerCase();
-  // Same local re-check immediately before sourceFile reaches
-  // fs.readFileSync/execFile as the other pathway save/annotation endpoints
-  // now all have — see the comment on save-graph's own re-check.
-  if (!_isPathInsideDir(sourceFile, dir)) {
+  // Resolved once, re-validated right here, and used (as resolvedSourceFile)
+  // in every fs.readFileSync/execFile call below — same reasoning as the
+  // other pathway endpoints' own resolvedSourceFile.
+  const resolvedSourceFile = path.resolve(sourceFile);
+  if (!_isPathInsideDir(resolvedSourceFile, dir)) {
     return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
   }
+  const lower = resolvedSourceFile.toLowerCase();
   try {
     if (lower.endsWith('.graph.json')) {
-      const data = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+      const data = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
       return res.json({ name: data.name || pathwayName || '', data });
     }
 
@@ -1658,7 +1659,7 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
     fs.mkdirSync(outDir);
     try {
       await new Promise((resolve, reject) => {
-        execFile(PYTHON_CMD, [RNEF_SCRIPT, sourceFile, outDir],
+        execFile(PYTHON_CMD, [RNEF_SCRIPT, resolvedSourceFile, outDir],
           { timeout: 600000 },
           (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
         );
@@ -1802,11 +1803,13 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
   }
 
   const isAlreadyJson = String(sourceFile).toLowerCase().endsWith('.graph.json');
-  // Same local re-validation as save-graph/save-graph-as, immediately before
-  // sourceFile reaches fs.readFileSync/execFile below — see the comment on
-  // save-graph's own re-check for why this is repeated here rather than
-  // relying solely on the containment check above.
-  if (!_isPathInsideDir(sourceFile, dir)) {
+  // Resolved once, re-validated right here, and used (as resolvedSourceFile,
+  // not the original sourceFile) in every fs.readFileSync/execFile call
+  // below — CodeQL's path-injection query wants the exact value reaching
+  // each sink to be the one just checked, not a same-named variable that
+  // was merely guarded by an early return further up the function.
+  const resolvedSourceFile = path.resolve(sourceFile);
+  if (!_isPathInsideDir(resolvedSourceFile, dir)) {
     return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
   }
   try {
@@ -1814,15 +1817,15 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
     let outPath;
 
     if (isAlreadyJson) {
-      pathwayData = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
-      outPath = sourceFile;
+      pathwayData = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
+      outPath = resolvedSourceFile;
     } else {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwannot-'));
       const outDir = path.join(tmpDir, 'out');
       fs.mkdirSync(outDir);
       try {
         await new Promise((resolve, reject) => {
-          execFile(PYTHON_CMD, [RNEF_SCRIPT, sourceFile, outDir],
+          execFile(PYTHON_CMD, [RNEF_SCRIPT, resolvedSourceFile, outDir],
             { timeout: 600000 },
             (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
           );
@@ -1839,7 +1842,10 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
       } finally {
         try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
       }
-      outPath = path.join(path.dirname(sourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
+      outPath = path.resolve(path.dirname(resolvedSourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
+    }
+    if (!_isPathInsideDir(outPath, dir)) {
+      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
     }
 
     pathwayData.properties = cleanProps;
@@ -1913,27 +1919,30 @@ app.post('/api/pathways/save-graph', dbLimiter, authMiddleware, (req, res) => {
     // resnetType, mirroring the annotation endpoint) when overwriting an
     // existing .graph.json — irrelevant for the create-new-file branch since
     // there's nothing yet to preserve.
-    // Re-validated locally (not just relying on the containment check earlier
-    // in this handler) immediately before sourceFile reaches fs.readFileSync/
-    // the outPath overwrite target below — same CodeQL "Uncontrolled data used
-    // in path expression" class as alert #142 (save-graph-as), and CodeQL's
-    // dataflow analysis apparently doesn't credit a containment check that
-    // happened several lines earlier in the same function as sanitizing a
-    // later use of the same variable, so every sink gets its own tight,
-    // local guard rather than relying on one shared check up top.
-    if (!_isPathInsideDir(sourceFile, dir)) {
+    //
+    // Both the read below and the final outPath used for the write are each
+    // resolved (path.resolve, not path.join) and re-validated right where
+    // they're computed, with the SINK using that same resolved variable —
+    // not just an early-return guard on the original sourceFile several
+    // lines up. CodeQL's path-injection query wants the exact value flowing
+    // into fs.readFileSync/fs.writeFileSync to be the one just checked.
+    const resolvedSourceFile = path.resolve(sourceFile);
+    if (!_isPathInsideDir(resolvedSourceFile, dir)) {
       return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
     }
     let resnetType = 'Pathway';
     let outPath;
     if (isAlreadyJson) {
       try {
-        const existing = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+        const existing = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
         if (existing && existing.resnetType) resnetType = existing.resnetType;
       } catch (e) { /* unreadable/corrupt existing file — fall through and overwrite anyway */ }
-      outPath = sourceFile;
+      outPath = resolvedSourceFile;
     } else {
-      outPath = path.join(path.dirname(sourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
+      outPath = path.resolve(path.dirname(resolvedSourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
+    }
+    if (!_isPathInsideDir(outPath, dir)) {
+      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
     }
 
     const pathwayData = {
@@ -2000,28 +2009,34 @@ app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) =>
       return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
     }
 
-    const outPath = path.join(targetDir, _pwSafeFilename(pathwayName) + '.graph.json');
+    // CodeQL (alert #142 and its siblings) wants the FINAL path actually
+    // passed to fs.*  re-resolved and re-validated right here, using the SAME
+    // resolved variable in every call below — checking an upstream variable
+    // (sourceFile/targetDir) earlier in the function, even via a dominating
+    // early-return guard, wasn't being credited as sanitizing this specific
+    // outPath value. path.resolve() (not path.join()) is used deliberately —
+    // it's the normalization CodeQL's own suggested fix for this alert uses.
+    const outPath = path.resolve(targetDir, _pwSafeFilename(pathwayName) + '.graph.json');
+    if (!_isPathInsideDir(outPath, dir)) {
+      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
+    }
     if (fs.existsSync(outPath)) {
       return res.status(409).json({ error: `A pathway named "${pathwayName}" already exists in that folder — choose a different name or folder.` });
     }
 
-    // CodeQL alert #142 ("Uncontrolled data used in path expression"): this
-    // peek at the ORIGINAL file's resnetType previously called
-    // fs.readFileSync(sourceFile, ...) with no containment check anywhere in
-    // this function gating that specific call — unlike /api/pathways/save-graph
-    // and /api/pathways/annotation, which both validate sourceFile via
-    // _isPathInsideDir() before ever reading it. The one _isPathInsideDir(sourceFile, dir)
-    // check that DID already exist further up (deciding targetDir) only runs
-    // when `subfolder` is omitted, and even then only gates targetDir, not
-    // this read — so a request with an explicit subfolder (the common case
-    // from the Save As dialog) could pass an arbitrary absolute sourceFile
-    // path straight into fs.readFileSync() with no validation at all.
+    // Same treatment for the read-only peek at the ORIGINAL file's
+    // resnetType: resolve sourceFile once, validate THAT resolved variable,
+    // and read from it — rather than validating sourceFile and then reading
+    // the original (unresolved) reference.
     let resnetType = 'Pathway';
-    if (sourceFile && _isPathInsideDir(sourceFile, dir) && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
-      try {
-        const existing = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
-        if (existing && existing.resnetType) resnetType = existing.resnetType;
-      } catch (e) { /* ignore — keep default */ }
+    if (sourceFile && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
+      const resolvedSourceFile = path.resolve(sourceFile);
+      if (_isPathInsideDir(resolvedSourceFile, dir)) {
+        try {
+          const existing = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
+          if (existing && existing.resnetType) resnetType = existing.resnetType;
+        } catch (e) { /* ignore — keep default */ }
+      }
     }
 
     const pathwayData = {
@@ -2090,7 +2105,12 @@ app.post('/api/pathways/save-alias-as', dbLimiter, authMiddleware, (req, res) =>
       return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
     }
 
-    const outPath = path.join(targetDir, _pwSafeFilename(name) + '.alias.json');
+    // Same resolve-then-check-the-resolved-variable pattern as the other
+    // three pathway save endpoints (see save-graph-as' own comment).
+    const outPath = path.resolve(targetDir, _pwSafeFilename(name) + '.alias.json');
+    if (!_isPathInsideDir(outPath, dir)) {
+      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
+    }
     if (fs.existsSync(outPath)) {
       return res.status(409).json({ error: `A pathway or alias named "${name}" already exists in that folder — choose a different name or folder.` });
     }
