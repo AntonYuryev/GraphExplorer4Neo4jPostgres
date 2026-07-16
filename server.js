@@ -1638,17 +1638,29 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
   }
 
-  // Resolved once, re-validated right here, and used (as resolvedSourceFile)
-  // in every fs.readFileSync/execFile call below — same reasoning as the
-  // other pathway endpoints' own resolvedSourceFile.
-  const resolvedSourceFile = path.resolve(sourceFile);
-  if (!_isPathInsideDir(resolvedSourceFile, dir)) {
-    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  // CodeQL-idiomatic sanitizer (matches the pattern applied to save-graph-as'
+  // own resnetType read): canonicalize both the configured root and the
+  // candidate file via fs.realpathSync (resolves symlinks, and throws for a
+  // nonexistent path -- caught below), then verify containment against the
+  // canonical root. This inline sequence is repeated at every sink rather
+  // than factored into a shared helper, since CodeQL's dataflow analysis
+  // did not credit sanitization performed inside a called function.
+  let canonicalSourceFile;
+  try {
+    const safeRoot = fs.realpathSync(dir);
+    const candidateSourceFile = path.resolve(safeRoot, String(sourceFile));
+    canonicalSourceFile = fs.realpathSync(candidateSourceFile);
+    if (!_isPathInsideDir(canonicalSourceFile, safeRoot)) {
+      return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+    }
+  } catch (e) {
+    return res.status(400).json({ error: 'sourceFile could not be resolved' });
   }
-  const lower = resolvedSourceFile.toLowerCase();
+
+  const lower = canonicalSourceFile.toLowerCase();
   try {
     if (lower.endsWith('.graph.json')) {
-      const data = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
+      const data = JSON.parse(fs.readFileSync(canonicalSourceFile, 'utf8'));
       return res.json({ name: data.name || pathwayName || '', data });
     }
 
@@ -1659,7 +1671,7 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
     fs.mkdirSync(outDir);
     try {
       await new Promise((resolve, reject) => {
-        execFile(PYTHON_CMD, [RNEF_SCRIPT, resolvedSourceFile, outDir],
+        execFile(PYTHON_CMD, [RNEF_SCRIPT, canonicalSourceFile, outDir],
           { timeout: 600000 },
           (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
         );
@@ -1802,30 +1814,37 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
     if (key) cleanProps[key] = String(v);
   }
 
-  const isAlreadyJson = String(sourceFile).toLowerCase().endsWith('.graph.json');
-  // Resolved once, re-validated right here, and used (as resolvedSourceFile,
-  // not the original sourceFile) in every fs.readFileSync/execFile call
-  // below — CodeQL's path-injection query wants the exact value reaching
-  // each sink to be the one just checked, not a same-named variable that
-  // was merely guarded by an early return further up the function.
-  const resolvedSourceFile = path.resolve(sourceFile);
-  if (!_isPathInsideDir(resolvedSourceFile, dir)) {
-    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  // CodeQL-idiomatic sanitizer, matching save-graph-as' own resnetType read:
+  // canonicalize both the configured root and the candidate file via
+  // fs.realpathSync (resolves symlinks; throws for a nonexistent path,
+  // caught below), then verify containment against the canonical root.
+  let canonicalSourceFile, safeRoot;
+  try {
+    safeRoot = fs.realpathSync(dir);
+    const candidateSourceFile = path.resolve(safeRoot, String(sourceFile));
+    canonicalSourceFile = fs.realpathSync(candidateSourceFile);
+    if (!_isPathInsideDir(canonicalSourceFile, safeRoot)) {
+      return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+    }
+  } catch (e) {
+    return res.status(400).json({ error: 'sourceFile could not be resolved' });
   }
+
+  const isAlreadyJson = canonicalSourceFile.toLowerCase().endsWith('.graph.json');
   try {
     let pathwayData;  // full rnef_to_json.py-shaped object for this ONE pathway
     let outPath;
 
     if (isAlreadyJson) {
-      pathwayData = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
-      outPath = resolvedSourceFile;
+      pathwayData = JSON.parse(fs.readFileSync(canonicalSourceFile, 'utf8'));
+      outPath = canonicalSourceFile;
     } else {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwannot-'));
       const outDir = path.join(tmpDir, 'out');
       fs.mkdirSync(outDir);
       try {
         await new Promise((resolve, reject) => {
-          execFile(PYTHON_CMD, [RNEF_SCRIPT, resolvedSourceFile, outDir],
+          execFile(PYTHON_CMD, [RNEF_SCRIPT, canonicalSourceFile, outDir],
             { timeout: 600000 },
             (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
           );
@@ -1842,10 +1861,18 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
       } finally {
         try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
       }
-      outPath = path.resolve(path.dirname(resolvedSourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
-    }
-    if (!_isPathInsideDir(outPath, dir)) {
-      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
+      // outPath is a brand-new file that doesn't exist yet, so it can't be
+      // fs.realpathSync'd directly -- instead its PARENT directory (which
+      // does exist, being the same directory the original sourceFile lives
+      // in) is canonicalized and containment-checked, and the filename
+      // component is joined on afterwards. _pwSafeFilename() strips every
+      // path separator and traversal character, so a sanitized filename
+      // joined onto an already-verified-canonical parent cannot escape it.
+      const canonicalParent = fs.realpathSync(path.dirname(canonicalSourceFile));
+      if (!_isPathInsideDir(canonicalParent, safeRoot)) {
+        return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
+      }
+      outPath = path.join(canonicalParent, _pwSafeFilename(pathwayName) + '.graph.json');
     }
 
     pathwayData.properties = cleanProps;
@@ -1911,38 +1938,51 @@ app.post('/api/pathways/save-graph', dbLimiter, authMiddleware, (req, res) => {
     return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
   }
 
+  // CodeQL-idiomatic sanitizer, matching save-graph-as' own resnetType read:
+  // canonicalize both the configured root and the candidate file via
+  // fs.realpathSync (resolves symlinks; throws for a nonexistent path,
+  // caught below), then verify containment against the canonical root.
+  let canonicalSourceFile, safeRoot;
+  try {
+    safeRoot = fs.realpathSync(dir);
+    const candidateSourceFile = path.resolve(safeRoot, String(sourceFile));
+    canonicalSourceFile = fs.realpathSync(candidateSourceFile);
+    if (!_isPathInsideDir(canonicalSourceFile, safeRoot)) {
+      return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+    }
+  } catch (e) {
+    return res.status(400).json({ error: 'sourceFile could not be resolved' });
+  }
+
   const { graphData: cleanGraph, properties: cleanProps } = _pwSanitizeGraphSavePayload(graphData, properties);
-  const isAlreadyJson = String(sourceFile).toLowerCase().endsWith('.graph.json');
+  const isAlreadyJson = canonicalSourceFile.toLowerCase().endsWith('.graph.json');
 
   try {
     // Preserve whatever fields we don't manage here (currently just
     // resnetType, mirroring the annotation endpoint) when overwriting an
     // existing .graph.json — irrelevant for the create-new-file branch since
     // there's nothing yet to preserve.
-    //
-    // Both the read below and the final outPath used for the write are each
-    // resolved (path.resolve, not path.join) and re-validated right where
-    // they're computed, with the SINK using that same resolved variable —
-    // not just an early-return guard on the original sourceFile several
-    // lines up. CodeQL's path-injection query wants the exact value flowing
-    // into fs.readFileSync/fs.writeFileSync to be the one just checked.
-    const resolvedSourceFile = path.resolve(sourceFile);
-    if (!_isPathInsideDir(resolvedSourceFile, dir)) {
-      return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
-    }
     let resnetType = 'Pathway';
     let outPath;
     if (isAlreadyJson) {
       try {
-        const existing = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
+        const existing = JSON.parse(fs.readFileSync(canonicalSourceFile, 'utf8'));
         if (existing && existing.resnetType) resnetType = existing.resnetType;
       } catch (e) { /* unreadable/corrupt existing file — fall through and overwrite anyway */ }
-      outPath = resolvedSourceFile;
+      outPath = canonicalSourceFile;
     } else {
-      outPath = path.resolve(path.dirname(resolvedSourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
-    }
-    if (!_isPathInsideDir(outPath, dir)) {
-      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
+      // outPath is a brand-new file that doesn't exist yet, so it can't be
+      // fs.realpathSync'd directly -- instead its PARENT directory (which
+      // does exist, being the same directory the original sourceFile lives
+      // in) is canonicalized and containment-checked, and the filename
+      // component is joined on afterwards. _pwSafeFilename() strips every
+      // path separator and traversal character, so a sanitized filename
+      // joined onto an already-verified-canonical parent cannot escape it.
+      const canonicalParent = fs.realpathSync(path.dirname(canonicalSourceFile));
+      if (!_isPathInsideDir(canonicalParent, safeRoot)) {
+        return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
+      }
+      outPath = path.join(canonicalParent, _pwSafeFilename(pathwayName) + '.graph.json');
     }
 
     const pathwayData = {
@@ -2005,38 +2045,44 @@ app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) =>
       targetDir = dir;
     }
     fs.mkdirSync(targetDir, { recursive: true });
-    if (!_isPathInsideDir(targetDir, dir)) {
-      return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
+
+    // CodeQL-idiomatic sanitizer: canonicalize both the configured root and
+    // the just-created target directory via fs.realpathSync, then verify
+    // containment against the canonical root. targetDir is guaranteed to
+    // exist at this point (mkdirSync just created it), so this is safe to
+    // do unconditionally, unlike a not-yet-existent file path.
+    let canonicalTargetDir, safeRoot;
+    try {
+      safeRoot = fs.realpathSync(dir);
+      canonicalTargetDir = fs.realpathSync(targetDir);
+      if (!_isPathInsideDir(canonicalTargetDir, safeRoot)) {
+        return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
+      }
+    } catch (e) {
+      return res.status(400).json({ error: 'Target folder could not be resolved' });
     }
 
-    // CodeQL (alert #142 and its siblings) wants the FINAL path actually
-    // passed to fs.*  re-resolved and re-validated right here, using the SAME
-    // resolved variable in every call below — checking an upstream variable
-    // (sourceFile/targetDir) earlier in the function, even via a dominating
-    // early-return guard, wasn't being credited as sanitizing this specific
-    // outPath value. path.resolve() (not path.join()) is used deliberately —
-    // it's the normalization CodeQL's own suggested fix for this alert uses.
-    const outPath = path.resolve(targetDir, _pwSafeFilename(pathwayName) + '.graph.json');
-    if (!_isPathInsideDir(outPath, dir)) {
-      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
-    }
+    // outPath itself is a brand-new file that doesn't exist yet, so it can't
+    // be fs.realpathSync'd directly -- it's built by joining the sanitized
+    // filename (no path separators or traversal characters possible, per
+    // _pwSafeFilename) onto the already-verified-canonical target directory.
+    const outPath = path.join(canonicalTargetDir, _pwSafeFilename(pathwayName) + '.graph.json');
     if (fs.existsSync(outPath)) {
       return res.status(409).json({ error: `A pathway named "${pathwayName}" already exists in that folder — choose a different name or folder.` });
     }
 
-    // Same treatment for the read-only peek at the ORIGINAL file's
-    // resnetType: resolve sourceFile once, validate THAT resolved variable,
-    // and read from it — rather than validating sourceFile and then reading
-    // the original (unresolved) reference.
     let resnetType = 'Pathway';
     if (sourceFile && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
-      const resolvedSourceFile = path.resolve(sourceFile);
-      if (_isPathInsideDir(resolvedSourceFile, dir)) {
-        try {
-          const existing = JSON.parse(fs.readFileSync(resolvedSourceFile, 'utf8'));
-          if (existing && existing.resnetType) resnetType = existing.resnetType;
-        } catch (e) { /* ignore — keep default */ }
-      }
+      try {
+        const candidateSourceFile = path.resolve(safeRoot, String(sourceFile));
+        const canonicalSourceFile = fs.realpathSync(candidateSourceFile);
+        if (_isPathInsideDir(canonicalSourceFile, safeRoot)) {
+          try {
+            const existing = JSON.parse(fs.readFileSync(canonicalSourceFile, 'utf8'));
+            if (existing && existing.resnetType) resnetType = existing.resnetType;
+          } catch (e) { /* ignore — keep default */ }
+        }
+      } catch (e) { /* ignore invalid/nonexistent source file — keep default */ }
     }
 
     const pathwayData = {
@@ -2101,16 +2147,28 @@ app.post('/api/pathways/save-alias-as', dbLimiter, authMiddleware, (req, res) =>
       : '';
     const targetDir = cleanSub ? path.join(dir, cleanSub) : dir;
     fs.mkdirSync(targetDir, { recursive: true });
-    if (!_isPathInsideDir(targetDir, dir)) {
-      return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
+
+    // CodeQL-idiomatic sanitizer: canonicalize both the configured root and
+    // the just-created target directory via fs.realpathSync, then verify
+    // containment against the canonical root. targetDir is guaranteed to
+    // exist at this point (mkdirSync just created it), so this is safe to
+    // do unconditionally, unlike a not-yet-existent file path.
+    let canonicalTargetDir, safeRoot;
+    try {
+      safeRoot = fs.realpathSync(dir);
+      canonicalTargetDir = fs.realpathSync(targetDir);
+      if (!_isPathInsideDir(canonicalTargetDir, safeRoot)) {
+        return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
+      }
+    } catch (e) {
+      return res.status(400).json({ error: 'Target folder could not be resolved' });
     }
 
-    // Same resolve-then-check-the-resolved-variable pattern as the other
-    // three pathway save endpoints (see save-graph-as' own comment).
-    const outPath = path.resolve(targetDir, _pwSafeFilename(name) + '.alias.json');
-    if (!_isPathInsideDir(outPath, dir)) {
-      return res.status(400).json({ error: 'Output file path is not inside your configured pathway collection directory' });
-    }
+    // outPath itself is a brand-new file that doesn't exist yet, so it can't
+    // be fs.realpathSync'd directly -- it's built by joining the sanitized
+    // filename (no path separators or traversal characters possible, per
+    // _pwSafeFilename) onto the already-verified-canonical target directory.
+    const outPath = path.join(canonicalTargetDir, _pwSafeFilename(name) + '.alias.json');
     if (fs.existsSync(outPath)) {
       return res.status(409).json({ error: `A pathway or alias named "${name}" already exists in that folder — choose a different name or folder.` });
     }
