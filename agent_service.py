@@ -1319,6 +1319,38 @@ def _current_graph_prompt_section(current_graph: Optional[Dict[str, Any]]) -> st
                 f"Nodes currently displayed (name (label)): {node_listing}\n"
                 f"Edges currently displayed (source -[type, Effect]-> target (RelationID)): {edge_listing}")
 
+    # SELECTION — a subset of what's displayed above (possibly empty, possibly
+    # everything). This is a separate concept from "displayed": the user can
+    # click/box-select specific nodes and edges in the graph viewer, and a
+    # request phrased as "the selected node(s)", "what I selected/highlighted/
+    # picked", etc. refers to THIS list, not the full displayed graph above.
+    sel_node_count = current_graph.get("selectedNodeCount", 0)
+    sel_edge_count = current_graph.get("selectedEdgeCount", 0)
+    sel_nodes      = current_graph.get("selectedNodes") or []
+    sel_edges      = current_graph.get("selectedEdges") or []
+
+    if sel_node_count == 0 and sel_edge_count == 0:
+        selection_body = "Nothing is currently selected in the graph viewer."
+    else:
+        sel_lines = []
+        if sel_node_count:
+            sel_node_listing = ", ".join(f"{n.get('name','?')} ({n.get('label','?')})" for n in sel_nodes if n.get("name"))
+            if sel_node_count > len(sel_nodes):
+                sel_node_listing += f", … and {sel_node_count - len(sel_nodes)} more"
+            sel_lines.append(f"{sel_node_count} node(s) selected: {sel_node_listing}")
+        if sel_edge_count:
+            sel_edge_listing = "; ".join(
+                f"{e.get('source','?')} -[{e.get('type','?')}]-> {e.get('target','?')}"
+                + (f" (RelationID {e.get('relationId')})" if e.get("relationId") else "")
+                for e in sel_edges
+            )
+            if sel_edge_count > len(sel_edges):
+                sel_edge_listing += f"; … and {sel_edge_count - len(sel_edges)} more"
+            sel_lines.append(f"{sel_edge_count} edge(s) selected: {sel_edge_listing}")
+        selection_body = " ".join(sel_lines)
+
+    body += f"\n\nCurrently SELECTED in the graph viewer: {selection_body}"
+
     return (
         "\n\n## Current Graph View State — GROUND TRUTH, do not guess\n"
         f"{body}\n"
@@ -1346,7 +1378,14 @@ def _current_graph_prompt_section(current_graph: Optional[Dict[str, Any]]) -> st
         "the cached sentence(s) don't give you a clear answer (e.g. for inferring Effect), that means "
         "check the REST of that RelationID's sentences from PostgreSQL, it does NOT mean the answer is "
         "'unknown'. Only skip PostgreSQL entirely for an edge when the cached text ALREADY gives you a "
-        "clear, usable answer."
+        "clear, usable answer. "
+        "The 'Currently SELECTED' line is a SEPARATE, usually smaller subset of the displayed nodes/"
+        "edges above — the user has actually clicked or box-selected these specific elements in the "
+        "graph viewer. Whenever the user refers to \"the selected node(s)/entities\", \"what I selected/"
+        "highlighted/picked\", or asks you to list or analyze a selection, answer directly from THIS "
+        "line (never say you have no way to know what's selected — you do, right here) and scope any "
+        "follow-up query or analysis to exactly those names/RelationIDs rather than the full displayed "
+        "graph. If it says nothing is selected, tell the user that plainly instead of guessing."
     )
 
 def _system_prompt(user_message: str = "", current_graph: Optional[Dict[str, Any]] = None) -> str:
@@ -1911,6 +1950,26 @@ These rules apply to **every** Cypher query you write. Violating them returns em
    unchanged graph. Whenever building a follow-up query about node(s) a prior query in this same task \
    already identified, copy that prior query's label constraint for that specific role character-for- \
    character rather than reconstructing it.
+20. **When ranking/reporting "top N [type] linked to [entity]" results, the DEFAULT ranking criterion \
+   is `sum(coalesce(r.RelationNumberOfReferences, 0))` (literature support), NOT `count(r)` or a \
+   `COUNT{{}}` connectivity subquery.** Only rank by raw connection/relation count instead when the \
+   user explicitly asks to rank "by number of connections", "by connectivity", or similar — e.g. a \
+   genuinely different question like "which cell types connect to the most OTHER nodes in my current \
+   graph" (ranking by how many distinct entities each candidate touches, per rule 9's `COUNT{{}}` \
+   pattern) is a different question from "top 10 cell types linked to blood flow" (ranking by how well- \
+   supported each specific candidate's connection is). A real production bug happened from conflating \
+   these: asked for "top 10 cell types linked to blood flow", the agent wrote `WITH ct, COUNT(r) AS \
+   connectionCount ... ORDER BY connectionCount DESC` — but when expanding outward from a SINGLE seed \
+   node, `COUNT(r)` per candidate is structurally near-meaningless as a ranking signal (it's usually 1, \
+   or a small count reflecting how many separate relation records happen to exist between that one pair, \
+   not how well-established or important the connection is) — the agent had likely over-generalized rule \
+   9's connectivity-counting pattern (meant for measuring a node's OWN total degree across the whole \
+   graph) into a ranking criterion for a completely different single-seed-expansion question. The \
+   correct default: `WITH ct, sum(coalesce(r.RelationNumberOfReferences, 0)) AS totalReferences ORDER BY \
+   totalReferences DESC` — ranking by how much literature actually supports each candidate's link to the \
+   seed entity, which is a meaningful signal regardless of how many seeds are involved. This applies to \
+   any "top N / most-linked / highest-ranked [type]" question that doesn't explicitly ask for a \
+   connectivity/connection-count ranking instead.
 
 ## How to query Neo4j (after concept resolution)
 ```json
@@ -2260,6 +2319,23 @@ viewer happens to draw. "Visualize X" on a brand-new question is still: run the 
 report the count, THEN render — the only shortcut this section grants is for re-opening/re-exporting a \
 query that's already been through that check.
 
+**CRITICAL — never write out `[Cypher executed/rendered this turn — reuse this EXACT text verbatim...]` \
+(or anything resembling it) yourself, in your own reply text.** You will see this exact bracketed \
+pattern appear inside EARLIER turns in this conversation's visible history — that text is inserted \
+automatically by the app itself, purely so you have the real prior query available to copy per the rule \
+above. It is never something you write. A real production bug happened from getting this wrong: asked \
+an analytical counting/ranking question, the agent wrote a plausible-sounding narrative answer with \
+specific numbers (a ranked list of "top 5" results) and then appended this exact bracketed pattern \
+itself, containing a query it never actually ran — no `cypher` action was emitted that turn at all. This \
+is worse than a formatting mistake: it means the reported numbers were never verified against the real \
+database, and the user had no clickable/reusable query box (since none of the app's own machinery ever \
+ran or tracked it) — just confusing plain text they had to manually select and copy. If you find \
+yourself about to describe running a query and state specific counts/rankings/numbers, check that you \
+have ACTUALLY emitted a `cypher` action this turn (or are correctly reusing an already-verified one per \
+the rule above) — never narrate a query and its results in plain prose as a substitute for actually \
+running one. Every specific number you report must trace back to a real tool result, not to text you \
+composed that merely looks like one.
+
 **CRITICAL — "recount", "count again", "verify the count", "how many again", "double check" ALWAYS \
 force a fresh `cypher` action this turn, even for a query the verbatim-reuse rule above would otherwise \
 let you skip straight to `render` with.** The verbatim-reuse rule is about not mangling the QUERY TEXT \
@@ -2457,6 +2533,56 @@ silently overwriting the correct name of a pathway the user had loaded from file
 use `tool: "graph"` or any export tool for a plain "save this graph" request either — those run a NEW \
 query and would not necessarily reproduce the exact current view (including manual node positions/ \
 layout), which is the whole point of Save subgraph.
+
+**Change the layout of the CURRENT graph** — MANDATORY for any request that is ONLY about \
+rearranging the graph already on screen, with no new data involved: "perform hierarchical layout on \
+the current graph", "switch to a circular layout", "rearrange this", "use dagre layout here":
+```json
+{{"action": "render", "tool": "relayout", "layout": "dagre", "description": "..."}}
+```
+Like `save_subgraph`, this is a render tool that takes NO `cypher` field — it applies the named layout \
+directly to whatever nodes/edges are ALREADY displayed, with no query involved at all, since a pure \
+layout change never touches the database. **Never construct, reconstruct, or reuse ANY Cypher query \
+for a request like this — there is nothing to query.** A real production bug happened from getting \
+this wrong: asked to "perform hierarchical layout on the current graph," the agent fabricated an \
+entirely unrelated, invalid query (matching relations against a hardcoded list of RelationID values \
+that had no clear origin) instead of recognizing this as a pure visual rearrangement of data already on \
+screen — the fabricated query was not just unnecessary but actively wrong, and still didn't produce the \
+requested layout. If the Current Graph View State section shows the graph is empty, say there's nothing \
+to lay out instead of emitting this action. Layout name must be one of `cose`, `dagre`, `circle`, \
+`concentric`, `grid`, `klay` — `dagre` is this app's hierarchical/tree/top-down layout (see the layout \
+name list under the Graph view render tool below); there is no separate "hierarchical" value, same as \
+elsewhere in this prompt.
+
+**Ontology analysis for a list of nodes** — MANDATORY for any request to "perform ontology analysis", \
+"find ontological relationships" between/among a set of nodes, or ask about "ontology parents/ \
+categories" for a list of nodes (e.g. "find ontological relationships between these cell processes", \
+"what ontology categories do these belong to", "investigate ontological relations between X, Y, Z up \
+to N levels up"). **Do NOT try to compute or render ontology structure yourself with Cypher for this \
+kind of request — hand it off to the app's own purpose-built "Ontology Analysis" dialog instead**, \
+which lets the user interactively drill down the real ontology tree, see per-branch counts, and pull \
+whatever specific subtree they care about into the graph — all things a one-shot Cypher query/render \
+cannot offer. Emit:
+```json
+{{"action": "render", "tool": "ontology_analysis", "cypher": "MATCH (n) WHERE toLower(n.Name) IN [toLower('vasomotor reflex'), toLower('vasodilation')] RETURN n", "description": "..."}}
+```
+The `cypher` field here should be a LEAN, unfiltered lookup of exactly the named nodes the user wants \
+analyzed — `MATCH (n) WHERE toLower(n.Name) IN [...] RETURN n` — nothing more; its only job is to \
+resolve the given names to real nodes (the dialog matches internally on each node's URN, not its \
+name), not to compute any ontology relationships itself. Do not add label restrictions unless the \
+user's own request implies one; do not attempt any is_a/part_of traversal in this query — the dialog \
+does that interactively once opened. **Keep your own chat-text reply for this action brief — a short \
+sentence like "Opening the Ontology Analysis dialog for these N nodes." is enough. Do NOT write out \
+detailed usage instructions (how to drill down, right-click, copy/add to clipboard, paste, etc.) \
+yourself** — the app automatically appends its own complete, accurate how-to-use message right after \
+this action runs, and that frontend message is the single source of truth for those instructions (it \
+also reflects real UI details, like exact menu item names, that can change independently of this \
+prompt). Writing your own version of the same explanation only duplicates it and risks drifting out of \
+sync with the real UI over time. Do not separately try to list or describe the ontology relationships \
+yourself in text either; the dialog is where that discovery actually happens. This supersedes an \
+earlier, now-abandoned approach of computing shared ontology ancestors directly via Cypher and \
+rendering them onto the main graph (still present in the Cypher examples for reference only, marked \
+superseded) — always prefer the dialog hand-off for this category of request now.
 
 Render rules (all of these assume the user has already asked for SOME visualization/export — per the \
 "Never auto-visualize" rule above, don't reach this section at all for a plain analytical question):
@@ -2677,7 +2803,7 @@ def ping_llm(req: PingRequest = None):
         if _is_gemini_model(model):
             api_key = llm.get("apikey") or os.environ.get("GEMINI_API_KEY", "")
             if not api_key:
-                return {"error": "Gemini API key not set — configure in Settings → Agentic AI"}
+                return {"ok": False, "error": "Gemini API key not set — configure in Settings → Agentic AI"}
             ping_url  = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                          f"{model}:generateContent")
             ping_body = json.dumps({
@@ -2714,7 +2840,8 @@ def ping_llm(req: PingRequest = None):
             pt.join(timeout=HARD_TIMEOUT + 2)
 
             if pt.is_alive():
-                return {"error": (f"Gemini API did not respond within {HARD_TIMEOUT}s. "
+                return {"ok": False,
+                        "error": (f"Gemini API did not respond within {HARD_TIMEOUT}s. "
                                   "Possible causes: corporate firewall blocking outbound HTTPS, "
                                   "API key not activated, or model name incorrect."),
                         "elapsed_s": round(time.time() - t0, 2), "model": model}
@@ -2722,9 +2849,9 @@ def ping_llm(req: PingRequest = None):
             if ping_error:
                 kind, code, msg = ping_error[0]
                 if kind == "http":
-                    return {"error": f"HTTP {code}: {msg}",
+                    return {"ok": False, "error": f"HTTP {code}: {msg}",
                             "elapsed_s": round(time.time() - t0, 2), "model": model}
-                return {"error": msg, "elapsed_s": round(time.time() - t0, 2), "model": model}
+                return {"ok": False, "error": msg, "elapsed_s": round(time.time() - t0, 2), "model": model}
 
             resp_body = ping_result[0] if ping_result else {}
             reply = (resp_body.get("candidates", [{}])[0]
@@ -2733,7 +2860,7 @@ def ping_llm(req: PingRequest = None):
                               .get("text", "PONG"))
         else:
             if not HAS_ANTHROPIC:
-                return {"error": "anthropic package not installed — run: pip install anthropic"}
+                return {"ok": False, "error": "anthropic package not installed — run: pip install anthropic"}
             client   = _anthropic_client(llm)
             response = client.messages.create(
                 model=model, max_tokens=16,
@@ -2745,13 +2872,13 @@ def ping_llm(req: PingRequest = None):
         elapsed  = time.time() - t0
         provider = "gemini" if _is_gemini_model(model) else "anthropic"
         log.info("Ping OK: model=%s elapsed=%.1fs reply=%r", model, elapsed, reply)
-        return {"model": model, "provider": provider,
+        return {"ok": True, "model": model, "provider": provider,
                 "elapsed_s": round(elapsed, 2),
                 "system_prompt_tokens": len(sp) // 4,
                 "reply": reply}
     except Exception:
         log.exception("Ping failed")
-        return {"error": "Ping failed due to an internal error.", "elapsed_s": round(time.time() - t0, 2), "model": model}
+        return {"ok": False, "error": "Ping failed due to an internal error.", "elapsed_s": round(time.time() - t0, 2), "model": model}
 
 @app.post("/schema")
 def update_schema(payload: SchemaPayload):
@@ -2868,6 +2995,7 @@ def chat(req: ChatRequest):
 
     # Agentic loop — allow up to 8 LLM↔tool round-trips
     truncation_retries = 0
+    hallucination_retries = 0
     for _turn in range(8):
         log.info("Agentic loop turn %d", _turn)
         # A single failed LLM call (network blip, provider momentarily overloaded,
@@ -2916,6 +3044,39 @@ def chat(req: ChatRequest):
                     "If the query itself is very long, simplify it so the whole block fits."
                 )})
                 continue
+
+            # Hallucinated-action retry: catches the model narrating a query
+            # and specific results in prose, then appending the app's own
+            # internal "[Cypher executed/rendered this turn...]" history
+            # marker as if that made the numbers legitimate — without ever
+            # emitting a real action this turn. Retrying INSIDE this loop
+            # (same pattern as the truncation-retry case above) gives the
+            # model a chance to actually run a real query before the user
+            # ever sees anything, and — critically — never writes the
+            # hallucinated reply into the VISIBLE conversation history. An
+            # earlier version of this fix only caught the pattern AFTER this
+            # loop ended, substituting a corrective apology into the final
+            # reply — but that apology then sat in history as a normal-
+            # looking assistant turn, and the model started copying THAT
+            # phrasing too for later, unrelated questions, since anything
+            # sitting in its own visible history reads as "an example of how
+            # I respond." Fixing it inside the loop, before anything is ever
+            # shown to the user, avoids creating that new learned pattern.
+            if "Cypher executed/rendered this turn" in reply_text and hallucination_retries < 2:
+                hallucination_retries += 1
+                log.warning("Turn %d: reply narrated a query/results without emitting a real action "
+                            "(retry %d/2)", _turn, hallucination_retries)
+                messages.append({"role": "user", "content": (
+                    "You just described running a query and stated specific results in your reply, "
+                    "but you did NOT actually emit a real action block this turn — no query was "
+                    "executed, so those numbers are not verified against the database. Do not write "
+                    "out the app's own internal '[Cypher executed/rendered this turn...]' marker "
+                    "yourself — that text is inserted automatically elsewhere by the app and is never "
+                    "something you produce. Please answer the original question again, this time by "
+                    "actually emitting a real `cypher` (or `render`) action so the results are genuine."
+                )})
+                continue
+
             break  # LLM gave a final answer — done
 
         action_type = action.get("action", "cypher")
@@ -3261,6 +3422,29 @@ def chat(req: ChatRequest):
         log.warning("Dangling/unterminated action block detected in reply — replacing with a clear message")
         cleaned_reply = ("My response was cut off before finishing, so nothing was executed. "
                           "Please try again — if it keeps happening, try a narrower or simpler request.")
+
+    # ── Hallucinated-action safety net ────────────────────────────────────────
+    # The exact marker "[Cypher executed/rendered this turn — reuse this EXACT
+    # text verbatim...]" is constructed ONLY by this backend, inserted into
+    # HISTORY messages sent TO the model (see the history-building loop
+    # earlier in this function) — it should never appear in a reply the model
+    # is generating right now. Its presence here means the model narrated a
+    # query and specific results in prose, then appended this marker itself
+    # as if the app had verified it, when no real `cypher`/`render` action
+    # actually ran this turn — so any numbers/rankings in that reply were
+    # never checked against the real database. This exact "narrated instead
+    # of executed" failure pattern recurred multiple times this session for
+    # different actions despite repeated, explicit prompt instructions not to
+    # do it, so — matching the fix applied to those other cases — this is
+    # caught deterministically here instead of trusting the model to comply.
+    if generated_cypher is None and render_action is None and "Cypher executed/rendered this turn" in cleaned_reply:
+        log.warning("Detected hallucinated 'Cypher executed/rendered this turn' marker with no real action this turn — replacing with a clear message")
+        cleaned_reply = (
+            "I need to correct myself — I was about to state specific results, but I didn't actually "
+            "run a query this turn, so those numbers would not have been verified against the real "
+            "database. Please ask me again, or ask me to run the query for real, and I'll give you "
+            "confirmed results."
+        )
 
     # ── Vocabulary save safety net ────────────────────────────────────────────
     # If the LLM confirmed saving a vocabulary mapping in its text reply but did
