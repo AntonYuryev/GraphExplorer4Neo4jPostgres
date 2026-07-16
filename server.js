@@ -1639,6 +1639,12 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
   }
 
   const lower = String(sourceFile).toLowerCase();
+  // Same local re-check immediately before sourceFile reaches
+  // fs.readFileSync/execFile as the other pathway save/annotation endpoints
+  // now all have — see the comment on save-graph's own re-check.
+  if (!_isPathInsideDir(sourceFile, dir)) {
+    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  }
   try {
     if (lower.endsWith('.graph.json')) {
       const data = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
@@ -1796,6 +1802,13 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
   }
 
   const isAlreadyJson = String(sourceFile).toLowerCase().endsWith('.graph.json');
+  // Same local re-validation as save-graph/save-graph-as, immediately before
+  // sourceFile reaches fs.readFileSync/execFile below — see the comment on
+  // save-graph's own re-check for why this is repeated here rather than
+  // relying solely on the containment check above.
+  if (!_isPathInsideDir(sourceFile, dir)) {
+    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  }
   try {
     let pathwayData;  // full rnef_to_json.py-shaped object for this ONE pathway
     let outPath;
@@ -1900,6 +1913,17 @@ app.post('/api/pathways/save-graph', dbLimiter, authMiddleware, (req, res) => {
     // resnetType, mirroring the annotation endpoint) when overwriting an
     // existing .graph.json — irrelevant for the create-new-file branch since
     // there's nothing yet to preserve.
+    // Re-validated locally (not just relying on the containment check earlier
+    // in this handler) immediately before sourceFile reaches fs.readFileSync/
+    // the outPath overwrite target below — same CodeQL "Uncontrolled data used
+    // in path expression" class as alert #142 (save-graph-as), and CodeQL's
+    // dataflow analysis apparently doesn't credit a containment check that
+    // happened several lines earlier in the same function as sanitizing a
+    // later use of the same variable, so every sink gets its own tight,
+    // local guard rather than relying on one shared check up top.
+    if (!_isPathInsideDir(sourceFile, dir)) {
+      return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+    }
     let resnetType = 'Pathway';
     let outPath;
     if (isAlreadyJson) {
@@ -1981,8 +2005,19 @@ app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) =>
       return res.status(409).json({ error: `A pathway named "${pathwayName}" already exists in that folder — choose a different name or folder.` });
     }
 
+    // CodeQL alert #142 ("Uncontrolled data used in path expression"): this
+    // peek at the ORIGINAL file's resnetType previously called
+    // fs.readFileSync(sourceFile, ...) with no containment check anywhere in
+    // this function gating that specific call — unlike /api/pathways/save-graph
+    // and /api/pathways/annotation, which both validate sourceFile via
+    // _isPathInsideDir() before ever reading it. The one _isPathInsideDir(sourceFile, dir)
+    // check that DID already exist further up (deciding targetDir) only runs
+    // when `subfolder` is omitted, and even then only gates targetDir, not
+    // this read — so a request with an explicit subfolder (the common case
+    // from the Save As dialog) could pass an arbitrary absolute sourceFile
+    // path straight into fs.readFileSync() with no validation at all.
     let resnetType = 'Pathway';
-    if (sourceFile && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
+    if (sourceFile && _isPathInsideDir(sourceFile, dir) && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
       try {
         const existing = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
         if (existing && existing.resnetType) resnetType = existing.resnetType;
