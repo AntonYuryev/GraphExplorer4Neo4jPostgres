@@ -10,6 +10,7 @@ const { execFile, spawn } = require('child_process');
 const http = require('http');
 const rateLimit = require('express-rate-limit');
 const _crypto   = require('crypto');
+const FlexSearch = require('flexsearch');
 
 // ── Log injection hardening (CodeQL: js/log-injection, CWE-117) ───────────────
 // Many log calls throughout this file interpolate request-derived or
@@ -124,6 +125,11 @@ function safeError(err, context) {
 // served to clients (it is outside the public/ directory).
 const SETTINGS_FILE  = path.join(__dirname, 'settings.json');
 const HISTORY_FILE   = path.join(__dirname, 'cypher_history.tsv');
+// Persisted Pathway Collection Search indexes — PER USER (each user points at
+// their own local directory; one JSON file per user, loaded lazily into
+// memory — including a rebuilt FlexSearch text index — the first time that
+// user searches after a server restart, rather than eagerly for every user).
+const PATHWAY_INDEX_DIR = path.join(__dirname, 'pathway_indexes');
 
 // DEFAULT_SETTINGS is used only when settings.json does not exist.
 // Passwords are intentionally blank — configure via the Settings UI after first login,
@@ -153,6 +159,11 @@ const DEFAULT_SETTINGS = {
     top_p:      0.9,
     json_mode:  false
   }
+  // Note: pathwayCollection (the local directory for Pathway Collection
+  // Search) is a PER-USER setting, not an admin-wide one — each user's own
+  // directory path lives on their users.json entry (see saveUsers()/
+  // _resolvePathwayCollectionDirForUser()), the same way "My Postgres"/"My
+  // Neo4j" overrides do, rather than here in the shared appSettings.
 };
 
 function loadAppSettings() {
@@ -273,6 +284,13 @@ function invalidateAllNeo4jConns() {
 // Path to rnef_to_json.py — defaults to same directory as server.js.
 // Override with RNEF_SCRIPT env var if placed elsewhere.
 const RNEF_SCRIPT = process.env.RNEF_SCRIPT || path.join(__dirname, 'rnef_to_json.py');
+// rnef_index.py — lightweight metadata-only extraction for the Pathway
+// Collection Search feature (indexing); a separate script from RNEF_SCRIPT
+// above, which builds the full render-ready graph JSON for a single pathway
+// opened in the graph viewer. Walks an entire directory in one process
+// (parallelized internally across CPU cores) rather than being invoked once
+// per file, since a real collection can be tens of GB across 500+ files.
+const RNEF_INDEX_SCRIPT = process.env.RNEF_INDEX_SCRIPT || path.join(__dirname, 'rnef_index.py');
 const PYTHON_CMD  = process.env.PYTHON_CMD  || (() => {
   // Auto-detect: try py first (Windows Launcher), then python3, then python
   const { execFileSync } = require('child_process');
@@ -421,6 +439,16 @@ function saveUsers(users) {
     }
     return has ? out : undefined;
   };
+  // Directory paths can legitimately be longer than the 500-char credential
+  // cap above (deep folder nesting) — a generous but still bounded cap of
+  // its own, just to keep users.json from growing unbounded on bad input.
+  const PATH_STR_MAX = 2000;
+  const cleanPathwayCollection = (pc) => {
+    if (!pc || typeof pc !== 'object') return undefined;
+    const dir = pc.directory;
+    if (typeof dir !== 'string' || !dir.length || dir.length > PATH_STR_MAX) return undefined;
+    return { directory: dir };
+  };
 
   const safe = [];
   for (const u of users) {
@@ -432,8 +460,10 @@ function saveUsers(users) {
       const entry = { username: nameMatch[0], password: hashMatch[0], role };
       const neo4j    = cleanConn(u.neo4j,    ['database', 'username', 'password']);
       const postgres = cleanConn(u.postgres, ['database', 'schema', 'username', 'password']);
+      const pathwayCollection = cleanPathwayCollection(u.pathwayCollection);
       if (neo4j)    entry.neo4j    = neo4j;
       if (postgres) entry.postgres = postgres;
+      if (pathwayCollection) entry.pathwayCollection = pathwayCollection;
       safe.push(entry);
     }
   }
@@ -690,6 +720,51 @@ app.post('/api/settings/my-neo4j', dbLimiter, authMiddleware, async (req, res) =
   res.json({ success: true });
 });
 
+// Lists the Neo4j databases the given (possibly not-yet-saved) credentials
+// can actually see, via the built-in "SHOW DATABASES" system command — so the
+// user can pick from a real list instead of typing a database name and
+// risking a typo. Mirrors the connection-test pattern in POST
+// /api/settings/my-neo4j above (same admin-managed url, same fallback to the
+// user's already-saved password), but never persists anything — this is a
+// read-only lookup. Access control is NOT enforced by the app here: Neo4j
+// itself only returns databases this login is actually permitted to use, so
+// this simply surfaces whatever the database administrator has already
+// granted — a login restricted from a given database just won't see it here.
+app.post('/api/settings/list-neo4j-databases', dbLimiter, authMiddleware, async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username is required' });
+
+  const current = _resolveNeo4jCfgForUser(req.user.username);
+  const cfg = {
+    url:      appSettings.neo4j.url,
+    username: String(username).trim(),
+    password: (password && password !== '••••••••') ? String(password) : current.password
+  };
+
+  const testDriver = makeNeo4jDriver(cfg);
+  try {
+    const session = testDriver.session({ database: 'system' });
+    try {
+      const result = await session.run('SHOW DATABASES');
+      // "system" itself is a real database but an internal administrative
+      // one, not a working dataset — excluded so it doesn't show up as if it
+      // were a normal option to pick.
+      const names = result.records
+        .map(r => r.get('name'))
+        .filter(name => name && name !== 'system')
+        .sort();
+      res.json({ databases: names });
+    } finally {
+      await session.close();
+    }
+  } catch (e) {
+    console.error('[settings/list-neo4j-databases] Failed for %s: %s', req.user.username, e.message);
+    res.status(400).json({ error: 'Could not list databases. Check the username/password, or ask your Neo4j administrator whether SHOW DATABASES is permitted for this login.' });
+  } finally {
+    await testDriver.close();
+  }
+});
+
 app.get('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, (req, res) => {
   res.json({ host: appSettings.postgres.host, port: appSettings.postgres.port });
 });
@@ -763,6 +838,48 @@ app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res
   res.json({ success: true });
 });
 
+// Lists the PostgreSQL schemas the given (possibly not-yet-saved)
+// database/credentials can actually see, via information_schema.schemata —
+// so the user can pick from a real list instead of typing a schema name and
+// risking a typo. Mirrors the connection-test pattern in POST
+// /api/settings/my-postgres above (same admin-managed host/port, same
+// fallback to the user's already-saved password), but never persists
+// anything — this is a read-only lookup. Access control is NOT enforced by
+// the app here: information_schema.schemata is already permission-filtered
+// by Postgres itself, so this simply surfaces whatever the database
+// administrator has already granted — a login restricted from a given schema
+// just won't see it here.
+app.post('/api/settings/list-pg-schemas', dbLimiter, authMiddleware, async (req, res) => {
+  const { database, username, password } = req.body || {};
+  if (!database || !username) return res.status(400).json({ error: 'database and username are required' });
+
+  const current = _resolvePgCfgForUser(req.user.username);
+  const cfg = {
+    host:     appSettings.postgres.host,
+    port:     appSettings.postgres.port,
+    database: String(database).trim(),
+    username: String(username).trim(),
+    password: (password && password !== '••••••••') ? String(password) : current.password
+  };
+
+  const testPool = makePgPool(cfg);
+  try {
+    const result = await testPool.query(
+      `SELECT schema_name FROM information_schema.schemata
+       WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+         AND schema_name NOT LIKE 'pg_toast%'
+         AND schema_name NOT LIKE 'pg_temp%'
+       ORDER BY schema_name`
+    );
+    res.json({ schemas: result.rows.map(r => r.schema_name) });
+  } catch (e) {
+    console.error('[settings/list-pg-schemas] Failed for %s: %s', req.user.username, e.message);
+    res.status(400).json({ error: 'Could not list schemas. Check the database name/credentials, or ask your PostgreSQL administrator whether this login can read information_schema.' });
+  } finally {
+    await testPool.end();
+  }
+});
+
 // ─── LLM / Agentic AI settings ───────────────────────────────────────────────
 // Returns providers list + global defaults. Any authenticated user can read.
 // Admin-only POST for write.
@@ -797,6 +914,1183 @@ app.post('/api/settings/llm', dbLimiter, authMiddleware, adminMiddleware, async 
   appSettings.llm = cfg;
   saveAppSettings(appSettings);
   res.json({ success: true });
+});
+
+// ─── Pathway Collection Search ────────────────────────────────────────────────
+// Local directory of RNEF/.graph.json pathway files → text search (FlexSearch,
+// fuzzy/stemmed) over each pathway's Name plus every attribute found in its
+// <properties> section (Description, Notes, etc. — captured generically,
+// see rnef_index.py's extract_pathway()). Entity-overlap search, Anatomy
+// Index, and Statistics (which would need node/relation/reference data this
+// index deliberately does NOT extract yet) are later phases, not built here.
+
+// -- lightweight stemmer (mirrors the same suffix-stripping heuristic already
+// used for Cypher-example relevance matching in agent_service.py's _stem(),
+// extended here to also cover common verb-tense suffixes per REQ-3.13's
+// "verb tenses" requirement) — applied to BOTH indexed pathway text and
+// search queries so stemmed forms line up on both sides. -----------------
+const _PW_STOPWORDS = new Set(['the','a','an','of','in','on','for','and','or','to','with','is','are','was','were']);
+function _pwStem(word) {
+  if (word.length > 5 && word.endsWith('ing')) return word.slice(0, -3);
+  if (word.length > 4 && word.endsWith('ies')) return word.slice(0, -3) + 'y';
+  if (word.length > 4 && word.endsWith('ed'))  return word.slice(0, -2);
+  if (word.length > 4 && word.endsWith('es'))  return word.slice(0, -2);
+  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
+  return word;
+}
+function _pwTokenize(text) {
+  const words = String(text || '').toLowerCase().match(/[a-z][a-z0-9]{2,}/g) || [];
+  return words.map(_pwStem).filter(w => !_PW_STOPWORDS.has(w));
+}
+
+// -- per-user index state cache -----------------------------------------
+// Mirrors the per-user Neo4j driver / Postgres pool cache pattern
+// (_userPgConns et al.) — each user has their OWN pathway collection
+// directory (stored on their users.json entry, not shared appSettings) and
+// their OWN search index, loaded lazily on first use after a restart and
+// cached in memory thereafter.
+const _userPathwayIndexCache = new Map();  // username -> { pathwayIndex, textIdx, urnMap }
+
+function _emptyPathwayIndex() {
+  return {
+    builtAt: null, directory: '', pathways: [], filesScanned: 0, filesFailed: 0, errors: [],
+    nodeTypeCounts: {}, totalUniqueEntities: 0,
+    relationTypeCounts: {}, totalUniqueReferences: 0, totalSupportingSentences: 0,
+  };
+}
+
+function _pathwayIndexFilePath(username) {
+  // username is already constrained to NAME_RE ([a-zA-Z0-9_-]{1,64}) by
+  // loadUsers()/saveUsers(), but re-validated here defensively since this
+  // builds a filesystem path from it.
+  const safe = /^[a-zA-Z0-9_-]{1,64}$/.test(username) ? username : 'unknown';
+  return path.join(PATHWAY_INDEX_DIR, `pathway_index_${safe}.json`);
+}
+
+function _resolvePathwayCollectionDirForUser(loginUsername) {
+  const users = loadUsers();
+  const u = users.find(x => x.username === loginUsername);
+  return (u && u.pathwayCollection && u.pathwayCollection.directory) || '';
+}
+
+function _savePathwayCollectionDirForUser(loginUsername, directory) {
+  const users = loadUsers();
+  const u = users.find(x => x.username === loginUsername);
+  if (!u) throw new Error('User not found');
+  u.pathwayCollection = { directory };
+  saveUsers(users);
+}
+
+// p.properties holds whatever attributes rnef_index.py found under this
+// pathway's <properties> section (Description, Notes, or anything else
+// present there) — captured generically rather than as hardcoded fields, so
+// this combines the pathway Name with every one of those property VALUES
+// for indexing, not just specific known field names. Used ONLY to build the
+// FlexSearch candidate index (a broad net is fine there) — NOT for scoring
+// (see _pwRelevanceScore below), since flattening every field into one blob
+// before scoring was exactly the bug reported: a long, verbose Notes section
+// mentioning a query word many times could outscore a concise, near-exact
+// match in the pathway's own Name.
+function _pwCombinedText(p) {
+  const propValues = p.properties ? Object.values(p.properties) : [];
+  // p.anatomy (Organ, Organ System, Organelle, Tissue, CellType) is built
+  // separately from p.properties: properties[name] only keeps the LAST
+  // value when a field is repeated (e.g. 4 separate CellType tags on one
+  // pathway), while anatomy keeps the full deduplicated list -- so a term
+  // that lost that overwrite race would otherwise never be searchable here.
+  const anatomyValues = p.anatomy ? Object.values(p.anatomy).flat() : [];
+  return [p.name, ...propValues, ...anatomyValues].filter(Boolean).join(' ');
+}
+
+// Relevance scoring (REQ-3.14) — scores each field SEPARATELY and weighted,
+// Name > Description > Notes > any other property, rather than flattening
+// everything into one blob and counting matches with equal weight
+// regardless of which field they came from. A concise, near-exact match in
+// the pathway's own Name (e.g. "Collagen synthesis" vs a pathway actually
+// named "Collagen biosynthesis") should outrank a pathway whose Notes
+// happens to mention the same query word several times in passing.
+// NAME bumped from 10 to 12: once two pathways both reach full coverage
+// (every distinct query word matched somewhere), the coverage bonus stops
+// differentiating them and it comes down to raw weighted score — a Notes
+// section that happens to contain the query phrase verbatim (triggering
+// both ordinary token matches AND the phrase bonus) could still out-score a
+// pathway whose own Name is a near-exact match, which should win that
+// comparison. A modest increase keeps Name clearly ahead without needing a
+// much larger jump.
+const _PW_FIELD_WEIGHT_NAME = 12;
+const _PW_FIELD_WEIGHT_DESCRIPTION = 3;
+const _PW_FIELD_WEIGHT_NOTES = 1;
+const _PW_FIELD_WEIGHT_OTHER = 1;   // any <properties> attr besides Description/Notes
+
+// matchedTerms is a shared Set (across every field of one pathway) that
+// _pwRelevanceScore uses afterwards for the coverage bonus below — every
+// query token that matched (exactly OR partially) ANYWHERE gets added to it,
+// regardless of which field or how many times.
+function _pwFieldScore(queryTokens, fieldText, weight, matchedTerms, rawQueryLower) {
+  if (!fieldText) return 0;
+  const fieldTokens = _pwTokenize(fieldText);
+  let score = 0;
+  for (const qt of queryTokens) {
+    for (const ft of fieldTokens) {
+      if (ft === qt) {
+        score += weight;
+        matchedTerms.add(qt);
+      } else if (qt.length >= 5 && ft.length >= 5 && (ft.includes(qt) || qt.includes(ft))) {
+        // Partial/compound-word credit — e.g. query stem "synthesi" is
+        // (after stemming) a substring of pathway-name stem "biosynthesi".
+        // The plain suffix-stripping stemmer here has no notion of prefixes
+        // like "bio-", so without this, closely related compound words
+        // would share no exact stem and score zero relatedness. Reduced
+        // weight, and only for reasonably long tokens, so short incidental
+        // substrings don't inflate unrelated matches.
+        score += weight * 0.5;
+        matchedTerms.add(qt);
+      }
+    }
+  }
+  // Phrase/"NEAR" bonus: the query AS WRITTEN (not just its individual
+  // stemmed words) appearing together in this field is a much stronger
+  // signal than its words merely occurring somewhere, however often — e.g.
+  // a Description that literally says "collagen synthesis" should rank
+  // above one that separately mentions "collagen" once and "synthesis"
+  // fifteen times. Deliberately a plain substring check on the ORIGINAL
+  // (lowercased, unstemmed) query rather than anything fuzzy, so it only
+  // fires for a genuine near-verbatim phrase match.
+  if (rawQueryLower && rawQueryLower.length >= 5 && fieldText.toLowerCase().includes(rawQueryLower)) {
+    score += weight * 5;
+  }
+  return score;
+}
+
+function _pwRelevanceScore(queryTokens, p, rawQueryLower) {
+  const matchedTerms = new Set();
+  let score = _pwFieldScore(queryTokens, p.name, _PW_FIELD_WEIGHT_NAME, matchedTerms, rawQueryLower);
+  const props = p.properties || {};
+  for (const key of Object.keys(props)) {
+    const weight = key === 'Description' ? _PW_FIELD_WEIGHT_DESCRIPTION
+                 : key === 'Notes'       ? _PW_FIELD_WEIGHT_NOTES
+                 :                          _PW_FIELD_WEIGHT_OTHER;
+    score += _pwFieldScore(queryTokens, props[key], weight, matchedTerms, rawQueryLower);
+  }
+  // Anatomy annotation terms (Organ, Organ System, Organelle, Tissue,
+  // CellType) -- scored separately from properties above for the same
+  // reason _pwCombinedText() adds them separately: properties[name] only
+  // keeps the LAST value for a repeated field, so a pathway tagged with
+  // several cell types would only ever be findable by whichever one
+  // survived there. Scoring the full deduplicated list (same data Anatomy
+  // Index itself uses) makes every tagged term searchable, not just one.
+  const anatomy = p.anatomy || {};
+  for (const terms of Object.values(anatomy)) {
+    for (const term of terms) {
+      score += _pwFieldScore(queryTokens, term, _PW_FIELD_WEIGHT_OTHER, matchedTerms, rawQueryLower);
+    }
+  }
+
+  // Coverage bonus: a pathway matching MORE of the DISTINCT query words
+  // should rank far above one that only ever matches a SUBSET, no matter how
+  // frequently — this is the actual fix for "a pathway that mentions
+  // 'synthesis' 17 times in its Notes but never mentions 'collagen' at all
+  // outranking one that genuinely covers both query words." Squaring the
+  // coverage ratio makes partial-term-only matches lose decisively rather
+  // than just slightly (e.g. matching 1 of 2 query words -> only a 25%
+  // multiplier, not 50%).
+  const coverage = queryTokens.length ? matchedTerms.size / queryTokens.length : 1;
+  return score * coverage * coverage;
+}
+
+function buildPathwaySearchStructures(pathways) {
+  const textIdx = new FlexSearch.Index({ tokenize: 'forward' });
+  // urn -> [pathway array index, ...] — for Entity Search (REQ-2.04/3.23):
+  // given a set of selected node URNs, quickly find every pathway that
+  // contains any of them, without re-scanning every pathway's node list.
+  // Deliberately excludes 'Group' entries (named member-list resnets with no
+  // <controls>, e.g. a "Genes with Mutations Associated with X_group.rnef"
+  // gene list) — these are still fully searchable via Text Search/Browse/
+  // Alphabetical Index (they're in textIdx below same as any pathway), but
+  // their node lists are typically large, generic gene/protein sets that
+  // would show apparent "overlap" with almost any Entity Search selection,
+  // which isn't a meaningful signal the way overlap with an actual curated
+  // pathway's specific participants is.
+  const urnMap = new Map();
+  pathways.forEach((p, i) => {
+    const stemmed = _pwTokenize(_pwCombinedText(p)).join(' ');
+    textIdx.add(i, stemmed);
+    if (p.resnetType === 'Group') return;  // forEach callback — 'continue' isn't valid here
+    for (const urn of (p.nodeUrns || [])) {
+      if (!urnMap.has(urn)) urnMap.set(urn, []);
+      urnMap.get(urn).push(i);
+    }
+  });
+  return { textIdx, urnMap };
+}
+
+// Returns { pathwayIndex, textIdx, urnMap } for a user — from the in-memory
+// cache if already loaded this server run, else lazily read from that
+// user's own persisted index file on disk, else an empty/not-indexed state.
+function getPathwayIndexForUser(username) {
+  let entry = _userPathwayIndexCache.get(username);
+  if (entry) return entry;
+
+  entry = { pathwayIndex: _emptyPathwayIndex(), textIdx: null, urnMap: new Map() };
+  try {
+    const f = _pathwayIndexFilePath(username);
+    if (fs.existsSync(f)) {
+      const saved = JSON.parse(fs.readFileSync(f, 'utf8'));
+      const built = buildPathwaySearchStructures(saved.pathways || []);
+      entry = { pathwayIndex: saved, textIdx: built.textIdx, urnMap: built.urnMap };
+      console.log(`[INFO] Loaded pathway index for user "${username.replace(_LOG_CONTROL_CHARS_RE, ' ')}": ${saved.pathways.length} pathways`);
+    }
+  } catch (e) {
+    console.error('Failed to load per-user pathway index:', String(e.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+  }
+  _userPathwayIndexCache.set(username, entry);
+  return entry;
+}
+
+app.get('/api/settings/my-pathway-collection', dbLimiter, authMiddleware, (req, res) => {
+  const directory = _resolvePathwayCollectionDirForUser(req.user.username);
+  const entry = getPathwayIndexForUser(req.user.username);
+  res.json({
+    directory,
+    indexed: !!entry.pathwayIndex.builtAt,
+    builtAt: entry.pathwayIndex.builtAt,
+    pathwayCount: entry.pathwayIndex.pathways.length,
+    filesScanned: entry.pathwayIndex.filesScanned,
+    filesFailed: entry.pathwayIndex.filesFailed,
+    // Statistics (REQ-3.71-3.73) — all persisted from the last index run, so
+    // they survive a server restart without re-indexing.
+    nodeTypeCounts: entry.pathwayIndex.nodeTypeCounts || {},
+    totalUniqueEntities: entry.pathwayIndex.totalUniqueEntities || 0,
+    relationTypeCounts: entry.pathwayIndex.relationTypeCounts || {},
+    totalUniqueReferences: entry.pathwayIndex.totalUniqueReferences || 0,
+    totalSupportingSentences: entry.pathwayIndex.totalSupportingSentences || 0,
+  });
+});
+
+app.post('/api/settings/my-pathway-collection', dbLimiter, authMiddleware, (req, res) => {
+  const { directory } = req.body || {};
+  if (!directory || !String(directory).trim()) return res.status(400).json({ error: 'directory is required' });
+  const dir = String(directory).trim();
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    return res.status(400).json({ error: `Not a directory (or not accessible from the server): ${dir}` });
+  }
+  try {
+    _savePathwayCollectionDirForUser(req.user.username, dir);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/settings/my-pathway-collection/browse — REQ-3.41-3.42, but backed
+// entirely by this user's already-indexed pathway list (name/subfolder/
+// sourceFile only, no properties/nodeUrns) rather than a native OS file
+// picker: a native <input type="file"> can't be pointed at a starting
+// directory or restricted to stay within one via JavaScript (a deliberate
+// browser security limitation, not a config gap), so it always opens
+// wherever the browser/OS last remembered and lets the user navigate
+// anywhere on disk. Sourcing Browse from the index instead means it always
+// starts at, and can only ever show, this user's own configured pathway
+// collection — the frontend groups these by "subfolder" into a drill-down
+// folder tree.
+app.get('/api/settings/my-pathway-collection/browse', dbLimiter, authMiddleware, (req, res) => {
+  const entry = getPathwayIndexForUser(req.user.username);
+  if (!entry.pathwayIndex.builtAt) {
+    return res.status(400).json({ error: 'Your pathway collection has not been indexed yet — set a directory and click Index in Settings first.' });
+  }
+  const pathways = entry.pathwayIndex.pathways.map(p => ({
+    name: p.name, subfolder: p.subfolder || '', sourceFile: p.sourceFile,
+    // category -> [term, ...] (Organ, Organ System, Organelle, Tissue,
+    // CellType) -- small and bounded per pathway, so shipping it alongside
+    // the existing lightweight fields (rather than a separate endpoint) is
+    // cheap, and lets Anatomy Index reuse the same already-indexed list
+    // Browse/Alphabetical Index already fetch, grouping it client-side.
+    anatomy: p.anatomy || {},
+    // Pathway Alias ("symlink") entries -- see rnef_index.py's
+    // _extract_alias_records()/_resolve_alias_targets() comments. isAlias
+    // lets Browse render these with a distinct icon/suffix; the alias*
+    // fields point at the REAL pathway's own file/folder/name so clicking
+    // one opens the original rather than the (contentless) alias manifest
+    // itself. All three are null when the referenced pathway isn't present
+    // anywhere in this particular collection.
+    isAlias: !!p.isAlias,
+    aliasTargetSourceFile: p.aliasTargetSourceFile || null,
+    aliasTargetSubfolder: p.aliasTargetSubfolder || null,
+    aliasTargetName: p.aliasTargetName || null,
+  }));
+  res.json({ pathways });
+});
+
+// GET /api/settings/my-pathway-collection/annotation-fields — every DISTINCT
+// <properties> field name (Description, Notes, Organ, Tissue, CellType,
+// PMID, etc.) already used somewhere in this user's indexed collection, with
+// a usage count. Powers the Pathway Annotation "Edit" dialog's field-name
+// suggestions (a <datalist> the frontend attaches to each row's Field name
+// input) so a user adding/renaming a field is nudged toward reusing an
+// existing name (sorted most-used first) instead of accidentally typing a
+// near-duplicate ("Cell Type" vs "CellType") that would silently fragment
+// the same underlying annotation concept across pathways. Degrades
+// gracefully to an empty list if the collection hasn't been indexed yet --
+// this is a convenience suggestion, not a hard requirement to use Edit.
+app.get('/api/settings/my-pathway-collection/annotation-fields', dbLimiter, authMiddleware, (req, res) => {
+  const entry = getPathwayIndexForUser(req.user.username);
+  const counts = new Map();
+  for (const p of entry.pathwayIndex.pathways) {
+    for (const key of Object.keys(p.properties || {})) {
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  const fields = Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([name, count]) => ({ name, count }));
+  res.json({ fields });
+});
+
+// -- background indexing jobs, per user ------------------------------------
+// Indexing a large, real-world collection (tens of GB across 500+ files) can
+// take many minutes even parallelized across CPU cores, which is far too
+// long for a single blocking HTTP request — this runs the job in the
+// background and lets the client poll GET .../index-progress for live
+// status (current file/subfolder, files processed/remaining, pathways
+// indexed so far) rather than staring at one unresponsive request.
+const _userIndexingJobs = new Map();  // username -> job state (see _newIndexingJob())
+
+function _newIndexingJob() {
+  return {
+    running: true,
+    filesProcessed: 0, filesTotal: 0, filesRemaining: 0,
+    currentFile: '', currentSubfolder: '', pathwayNamesInFile: [],
+    pathwaysIndexedSoFar: 0,
+    done: false, success: null, error: null, result: null,
+  };
+}
+
+// POST /api/settings/my-pathway-collection/index — (re)build THIS user's own
+// search index by walking their configured directory. Starts the job in the
+// background and returns immediately; poll GET .../index-progress for
+// status. rnef_index.py parallelizes file parsing across CPU cores
+// internally and streams one JSON-lines progress event per completed file
+// on stdout, which is parsed here as it arrives — the final RESULT still
+// goes to a file, not stdout (see rnef_index.py), since a large collection
+// can produce enough JSON to overflow what a parent process can safely
+// buffer from a child's stdout.
+app.post('/api/settings/my-pathway-collection/index', dbLimiter, authMiddleware, (req, res) => {
+  const username = req.user.username;
+  const dir = _resolvePathwayCollectionDirForUser(username);
+  if (!dir) return res.status(400).json({ error: 'No pathway collection directory configured yet — set one first.' });
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    return res.status(400).json({ error: `Configured directory no longer exists or is not accessible: ${dir}` });
+  }
+  const existing = _userIndexingJobs.get(username);
+  if (existing && existing.running) {
+    return res.status(409).json({ error: 'An indexing run is already in progress for your account.' });
+  }
+
+  const job = _newIndexingJob();
+  _userIndexingJobs.set(username, job);
+  res.json({ started: true });  // respond immediately — the job continues in the background
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwindex-'));
+  const outFile = path.join(tmpDir, 'result.json');
+  const child = spawn(PYTHON_CMD, [RNEF_INDEX_SCRIPT, dir, outFile]);
+
+  const TIMEOUT_MS = 3600000;  // 60 min — a large, real-world collection can take a while even parallelized
+  const timeoutHandle = setTimeout(() => {
+    job.error = 'Indexing timed out after 60 minutes.';
+    try { child.kill(); } catch (e) {}
+  }, TIMEOUT_MS);
+
+  let stdoutBuf = '';
+  child.stdout.on('data', (chunk) => {
+    stdoutBuf += chunk.toString('utf8');
+    let idx;
+    while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
+      const line = stdoutBuf.slice(0, idx);
+      stdoutBuf = stdoutBuf.slice(idx + 1);
+      if (!line.trim()) continue;
+      let evt;
+      try { evt = JSON.parse(line); } catch (e) { continue; }  // ignore malformed/partial lines
+      if (evt.type === 'start') {
+        job.filesTotal = evt.filesTotal || 0;
+        job.filesRemaining = job.filesTotal;
+      } else if (evt.type === 'progress') {
+        job.filesProcessed = evt.filesProcessed || 0;
+        job.filesRemaining = evt.filesRemaining || 0;
+        job.filesTotal = evt.filesTotal || job.filesTotal;
+        job.currentFile = evt.currentFile || '';
+        job.currentSubfolder = evt.currentSubfolder || '';
+        job.pathwayNamesInFile = evt.pathwayNamesInFile || [];
+        job.pathwaysIndexedSoFar = evt.pathwaysIndexedSoFar || 0;
+      }
+    }
+  });
+
+  let stderrBuf = '';
+  child.stderr.on('data', (chunk) => { stderrBuf += chunk.toString('utf8'); });
+
+  child.on('error', (err) => {
+    clearTimeout(timeoutHandle);
+    job.running = false;
+    job.done = true;
+    job.success = false;
+    job.error = err.message;
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+  });
+
+  child.on('close', (code) => {
+    // Node's docs note 'error' and 'close' aren't strictly mutually
+    // exclusive in every edge case — if 'error' already ran (e.g. the
+    // Python executable itself couldn't be launched), don't let this
+    // handler overwrite that with a less useful generic message or try to
+    // read an outFile that was never written.
+    if (job.done) return;
+    clearTimeout(timeoutHandle);
+    job.running = false;
+    job.done = true;
+    try {
+      if (code !== 0) throw new Error(stderrBuf || `rnef_index.py exited with code ${code}`);
+
+      const parsed = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+      const newIndex = {
+        builtAt: new Date().toISOString(),
+        directory: dir,
+        pathways: parsed.pathways || [],
+        filesScanned: parsed.filesScanned || 0,
+        filesFailed: parsed.filesFailed || 0,
+        errors: parsed.errors || [],
+        // Global, unique-per-urn node counts by NodeType (REQ-3.72) — persisted
+        // now even though no Statistics UI reads it yet, so that feature won't
+        // need a second full re-index of a large collection later.
+        nodeTypeCounts: parsed.nodeTypeCounts || {},
+        // Background population size for Entity Search's Fisher exact test
+        // (REQ-3.24) — count of distinct urns across the whole collection.
+        totalUniqueEntities: parsed.totalUniqueEntities || 0,
+        // Statistics (REQ-3.72/3.73) — relation counts by type (simple sum,
+        // no dedup needed), unique DOI-else-PMID reference count, and total
+        // supporting-sentence count.
+        relationTypeCounts: parsed.relationTypeCounts || {},
+        totalUniqueReferences: parsed.totalUniqueReferences || 0,
+        totalSupportingSentences: parsed.totalSupportingSentences || 0,
+      };
+      const built = buildPathwaySearchStructures(newIndex.pathways);
+      _userPathwayIndexCache.set(username, { pathwayIndex: newIndex, textIdx: built.textIdx, urnMap: built.urnMap });
+
+      fs.mkdirSync(PATHWAY_INDEX_DIR, { recursive: true });
+      // codeql[js/network-data-written-to-file] - newIndex is built entirely
+      // server-side from files under this user's own configured local
+      // directory; no raw request data is written here.
+      fs.writeFileSync(_pathwayIndexFilePath(username), JSON.stringify(newIndex));
+
+      job.success = true;
+      job.result = {
+        pathwayCount: newIndex.pathways.length,
+        filesScanned: newIndex.filesScanned,
+        filesFailed: newIndex.filesFailed,
+        errors: newIndex.errors.slice(0, 20),  // cap — a bad collection could have thousands
+      };
+    } catch (err) {
+      console.error('Pathway indexing error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+      job.success = false;
+      job.error = job.error || safeError(err, 'Pathway indexing');
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+    }
+  });
+});
+
+// GET /api/settings/my-pathway-collection/index-progress — poll for live
+// status of THIS user's most recent (or in-progress) indexing job.
+app.get('/api/settings/my-pathway-collection/index-progress', dbLimiter, authMiddleware, (req, res) => {
+  const job = _userIndexingJobs.get(req.user.username);
+  if (!job) return res.json({ running: false, done: false, noJob: true });
+  res.json(job);
+});
+
+// POST /api/pathways/search/text — REQ-3.11-3.14. Body: { keywords }.
+// Searches the CALLING USER's own pathway index. FlexSearch finds the
+// fuzzy/stemmed CANDIDATE set (so typos/partial words/plurals still match),
+// then _pwRelevanceScore() ranks that candidate set field-by-field —
+// Name > Description > Notes > other properties — rather than a flat count
+// across all fields combined (see _pwRelevanceScore for why: a long Notes
+// section mentioning a query word repeatedly shouldn't outrank a concise,
+// near-exact match in the pathway's own Name).
+app.post('/api/pathways/search/text', dbLimiter, authMiddleware, (req, res) => {
+  const { keywords } = req.body || {};
+  if (!keywords || !String(keywords).trim()) return res.status(400).json({ error: 'keywords is required' });
+  const entry = getPathwayIndexForUser(req.user.username);
+  if (!entry.textIdx) return res.status(400).json({ error: 'Your pathway collection has not been indexed yet — set a directory and click Index in Settings.' });
+
+  const queryTokens = _pwTokenize(keywords);
+  if (!queryTokens.length) return res.json({ results: [] });
+  const rawQueryLower = String(keywords).trim().toLowerCase();
+
+  // Union of FlexSearch hits across each query token (broad candidate net —
+  // AND-style narrowing isn't appropriate here since REQ-3.14 wants a
+  // relevance-scored list, not a strict filter).
+  const candidateIdx = new Set();
+  for (const tok of queryTokens) {
+    const hits = entry.textIdx.search(tok, { limit: 5000 });
+    for (const idx of hits) candidateIdx.add(idx);
+  }
+
+  const results = [];
+  for (const idx of candidateIdx) {
+    const p = entry.pathwayIndex.pathways[idx];
+    if (!p) continue;
+    const score = _pwRelevanceScore(queryTokens, p, rawQueryLower);
+    if (score > 0) {
+      results.push({
+        name: p.name,
+        subfolder: p.subfolder,
+        sourceFile: p.sourceFile,
+        relevanceScore: score,
+        // category -> [term, ...] (Organ, Organ System, Organelle, Tissue,
+        // CellType) -- same already-indexed data Browse/Anatomy Index use,
+        // shipped here too so Text Search results can show/sort by these
+        // annotations without a separate lookup.
+        anatomy: p.anatomy || {},
+      });
+    }
+  }
+  results.sort((a, b) => b.relevanceScore - a.relevanceScore);
+  res.json({ results });
+});
+
+// ─── Fisher exact test (hypergeometric enrichment) ───────────────────────────
+// REQ-3.23/3.24: for each candidate pathway, tests whether it contains more
+// of the user's selected entities than expected by chance, given:
+//   N = total unique entities across the whole collection (background population)
+//   n = this pathway's own entity count
+//   K = number of selected entities (sample size)
+//   k = how many of the selected entities are actually in this pathway (overlap)
+// Implemented directly (no scipy/subprocess) via a numerically stable
+// log-gamma (Lanczos approximation) rather than raw factorials, which would
+// overflow for a collection-wide N in the tens of thousands+.
+const _LANCZOS_G = 7;
+const _LANCZOS_COEF = [
+  0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+  771.32342877765313, -176.61502916214059, 12.507343278686905,
+  -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+];
+function _logGamma(x) {
+  if (x < 0.5) {
+    // Reflection formula: Gamma(x)*Gamma(1-x) = pi/sin(pi*x)
+    return Math.log(Math.PI / Math.sin(Math.PI * x)) - _logGamma(1 - x);
+  }
+  x -= 1;
+  let a = _LANCZOS_COEF[0];
+  const t = x + _LANCZOS_G + 0.5;
+  for (let i = 1; i < _LANCZOS_G + 2; i++) a += _LANCZOS_COEF[i] / (x + i);
+  return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+}
+function _logChoose(n, k) {
+  if (k < 0 || k > n) return -Infinity;
+  return _logGamma(n + 1) - _logGamma(k + 1) - _logGamma(n - k + 1);
+}
+// log P(X = k) for X ~ Hypergeometric(N population, n "successes" in
+// population, K draws) -- the classic urn-without-replacement model.
+function _hypergeomLogPMF(N, n, K, k) {
+  return _logChoose(n, k) + _logChoose(N - n, K - k) - _logChoose(N, K);
+}
+// One-sided p-value for OVER-representation: P(X >= k). Loop bound is
+// min(n, K) - k terms, both of which are per-pathway/per-selection sizes
+// (typically small), so this stays fast even across thousands of pathways.
+function _hypergeomUpperTailPValue(N, n, K, k) {
+  const kMax = Math.min(n, K);
+  if (k > kMax) return 0;
+  const logTerms = [];
+  for (let i = k; i <= kMax; i++) logTerms.push(_hypergeomLogPMF(N, n, K, i));
+  const maxTerm = Math.max(...logTerms);
+  if (!isFinite(maxTerm)) return 1;
+  let sum = 0;
+  for (const t of logTerms) sum += Math.exp(t - maxTerm);
+  return Math.min(1, Math.exp(maxTerm + Math.log(sum)));
+}
+// Hypergeometric mean/variance -> Z-score for the observed overlap k.
+function _hypergeomZScore(N, n, K, k) {
+  const mean = (n * K) / N;
+  const variance = (n * K * (N - n) * (N - K)) / (N * N * (N - 1));
+  if (!(variance > 0)) return 0;
+  return (k - mean) / Math.sqrt(variance);
+}
+
+// Shared by Entity Search and Combined Search: given this user's index and a
+// set of selected URNs, computes {idx, overlapCount, zScore, pValue} for
+// every pathway that contains AT LEAST ONE selected entity (pathways with
+// zero overlap are never candidates for either feature). Uses the urn ->
+// pathway urnMap so only pathways actually touched by a selected urn are
+// ever considered, rather than scanning the entire collection.
+function _computeEntityOverlap(entry, selectedURNs) {
+  const N = entry.pathwayIndex.totalUniqueEntities || 0;
+  const uniqueSelected = Array.from(new Set(selectedURNs));
+  const K = uniqueSelected.length;
+  const overlapUrnsByIdx = new Map();  // pathway idx -> Set of matched (selected) urns
+  for (const urn of uniqueSelected) {
+    const idxs = entry.urnMap.get(urn);
+    if (!idxs) continue;
+    for (const idx of idxs) {
+      if (!overlapUrnsByIdx.has(idx)) overlapUrnsByIdx.set(idx, new Set());
+      overlapUrnsByIdx.get(idx).add(urn);
+    }
+  }
+  const out = [];
+  for (const [idx, urnSet] of overlapUrnsByIdx) {
+    const p = entry.pathwayIndex.pathways[idx];
+    if (!p) continue;
+    const k = urnSet.size;
+    const n = (p.nodeUrns || []).length;
+    const pValue = (N > 0 && n > 0 && K > 0) ? _hypergeomUpperTailPValue(N, n, K, k) : 1;
+    const zScore = (N > 1 && n > 0 && K > 0) ? _hypergeomZScore(N, n, K, k) : 0;
+    out.push({
+      idx, name: p.name, subfolder: p.subfolder, sourceFile: p.sourceFile, overlapCount: k, zScore, pValue,
+      // The actual selected urns found in this pathway — lets callers show
+      // "Common entities" by name (client resolves urn -> name from its own
+      // current selection) and pre-select those nodes when the pathway is opened.
+      overlapUrns: Array.from(urnSet),
+      // category -> [term, ...] (Organ, Organ System, Organelle, Tissue,
+      // CellType) -- shared by both Entity Search and Combined Search,
+      // which both build their own results from this same helper.
+      anatomy: p.anatomy || {},
+    });
+  }
+  return out;
+}
+
+// POST /api/pathways/search/entity — REQ-3.21-3.24. Body: { selectedURNs }.
+// Returns every pathway containing at least one selected entity, ranked by
+// statistical significance (p-value ascending, REQ-5.04).
+app.post('/api/pathways/search/entity', dbLimiter, authMiddleware, (req, res) => {
+  const { selectedURNs } = req.body || {};
+  if (!Array.isArray(selectedURNs) || !selectedURNs.length) {
+    return res.status(400).json({ error: 'selectedURNs (a non-empty array) is required' });
+  }
+  const entry = getPathwayIndexForUser(req.user.username);
+  if (!entry.textIdx) return res.status(400).json({ error: 'Your pathway collection has not been indexed yet — set a directory and click Index in Settings.' });
+
+  const results = _computeEntityOverlap(entry, selectedURNs)
+    .map(r => ({
+      name: r.name, subfolder: r.subfolder, sourceFile: r.sourceFile, zScore: r.zScore, pValue: r.pValue,
+      anatomy: r.anatomy, overlapCount: r.overlapCount, overlapUrns: r.overlapUrns,
+    }))
+    .sort((a, b) => a.pValue - b.pValue);
+  res.json({ results });
+});
+
+// POST /api/pathways/search/combined — REQ-3.31-3.34. Body: { selectedURNs, keywords }.
+// Phase 1 (Filter): Entity Overlap isolates pathways containing at least one
+// selected entity (same _computeEntityOverlap() used by Entity Search).
+// Phase 2 (Rank): the SAME keyword-count relevance scoring Text Search uses
+// (REQ-3.14) is applied only to that filtered subset, and the final list is
+// ranked by that Text Search Relevance Score (REQ-3.34) — the Fisher
+// statistics from Phase 1 are used purely to filter here, not to rank.
+app.post('/api/pathways/search/combined', dbLimiter, authMiddleware, (req, res) => {
+  const { selectedURNs, keywords } = req.body || {};
+  if (!Array.isArray(selectedURNs) || !selectedURNs.length) {
+    return res.status(400).json({ error: 'selectedURNs (a non-empty array) is required' });
+  }
+  if (!keywords || !String(keywords).trim()) return res.status(400).json({ error: 'keywords is required' });
+  const entry = getPathwayIndexForUser(req.user.username);
+  if (!entry.textIdx) return res.status(400).json({ error: 'Your pathway collection has not been indexed yet — set a directory and click Index in Settings.' });
+
+  const queryTokens = _pwTokenize(keywords);
+  const rawQueryLower = String(keywords).trim().toLowerCase();
+  const overlap = _computeEntityOverlap(entry, selectedURNs);  // Phase 1: filter
+
+  const results = [];
+  for (const o of overlap) {
+    const p = entry.pathwayIndex.pathways[o.idx];
+    if (!p) continue;
+    const score = _pwRelevanceScore(queryTokens, p, rawQueryLower);   // Phase 2: rank (Name > Description > Notes)
+    results.push({
+      name: p.name, subfolder: p.subfolder, sourceFile: p.sourceFile, relevanceScore: score,
+      overlapCount: o.overlapCount, overlapUrns: o.overlapUrns,
+    });
+  }
+  results.sort((a, b) => b.relevanceScore - a.relevanceScore);
+  res.json({ results });
+});
+
+// Returns true iff `candidate` resolves (following symlinks) to a path
+// actually inside `root` — a plain string prefix check like
+// candidate.startsWith(root) is unsafe (e.g. root="/foo" would wrongly admit
+// "/foo-evil"), so this compares real, absolute paths with an explicit
+// trailing separator boundary.
+function _isPathInsideDir(candidatePath, rootDir) {
+  try {
+    const real = fs.realpathSync(candidatePath);
+    const rootReal = fs.realpathSync(rootDir);
+    return real === rootReal || real.startsWith(rootReal + path.sep);
+  } catch (e) {
+    return false;  // doesn't exist, or a broken symlink — treat as not inside
+  }
+}
+
+// POST /api/pathways/open — REQ-3.43/6.03: open a specific pathway found via
+// search (identified by its server-side sourceFile path + exact name, since
+// one RNEF file can be a <batch> of several pathways) directly in the graph
+// viewer, without requiring the browser to have its own file-system access
+// to that path (unlike the existing File → Load subgraph picker).
+app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
+  const { sourceFile, pathwayName } = req.body || {};
+  const dir = _resolvePathwayCollectionDirForUser(req.user.username);
+  if (!sourceFile || !dir) return res.status(400).json({ error: 'sourceFile and a configured pathway collection directory are required' });
+  if (!_isPathInsideDir(sourceFile, dir)) {
+    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  }
+
+  const lower = String(sourceFile).toLowerCase();
+  try {
+    if (lower.endsWith('.graph.json')) {
+      const data = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+      return res.json({ name: data.name || pathwayName || '', data });
+    }
+
+    // .rnef / .xml — convert (a batch file may yield several pathways; find
+    // the one the user actually clicked by name).
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwopen-'));
+    const outDir = path.join(tmpDir, 'out');
+    fs.mkdirSync(outDir);
+    try {
+      await new Promise((resolve, reject) => {
+        execFile(PYTHON_CMD, [RNEF_SCRIPT, sourceFile, outDir],
+          { timeout: 600000 },
+          (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
+        );
+      });
+      const files = fs.readdirSync(outDir).filter(f => f.endsWith('.json'));
+      let match = null;
+      for (const f of files) {
+        const data = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8'));
+        if (!pathwayName || data.name === pathwayName) { match = data; break; }
+      }
+      if (!match && files.length) match = JSON.parse(fs.readFileSync(path.join(outDir, files[0]), 'utf8'));
+      if (!match) return res.status(404).json({ error: 'Pathway not found in the converted file' });
+      res.json({ name: match.name || pathwayName || '', data: match });
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+    }
+  } catch (err) {
+    console.error('Pathway open error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+    res.status(500).json({ error: safeError(err, 'Pathway open') });
+  }
+});
+
+// ─── Pathway Annotation editing (File → Pathway → View Annotation → Edit) ──
+// Lets a user add/edit/remove a pathway's <properties> fields (Description,
+// Notes, or any custom field) from the app, then save them back to disk.
+//
+// This never touches the pathway's own graph content (nodes/edges/layout) --
+// only its properties -- but still needs somewhere to persist the edit. The
+// app can only ever WRITE .graph.json (not RNEF XML back out), and this
+// collection is moving to JSON-native storage going forward anyway, so a
+// saved edit always ends up as a .graph.json:
+//   - First edit of an RNEF-sourced pathway: convert the .rnef (same helper
+//     /api/pathways/open already uses), splice in the new properties, and
+//     write the result out as a NEW <pathway name>.graph.json alongside the
+//     original .rnef, which is left completely untouched. Named after the
+//     PATHWAY itself (not the source file) via _pwSafeFilename(), matching
+//     rnef_to_json.py's own per-resnet output naming -- a single .rnef can
+//     be a <batch> of several distinctly-named pathways, so the source
+//     file's own name isn't a safe identity key for the saved copy.
+//   - Editing again later (sourceFile is already .graph.json): overwrite
+//     that SAME file in place. No new duplicate is ever created past the
+//     first edit.
+// Having two files describe the same pathway (the original .rnef and its
+// edited .graph.json) would be confusing in Browse/Search/Anatomy Index, so
+// rnef_index.py's own dedup logic (grouping by subfolder + sanitized
+// pathway name, keeping whichever file has the latest mtime) resolves this
+// during any full re-index; _patchPathwayIndexEntry() below applies the
+// same resolution immediately, in-memory, without waiting for one.
+function _pwSafeFilename(name) {
+  const s = String(name || '').replace(/[\\/:*?"<>|]/g, '_').trim();
+  return s || 'unnamed';
+}
+
+// Mirrors rnef_index.py's _ANATOMY_FIELD_ALIASES/_ANATOMY_TERM_SUFFIX_RE so
+// a freshly-saved pathway's Anatomy Index categories can be derived right
+// here in JS -- editing an annotation is common/fast enough that shelling
+// back out to Python for this small, purely textual transform isn't worth
+// the extra process-spawn latency.
+const _PW_ANATOMY_ALIASES = {
+  'organ': 'Organ', 'organ system': 'Organ System', 'organelle': 'Organelle',
+  'cell object': 'Organelle', 'tissue': 'Tissue', 'celltype': 'CellType', 'cell type': 'CellType',
+};
+const _PW_ANATOMY_SUFFIX_RE = /\s*\{[^}]*\}\s*$/;
+function _pwAnatomyFromProperties(properties) {
+  const anatomy = {};
+  for (const [n, v] of Object.entries(properties || {})) {
+    if (!v) continue;
+    const category = _PW_ANATOMY_ALIASES[String(n).trim().toLowerCase()];
+    if (!category) continue;
+    const term = String(v).replace(_PW_ANATOMY_SUFFIX_RE, '').trim();
+    if (!term) continue;
+    const terms = anatomy[category] || (anatomy[category] = []);
+    if (!terms.includes(term)) terms.push(term);
+  }
+  return anatomy;
+}
+
+// Same exclusions as rnef_index.py's extract_pathway_from_json_file(): skip
+// clones (share their original's URN) and synthetic HyperEdge hub nodes
+// (never present in the pathway's own real entity list) so Entity/Combined
+// Search's urn -> pathway map stays consistent regardless of whether a
+// pathway's index entry came from the Python indexer or this fast JS patch.
+function _pwNodeUrnsFromGraphData(graphData) {
+  const seen = new Set();
+  const nodeUrns = [];
+  for (const n of ((graphData && graphData.nodes) || [])) {
+    if (n.isClone) continue;
+    if (Array.isArray(n.labels) && n.labels.length === 1 && n.labels[0] === 'HyperEdge') continue;
+    const urn = (n.properties && n.properties.URN) || n.id;
+    if (!urn || seen.has(urn)) continue;
+    seen.add(urn);
+    nodeUrns.push(urn);
+  }
+  return nodeUrns;
+}
+
+// Patches ONE pathway's entry into this user's already-loaded index, both
+// in-memory (textIdx/urnMap rebuilt so Search/Entity Search see it right
+// away) and on disk (pathway_index_<user>.json, so it survives a server
+// restart) -- without re-invoking rnef_index.py over the whole collection.
+// Safe specifically because editing an annotation never changes a
+// pathway's own nodes/relations, so the collection-wide Statistics counters
+// (nodeTypeCounts/relationTypeCounts/totalUniqueEntities/etc, computed once
+// during a full re-index) remain valid; only this one pathway's own
+// name/properties/anatomy/nodeUrns/sourceFile needs to change here.
+function _patchPathwayIndexEntry(username, pathway) {
+  const entry = getPathwayIndexForUser(username);
+  const groupKey = (pathway.subfolder || '') + ' ' + _pwSafeFilename(pathway.name);
+  entry.pathwayIndex.pathways = entry.pathwayIndex.pathways.filter(p =>
+    ((p.subfolder || '') + ' ' + _pwSafeFilename(p.name)) !== groupKey
+  );
+  entry.pathwayIndex.pathways.push(pathway);
+  const built = buildPathwaySearchStructures(entry.pathwayIndex.pathways);
+  entry.textIdx = built.textIdx;
+  entry.urnMap = built.urnMap;
+  _userPathwayIndexCache.set(username, entry);
+  try {
+    fs.writeFileSync(_pathwayIndexFilePath(username), JSON.stringify(entry.pathwayIndex));
+  } catch (e) {
+    console.error('Failed to persist patched pathway index:', String(e.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+  }
+}
+
+app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res) => {
+  const { sourceFile, pathwayName, properties } = req.body || {};
+  const dir = _resolvePathwayCollectionDirForUser(req.user.username);
+  if (!sourceFile || !pathwayName || !properties || typeof properties !== 'object' || Array.isArray(properties)) {
+    return res.status(400).json({ error: 'sourceFile, pathwayName, and a properties object are required' });
+  }
+  if (!dir) return res.status(400).json({ error: 'No pathway collection directory configured' });
+  if (!_isPathInsideDir(sourceFile, dir)) {
+    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  }
+
+  // Annotation values are always plain text -- coerced to strings and
+  // blank/whitespace-only keys dropped, regardless of what the client sent.
+  const cleanProps = {};
+  for (const [k, v] of Object.entries(properties)) {
+    const key = String(k).trim();
+    if (key) cleanProps[key] = String(v);
+  }
+
+  const isAlreadyJson = String(sourceFile).toLowerCase().endsWith('.graph.json');
+  try {
+    let pathwayData;  // full rnef_to_json.py-shaped object for this ONE pathway
+    let outPath;
+
+    if (isAlreadyJson) {
+      pathwayData = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+      outPath = sourceFile;
+    } else {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwannot-'));
+      const outDir = path.join(tmpDir, 'out');
+      fs.mkdirSync(outDir);
+      try {
+        await new Promise((resolve, reject) => {
+          execFile(PYTHON_CMD, [RNEF_SCRIPT, sourceFile, outDir],
+            { timeout: 600000 },
+            (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
+          );
+        });
+        const files = fs.readdirSync(outDir).filter(f => f.endsWith('.json'));
+        let match = null;
+        for (const f of files) {
+          const data = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8'));
+          if (data.name === pathwayName) { match = data; break; }
+        }
+        if (!match && files.length === 1) match = JSON.parse(fs.readFileSync(path.join(outDir, files[0]), 'utf8'));
+        if (!match) return res.status(404).json({ error: 'Pathway not found in the converted file' });
+        pathwayData = match;
+      } finally {
+        try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+      }
+      outPath = path.join(path.dirname(sourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
+    }
+
+    pathwayData.properties = cleanProps;
+    pathwayData.savedAt = new Date().toISOString();
+    fs.writeFileSync(outPath, JSON.stringify(pathwayData));
+
+    const relDir = path.relative(dir, path.dirname(outPath)).split(path.sep).join('/');
+    const subfolder = relDir === '.' ? '' : relDir;
+    _patchPathwayIndexEntry(req.user.username, {
+      name: pathwayData.name || pathwayName,
+      resnetType: pathwayData.resnetType || 'Pathway',
+      properties: cleanProps,
+      anatomy: _pwAnatomyFromProperties(cleanProps),
+      nodeUrns: _pwNodeUrnsFromGraphData(pathwayData.graphData),
+      sourceFile: outPath,
+      subfolder,
+    });
+
+    res.json({ success: true, sourceFile: outPath, name: pathwayData.name || pathwayName, properties: cleanProps });
+  } catch (err) {
+    console.error('Pathway annotation save error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+    res.status(500).json({ error: safeError(err, 'Pathway annotation save') });
+  }
+});
+
+// Shared by /api/pathways/save-graph and /api/pathways/save-graph-as: strips
+// obviously-bogus graphData down to just {nodes, edges} arrays (defends
+// against a malformed/partial client payload writing garbage to disk) and
+// coerces properties to the same plain-string-values shape the annotation
+// endpoint above enforces.
+function _pwSanitizeGraphSavePayload(graphData, properties) {
+  const nodes = Array.isArray(graphData && graphData.nodes) ? graphData.nodes : [];
+  const edges = Array.isArray(graphData && graphData.edges) ? graphData.edges : [];
+  const cleanProps = {};
+  for (const [k, v] of Object.entries(properties || {})) {
+    const key = String(k).trim();
+    if (key) cleanProps[key] = String(v);
+  }
+  return { graphData: { nodes, edges }, properties: cleanProps };
+}
+
+// ─── Pathway graph save (File → Pathways → Save) ─────────────────────────────
+// Persists the CURRENT in-browser graph — including any node/edge additions,
+// deletions, property edits, and layout changes the user made, none of which
+// /api/pathways/annotation above ever touches — back to the file the pathway
+// was opened from. Unlike that endpoint, the full graph is already sitting in
+// the request body (the browser has it in memory), so there's no need to
+// re-convert the original RNEF via Python here at all.
+//   - sourceFile already .graph.json: overwritten in place.
+//   - sourceFile is .rnef/.xml (first save of a pathway that's never had its
+//     own .graph.json before): a new "<pathway name>.graph.json" is created
+//     alongside the untouched original .rnef, exactly like the annotation
+//     endpoint's first-edit case — the response's sourceFile tells the client
+//     to point future saves at this new file instead.
+app.post('/api/pathways/save-graph', dbLimiter, authMiddleware, (req, res) => {
+  const { sourceFile, pathwayName, properties, graphData, positions } = req.body || {};
+  const dir = _resolvePathwayCollectionDirForUser(req.user.username);
+  if (!sourceFile || !pathwayName || !graphData || typeof graphData !== 'object') {
+    return res.status(400).json({ error: 'sourceFile, pathwayName, and graphData are required' });
+  }
+  if (!dir) return res.status(400).json({ error: 'No pathway collection directory configured' });
+  if (!_isPathInsideDir(sourceFile, dir)) {
+    return res.status(400).json({ error: 'sourceFile is not inside your configured pathway collection directory' });
+  }
+
+  const { graphData: cleanGraph, properties: cleanProps } = _pwSanitizeGraphSavePayload(graphData, properties);
+  const isAlreadyJson = String(sourceFile).toLowerCase().endsWith('.graph.json');
+
+  try {
+    // Preserve whatever fields we don't manage here (currently just
+    // resnetType, mirroring the annotation endpoint) when overwriting an
+    // existing .graph.json — irrelevant for the create-new-file branch since
+    // there's nothing yet to preserve.
+    let resnetType = 'Pathway';
+    let outPath;
+    if (isAlreadyJson) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+        if (existing && existing.resnetType) resnetType = existing.resnetType;
+      } catch (e) { /* unreadable/corrupt existing file — fall through and overwrite anyway */ }
+      outPath = sourceFile;
+    } else {
+      outPath = path.join(path.dirname(sourceFile), _pwSafeFilename(pathwayName) + '.graph.json');
+    }
+
+    const pathwayData = {
+      name: pathwayName,
+      resnetType,
+      properties: cleanProps,
+      graphData: cleanGraph,
+      positions: (positions && typeof positions === 'object') ? positions : {},
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(outPath, JSON.stringify(pathwayData));
+
+    const relDir = path.relative(dir, path.dirname(outPath)).split(path.sep).join('/');
+    const subfolder = relDir === '.' ? '' : relDir;
+    _patchPathwayIndexEntry(req.user.username, {
+      name: pathwayName,
+      resnetType,
+      properties: cleanProps,
+      anatomy: _pwAnatomyFromProperties(cleanProps),
+      nodeUrns: _pwNodeUrnsFromGraphData(cleanGraph),
+      sourceFile: outPath,
+      subfolder,
+    });
+
+    res.json({ success: true, sourceFile: outPath, name: pathwayName, subfolder });
+  } catch (err) {
+    console.error('Pathway graph save error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+    res.status(500).json({ error: safeError(err, 'Pathway graph save') });
+  }
+});
+
+// ─── Pathway "Save As" (File → Pathways → Save As…) ──────────────────────────
+// Always creates a brand-new .graph.json — never overwrites an existing
+// pathway file — under a user-chosen name and (optionally) a different
+// folder within the collection. Defaults to the ORIGINAL pathway's own
+// folder when no subfolder override is given, matching normal "Save As"
+// expectations (same location, different name, unless told otherwise).
+app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) => {
+  const { sourceFile, pathwayName, subfolder, properties, graphData, positions } = req.body || {};
+  const dir = _resolvePathwayCollectionDirForUser(req.user.username);
+  if (!pathwayName || !String(pathwayName).trim() || !graphData || typeof graphData !== 'object') {
+    return res.status(400).json({ error: 'pathwayName and graphData are required' });
+  }
+  if (!dir) return res.status(400).json({ error: 'No pathway collection directory configured' });
+
+  const { graphData: cleanGraph, properties: cleanProps } = _pwSanitizeGraphSavePayload(graphData, properties);
+
+  try {
+    // Resolve the target directory: an explicit subfolder (may be '' for the
+    // collection root) wins; otherwise default to the original file's own
+    // folder; otherwise (no source file at all — e.g. a pathway built purely
+    // from a Cypher query result) fall back to the collection root.
+    let targetDir;
+    if (typeof subfolder === 'string') {
+      const cleanSub = subfolder.replace(/\\/g, '/').split('/').filter(p => p && p !== '.' && p !== '..').join('/');
+      targetDir = cleanSub ? path.join(dir, cleanSub) : dir;
+    } else if (sourceFile && _isPathInsideDir(sourceFile, dir)) {
+      targetDir = path.dirname(sourceFile);
+    } else {
+      targetDir = dir;
+    }
+    fs.mkdirSync(targetDir, { recursive: true });
+    if (!_isPathInsideDir(targetDir, dir)) {
+      return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
+    }
+
+    const outPath = path.join(targetDir, _pwSafeFilename(pathwayName) + '.graph.json');
+    if (fs.existsSync(outPath)) {
+      return res.status(409).json({ error: `A pathway named "${pathwayName}" already exists in that folder — choose a different name or folder.` });
+    }
+
+    let resnetType = 'Pathway';
+    if (sourceFile && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(sourceFile, 'utf8'));
+        if (existing && existing.resnetType) resnetType = existing.resnetType;
+      } catch (e) { /* ignore — keep default */ }
+    }
+
+    const pathwayData = {
+      name: pathwayName,
+      resnetType,
+      properties: cleanProps,
+      graphData: cleanGraph,
+      positions: (positions && typeof positions === 'object') ? positions : {},
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(outPath, JSON.stringify(pathwayData));
+
+    const relDir = path.relative(dir, targetDir).split(path.sep).join('/');
+    const outSubfolder = relDir === '.' ? '' : relDir;
+    _patchPathwayIndexEntry(req.user.username, {
+      name: pathwayName,
+      resnetType,
+      properties: cleanProps,
+      anatomy: _pwAnatomyFromProperties(cleanProps),
+      nodeUrns: _pwNodeUrnsFromGraphData(cleanGraph),
+      sourceFile: outPath,
+      subfolder: outSubfolder,
+    });
+
+    res.json({ success: true, sourceFile: outPath, name: pathwayName, subfolder: outSubfolder });
+  } catch (err) {
+    console.error('Pathway Save As error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+    res.status(500).json({ error: safeError(err, 'Pathway Save As') });
+  }
+});
+
+// ─── Pathway "Save As... Alias" (File → Pathways → Save As…, Alias mode) ─────
+// A Pathway Alias is a lightweight POINTER to a pathway that already exists
+// somewhere in the collection, not a copy of its content — see
+// rnef_index.py's own comments on _extract_alias_records()/curated
+// "<FolderName>_symlinks.rnef" manifests for the full story of why this
+// exists (avoiding duplicating the same pathway across multiple disease/
+// process folders). This app-created equivalent is a small
+// "<name>.alias.json" sidecar file ({name, aliasTargetUrn}) rather than
+// RNEF XML -- far simpler and less error-prone to write correctly than
+// parsing-and-appending to an existing (or newly authoring a) curated
+// "_symlinks.rnef" manifest, and produces an index entry that Browse
+// renders/opens IDENTICALLY to a curated symlink once rnef_index.py (or
+// this endpoint's own immediate _patchPathwayIndexEntry call below)
+// resolves aliasTargetUrn against every real pathway's own pathwayUrn.
+app.post('/api/pathways/save-alias-as', dbLimiter, authMiddleware, (req, res) => {
+  const { name, subfolder, aliasTargetUrn } = req.body || {};
+  const dir = _resolvePathwayCollectionDirForUser(req.user.username);
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: 'A pathway name is required' });
+  }
+  if (!aliasTargetUrn || !String(aliasTargetUrn).trim()) {
+    return res.status(400).json({
+      error: 'The pathway currently open has no identifying urn to alias — it likely wasn\'t opened from an RNEF/.graph.json source that carried one. Use "Full copy" instead.',
+    });
+  }
+  if (!dir) return res.status(400).json({ error: 'No pathway collection directory configured' });
+
+  try {
+    const cleanSub = typeof subfolder === 'string'
+      ? subfolder.replace(/\\/g, '/').split('/').filter(p => p && p !== '.' && p !== '..').join('/')
+      : '';
+    const targetDir = cleanSub ? path.join(dir, cleanSub) : dir;
+    fs.mkdirSync(targetDir, { recursive: true });
+    if (!_isPathInsideDir(targetDir, dir)) {
+      return res.status(400).json({ error: 'Target folder is not inside your configured pathway collection directory' });
+    }
+
+    const outPath = path.join(targetDir, _pwSafeFilename(name) + '.alias.json');
+    if (fs.existsSync(outPath)) {
+      return res.status(409).json({ error: `A pathway or alias named "${name}" already exists in that folder — choose a different name or folder.` });
+    }
+
+    const aliasData = { name, aliasTargetUrn, savedAt: new Date().toISOString() };
+    fs.writeFileSync(outPath, JSON.stringify(aliasData));
+
+    // Resolve the target immediately (against this user's already-loaded
+    // index) so Browse shows a correctly-linked alias right away, rather
+    // than "target not found" until the next full re-index -- mirrors
+    // rnef_index.py's own urn_to_pathway resolution, just scoped to one
+    // new entry instead of the whole collection.
+    const entry = getPathwayIndexForUser(req.user.username);
+    const target = (entry.pathwayIndex.pathways || []).find(p => p.pathwayUrn === aliasTargetUrn && !p.isAlias);
+
+    _patchPathwayIndexEntry(req.user.username, {
+      name,
+      resnetType: 'Alias',
+      isAlias: true,
+      aliasTargetUrn,
+      aliasTargetSourceFile: target ? target.sourceFile : null,
+      aliasTargetSubfolder: target ? (target.subfolder || '') : null,
+      aliasTargetName: target ? target.name : null,
+      properties: {},
+      anatomy: {},
+      nodeUrns: [],
+      sourceFile: outPath,
+      subfolder: cleanSub,
+    });
+
+    res.json({ success: true, sourceFile: outPath, name, subfolder: cleanSub, resolved: !!target });
+  } catch (err) {
+    console.error('Pathway Save As Alias error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
+    res.status(500).json({ error: safeError(err, 'Pathway Save As Alias') });
+  }
 });
 
 // ─── Per-user LLM override (provider/model/API key) ──────────────────────────
@@ -1140,6 +2434,26 @@ app.post('/api/nodes/property-names', dbLimiter, authMiddleware, async (req, res
   }
 });
 
+// ─── Node property names, DB-wide (not scoped to any particular nodes) ───────
+// Used to populate the property-name autocomplete for the Explore "All
+// relations" dialog's node-property "+ Add filter" rows — candidate nodes
+// there can come from anywhere in the database (Expand, Find Common
+// Neighbors), not just the currently loaded pathway, so the pathway-scoped
+// /api/nodes/property-names above isn't useful here. attr.name values are a
+// bounded vocabulary of property keys (not per-node data), so a single
+// unscoped DISTINCT is cheap regardless of database size.
+app.get('/api/nodes/property-names-all', dbLimiter, authMiddleware, async (req, res) => {
+  try {
+    const result = await req.pg.pool.query(
+      `SELECT DISTINCT name FROM ${req.pg.schema}.attr ORDER BY name`
+    );
+    res.json(result.rows.map(r => r.name));
+  } catch (err) {
+    console.error('property-names-all error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
 // ─── Load selected node properties for pathway nodes ─────────────────────────
 // Matches by numeric NodeID (Neo4j nodes) and/or URN string (RNEF nodes).
 // Returns { byNodeId: { "123": {prop:val,...} }, byUrn: { "urn:...": {prop:val,...} } }
@@ -1450,14 +2764,26 @@ RETURN row.relURN AS relURN, r.RelationID AS relationID, r.RelationNumberOfSente
       }
     }
 
-    // ── ChemicalReaction hyperedges ─────────────────────────────────────────
-    // In Neo4j a ChemicalReaction hyperedge is stored as many (a)-[r]->(b) rows
-    // sharing the same RelationID.  We pre-filter with IN, then verify the full
-    // set of matched regulators/targets equals the RNEF set via size comparison.
+    // ── Hyperedges (ANY relation type with >2 participants, not just
+    // ChemicalReaction — each row carries its own relType now) ──────────────
+    // In Neo4j a hyperedge is stored as many (a)-[r]->(b) rows sharing the
+    // same RelationID. We pre-filter with IN, then verify the full set of
+    // matched regulators/targets equals the RNEF set via size comparison.
+    // Cypher cannot parametrize relationship types, so — same as the regular
+    // batch above — rows are grouped by relType and one query runs per type.
     if (hyperedgeBatch.length > 0) {
-      const cypher = `
+      const hyperByType = Object.create(null); // null prototype prevents remote property injection
+      hyperedgeBatch.forEach(row => {
+        if (typeof row.relType !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(row.relType)) return;
+        (hyperByType[row.relType] = hyperByType[row.relType] || []).push(row);
+      });
+
+      for (const [relType, rows] of Object.entries(hyperByType)) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(relType)) continue;
+
+        const cypher = `
 UNWIND $rows AS row
-MATCH (a)-[r:ChemicalReaction]->(b)
+MATCH (a)-[r:\`${relType}\`]->(b)
 WHERE a.URN IN row.rURNs AND b.URN IN row.tURNs
 WITH row, r.RelationID AS relID, r.RelationNumberOfSentences AS numSentences,
      collect(DISTINCT a.URN) AS matchedRegs,
@@ -1465,18 +2791,19 @@ WITH row, r.RelationID AS relID, r.RelationNumberOfSentences AS numSentences,
 WHERE size(matchedRegs) = size(row.rURNs) AND size(matchedTgts) = size(row.tURNs)
 RETURN DISTINCT row.relURN AS relURN, relID AS relationID, numSentences`;
 
-      const result = await session.run(cypher, { rows: hyperedgeBatch });
-      result.records.forEach(record => {
-        const relURN    = record.get('relURN');
-        const relationID = record.get('relationID');
-        if (relURN != null && relationID != null) {
-          const nos = record.get('numSentences');
-          mapping[String(relURN)] = {
-            id:          String(toPlain(relationID)),
-            numSentences: nos != null ? (typeof nos === 'object' && nos.toNumber ? nos.toNumber() : Number(nos)) : null
-          };
-        }
-      });
+        const result = await session.run(cypher, { rows });
+        result.records.forEach(record => {
+          const relURN    = record.get('relURN');
+          const relationID = record.get('relationID');
+          if (relURN != null && relationID != null) {
+            const nos = record.get('numSentences');
+            mapping[String(relURN)] = {
+              id:          String(toPlain(relationID)),
+              numSentences: nos != null ? (typeof nos === 'object' && nos.toNumber ? nos.toNumber() : Number(nos)) : null
+            };
+          }
+        });
+      }
     }
 
     res.json(mapping);
@@ -1953,6 +3280,22 @@ app.post('/api/graph/count-query', dbLimiter, authMiddleware, async (req, res) =
   //   →   run count(*) on each branch and sum
 
   function branchToCountQuery(branch) {
+    // A trailing LIMIT bounds how many rows the query can actually return,
+    // regardless of how many total matches exist before it — naively
+    // replacing everything from RETURN onward (below) throws that LIMIT away
+    // entirely, since it's part of what gets replaced. This was a real bug:
+    // a "top 10 ..." ranking query (RETURN ... ORDER BY ... LIMIT 10) had its
+    // LIMIT silently stripped by this count check, which then reported the
+    // full unbounded match count — often far larger than 10 — incorrectly
+    // triggering the "results too large" warning for a query that would
+    // actually only ever return 10 rows. When a LIMIT is present, wrap the
+    // ENTIRE original branch (preserving its own RETURN/ORDER BY/LIMIT
+    // exactly as written) in a CALL {} subquery and count the rows that come
+    // out of it, instead of replacing the RETURN clause outright.
+    const hasLimit = /\bLIMIT\s+\d+\s*$/i.test(branch);
+    if (hasLimit) {
+      return 'CALL {\n' + branch + '\n}\nRETURN count(*) AS edgeCount';
+    }
     const pos = branch.search(/\bRETURN\b/i);
     return pos !== -1
       ? branch.substring(0, pos) + 'RETURN count(*) AS edgeCount'
@@ -2509,8 +3852,28 @@ app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, r
 // For every pair among the given nodes, finds the shortest undirected path (up
 // to maxLength hops) using only the given relationship types, and returns the
 // union of nodes/edges across every path found (Database → Shortest path menu).
+// POST /api/graph/shortest-path
+// Body: { nodeParams: [{label, urn}, ...], maxLength, relTypes?, nodeTypes?,
+//         propFilters?, nodePropFilters? }
+// Driven by the Explore menu's universal "All relations" config dialog
+// (action 'shortestPath') — relTypes/nodeTypes/propFilters/nodePropFilters
+// are all optional now (previously relTypes was mandatory and errored if
+// empty); omitting a filter means "no restriction", consistent with the
+// other 3 actions that dialog also drives.
+//   - relTypes empty/omitted → untyped variable-length pattern (traverse ANY
+//     relationship type), instead of the old "must pick at least one type" error.
+//   - nodeTypes restricts INTERMEDIATE path nodes only — the two path
+//     endpoints are the user's own explicit selection and are never subject
+//     to type filtering (requiring the user to also check their own two
+//     endpoints' types would be an easy-to-forget footgun).
+//   - propFilters (relation properties) must hold for EVERY relationship
+//     along the path — same "every step must qualify" semantics as
+//     nodeTypes, expressed via Neo4j's all(... IN ... WHERE ...) predicate.
+//   - nodePropFilters (node properties, from Postgres node+attr) are
+//     evaluated per-path AFTER the Cypher query returns, same as
+//     explore-relations-report, again only against intermediate nodes.
 app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res) => {
-  const { nodeParams = [], maxLength, relTypes = [] } = req.body || {};
+  const { nodeParams = [], maxLength, relTypes, nodeTypes, propFilters, nodePropFilters } = req.body || {};
 
   const safeNodes = (Array.isArray(nodeParams) ? nodeParams : []).filter(np =>
     np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
@@ -2523,18 +3886,34 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
 
   const len = Number.isInteger(maxLength) && maxLength >= 1 && maxLength <= 15 ? maxLength : 2;
 
-  const safeTypes = (Array.isArray(relTypes) ? relTypes : [])
-    .filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
-  if (!safeTypes.length)
-    return res.status(400).json({ error: 'At least one relation type must be selected' });
+  const safeIdent = s => typeof s === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
 
-  const typePattern = safeTypes.map(t => '`' + t + '`').join('|');
+  let relPattern = '';
+  if (Array.isArray(relTypes) && relTypes.length) {
+    const safeTypes = relTypes.filter(safeIdent);
+    if (safeTypes.length) relPattern = ':' + safeTypes.map(t => '`' + t + '`').join('|');
+  }
+
+  let safeNodeTypes = [];
+  let nodeTypeClause = '';
+  if (Array.isArray(nodeTypes) && nodeTypes.length) {
+    safeNodeTypes = nodeTypes.filter(safeIdent);
+    if (safeNodeTypes.length) nodeTypeClause = 'all(n IN nodes(p)[1..-1] WHERE any(lbl IN labels(n) WHERE lbl IN $nodeTypesParam))';
+  }
+
+  const { clauses: propClauses, params: propParams } = _buildRelPropFilterClauses(propFilters, 'r');
+  const relPropClause = propClauses.length ? 'all(r IN relationships(p) WHERE ' + propClauses.join(' AND ') + ')' : '';
+
+  const extraWhereParts = [nodeTypeClause, relPropClause].filter(Boolean);
+  const extraWhere = extraWhereParts.length ? ('WHERE ' + extraWhereParts.join(' AND ')) : '';
 
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
-    const nodesMap = new Map();
-    const edgesMap = new Map();
-    let pathsFound = 0;
+    // Every matched path is kept SEPARATE (not merged into a shared map yet)
+    // until after the node-property post-filter runs below, since dropping a
+    // path that fails a node-property filter must also drop whichever of its
+    // nodes/edges aren't shared with any other surviving path.
+    const candidatePaths = [];
 
     for (let i = 0; i < safeNodes.length; i++) {
       for (let j = i + 1; j < safeNodes.length; j++) {
@@ -2542,23 +3921,64 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
         const cypher = `
           MATCH (a {\`${NEO4J_URN_PROP}\`: $urnA}), (b {\`${NEO4J_URN_PROP}\`: $urnB})
           WHERE $labelA IN labels(a) AND $labelB IN labels(b)
-          MATCH p = shortestPath((a)-[:${typePattern}*1..${len}]-(b))
+          MATCH p = shortestPath((a)-[${relPattern}*1..${len}]-(b))
+          ${extraWhere}
           RETURN p
         `;
         const result = await session.run(cypher, {
-          urnA: a.urn, urnB: b.urn, labelA: a.label, labelB: b.label
+          urnA: a.urn, urnB: b.urn, labelA: a.label, labelB: b.label,
+          nodeTypesParam: safeNodeTypes, ...propParams
         });
         result.records.forEach(record => {
           const p = record.get('p');
-          if (p) { pathsFound++; processValue(p, nodesMap, edgesMap); }
+          if (!p) return;
+          const tempNodes = new Map(), tempEdges = new Map();
+          processValue(p, tempNodes, tempEdges);
+          candidatePaths.push({ tempNodes, tempEdges, endpointURNs: new Set([String(a.urn), String(b.urn)]) });
         });
       }
     }
 
+    // Node-property post-filter — every INTERMEDIATE node (never the two
+    // path endpoints) in a kept path must satisfy every nodePropFilter.
+    const safeNodePropFilters = _sanitizeNodePropFilters(nodePropFilters);
+    if (safeNodePropFilters.length && candidatePaths.length) {
+      const filterNames = Array.from(new Set(safeNodePropFilters.map(f => f.key.trim())));
+      const allNodeIds = new Set();
+      candidatePaths.forEach(cp => {
+        cp.tempNodes.forEach(n => {
+          const urn = n.properties && n.properties[NEO4J_URN_PROP];
+          if (urn && cp.endpointURNs.has(String(urn))) return;
+          const nid = n.properties && n.properties.NodeID;
+          if (nid != null) allNodeIds.add(String(nid));
+        });
+      });
+      const propsByNodeId = await _fetchNodePropsByNodeId(req.pg, Array.from(allNodeIds), filterNames);
+      for (let k = candidatePaths.length - 1; k >= 0; k--) {
+        const cp = candidatePaths[k];
+        let ok = true;
+        for (const n of cp.tempNodes.values()) {
+          const urn = n.properties && n.properties[NEO4J_URN_PROP];
+          if (urn && cp.endpointURNs.has(String(urn))) continue;
+          const nid = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : null;
+          const props = (nid && propsByNodeId.get(nid)) || {};
+          if (!_nodePropFilterMatches(props, safeNodePropFilters)) { ok = false; break; }
+        }
+        if (!ok) candidatePaths.splice(k, 1);
+      }
+    }
+
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+    candidatePaths.forEach(cp => {
+      cp.tempNodes.forEach((v, k) => { if (!nodesMap.has(k)) nodesMap.set(k, v); });
+      cp.tempEdges.forEach((v, k) => { if (!edgesMap.has(k)) edgesMap.set(k, v); });
+    });
+
     res.json({
       nodes: Array.from(nodesMap.values()),
       edges: Array.from(edgesMap.values()),
-      pathsFound,
+      pathsFound: candidatePaths.length,
       pairsChecked: (safeNodes.length * (safeNodes.length - 1)) / 2
     });
   } catch (err) {
@@ -2864,6 +4284,743 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
   } finally {
     await session.close();
   }
+});
+
+
+// POST /api/graph/find-drugs (Database → Find drugs upstream)
+// Body: { nodeParams: [{label: string, urn: string}, ...], relTypes?: string[], effect?: 'positive'|'negative' }
+// Finds :SmallMol nodes that are UPSTREAM regulators of the given (selected)
+// entities — (drug)-[r]->(entity), drug as source — and that the Pathway
+// Studio Ontology actually classifies as a DRUG, not just any small molecule
+// (plain :SmallMol also covers metabolites, reagents, and other non-drug
+// compounds). The is_a-chain-to-a-drug-ontology-root filter mirrors
+// cypher_examples.json's "Find drugs without PAINS compounds" example
+// (is_a* up to either the SmallMol 'plant medicinal product' node or the
+// SemanticConcept 'drugs' node).
+//
+// relTypes/effect narrow this to the specific submenu variants under "Find
+// drugs upstream": direct/indirect antagonists (Effect=negative) or agonists
+// (Effect=positive) restricted to DirectRegulation (direct) or Regulation/
+// Expression/MolTransport (indirect), and expression modulators (Expression
+// only, either Effect sign). Omitting both keeps the original unrestricted
+// behavior ("All relations").
+//
+// Returns the same { nodes, edges } shape as /api/graph/ontology-children
+// and /api/graph/expand, so the caller can merge it into the graph via the
+// same expand-confirm-modal flow findOntologyChildren() already uses.
+app.post('/api/graph/find-drugs', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeParams = [], relTypes, effect } = req.body || {};
+  if (!Array.isArray(nodeParams) || !nodeParams.length)
+    return res.status(400).json({ error: 'nodeParams array is required' });
+
+  const safe = nodeParams.filter(np =>
+    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    typeof np.urn === 'string' && np.urn.trim().length > 0
+  );
+  if (!safe.length) return res.json({ nodes: [], edges: [] });
+
+  // Relation types cannot be parameterized in Cypher — validated against a
+  // safe-identifier allowlist (same pattern /api/graph/expand uses) before
+  // being inlined, never taken from the client as a raw string.
+  let relClause = '-[r]->';
+  if (Array.isArray(relTypes) && relTypes.length) {
+    const safeTypes = relTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+    if (safeTypes.length) relClause = '-[r:' + safeTypes.join('|') + ']->';
+  }
+
+  const params = { nodeParams: safe };
+  let effectClause = '';
+  if (effect === 'positive' || effect === 'negative') {
+    effectClause = '\n      AND r.Effect = $effect';
+    params.effect = effect;
+  }
+
+  const cypher = `
+    UNWIND $nodeParams AS np
+    MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
+    WHERE np.label IN labels(p)
+    MATCH (d:SmallMol)${relClause}(p)
+    WHERE (
+      (d)-[:is_a*]->(:SmallMol {Name:'plant medicinal product'})
+      OR (d)-[:is_a*]->(:SemanticConcept {Name:'drugs'})
+    )${effectClause}
+    WITH DISTINCT p, r, d
+    RETURN p, r, d
+    LIMIT 2000
+  `;
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    const result = await session.run(cypher, params);
+    const nodesMap = new Map();
+    const edgesMap = new Map();
+    result.records.forEach(record => {
+      record.keys.forEach(key => processValue(record.get(key), nodesMap, edgesMap));
+    });
+    res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
+  } catch (err) {
+    console.error('find-drugs error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+
+// POST /api/graph/find-drugs-report
+// Body: same as /api/graph/find-drugs — { nodeParams, relTypes?, effect? }
+// Used instead of the plain /api/graph/find-drugs merge-confirm flow whenever
+// more than 2 input entities are selected: groups the same upstream-drug
+// matches BY DRUG (rather than returning one flat node/edge soup) and adds
+// per-drug reference/snippet counts from Postgres, so the "Connectivity
+// Report" dialog can rank drugs by how many of the input entities they
+// actually connect to before the user decides which ones to visualize.
+//
+// Response shape is intentionally generic (`groups`, not `drugs`) — the same
+// dialog and response contract are meant to be reused by "Find common
+// regulators" / "Find common targets" later, which will group by regulator/
+// target instead of by drug but return the exact same
+// { node, targetCount, referenceCount, snippetCount, targets, edges } shape.
+app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeParams = [], relTypes, effect } = req.body || {};
+  if (!Array.isArray(nodeParams) || !nodeParams.length)
+    return res.status(400).json({ error: 'nodeParams array is required' });
+
+  const safe = nodeParams.filter(np =>
+    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    typeof np.urn === 'string' && np.urn.trim().length > 0
+  );
+  if (!safe.length) return res.json({ groups: [] });
+
+  // Same relType/effect validation and clause-building as /api/graph/find-drugs.
+  let relClause = '-[r]->';
+  if (Array.isArray(relTypes) && relTypes.length) {
+    const safeTypes = relTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+    if (safeTypes.length) relClause = '-[r:' + safeTypes.join('|') + ']->';
+  }
+  const cypherParams = { nodeParams: safe };
+  let effectClause = '';
+  if (effect === 'positive' || effect === 'negative') {
+    effectClause = '\n      AND r.Effect = $effect';
+    cypherParams.effect = effect;
+  }
+
+  // Grouped by drug: collect({target, rel}) gives each drug its own list of
+  // (target node, relationship) pairs in one round trip, rather than a flat
+  // node/edge soup that would need re-grouping client-side.
+  const cypher = `
+    UNWIND $nodeParams AS np
+    MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
+    WHERE np.label IN labels(p)
+    MATCH (d:SmallMol)${relClause}(p)
+    WHERE (
+      (d)-[:is_a*]->(:SmallMol {Name:'plant medicinal product'})
+      OR (d)-[:is_a*]->(:SemanticConcept {Name:'drugs'})
+    )${effectClause}
+    WITH DISTINCT d, p, r
+    RETURN d, collect({target: p, rel: r}) AS links
+  `;
+
+  const nodeToPlain = (n) => ({
+    id: n.identity.toString(),
+    elementId: n.elementId || n.identity.toString(),
+    labels: n.labels,
+    properties: toPlain(n.properties),
+  });
+  // r.RelationID can be a scalar OR a list (StringArray) in Neo4j — same
+  // normalization /api/relations/properties already uses for this quirk.
+  const relIdsOf = (r) => {
+    const raw = r.properties && r.properties.RelationID;
+    if (raw == null) return [];
+    return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
+  };
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  let groups;
+  try {
+    const result = await session.run(cypher, cypherParams);
+    groups = result.records.map(rec => {
+      const d = rec.get('d');
+      const links = rec.get('links') || [];
+      const targetsById = new Map();
+      const edgesById = new Map();
+      const relIdSet = new Set();
+      links.forEach(link => {
+        const p = link.target, r = link.rel;
+        const pid = p.identity.toString();
+        if (!targetsById.has(pid)) targetsById.set(pid, nodeToPlain(p));
+        const eid = r.identity.toString();
+        if (!edgesById.has(eid)) {
+          edgesById.set(eid, {
+            id: eid,
+            elementId: r.elementId || eid,
+            type: r.type,
+            startNodeId: r.start.toString(),
+            endNodeId: r.end.toString(),
+            properties: toPlain(r.properties),
+          });
+        }
+        relIdsOf(r).forEach(rid => relIdSet.add(rid));
+      });
+      return {
+        node: nodeToPlain(d),
+        targetCount: targetsById.size,
+        targets: Array.from(targetsById.values()),
+        edges: Array.from(edgesById.values()),
+        _relationIds: Array.from(relIdSet),  // internal only — stripped before response
+      };
+    });
+  } catch (err) {
+    console.error('find-drugs-report Neo4j error:', err.message);
+    return res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+
+  // Batched Postgres lookup: ONE query for every RelationID across every
+  // drug (not one query per drug), then re-grouped back out per drug below —
+  // avoids N round trips for a result set that can easily have dozens of drugs.
+  const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
+    .filter(id => /^-?\d+$/.test(id));
+  const rowsByRelId = new Map();
+  if (allRelIds.length && req.pg && req.pg.pool) {
+    try {
+      const sql = `SELECT id, doi, pmid, unique_id FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      const pgResult = await req.pg.pool.query(sql, [allRelIds]);
+      pgResult.rows.forEach(row => {
+        const key = String(row.id);
+        if (!rowsByRelId.has(key)) rowsByRelId.set(key, []);
+        rowsByRelId.get(key).push(row);
+      });
+    } catch (err) {
+      console.error('find-drugs-report Postgres error:', err.message);
+      // Reference/snippet counts just come back as 0 below — the node/edge
+      // data itself (from Neo4j) is still useful without them.
+    }
+  }
+
+  groups.forEach(g => {
+    // # references: SELECT COUNT(DISTINCT COALESCE(doi, pmid)) FROM reference
+    // WHERE id IN (this drug's RelationIDs) — computed here from the shared
+    // batch fetch above instead of issuing that query per drug.
+    const refKeys = new Set();
+    // #snippets: SELECT COUNT(unique_id) FROM reference WHERE id IN (...) —
+    // counts ROWS (supporting sentences), not distinct papers.
+    let snippetCount = 0;
+    g._relationIds.forEach(rid => {
+      (rowsByRelId.get(rid) || []).forEach(row => {
+        const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+        if (coalesced != null && coalesced !== '') refKeys.add(String(coalesced));
+        if (row.unique_id != null) snippetCount++;
+      });
+    });
+    g.referenceCount = refKeys.size;
+    g.snippetCount = snippetCount;
+    delete g._relationIds;
+  });
+
+  groups.sort((a, b) => b.targetCount - a.targetCount);
+  res.json({ groups });
+});
+
+
+// POST /api/graph/common-neighbors-report (Database → Find common neighbors)
+// Body: { nodeParams: [{label, urn}, ...], direction: 'any'|'in'|'out', nodeTypes?: string[], relTypes?: string[] }
+// General-purpose sibling of /api/graph/find-drugs-report — same grouped-by-
+// neighbor response shape ({ groups: [{node, targetCount, referenceCount,
+// snippetCount, targets, edges}] }), same Postgres reference/snippet
+// batching, and feeds the same Connectivity Report dialog. Unlike find-
+// drugs-report, there's no SmallMol/drug-ontology filter here: candidates
+// are any node (optionally restricted to user-picked labels), matched via
+// user-picked relation types, with `direction` choosing what "neighbor"
+// means:
+//   'any' ("All relations")   — (d)-[r]-(p)  neighbor connected either way
+//   'in'  ("Find regulators") — (d)-[r]->(p) neighbor is an UPSTREAM regulator of the input
+//   'out' ("Find targets")    — (p)-[r]->(d) neighbor is a DOWNSTREAM target of the input
+// Builds extra WHERE clauses filtering the MATCHED RELATION (r) by arbitrary
+// user-picked properties — Effect, Mechanism, Tissue, CellType,
+// RelationNumberOfReferences, or anything else in the schema. Property
+// KEYS can't be parameterized in Cypher (they're inlined as backtick-quoted
+// identifiers, same as /api/schema/prop-values and the annotation-save
+// endpoint already do), so they're validated to contain no backtick rather
+// than restricted to a strict identifier pattern — several real property
+// names here legitimately contain spaces/parens (e.g. "Confidence (%)").
+// VALUES always travel as Cypher parameters, never inlined, regardless of
+// operator. `>`/`>=`/`<`/`<=` require a numeric value (rows that don't parse
+// are skipped); `=`/`<>` auto-detect numeric-looking text so
+// RelationNumberOfReferences = 5 compares as a number, not a string.
+function _buildRelPropFilterClauses(propFilters, relVar) {
+  const clauses = [];
+  const params = {};
+  (Array.isArray(propFilters) ? propFilters : []).forEach((f, i) => {
+    if (!f || typeof f.key !== 'string') return;
+    const key = f.key.trim();
+    if (!key || key.length > 100 || key.includes('`')) return;
+    const op = f.op;
+    const propRef = `${relVar}.\`${key}\``;
+    if (op === 'exists') {
+      clauses.push(`${propRef} IS NOT NULL`);
+      return;
+    }
+    if (f.value == null || String(f.value).trim() === '') return;  // no value given, and not "exists" -- nothing to filter on
+    const raw = String(f.value).trim();
+    const paramName = `pf${i}`;
+    if (op === '>' || op === '>=' || op === '<' || op === '<=') {
+      const num = Number(raw);
+      if (!Number.isFinite(num)) return;  // not a valid number for a numeric comparison -- skip rather than error the whole query
+      params[paramName] = num;
+      clauses.push(`${propRef} ${op} $${paramName}`);
+    } else if (op === 'contains') {
+      params[paramName] = raw;
+      clauses.push(`toLower(toString(${propRef})) CONTAINS toLower($${paramName})`);
+    } else if (op === '=' || op === '<>') {
+      // Numeric-looking text compares as a number (so RelationNumberOfReferences
+      // = "5" actually matches the integer 5); anything else stays a string.
+      params[paramName] = /^-?\d+(\.\d+)?$/.test(raw) ? Number(raw) : raw;
+      clauses.push(`${propRef} ${op} $${paramName}`);
+    }
+  });
+  return { clauses, params };
+}
+
+app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async (req, res) => {
+  const { nodeParams = [], direction, nodeTypes, relTypes, propFilters } = req.body || {};
+  if (!Array.isArray(nodeParams) || !nodeParams.length)
+    return res.status(400).json({ error: 'nodeParams array is required' });
+
+  const safe = nodeParams.filter(np =>
+    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    typeof np.urn === 'string' && np.urn.trim().length > 0
+  );
+  if (!safe.length) return res.json({ groups: [] });
+
+  // Relation types cannot be parameterized in Cypher — validated against a
+  // safe-identifier allowlist before being inlined, same pattern
+  // /api/graph/expand and /api/graph/find-drugs use.
+  let relTypeClause = '';
+  if (Array.isArray(relTypes) && relTypes.length) {
+    const safeTypes = relTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+    if (safeTypes.length) relTypeClause = ':' + safeTypes.join('|');
+  }
+  // Direction determines which side of the pattern is the candidate neighbor
+  // (d) vs. the input entity (p) — see the endpoint comment above.
+  let matchClause;
+  if (direction === 'in') {
+    matchClause = `MATCH (d)-[r${relTypeClause}]->(p)`;
+  } else if (direction === 'out') {
+    matchClause = `MATCH (p)-[r${relTypeClause}]->(d)`;
+  } else {
+    matchClause = `MATCH (d)-[r${relTypeClause}]-(p)`;
+  }
+
+  // Node labels also cannot be parameterized — same allowlist treatment.
+  let nodeTypeClause = '';
+  if (Array.isArray(nodeTypes) && nodeTypes.length) {
+    const safeNodeTypes = nodeTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+    if (safeNodeTypes.length) nodeTypeClause = ` AND any(lbl IN labels(d) WHERE lbl IN ${JSON.stringify(safeNodeTypes)})`;
+  }
+
+  // Additional relation-property filters (Effect, Mechanism, Tissue,
+  // CellType, RelationNumberOfReferences, ...) — narrows the match itself,
+  // which is what actually cuts query time down on a large fan-out, rather
+  // than filtering the already-fetched result afterward.
+  const { clauses: propClauses, params: propParams } = _buildRelPropFilterClauses(propFilters, 'r');
+  const propFilterClause = propClauses.length ? ' AND ' + propClauses.join(' AND ') : '';
+
+  const cypher = `
+    UNWIND $nodeParams AS np
+    MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
+    WHERE np.label IN labels(p)
+    ${matchClause}
+    WHERE d <> p${nodeTypeClause}${propFilterClause}
+    WITH DISTINCT d, p, r
+    RETURN d, collect({target: p, rel: r}) AS links
+  `;
+
+  const nodeToPlain = (n) => ({
+    id: n.identity.toString(),
+    elementId: n.elementId || n.identity.toString(),
+    labels: n.labels,
+    properties: toPlain(n.properties),
+  });
+  const relIdsOf = (r) => {
+    const raw = r.properties && r.properties.RelationID;
+    if (raw == null) return [];
+    return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
+  };
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  let groups;
+  try {
+    const result = await session.run(cypher, { nodeParams: safe, ...propParams });
+    groups = result.records.map(rec => {
+      const d = rec.get('d');
+      const links = rec.get('links') || [];
+      const targetsById = new Map();
+      const edgesById = new Map();
+      const relIdSet = new Set();
+      links.forEach(link => {
+        const p = link.target, r = link.rel;
+        const pid = p.identity.toString();
+        if (!targetsById.has(pid)) targetsById.set(pid, nodeToPlain(p));
+        const eid = r.identity.toString();
+        if (!edgesById.has(eid)) {
+          edgesById.set(eid, {
+            id: eid,
+            elementId: r.elementId || eid,
+            type: r.type,
+            startNodeId: r.start.toString(),
+            endNodeId: r.end.toString(),
+            properties: toPlain(r.properties),
+          });
+        }
+        relIdsOf(r).forEach(rid => relIdSet.add(rid));
+      });
+      return {
+        node: nodeToPlain(d),
+        targetCount: targetsById.size,
+        targets: Array.from(targetsById.values()),
+        edges: Array.from(edgesById.values()),
+        _relationIds: Array.from(relIdSet),
+      };
+    });
+  } catch (err) {
+    console.error('common-neighbors-report Neo4j error:', err.message);
+    return res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+
+  // Same batched Postgres lookup as find-drugs-report: one query for every
+  // RelationID across every group, re-aggregated per group below.
+  const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
+    .filter(id => /^-?\d+$/.test(id));
+  const rowsByRelId = new Map();
+  if (allRelIds.length && req.pg && req.pg.pool) {
+    try {
+      const sql = `SELECT id, doi, pmid, unique_id FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      const pgResult = await req.pg.pool.query(sql, [allRelIds]);
+      pgResult.rows.forEach(row => {
+        const key = String(row.id);
+        if (!rowsByRelId.has(key)) rowsByRelId.set(key, []);
+        rowsByRelId.get(key).push(row);
+      });
+    } catch (err) {
+      console.error('common-neighbors-report Postgres error:', err.message);
+    }
+  }
+
+  groups.forEach(g => {
+    const refKeys = new Set();
+    let snippetCount = 0;
+    g._relationIds.forEach(rid => {
+      (rowsByRelId.get(rid) || []).forEach(row => {
+        const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+        if (coalesced != null && coalesced !== '') refKeys.add(String(coalesced));
+        if (row.unique_id != null) snippetCount++;
+      });
+    });
+    g.referenceCount = refKeys.size;
+    g.snippetCount = snippetCount;
+    delete g._relationIds;
+  });
+
+  groups.sort((a, b) => b.targetCount - a.targetCount);
+  res.json({ groups });
+});
+
+// POST /api/graph/explore-relations-report
+// Body: { action: 'findBetween'|'connectSelected'|'expand'|'commonNeighbors',
+//         anchorURNs?, scopeURNs?, nodeParams?, direction?,
+//         nodeTypes?, relTypes?, propFilters?, nodePropFilters? }
+//
+// Shared backend for the Explore menu's universal "All relations" config
+// dialog — one endpoint instead of teaching find-between/connect-selected/
+// expand each their own copy of the grouping + Postgres-batching logic that
+// common-neighbors-report above already has. The three existing preset-driven
+// endpoints (find-between, connect-selected, expand) are left completely
+// untouched — they still power the Direct/Biomarker/Indirect/Expand-To…
+// menu items exactly as before; this endpoint only serves the NEW dialog's
+// "All relations" path across all four actions.
+//
+// Every action produces the same {node, targetCount, targets, edges,
+// referenceCount, snippetCount} grouped shape common-neighbors-report does,
+// so results can feed the same Connectivity Report dialog regardless of
+// which menu item triggered the query:
+//   findBetween     — group by node OUTSIDE the anchor selection, connected
+//                      to one or more anchors (mirrors /api/relations/find-between)
+//   connectSelected — group by each anchor node, targets = OTHER anchor nodes
+//                      it connects to directly (closed-loop, mirrors
+//                      /api/relations/connect-selected)
+//   expand          — group by any node NOT in the anchor set, connected to
+//                      one or more anchors (mirrors /api/graph/expand's
+//                      mode==='all')
+//   commonNeighbors — identical to /api/graph/common-neighbors-report
+//
+// nodePropFilters is the new piece none of the existing endpoints have: since
+// candidate nodes can come from anywhere in the database (not just the
+// currently loaded pathway), their Postgres node+attr properties are batch-
+// fetched by NodeID AFTER the Neo4j query returns, and groups whose node
+// fails any filter are dropped — the same {key, op, value} shape and
+// operator set (=, <>, contains, >, >=, <, <=, exists) as relation property
+// filters, just evaluated in JS against Postgres text values instead of
+// pushed into the Cypher WHERE clause (there's no single Neo4j pattern that
+// covers "any of these four possible actions", so pre-filtering nodes in
+// Cypher isn't practical the way it is for relation properties).
+function _nodePropFilterMatches(propsMap, filters) {
+  return (Array.isArray(filters) ? filters : []).every(f => {
+    if (!f || typeof f.key !== 'string') return true;
+    const key = f.key.trim();
+    if (!key) return true;
+    const raw = Object.prototype.hasOwnProperty.call(propsMap, key) ? propsMap[key] : undefined;
+    if (f.op === 'exists') return raw !== undefined;
+    if (raw === undefined) return false;
+    if (f.value == null || String(f.value).trim() === '') return true;
+    const val = String(f.value).trim();
+    if (f.op === '>' || f.op === '>=' || f.op === '<' || f.op === '<=') {
+      const a = Number(raw), b = Number(val);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+      if (f.op === '>')  return a > b;
+      if (f.op === '>=') return a >= b;
+      if (f.op === '<')  return a < b;
+      return a <= b;
+    }
+    if (f.op === 'contains') return String(raw).toLowerCase().includes(val.toLowerCase());
+    if (f.op === '=' || f.op === '<>') {
+      const numeric = /^-?\d+(\.\d+)?$/.test(val);
+      const eq = numeric ? (Number(raw) === Number(val)) : (String(raw) === val);
+      return f.op === '=' ? eq : !eq;
+    }
+    return true;
+  });
+}
+
+// Shared by every endpoint that supports node-property filtering
+// (explore-relations-report, shortest-path): validates {key, op, value} rows
+// the same way relation-property filters are validated (no backtick, bounded
+// length), so a stray unfinished "+ Add filter" row can't reach the database
+// query.
+function _sanitizeNodePropFilters(nodePropFilters) {
+  return (Array.isArray(nodePropFilters) ? nodePropFilters : [])
+    .filter(f => f && typeof f.key === 'string' && f.key.trim() && f.key.length <= 100 && !f.key.includes('`'));
+}
+
+// Batch-fetches Postgres node+attr properties for the given NodeIDs — only
+// the property NAMES actually referenced by a filter (propNames), to keep
+// the query small regardless of how many other properties a node carries.
+// Returns a Map keyed by NodeID (string) -> {propName: value}.
+async function _fetchNodePropsByNodeId(pg, nodeIds, propNames) {
+  const propsByNodeId = new Map();
+  const safeIds = (nodeIds || []).map(String).filter(id => /^-?\d+$/.test(id));
+  if (!safeIds.length || !propNames || !propNames.length || !pg || !pg.pool) return propsByNodeId;
+  try {
+    const sql = `
+      SELECT n.id::text AS node_id, a.name, a.value
+      FROM ${pg.schema}.node AS n
+      JOIN ${pg.schema}.attr AS a ON a.id = ANY(n.attributes)
+      WHERE n.id = ANY($1::bigint[]) AND a.name = ANY($2::text[])
+    `;
+    const pgResult = await pg.pool.query(sql, [safeIds, propNames]);
+    pgResult.rows.forEach(row => {
+      if (!propsByNodeId.has(row.node_id)) propsByNodeId.set(row.node_id, {});
+      propsByNodeId.get(row.node_id)[row.name] = row.value;
+    });
+  } catch (err) {
+    console.error('node-property batch lookup error:', err.message);
+  }
+  return propsByNodeId;
+}
+
+app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async (req, res) => {
+  const {
+    action, anchorURNs = [], scopeURNs = [], nodeParams = [], direction,
+    nodeTypes, relTypes, propFilters, nodePropFilters
+  } = req.body || {};
+
+  const VALID_ACTIONS = new Set(['findBetween', 'connectSelected', 'expand', 'commonNeighbors']);
+  if (!VALID_ACTIONS.has(action)) return res.status(400).json({ error: 'Invalid or missing action' });
+
+  // Relation types and node labels can't be parameterized in Cypher — same
+  // safe-identifier allowlist common-neighbors-report/expand already use.
+  const safeIdent = s => typeof s === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
+  let relTypeClause = '';
+  if (Array.isArray(relTypes) && relTypes.length) {
+    const safeTypes = relTypes.filter(safeIdent);
+    if (safeTypes.length) relTypeClause = ':' + safeTypes.join('|');
+  }
+  let nodeTypeClause = '';
+  if (Array.isArray(nodeTypes) && nodeTypes.length) {
+    const safeNodeTypes = nodeTypes.filter(safeIdent);
+    if (safeNodeTypes.length) nodeTypeClause = ` AND any(lbl IN labels(d) WHERE lbl IN ${JSON.stringify(safeNodeTypes)})`;
+  }
+  const { clauses: propClauses, params: propParams } = _buildRelPropFilterClauses(propFilters, 'r');
+  const propFilterClause = propClauses.length ? ' AND ' + propClauses.join(' AND ') : '';
+
+  let cypher, cypherParams;
+
+  if (action === 'commonNeighbors') {
+    const safeNodeParams = (Array.isArray(nodeParams) ? nodeParams : []).filter(np =>
+      np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+      typeof np.urn === 'string' && np.urn.trim().length > 0
+    );
+    if (!safeNodeParams.length) return res.json({ groups: [] });
+    let matchClause;
+    if (direction === 'in')       matchClause = `MATCH (d)-[r${relTypeClause}]->(p)`;
+    else if (direction === 'out') matchClause = `MATCH (p)-[r${relTypeClause}]->(d)`;
+    else                          matchClause = `MATCH (d)-[r${relTypeClause}]-(p)`;
+    cypher = `
+      UNWIND $anchors AS np
+      MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
+      WHERE np.label IN labels(p)
+      ${matchClause}
+      WHERE d <> p${nodeTypeClause}${propFilterClause}
+      WITH DISTINCT d, p, r
+      RETURN d, collect({target: p, rel: r}) AS links
+    `;
+    cypherParams = { anchors: safeNodeParams, ...propParams };
+  } else {
+    const safeAnchors = (Array.isArray(anchorURNs) ? anchorURNs : []).filter(u => typeof u === 'string' && u.trim().length > 0);
+    if (!safeAnchors.length) return res.json({ groups: [] });
+
+    if (action === 'findBetween') {
+      const anchorSet = new Set(safeAnchors);
+      const unselected = (Array.isArray(scopeURNs) ? scopeURNs : []).filter(u => typeof u === 'string' && !anchorSet.has(u));
+      if (!unselected.length) return res.json({ groups: [] });
+      cypher = `
+        UNWIND $anchors AS aURN
+        MATCH (a {\`${NEO4J_URN_PROP}\`: aURN})-[r${relTypeClause}]-(d)
+        WHERE d.\`${NEO4J_URN_PROP}\` IN $unselected${nodeTypeClause}${propFilterClause}
+        WITH DISTINCT d, a, r
+        RETURN d, collect({target: a, rel: r}) AS links
+      `;
+      cypherParams = { anchors: safeAnchors, unselected, ...propParams };
+    } else if (action === 'connectSelected') {
+      if (safeAnchors.length < 2) return res.json({ groups: [] });
+      cypher = `
+        UNWIND $anchors AS aURN
+        MATCH (d {\`${NEO4J_URN_PROP}\`: aURN})-[r${relTypeClause}]-(p)
+        WHERE p.\`${NEO4J_URN_PROP}\` IN $anchors AND p.\`${NEO4J_URN_PROP}\` <> aURN${nodeTypeClause}${propFilterClause}
+        WITH DISTINCT d, p, r
+        RETURN d, collect({target: p, rel: r}) AS links
+      `;
+      cypherParams = { anchors: safeAnchors, ...propParams };
+    } else { // 'expand'
+      cypher = `
+        UNWIND $anchors AS aURN
+        MATCH (a {\`${NEO4J_URN_PROP}\`: aURN})-[r${relTypeClause}]-(d)
+        WHERE NOT d.\`${NEO4J_URN_PROP}\` IN $anchors${nodeTypeClause}${propFilterClause}
+        WITH DISTINCT d, a, r
+        RETURN d, collect({target: a, rel: r}) AS links
+      `;
+      cypherParams = { anchors: safeAnchors, ...propParams };
+    }
+  }
+
+  const nodeToPlain = (n) => ({
+    id: n.identity.toString(),
+    elementId: n.elementId || n.identity.toString(),
+    labels: n.labels,
+    properties: toPlain(n.properties),
+  });
+  const relIdsOf = (r) => {
+    const raw = r.properties && r.properties.RelationID;
+    if (raw == null) return [];
+    return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
+  };
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  let groups;
+  try {
+    const result = await session.run(cypher, cypherParams);
+    groups = result.records.map(rec => {
+      const d = rec.get('d');
+      const links = rec.get('links') || [];
+      const targetsById = new Map();
+      const edgesById = new Map();
+      const relIdSet = new Set();
+      links.forEach(link => {
+        const p = link.target, r = link.rel;
+        const pid = p.identity.toString();
+        if (!targetsById.has(pid)) targetsById.set(pid, nodeToPlain(p));
+        const eid = r.identity.toString();
+        if (!edgesById.has(eid)) {
+          edgesById.set(eid, {
+            id: eid,
+            elementId: r.elementId || eid,
+            type: r.type,
+            startNodeId: r.start.toString(),
+            endNodeId: r.end.toString(),
+            properties: toPlain(r.properties),
+          });
+        }
+        relIdsOf(r).forEach(rid => relIdSet.add(rid));
+      });
+      return {
+        node: nodeToPlain(d),
+        targetCount: targetsById.size,
+        targets: Array.from(targetsById.values()),
+        edges: Array.from(edgesById.values()),
+        _relationIds: Array.from(relIdSet),
+      };
+    });
+  } catch (err) {
+    console.error('explore-relations-report Neo4j error:', err.message);
+    return res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+
+  // Node-property post-filter — batch-fetch Postgres node+attr properties for
+  // every candidate group's node (by NodeID) and drop groups that fail any
+  // filter.
+  const safeNodePropFilters = _sanitizeNodePropFilters(nodePropFilters);
+  if (safeNodePropFilters.length && groups.length) {
+    const filterNames = Array.from(new Set(safeNodePropFilters.map(f => f.key.trim())));
+    const nodeIds = groups.map(g => g.node.properties && g.node.properties.NodeID)
+      .filter(id => id != null).map(String);
+    const propsByNodeId = await _fetchNodePropsByNodeId(req.pg, nodeIds, filterNames);
+    groups = groups.filter(g => {
+      const nid = g.node.properties && g.node.properties.NodeID != null ? String(g.node.properties.NodeID) : null;
+      const props = (nid && propsByNodeId.get(nid)) || {};
+      return _nodePropFilterMatches(props, safeNodePropFilters);
+    });
+  }
+
+  // Same batched Postgres reference/snippet lookup as common-neighbors-report.
+  const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
+    .filter(id => /^-?\d+$/.test(id));
+  const rowsByRelId = new Map();
+  if (allRelIds.length && req.pg && req.pg.pool) {
+    try {
+      const sql = `SELECT id, doi, pmid, unique_id FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      const pgResult = await req.pg.pool.query(sql, [allRelIds]);
+      pgResult.rows.forEach(row => {
+        const key = String(row.id);
+        if (!rowsByRelId.has(key)) rowsByRelId.set(key, []);
+        rowsByRelId.get(key).push(row);
+      });
+    } catch (err) {
+      console.error('explore-relations-report Postgres error:', err.message);
+    }
+  }
+
+  groups.forEach(g => {
+    const refKeys = new Set();
+    let snippetCount = 0;
+    g._relationIds.forEach(rid => {
+      (rowsByRelId.get(rid) || []).forEach(row => {
+        const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+        if (coalesced != null && coalesced !== '') refKeys.add(String(coalesced));
+        if (row.unique_id != null) snippetCount++;
+      });
+    });
+    g.referenceCount = refKeys.size;
+    g.snippetCount = snippetCount;
+    delete g._relationIds;
+  });
+
+  groups.sort((a, b) => b.targetCount - a.targetCount);
+  res.json({ groups });
 });
 
 
