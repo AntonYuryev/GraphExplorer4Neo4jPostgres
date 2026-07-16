@@ -463,6 +463,46 @@
       "use_count": 1,
       "confirmed": false,
       "last_used": "2026-07-07"
+    },
+    {
+      "user_term": "blood flow",
+      "neo4j_name": "blood flow",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-08"
+    },
+    {
+      "user_term": "blood flow",
+      "neo4j_name": "blood flow velocity",
+      "neo4j_label": "ClinicalParameter",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-08"
+    },
+    {
+      "user_term": "blood flow",
+      "neo4j_name": "vein blood flow",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-08"
+    },
+    {
+      "user_term": "blood flow",
+      "neo4j_name": "duodenum blood flow",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-08"
+    },
+    {
+      "user_term": "blood flow",
+      "neo4j_name": "bone marrow blood flow",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-08"
     }
   ]
 }
