@@ -393,6 +393,7 @@ body {
 }
 .ctx-item { padding: 8px 16px; cursor: pointer; font-size: 12px; color: #c0c4d4; user-select: none; }
 .ctx-item:hover { background: #252a3d; color: #fff; }
+.ctx-item.disabled { opacity: 0.4; cursor: default; pointer-events: none; }
 .ctx-separator { height: 1px; background: #2d3147; margin: 3px 0; }
 
 /* Curation modal: property section title */
