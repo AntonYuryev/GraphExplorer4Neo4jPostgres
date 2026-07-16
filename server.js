@@ -2036,13 +2036,34 @@ app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) =>
     // folder; otherwise (no source file at all — e.g. a pathway built purely
     // from a Cypher query result) fall back to the collection root.
     let targetDir;
+    let canonicalSourceFile = null;
+    let safeRoot;
+    try {
+    safeRoot = fs.realpathSync(dir);
+    } catch (e) {
+    return res.status(400).json({ error: 'No pathway collection directory configured' });
+    }
+
     if (typeof subfolder === 'string') {
       const cleanSub = subfolder.replace(/\\/g, '/').split('/').filter(p => p && p !== '.' && p !== '..').join('/');
-      targetDir = cleanSub ? path.join(dir, cleanSub) : dir;
-    } else if (sourceFile && _isPathInsideDir(sourceFile, dir)) {
-      targetDir = path.dirname(sourceFile);
+      targetDir = cleanSub ? path.join(safeRoot, cleanSub) : safeRoot;
+      } else if (sourceFile) {
+      try {
+      const candidateSourceFile = path.resolve(safeRoot, String(sourceFile));
+      canonicalSourceFile = fs.realpathSync(candidateSourceFile);
+      if (_isPathInsideDir(canonicalSourceFile, safeRoot)) {
+      targetDir = path.dirname(canonicalSourceFile);
+      } else {
+      targetDir = safeRoot;
+      canonicalSourceFile = null;
+      }
+      } catch (e) {
+      targetDir = safeRoot;
+      canonicalSourceFile = null;
+      }
+
     } else {
-      targetDir = dir;
+      targetDir = safeRoot;
     }
     fs.mkdirSync(targetDir, { recursive: true });
 
@@ -2051,7 +2072,7 @@ app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) =>
     // containment against the canonical root. targetDir is guaranteed to
     // exist at this point (mkdirSync just created it), so this is safe to
     // do unconditionally, unlike a not-yet-existent file path.
-    let canonicalTargetDir, safeRoot;
+    let canonicalTargetDir;
     try {
       safeRoot = fs.realpathSync(dir);
       canonicalTargetDir = fs.realpathSync(targetDir);
@@ -2072,17 +2093,12 @@ app.post('/api/pathways/save-graph-as', dbLimiter, authMiddleware, (req, res) =>
     }
 
     let resnetType = 'Pathway';
-    if (sourceFile && String(sourceFile).toLowerCase().endsWith('.graph.json')) {
+    if (canonicalSourceFile && String(canonicalSourceFile).toLowerCase().endsWith('.graph.json')) {
       try {
-        const candidateSourceFile = path.resolve(safeRoot, String(sourceFile));
-        const canonicalSourceFile = fs.realpathSync(candidateSourceFile);
-        if (_isPathInsideDir(canonicalSourceFile, safeRoot)) {
-          try {
-            const existing = JSON.parse(fs.readFileSync(canonicalSourceFile, 'utf8'));
-            if (existing && existing.resnetType) resnetType = existing.resnetType;
-          } catch (e) { /* ignore — keep default */ }
-        }
-      } catch (e) { /* ignore invalid/nonexistent source file — keep default */ }
+        const existing = JSON.parse(fs.readFileSync(canonicalSourceFile, 'utf8'));
+        if (existing && existing.resnetType) resnetType = existing.resnetType;
+        } 
+        catch (e) { /* ignore — keep default */ }
     }
 
     const pathwayData = {
