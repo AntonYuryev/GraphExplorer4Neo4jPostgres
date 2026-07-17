@@ -86,7 +86,6 @@
           </div>
         </div>
       </div>
-      <button id="agentic-ai-btn" onclick="toggleAgenticPanel()" style="padding:5px 14px;background:linear-gradient(135deg,#2e7d52,#1a5c38);border:1px solid #3a9c66;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600;letter-spacing:0.02em;display:none">🤖 AI Agent</button>
       <button class="btn-danger-ghost" onclick="logout()">Sign Out</button>
     </div>
   </header>
@@ -339,6 +338,17 @@
         <div class="menu-item" onclick="deleteSelection();closeMenus()">Delete selected</div>
         <div class="menu-separator"></div>
         <div class="menu-item" id="me-create-relation" style="display:none;color:#3a4060;pointer-events:none" onclick="openRelationCurationDialog();closeMenus()">Create/Edit relation</div>
+      </div>
+    </div>
+
+    <!-- AI -->
+    <div class="menu-entry" id="me-ai">
+      <div class="menu-label" onclick="toggleMenu('me-ai')" onmouseenter="hoverMenu('me-ai')">AI</div>
+      <div class="menu-dropdown">
+        <div class="menu-item" onclick="openAgenticPanel('text2cypher');closeMenus()">Text2Cypher</div>
+        <div class="menu-item" onclick="openAgenticPanel('summarize');closeMenus()">Summarize</div>
+        <div class="menu-item disabled" title="Coming soon">Curate</div>
+        <div class="menu-item disabled" title="Coming soon">AI help</div>
       </div>
     </div>
 
@@ -1103,7 +1113,7 @@
   <!-- Panel header -->
   <div style="background:#1e2235;border-bottom:1px solid #2a3050;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
     <div style="display:flex;align-items:center;gap:10px">
-      <span style="font-size:15px;font-weight:600;color:#e0e0e0">🤖 Agentic AI</span>
+      <span id="agent-panel-title" style="font-size:15px;font-weight:600;color:#e0e0e0">🤖 Text2Cypher</span>
       <span id="agent-status-dot" title="Agent service status" style="width:8px;height:8px;border-radius:50%;background:#888;display:inline-block"></span>
       <span id="agent-status-label" style="font-size:11px;color:#7a8099">connecting…</span>
     </div>
@@ -1126,9 +1136,20 @@
     </div>
   </div>
 
+  <!-- Mode switcher — each AI submenu drives the same panel, swapping which
+       agent (system prompt + tool set) the input below talks to. Only
+       Text2Cypher (today's existing agent) is wired up so far; Summarize/
+       Curate/AI help are disabled placeholders until their own FDRs land. -->
+  <div id="agent-mode-tabs" style="display:flex;gap:4px;padding:8px 16px 0;background:#161929;border-bottom:1px solid #2a3050;flex-shrink:0">
+    <div class="agent-mode-tab active" data-mode="text2cypher" onclick="switchAgentMode('text2cypher')">Text2Cypher</div>
+    <div class="agent-mode-tab" data-mode="summarize" onclick="switchAgentMode('summarize')">Summarize</div>
+    <div class="agent-mode-tab disabled" data-mode="curate" title="Coming soon">Curate</div>
+    <div class="agent-mode-tab disabled" data-mode="help" title="Coming soon">AI help</div>
+  </div>
+
   <!-- Chat messages -->
   <div id="agent-chat-messages" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px">
-    <div style="text-align:center;color:#5a6080;font-size:12px;padding:20px 0">
+    <div id="agent-chat-intro" style="text-align:center;color:#5a6080;font-size:12px;padding:20px 0">
       Ask anything about your graph — I can translate natural language to Cypher, run queries, and chain multi-step workflows.
     </div>
   </div>
@@ -1139,7 +1160,7 @@
       <textarea id="agent-input" rows="2" placeholder="Ask a question or describe a task…"
         style="flex:1;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:8px 10px;resize:none;outline:none;font-family:inherit;line-height:1.4"
         onkeydown="agentInputKeydown(event)"></textarea>
-      <button onclick="agentSend()" id="agent-send-btn"
+      <button onclick="_agentDispatchSend()" id="agent-send-btn"
         style="padding:8px 16px;background:#4f8ef7;border:none;border-radius:6px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;align-self:stretch">Send</button>
     </div>
     <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
