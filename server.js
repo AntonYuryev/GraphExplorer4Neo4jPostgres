@@ -528,6 +528,33 @@ function toPlain(val) {
   return val;
 }
 
+// Neo4j's RelationID property can be a scalar (integer/string) OR a list
+// (StringArray) -- confirmed to happen on real relationships, independent of
+// anything this app itself does (e.g. mergeSimilarRelations()'s own
+// RelationIDs, plural, app-level convention). Every place that reads
+// RelationID off a relationship needs to handle both shapes, or a genuinely
+// list-valued one silently collapses into a useless comma-joined string via
+// naive String(value) -- not a crash, just a relation whose references,
+// tooltip counts, etc. permanently show nothing because that joined string
+// never matches any real Postgres id or Neo4j RelationID again.
+//
+// Accepts EITHER shape callers already used before this helper existed:
+//   - the raw property value itself (e.g. from `RETURN r.RelationID AS relationID`)
+//   - a full Neo4j relationship/record object with a `.properties.RelationID`
+//     (e.g. from `RETURN r`)
+// Always returns a flat array of string ids (never nested, never empty-if-
+// present), so callers needing "the" id can just take result[0] and callers
+// needing every id this relationship represents can use the whole array.
+function _relationIdsOf(relOrValue) {
+  if (relOrValue == null) return [];
+  const raw = (typeof relOrValue === 'object' && relOrValue.properties &&
+               Object.prototype.hasOwnProperty.call(relOrValue.properties, 'RelationID'))
+    ? relOrValue.properties.RelationID
+    : relOrValue;
+  if (raw == null) return [];
+  return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
+}
+
 function processValue(val, nodesMap, edgesMap) {
   if (!val || typeof val !== 'object') return;
   const ctor = val.constructor ? val.constructor.name : '';
@@ -2861,6 +2888,16 @@ app.post('/api/relations/match-rnef', dbLimiter, authMiddleware, async (req, res
 
         const arrow = NONDIRECTIONAL_TYPES.has(relType) ? '-' : '->';
         // Normalize Effect: treat NULL, '', '_', 'Unknown' as equivalent "no effect"
+        //
+        // NOTE: this endpoint is no longer called by the client (app.js's
+        // matchRnefRelationsToNeo4j() now computes RelationID deterministically
+        // client-side via calcRelationIdClient(), the same hash algorithm as
+        // calcRelationId() below, and never asks Neo4j to "find" a relation by
+        // node-pair/type match). Left as-is, without a tie-break for node pairs
+        // that have more than one real relationship of the same type: the
+        // RelationID is a deterministic function of relation properties, and if
+        // no relation with that exact ID exists, the app should report no
+        // match rather than substituting a different, "closest" relation.
         const cypher = `
 UNWIND $rows AS row
 MATCH (a {URN: row.rURN})-[r:\`${relType}\`]${arrow}(b {URN: row.tURN})
@@ -3077,8 +3114,6 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
     };
   }
 
-  const session = req.neo4j.driver.session({ database: req.neo4j.database });
-
   try {
     // resultMap[idx] = { idx, check, relations: [...] }
     const resultMap = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
@@ -3103,6 +3138,41 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
       return g;
     }
 
+    // Runs one query PER GROUP concurrently, each on its OWN session, and
+    // returns the combined list of result records. A Neo4j Session serializes
+    // every query run through it -- awaiting session.run() in a for-loop, one
+    // relType group at a time, meant a large pathway with many distinct
+    // relation types (common) paid for N sequential network round trips per
+    // check instead of overlapping them. Since each group's rows are a
+    // disjoint idx partition (a relation belongs to exactly one relType), the
+    // groups have no cross-dependency and are safe to run in parallel -- only
+    // the 3 CHECK STAGES themselves must stay sequential, since Check 2/3 need
+    // to know which idx values Check 1/2 already matched. Each query gets its
+    // own session (closed as soon as it's done) rather than sharing one,
+    // since that's what actually lets them execute concurrently against Neo4j
+    // instead of just queuing up on a single connection.
+    // NOTE: `groups` keys are NOT necessarily bare relationship-type strings
+    // (Check 3 uses "relType#groupIndex" to keep a type's undirected/directed
+    // equivalence groups separate) -- so no REL_TYPE_RE re-check happens here.
+    // Every caller already validates the real relType(s) before this point:
+    // groupByType() only admits rows whose relType passes REL_TYPE_RE, and
+    // Check 3's compound keys are built from those already-validated groups.
+    async function runGrouped(groups, buildCypher, extraParams) {
+      const entries = Object.entries(groups);
+      const perGroupRecords = await Promise.all(entries.map(async ([relType, rows]) => {
+        const cypher = buildCypher(relType);
+        const groupSession = req.neo4j.driver.session({ database: req.neo4j.database });
+        try {
+          const params = Object.assign({ rows }, extraParams ? extraParams(relType) : null);
+          const result = await groupSession.run(cypher, params);
+          return result.records;
+        } finally {
+          await groupSession.close();
+        }
+      }));
+      return perGroupRecords.flat();
+    }
+
     // Prepare rows with normalised effect
     const workList = relations.map(r => ({
       idx:        r.idx,
@@ -3113,55 +3183,59 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
     }));
 
     // ── Check 1: same type + same normalised effect ──────────────────────────
-    for (const [relType, rows] of Object.entries(groupByType(workList))) {
-      if (!REL_TYPE_RE.test(relType)) continue;
+    const check1Records = await runGrouped(groupByType(workList), (relType) => {
       const arrow = NONDIRECTIONAL.has(relType) ? '-' : '->';
-      const cypher = `
+      return `
 UNWIND $rows AS row
 MATCH (a {URN: row.rURN})-[r:\`${relType}\`]${arrow}(b {URN: row.tURN})
 WHERE (CASE WHEN coalesce(r.Effect,'') IN ['','_','Unknown','unknown'] THEN ''
             ELSE r.Effect END) = row.normEffect
 RETURN row.idx AS idx, ${RETURN_COLS}`;
-      const result = await session.run(cypher, { rows });
-      result.records.forEach(rec => acceptRecord(1, rec));
-    }
+    });
+    check1Records.forEach(rec => acceptRecord(1, rec));
 
     // ── Check 2: same type, any effect ───────────────────────────────────────
     const unmatched2 = workList.filter(r => !resultMap[r.idx]);
-    for (const [relType, rows] of Object.entries(groupByType(unmatched2))) {
-      if (!REL_TYPE_RE.test(relType)) continue;
+    const check2Records = await runGrouped(groupByType(unmatched2), (relType) => {
       const arrow = NONDIRECTIONAL.has(relType) ? '-' : '->';
-      const cypher = `
+      return `
 UNWIND $rows AS row
 MATCH (a {URN: row.rURN})-[r:\`${relType}\`]${arrow}(b {URN: row.tURN})
 RETURN row.idx AS idx, ${RETURN_COLS}`;
-      const result = await session.run(cypher, { rows });
-      result.records.forEach(rec => acceptRecord(2, rec));
-    }
+    });
+    check2Records.forEach(rec => acceptRecord(2, rec));
 
     // ── Check 3: equivalent type ─────────────────────────────────────────────
+    // Each relType can expand into more than one equivGroup (undirected AND
+    // directed equivalence sets) -- flatten to one entry per (relType, group
+    // index) so every group still gets its own concurrent query/session,
+    // same as checks 1 and 2.
     const unmatched3 = workList.filter(r => !resultMap[r.idx]);
+    const check3Groups = Object.create(null);
     for (const [relType, rows] of Object.entries(groupByType(unmatched3))) {
       const equivGroups = TYPE3_EQUIV[relType];
       if (!equivGroups) continue;
-      for (const { equivTypes, undirected } of equivGroups) {
+      equivGroups.forEach((group, i) => { check3Groups[relType + '#' + i] = { rows, group }; });
+    }
+    const check3Records = await runGrouped(
+      Object.fromEntries(Object.entries(check3Groups).map(([k, v]) => [k, v.rows])),
+      (key) => {
+        const { undirected } = check3Groups[key].group;
         const arrow = undirected ? '-' : '->';
-        const cypher = `
+        return `
 UNWIND $rows AS row
 MATCH (a {URN: row.rURN})-[r]${arrow}(b {URN: row.tURN})
 WHERE type(r) IN $equivTypes
 RETURN row.idx AS idx, ${RETURN_COLS}`;
-        const result = await session.run(cypher, { rows, equivTypes });
-        result.records.forEach(rec => acceptRecord(3, rec));
-      }
-    }
+      },
+      (key) => ({ equivTypes: check3Groups[key].group.equivTypes })
+    );
+    check3Records.forEach(rec => acceptRecord(3, rec));
 
     res.json({ results: Object.values(resultMap) });
   } catch (err) {
     console.error('find-similar error:', err.message);
     res.status(500).json({ error: safeError(err) });
-  } finally {
-    await session.close();
   }
 });
 
@@ -4036,17 +4110,33 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
   const extraWhereParts = [nodeTypeClause, relPropClause].filter(Boolean);
   const extraWhere = extraWhereParts.length ? ('WHERE ' + extraWhereParts.join(' AND ')) : '';
 
-  const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     // Every matched path is kept SEPARATE (not merged into a shared map yet)
     // until after the node-property post-filter runs below, since dropping a
     // path that fails a node-property filter must also drop whichever of its
     // nodes/edges aren't shared with any other surviving path.
-    const candidatePaths = [];
 
+    // Each (a, b) pair's shortestPath lookup is completely independent of
+    // every other pair -- different endpoints, no shared mutable state --
+    // yet with up to 10 selected nodes that's up to 45 pairs, and a longer
+    // maxLength makes each individual shortestPath traversal more expensive.
+    // Previously these ran one at a time, awaited in sequence, inside a
+    // single shared session; now each pair gets its own session and they're
+    // dispatched concurrently (same _mapWithConcurrencyLimit pattern as
+    // /api/ontology/batch-counts), so Neo4j can schedule them across
+    // separate cores instead of queueing them behind one another. A single
+    // pair's query failing no longer aborts paths already found by the
+    // others -- it's logged and just contributes no path for that pair.
+    const pairs = [];
     for (let i = 0; i < safeNodes.length; i++) {
       for (let j = i + 1; j < safeNodes.length; j++) {
-        const a = safeNodes[i], b = safeNodes[j];
+        pairs.push([safeNodes[i], safeNodes[j]]);
+      }
+    }
+
+    const settled = await _mapWithConcurrencyLimit(pairs, 25, async ([a, b]) => {
+      const session = req.neo4j.driver.session({ database: req.neo4j.database });
+      try {
         const cypher = `
           MATCH (a {\`${NEO4J_URN_PROP}\`: $urnA}), (b {\`${NEO4J_URN_PROP}\`: $urnB})
           WHERE $labelA IN labels(a) AND $labelB IN labels(b)
@@ -4058,15 +4148,29 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
           urnA: a.urn, urnB: b.urn, labelA: a.label, labelB: b.label,
           nodeTypesParam: safeNodeTypes, ...propParams
         });
+        const found = [];
         result.records.forEach(record => {
           const p = record.get('p');
           if (!p) return;
           const tempNodes = new Map(), tempEdges = new Map();
           processValue(p, tempNodes, tempEdges);
-          candidatePaths.push({ tempNodes, tempEdges, endpointURNs: new Set([String(a.urn), String(b.urn)]) });
+          found.push({ tempNodes, tempEdges, endpointURNs: new Set([String(a.urn), String(b.urn)]) });
         });
+        return found;
+      } finally {
+        await session.close();
       }
-    }
+    });
+
+    const candidatePaths = [];
+    settled.forEach((r, idx) => {
+      if (r.status === 'fulfilled') {
+        candidatePaths.push(...r.value);
+      } else {
+        const [a, b] = pairs[idx];
+        console.error('shortest-path pair error:', a.urn, b.urn, r.reason && r.reason.message);
+      }
+    });
 
     // Node-property post-filter — every INTERMEDIATE node (never the two
     // path endpoints) in a kept path must satisfy every nodePropFilter.
@@ -4113,8 +4217,6 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
   } catch (err) {
     console.error('shortest-path error:', err.message);
     res.status(500).json({ error: safeError(err) });
-  } finally {
-    await session.close();
   }
 });
 
@@ -4186,46 +4288,27 @@ app.get('/api/schema/relation-properties', dbLimiter, authMiddleware, async (req
 });
 
 // POST /api/curation/calculate-relation-id  — deterministic hash for live preview
-// Also checks Neo4j for an existing relation of the same type between the same nodes,
-// and returns the EXISTING RelationID if found (to avoid creating duplicates of
-// relations that were loaded by the external Python pipeline with a different hash).
+//
+// Always returns the computed hash, full stop -- RelationID is a
+// deterministic function of a relation's own properties (NodeIDs, type,
+// ontology, relationship, effect, mechanism), so it either matches a real
+// relation or it doesn't. This used to also search Neo4j for an "existing"
+// relation between the same node pair/type (ignoring the computed hash
+// entirely) and substitute that ID instead, to avoid creating duplicates of
+// relations loaded by the external Python pipeline under a different hash.
+// That meant this dialog could show a DIFFERENT RelationID than the same
+// relation's own tooltip (which computes the hash client-side via
+// calcRelationIdClient() and never substitutes anything) -- confirmed in
+// production for a node pair with more than one real Neo4j relationship of
+// the same type, where the "existing" lookup had no reliable way to pick the
+// same one the tooltip's pure hash calculation would land on (or wouldn't).
+// Per product decision: if the computed RelationID doesn't correspond to
+// anything in Neo4j/Postgres, that's the correct, honest answer -- the app
+// should not guess a "closest" relation to paper over it, even at the cost
+// of write-relation being able to create a duplicate of a pipeline-loaded
+// relation whose original hash happened to differ from this one.
 app.post('/api/curation/calculate-relation-id', dbLimiter, authMiddleware, async (req, res) => {
-  const body = req.body || {};
-  const computed = calcRelationId(body);
-
-  // Try to find an existing relation in Neo4j with the same type + same node pair
-  const { inref = [], outref = [], inoutref = [], control_type = '' } = body;
-  const safeType = /^[A-Za-z_][A-Za-z0-9_]*$/.test(control_type) ? control_type : null;
-
-  if (safeType && (inref.length || outref.length || inoutref.length)) {
-    const session = req.neo4j.driver.session({ database: req.neo4j.database });
-    try {
-      let result;
-      if (inref.length === 1 && outref.length === 1 && !inoutref.length) {
-        // Directional: single source → single target
-        result = await session.run(
-          `MATCH (a {NodeID: $src})-[r:\`${safeType}\`]->(b {NodeID: $tgt})
-           WHERE r.RelationID IS NOT NULL
-           RETURN toString(r.RelationID) AS rid LIMIT 1`,
-          { src: inref[0], tgt: outref[0] }
-        );
-      } else if (!inref.length && !outref.length && inoutref.length >= 2) {
-        // Non-directional: match either direction
-        result = await session.run(
-          `MATCH (a {NodeID: $n1})-[r:\`${safeType}\`]-(b {NodeID: $n2})
-           WHERE r.RelationID IS NOT NULL
-           RETURN toString(r.RelationID) AS rid LIMIT 1`,
-          { n1: inoutref[0], n2: inoutref[1] }
-        );
-      }
-      if (result && result.records.length) {
-        const existing = result.records[0].get('rid');
-        return res.json({ relationId: existing, existingFound: true });
-      }
-    } catch(e) { /* fall through to computed */ }
-    finally { await session.close(); }
-  }
-
+  const computed = calcRelationId(req.body || {});
   res.json({ relationId: computed });
 });
 
@@ -4387,32 +4470,50 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
   );
   if (!safe.length) return res.json({ nodes: [], edges: [] });
 
-  // UNWIND the list so all parent nodes are resolved in a single round-trip.
-  // Labels cannot be parameterized in Cypher, so we filter by label using WHERE.
-  const cypher = `
-    UNWIND $nodeParams AS np
-    MATCH (p {\`${NEO4J_URN_PROP}\`: np.urn})
-    WHERE np.label IN labels(p)
+  // Each requested node's own full is_a/part_of subtree is completely
+  // independent of every other requested node's subtree, and this traversal
+  // is COMPLETELY UNBOUNDED (`*`, no depth cap) -- the exact same shape of
+  // cost as the original /api/ontology/batch-counts slowdown, just walking
+  // paths instead of counting nodes. Rather than a single UNWIND query that
+  // Neo4j processes one node at a time on a single thread regardless of how
+  // the Cypher is written, each node gets its own session and they're
+  // dispatched concurrently (capped, same _mapWithConcurrencyLimit pattern
+  // as batch-counts and shortest-path). One node's subtree failing to
+  // resolve doesn't block the others' results.
+  const perNodeCypher = `
+    MATCH (p {\`${NEO4J_URN_PROP}\`: $urn})
+    WHERE $label IN labels(p)
     OPTIONAL MATCH path = (child)-[:is_a|part_of*]->(p)
     WITH p, collect(DISTINCT path) AS paths
     RETURN p, paths
   `;
 
-  const session = req.neo4j.driver.session({ database: req.neo4j.database });
-  try {
-    const result = await session.run(cypher, { nodeParams: safe });
-    const nodesMap = new Map();
-    const edgesMap = new Map();
-    result.records.forEach(record => {
-      record.keys.forEach(key => processValue(record.get(key), nodesMap, edgesMap));
-    });
-    res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
-  } catch (err) {
-    console.error('ontology-children error:', err.message);
-    res.status(500).json({ error: safeError(err) });
-  } finally {
-    await session.close();
-  }
+  const settled = await _mapWithConcurrencyLimit(safe, 25, async (np) => {
+    const session = req.neo4j.driver.session({ database: req.neo4j.database });
+    try {
+      const result = await session.run(perNodeCypher, { urn: np.urn, label: np.label });
+      const nodesMap = new Map();
+      const edgesMap = new Map();
+      result.records.forEach(record => {
+        record.keys.forEach(key => processValue(record.get(key), nodesMap, edgesMap));
+      });
+      return { nodesMap, edgesMap };
+    } finally {
+      await session.close();
+    }
+  });
+
+  const nodesMap = new Map();
+  const edgesMap = new Map();
+  settled.forEach((r, idx) => {
+    if (r.status === 'fulfilled') {
+      r.value.nodesMap.forEach((v, k) => { if (!nodesMap.has(k)) nodesMap.set(k, v); });
+      r.value.edgesMap.forEach((v, k) => { if (!edgesMap.has(k)) edgesMap.set(k, v); });
+    } else {
+      console.error('ontology-children error:', safe[idx].urn, r.reason && r.reason.message);
+    }
+  });
+  res.json({ nodes: Array.from(nodesMap.values()), edges: Array.from(edgesMap.values()) });
 });
 
 
@@ -4556,13 +4657,6 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
     labels: n.labels,
     properties: toPlain(n.properties),
   });
-  // r.RelationID can be a scalar OR a list (StringArray) in Neo4j — same
-  // normalization /api/relations/properties already uses for this quirk.
-  const relIdsOf = (r) => {
-    const raw = r.properties && r.properties.RelationID;
-    if (raw == null) return [];
-    return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
-  };
 
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   let groups;
@@ -4589,7 +4683,7 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
             properties: toPlain(r.properties),
           });
         }
-        relIdsOf(r).forEach(rid => relIdSet.add(rid));
+        _relationIdsOf(r).forEach(rid => relIdSet.add(rid));
       });
       return {
         node: nodeToPlain(d),
@@ -4803,7 +4897,7 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
             properties: toPlain(r.properties),
           });
         }
-        relIdsOf(r).forEach(rid => relIdSet.add(rid));
+        _relationIdsOf(r).forEach(rid => relIdSet.add(rid));
       });
       return {
         node: nodeToPlain(d),
@@ -5082,7 +5176,7 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
             properties: toPlain(r.properties),
           });
         }
-        relIdsOf(r).forEach(rid => relIdSet.add(rid));
+        _relationIdsOf(r).forEach(rid => relIdSet.add(rid));
       });
       return {
         node: nodeToPlain(d),
@@ -5227,6 +5321,32 @@ app.post('/api/ontology/direct-children', dbLimiter, authMiddleware, async (req,
 });
 
 
+// Runs fn(item) over items with at most `limit` calls in flight at once,
+// preserving item order in the returned array of settled results. Used below
+// so a very large branch count (unlikely in practice, but not bounded by the
+// client) can't open an unbounded number of concurrent Neo4j sessions at
+// once; for the normal case (a few dozen branches) this never even hits the
+// limit and everything just runs concurrently.
+async function _mapWithConcurrencyLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      try {
+        results[i] = { status: 'fulfilled', value: await fn(items[i], i) };
+      } catch (err) {
+        results[i] = { status: 'rejected', reason: err };
+      }
+    }
+  }
+  const workers = [];
+  for (let w = 0; w < Math.min(limit, items.length); w++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
 // POST /api/ontology/batch-counts
 // Body: { urns: string[], graphUrns: string[] }
 // For each ontology URN, counts how many graphUrns are descendants of it.
@@ -5247,33 +5367,39 @@ app.post('/api/ontology/batch-counts', dbLimiter, authMiddleware, async (req, re
     return res.json({ entries: safeUrns.map(u => ({ urn: u, count: 0 })) });
   }
 
-  const cypher = `
-    UNWIND $urns AS parentUrn
-    MATCH (parent {\`${NEO4J_URN_PROP}\`: parentUrn})
+  // One independent query PER branch, each in its own session, dispatched
+  // concurrently (up to the limit below) -- rather than a single UNWIND
+  // query, which Neo4j's default (non-Enterprise-parallel-runtime) execution
+  // engine processes one branch at a time on a single thread no matter how
+  // the Cypher is structured. Every branch's traversal is fully independent
+  // (read-only, no shared mutable state), so the server can schedule them
+  // across separate cores instead of queueing them behind one another.
+  // A single branch's query failing doesn't abort the batch -- it's logged
+  // and just falls back to a count of 0 for that branch.
+  const perBranchCypher = `
+    MATCH (parent {\`${NEO4J_URN_PROP}\`: $parentUrn})
     OPTIONAL MATCH (descendant)-[:is_a|part_of*0..]->(parent)
     WHERE descendant.\`${NEO4J_URN_PROP}\` IN $graphUrns
-    RETURN parentUrn, count(DISTINCT descendant) AS cnt
+    RETURN count(DISTINCT descendant) AS cnt
   `;
-  const session = req.neo4j.driver.session({ database: req.neo4j.database });
-  try {
-    const result = await session.run(cypher, { urns: safeUrns, graphUrns });
-    // Use a Map (not a plain object) to accumulate Neo4j results; Map keys are not prototype-pollutable.
-    const cntMap = new Map();
-    result.records.forEach(r => {
-      const u = String(r.get('parentUrn'));
-      if (_URN_KEY_RE.test(u)) {
-        cntMap.set(u, neo4j.isInt(r.get('cnt')) ? r.get('cnt').toNumber() : (Number(r.get('cnt')) || 0));
-      }
-    });
-    // Emit as an array of {urn, count} entries — no user string is ever an object property key
-    const entries = safeUrns.map(u => ({ urn: u, count: cntMap.get(u) || 0 }));
-    res.json({ entries });
-  } catch (err) {
-    console.error('ontology-batch-counts error:', err.message);
-    res.status(500).json({ error: safeError(err) });
-  } finally {
-    await session.close();
-  }
+
+  const settled = await _mapWithConcurrencyLimit(safeUrns, 25, async (parentUrn) => {
+    const session = req.neo4j.driver.session({ database: req.neo4j.database });
+    try {
+      const result = await session.run(perBranchCypher, { parentUrn, graphUrns });
+      const rec = result.records[0];
+      return rec ? (neo4j.isInt(rec.get('cnt')) ? rec.get('cnt').toNumber() : (Number(rec.get('cnt')) || 0)) : 0;
+    } finally {
+      await session.close();
+    }
+  });
+
+  const entries = settled.map((r, i) => {
+    if (r.status === 'fulfilled') return { urn: safeUrns[i], count: r.value };
+    console.error('ontology-batch-counts branch error:', safeUrns[i], r.reason && r.reason.message);
+    return { urn: safeUrns[i], count: 0 };
+  });
+  res.json({ entries });
 });
 
 
