@@ -5659,7 +5659,26 @@ function renderTooltip(edge, refs) {
       + escHtml(String(mechanism).trim()) + '</div>';
   }
 
-  var metaLine = (numRefs || 0) + ' reference(s)';
+  // REQ (tooltip breakdown): split the reference count into "database" vs
+  // "file" using the same signal _mergeInlineAndDbRefs() already relies on --
+  // only a row that actually matched/came from Postgres carries
+  // reference.unique_id (see that function's own comment above); a row with
+  // no unique_id is either purely file-embedded or a file row Postgres never
+  // matched, so it counts as a file reference either way. Only computable
+  // once refs has actually been fetched/merged -- before that, fall back to
+  // the plain total (numRefs) the cy edge already carries from render time.
+  var metaLine;
+  if (refs && refs.length > 0) {
+    var _dbRefCount = 0, _fileRefCount = 0;
+    refs.forEach(function(r) {
+      if (r && r.unique_id != null && String(r.unique_id).trim() !== '') _dbRefCount++;
+      else _fileRefCount++;
+    });
+    metaLine = _dbRefCount + ' database reference' + (_dbRefCount === 1 ? '' : 's')
+             + ', ' + _fileRefCount + ' reference' + (_fileRefCount === 1 ? '' : 's') + ' from file';
+  } else {
+    metaLine = (numRefs || 0) + ' reference(s)';
+  }
   if (confidence !== '' && confidence != null) metaLine += ' · Confidence: ' + confidence + '%';
   if (citationScore !== '' && citationScore != null) metaLine += ' · Citation score: ' + citationScore;
   html += '<div style="font-size:11px;color:#7a8099;margin-bottom:8px">' + metaLine + '</div>';
@@ -7863,14 +7882,12 @@ async function matchRnefRelationsToNeo4j() {
             var relId = String(e.properties.RelationID);
             var dbRefs     = preRefsGrouped[relId] || [];
             var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
-            var allRefs    = inlineRefs.concat(dbRefs);
-            var seenKeys   = new Set();
-            var dedupedRefs = allRefs.filter(function(ref) {
-              var k = preRefKey(ref);
-              if (seenKeys.has(k)) return false;
-              seenKeys.add(k);
-              return true;
-            });
+            // _mergeInlineAndDbRefs (not a first-wins concat+filter) so the
+            // Postgres copy -- carrying reference.unique_id -- wins whenever
+            // the same assertion exists in both the file and Postgres. See
+            // the comment on the identical fix in matchRnefRelationsToNeo4j's
+            // main matched-edges block above.
+            var dedupedRefs = _mergeInlineAndDbRefs(inlineRefs, dbRefs);
             var refCount = calcRefCount(dedupedRefs);
             e.properties.references                 = dedupedRefs;
             e.properties.RelationNumberOfReferences = refCount;
@@ -8000,14 +8017,9 @@ async function matchRnefRelationsToNeo4j() {
               var relId = String(e.properties.RelationID);
               var dbRefs     = bgRefsGrouped[relId] || [];
               var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
-              var allRefs    = inlineRefs.concat(dbRefs);
-              var seenKeys   = new Set();
-              var dedupedRefs = allRefs.filter(function(ref) {
-                var k = bgRefKey(ref);
-                if (seenKeys.has(k)) return false;
-                seenKeys.add(k);
-                return true;
-              });
+              // _mergeInlineAndDbRefs, not a first-wins concat+filter -- see
+              // the comment on the identical fix above in this function.
+              var dedupedRefs = _mergeInlineAndDbRefs(inlineRefs, dbRefs);
               var refCount = calcRefCount(dedupedRefs);
               e.properties.references                 = dedupedRefs;
               e.properties.RelationNumberOfReferences = refCount;
@@ -8104,25 +8116,23 @@ async function matchRnefRelationsToNeo4j() {
     });
 
     // ── Fetch and merge references for all newly matched edges ──────────────────
-    // Uses the same assertion-level dedup key as mergeSimilarRelations so that
-    // inline RNEF references and Neo4j DB references are combined without
-    // creating duplicate rows for the same assertion.
+    // Uses _mergeInlineAndDbRefs() (the SAME assertion-level dedup used
+    // everywhere else references get combined, e.g. the tooltip's own
+    // on-demand merge) so inline RNEF references and Neo4j DB references are
+    // combined without creating duplicate rows for the same assertion --
+    // critically, keeping the Postgres copy (not the file copy) whenever a
+    // reference exists on both sides, since only the Postgres row carries
+    // reference.unique_id. A previous, separate reimplementation here
+    // concatenated inline refs BEFORE dbRefs and kept the first-seen copy on
+    // a duplicate key, which silently discarded unique_id from every
+    // reference Postgres actually has whenever the file also carried a copy
+    // of it -- making every relation with any overlap look 100% file-only
+    // (unique_id never present) even when most of its references were
+    // genuinely in the database.
     if (matched > 0) {
       var newRelIds = Array.from(matchedRelIds);
       try {
         var matchedRefsGrouped = await api('/api/references/batch', { relationIds: newRelIds, scopusColumns: [] });
-
-        // Assertion-level key: identical to refKey / refSentenceKey in mergeSimilarRelations
-        function mRefSentenceKey(msrc) {
-          if (!msrc) return '';
-          return msrc.slice(0, 100).replace(/ID\{[^}]*\}/g, '').slice(0, 30);
-        }
-        function mRefKey(ref) {
-          var sentence = mRefSentenceKey(ref.msrc || '');
-          if (ref.doi)  return 'doi:'  + String(ref.doi).toLowerCase().trim()  + '\x00' + sentence;
-          if (ref.pmid) return 'pmid:' + String(ref.pmid).trim()               + '\x00' + sentence;
-          return 'cnt:' + (ref.pubyear || '') + '\x00' + (ref.journal || '') + '\x00' + sentence;
-        }
 
         // Build URN → cy edge map (only valid if still on same tab)
         var urnToCyEdgeMatch = {};
@@ -8142,14 +8152,7 @@ async function matchRnefRelationsToNeo4j() {
           var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
 
           // Merge inline RNEF refs (from XML) with DB refs, deduplicating at assertion level
-          var allRefs = inlineRefs.concat(dbRefs);
-          var seenKeys = new Set();
-          var dedupedRefs = allRefs.filter(function(ref) {
-            var k = mRefKey(ref);
-            if (seenKeys.has(k)) return false;
-            seenKeys.add(k);
-            return true;
-          });
+          var dedupedRefs = _mergeInlineAndDbRefs(inlineRefs, dbRefs);
 
           var refCount = calcRefCount(dedupedRefs);
 
@@ -8277,9 +8280,27 @@ async function matchRnefRelationsToNeo4j() {
 }
 
 // ─── Load similar relations from Neo4j ────────────────────────────────────────
-// For every RNEF edge in the current pathway that has no RelationID, queries
-// Neo4j for similar relations using a 3-tier matching hierarchy and adds the
-// found Neo4j relations to the graph as new edges.
+// Per the original FRD, this searches for similar relations for every RNEF
+// relation in the pathway using a 3-tier heuristic on relation PROPERTIES
+// (never RelationID -- the FRD's own Check 1/2/3 rules are stated purely in
+// terms of node pair, direction, Type, and Effect):
+//   Check 1: same two nodes, same direction, same Type and Effect
+//            (directionality ignored for non-directional types)
+//   Check 2: relations that missed Check 1 -- same two nodes, same direction,
+//            same Type, ANY Effect (directionality ignored for non-directional)
+//   Check 3: relations that missed Check 1 and 2 -- same two nodes, matching
+//            one of the equivalent-type pairs (TYPE3_EQUIV in server.js)
+// Every match found (at whichever check level) is added to the graph as its
+// own NEW edge -- this never overwrites or reassigns the original RNEF
+// relation's own RelationID/identity. That distinction matters: an earlier
+// version of this code treated a Check-1 match as confirmation that the file
+// relation and the database relation were "the same" and rewrote the file
+// relation's RelationID to match it -- a real production bug, since Check 1
+// doesn't compare Mechanism/Ontology/Relationship at all, so a "same Type
+// and Effect" match can still be a genuinely different curated relation
+// (e.g. same Effect but Mechanism = "direct interaction" vs. none). Whether
+// or not a similar/exact-property match is found here has no bearing on the
+// original relation's own (deterministically computed) RelationID.
 async function loadSimilarRelations() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
   if (matchingInProgress) { alert('Relation matching is still in progress. Please wait for it to finish before loading similar relations.'); return; }
@@ -8295,9 +8316,6 @@ async function loadSimilarRelations() {
   // after enrichNodesFromNeo4j may have transformed node properties.
   var nodeUrnById = {};   // cyNodeId  → URN
   var urnToCyIds  = {};   // URN       → [cyNodeId, ...]
-  // URN → graphData node ID (Neo4j integer after enrichment, URN before).
-  // Used when pushing new edges to graphData so their startNodeId/endNodeId
-  // match graphData.nodes[i].id — otherwise renderGraph skips them on tab restore.
   var urnToGdId = {};
   graphData.nodes.forEach(function(n) {
     var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
@@ -8306,15 +8324,13 @@ async function loadSimilarRelations() {
   cy.nodes().forEach(function(n) {
     var urn = n.data('URN');
     if (!urn) {
-      // Clones may carry cloneOf; resolve to original's URN
       var orig = n.data('cloneOf');
-      if (orig) urn = nodeUrnById[orig];  // orig already processed if it appeared first
+      if (orig) urn = nodeUrnById[orig];
     }
     if (!urn) return;
     nodeUrnById[n.id()] = String(urn);
     (urnToCyIds[urn] = urnToCyIds[urn] || []).push(n.id());
   });
-  // Second pass for clones whose original hadn't been processed yet
   cy.nodes().forEach(function(n) {
     if (nodeUrnById[n.id()]) return;
     var orig = n.data('cloneOf');
@@ -8325,18 +8341,16 @@ async function loadSimilarRelations() {
     }
   });
 
-  // Collect RNEF edges without RelationID
-  var unmatchedEdges = cy.edges().filter(function(e) {
-    return e.data('edgeURN') && !e.data('relId');
-  });
-  if (!unmatchedEdges.length) {
-    alert('All relations in this pathway already have a RelationID.');
+  // Every RNEF edge is a candidate, unconditionally -- no RelationID or
+  // database-confirmation gate (RelationID has no bearing on this search).
+  var searchEdges = cy.edges().filter(function(e) { return !!e.data('edgeURN'); });
+  if (!searchEdges.length) {
+    alert('This pathway has no RNEF-sourced relations to search for.');
     return;
   }
 
-  // Build batch
   var batch = [];
-  unmatchedEdges.forEach(function(e, idx) {
+  searchEdges.forEach(function(e, idx) {
     var rURN = nodeUrnById[e.data('source')];
     var tURN = nodeUrnById[e.data('target')];
     if (rURN && tURN) {
@@ -8351,15 +8365,14 @@ async function loadSimilarRelations() {
     }
   });
   if (!batch.length) {
-    var diag = 'Could not resolve node URNs for any unmatched relation.\n\n'
-      + 'Unmatched edges: ' + unmatchedEdges.length + '\n'
+    var diag = 'Could not resolve node URNs for any relation.\n\n'
+      + 'Relations: ' + searchEdges.length + '\n'
       + 'Nodes with URN: ' + Object.keys(nodeUrnById).length + '\n'
-      + 'Sample source IDs: ' + unmatchedEdges.slice(0,3).map(function(e){ return e.data('source'); }).join(', ');
+      + 'Sample source IDs: ' + searchEdges.slice(0,3).map(function(e){ return e.data('source'); }).join(', ');
     alert(diag);
     return;
   }
 
-  // Show progress in stats bar
   var statsEl = document.getElementById('graph-stats');
   var simSpan = document.createElement('span');
   simSpan.id = 'sim-rel-status';
@@ -8373,31 +8386,24 @@ async function loadSimilarRelations() {
     var results  = response.results || [];
 
     // ── Re-establish targets after the async gap ──────────────────────────────
-    // If the user opened a new tab while the search was running, cy and graphData
-    // now belong to that OTHER tab.  We must never touch the wrong cy (which would
-    // corrupt tab 2) or the wrong graphData.  Instead we route all writes to the
-    // snapshot of the originating tab; renderGraph will apply them when the user
-    // switches back.
     var isCurrentTab = (activeTabIdx === simTabIdx);
     var targetGD = isCurrentTab
       ? graphData
       : (tabs[simTabIdx] && tabs[simTabIdx].snapshot && tabs[simTabIdx].snapshot.graphData);
 
     if (!targetGD) {
-      // The originating tab was closed while the search was in flight
       if (simSpan.parentNode) simSpan.remove();
       return;
     }
 
-    // Rebuild urnToGdId from the chosen targetGD — enrichNodesFromNeo4j may have
-    // updated node IDs after the batch request was sent.
     var targetUrnToGdId = {};
     targetGD.nodes.forEach(function(n) {
       var urn = n.properties && n.properties.URN ? String(n.properties.URN) : null;
       if (urn && !n.isClone) targetUrnToGdId[urn] = n.id;
     });
 
-    // Build existingRelIds from the correct data source
+    // Dedup set: don't add a second edge for a relation already visually
+    // present in the graph.
     var existingRelIds = new Set();
     if (isCurrentTab) {
       cy.edges().forEach(function(e) {
@@ -8412,12 +8418,9 @@ async function loadSimilarRelations() {
         if (Array.isArray(rids)) rids.forEach(function(id) { existingRelIds.add(String(id)); });
       });
     }
-    var preMatchedCount = existingRelIds.size;
 
-    // Snapshot for undo — only meaningful when still on the originating tab
     if (isCurrentTab) pushUndo();
 
-    // Counters for summary
     var exactCount   = 0;   // idx matched at Check 1
     var similarIdxs  = new Set();  // original idx matched at Check 2 or 3
     var addedEdges   = 0;   // new edges pushed to targetGD (and cy when current tab)
@@ -8426,29 +8429,11 @@ async function loadSimilarRelations() {
       if (entry.check === 1) exactCount++;
       else similarIdxs.add(entry.idx);
 
-      // The original unmatchedEdges cy element references retain their .data()
-      // even after the element is removed from cy on a tab switch — safe to read.
-      var origEdge = unmatchedEdges[entry.idx];
-      var edgeURN  = origEdge ? String(origEdge.data('edgeURN') || '') : '';
+      var origEdge = searchEdges[entry.idx];
 
-      // For Check 1 exact matches, annotate the existing RNEF edge in graphData
-      // and (if still on same tab) in the live cy graph.
-      if (entry.check === 1 && entry.relations.length > 0) {
-        var firstRel = entry.relations[0];
-        if (firstRel.relationID && firstRel.relationID !== 'null') {
-          var gEdge = edgeURN ? targetGD.edges.find(function(e) {
-            return e.properties && String(e.properties.URN) === edgeURN;
-          }) : null;
-          if (gEdge) gEdge.properties.RelationID = firstRel.relationID;
-          if (isCurrentTab && edgeURN) {
-            cy.edges().forEach(function(cyE) {
-              if (String(cyE.data('edgeURN')) === edgeURN) cyE.data('relId', firstRel.relationID);
-            });
-          }
-        }
-      }
-
-      // Add each found Neo4j relation as a new edge (dedup by RelationID)
+      // Every match (any check level) is added as its own new edge -- never
+      // overwrites the original relation's own RelationID. See this
+      // function's header comment for why.
       entry.relations.forEach(function(rel) {
         if (!rel.relationID || rel.relationID === 'null') return;
         if (existingRelIds.has(rel.relationID)) return;
@@ -8458,12 +8443,10 @@ async function loadSimilarRelations() {
         var numRefs    = typeof rel.numRefs === 'number' ? rel.numRefs : 0;
         var edgeId     = 'sim-' + rel.relationID;
 
-        // Resolve graphData node IDs (rebuilt after potential enrichment)
         var srcGdId = targetUrnToGdId[rel.rURN] !== undefined ? targetUrnToGdId[rel.rURN] : rel.rURN;
         var tgtGdId = targetUrnToGdId[rel.tURN] !== undefined ? targetUrnToGdId[rel.tURN] : rel.tURN;
 
         if (isCurrentTab) {
-          // ── Current tab: need valid cy node IDs; skip edge if nodes absent ──
           var srcCyIds = urnToCyIds[rel.rURN] || [];
           var tgtCyIds = urnToCyIds[rel.tURN] || [];
           if (!srcCyIds.length || !tgtCyIds.length) return;
@@ -8489,9 +8472,6 @@ async function loadSimilarRelations() {
           });
 
         } else {
-          // ── Background tab: write only to snapshot graphData ─────────────────
-          // cy will render these edges when the user switches back and
-          // applyTabState → renderGraph reads them from the snapshot.
           targetGD.edges.push({
             id: edgeId, elementId: edgeId, type: rel.relType,
             startNodeId: srcGdId, endNodeId: tgtGdId,
@@ -8505,7 +8485,6 @@ async function loadSimilarRelations() {
       });
     });
 
-    // Update status
     if (simSpan.parentNode) {
       if (addedEdges > 0) {
         simSpan.style.color = '#4caf50';
@@ -8516,11 +8495,10 @@ async function loadSimilarRelations() {
       }
     }
 
-    // Summary message
     var msg = 'Load similar relations complete:\n\n'
-      + '  Relations with RelationID before this search: ' + preMatchedCount + '\n'
-      + '  New exact matches found (RelationID assigned): ' + exactCount + '\n'
-      + '  Original pathway relations that have similar relations in the database: ' + similarIdxs.size + '\n'
+      + '  Pathway relations searched: ' + searchEdges.length + '\n'
+      + '  Relations with an exact Type+Effect match (Check 1): ' + exactCount + '\n'
+      + '  Relations with only a Check 2/3 similar match: ' + similarIdxs.size + '\n'
       + '  Similar relations loaded from Neo4j: ' + addedEdges;
     alert(msg);
 
@@ -8542,13 +8520,45 @@ function edgeDirectionToken(ei) {
   return m ? m[1] : null;
 }
 
+// ─── Selected nodes for Explore-menu "how many nodes are selected" gates ────
+// Connect Selected Nodes / Shortest Path / Find Common Neighbors / Find
+// Relations Between Selected & Unselected all require a minimum number of
+// DISTINCT selected entities. A clone is the SAME entity as its original
+// (same URN, copied onto it verbatim in cloneNode() -- see that function's
+// own comment) -- it exists only so the same node can appear in more than
+// one place on the canvas, not to represent a second entity. The previous
+// `.not('[?isClone]')` filter used throughout these functions dealt with
+// that by excluding every selected clone outright, which overcorrects: if
+// the user selects one original node PLUS a clone of a DIFFERENT,
+// otherwise-unselected node, the real intent is "I selected two distinct
+// entities" -- but the old filter discarded the clone entirely, leaving only
+// 1 counted, so the menu stayed dimmed and the action's own "select at least
+// N nodes" guard fired incorrectly. This dedupes by URN instead (a selected
+// original wins over a selected clone of the same URN, so selecting both
+// still counts as exactly one entity) rather than blanket-excluding clones.
+function _selectedRealNodes() {
+  if (!cy) return null;
+  var byUrn = Object.create(null);  // URN -> chosen cy node
+  var noUrn = [];                    // selected nodes with no resolvable URN, kept as-is
+  cy.nodes(':selected').forEach(function(n) {
+    var urn = n.data('URN') || n.data('urn') || '';
+    if (!urn) { noUrn.push(n); return; }
+    var existing = byUrn[urn];
+    if (!existing || (existing.data('isClone') && !n.data('isClone'))) {
+      byUrn[urn] = n;
+    }
+  });
+  var chosen = Object.keys(byUrn).map(function(urn) { return byUrn[urn]; }).concat(noUrn);
+  return cy.collection(chosen);
+}
+
 // ─── Find relations between selected and unselected nodes ────────────────────
 // filterType: 'all' | 'direct' | 'biomarker' | 'indirect'
 async function findRelationsBetweenGroups(filterType) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
   // Collect selected node URNs
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     alert('Please select at least one node to find relations.');
     return;
@@ -8697,7 +8707,7 @@ async function findRelationsBetweenGroups(filterType) {
 async function connectSelectedNodes(filterType) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length < 2) {
     alert('Please select at least two nodes to find connections between them.');
     return;
@@ -8828,7 +8838,7 @@ async function connectSelectedNodes(filterType) {
 // branch and /api/graph/shortest-path in server.js for how these get applied.
 async function openShortestPathDialog() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length < 2) {
     alert('Please select at least two nodes to find a shortest path between them.');
     return;
@@ -9166,15 +9176,26 @@ async function mergeSimilarRelations() {
       }
     }
 
-    // FRD 5: merge + deduplicate references by (year, journal, first-30-of-sentence)
+    // FRD 5: merge + deduplicate references across every edge in the group.
+    // Each edge's own .refs may ALREADY be a file+DB merge from the matching
+    // step above (see _mergeInlineAndDbRefs), so a plain "first array wins"
+    // concat+filter (the previous approach here) can still throw away a
+    // unique_id-bearing copy if the SAME reference happens to appear on a
+    // non-anchor edge before the anchor's own copy gets deduped in -- same
+    // class of bug as the fetch-and-merge fix above. Deduping in two passes
+    // (unique_id-bearing refs first) guarantees a database-confirmed copy is
+    // always the one kept, regardless of which edge in the group it came from.
     var allRefs = anchor.refs.slice();
     others.forEach(function(e) { allRefs = allRefs.concat(e.refs); });
     var seenKeys = new Set();
-    var dedupedRefs = allRefs.filter(function(ref) {
+    var dedupedRefs = [];
+    var withUniqueId = allRefs.filter(function(ref) { return ref && ref.unique_id != null && String(ref.unique_id).trim() !== ''; });
+    var withoutUniqueId = allRefs.filter(function(ref) { return !(ref && ref.unique_id != null && String(ref.unique_id).trim() !== ''); });
+    withUniqueId.concat(withoutUniqueId).forEach(function(ref) {
       var k = refKey(ref);
-      if (seenKeys.has(k)) return false;
+      if (seenKeys.has(k)) return;
       seenKeys.add(k);
-      return true;
+      dedupedRefs.push(ref);
     });
 
     // Collect all RelationIDs from every edge in this group (including already-merged ones)
@@ -9354,7 +9375,7 @@ var _expandPending = null;   // { nodes, edges }
 async function expandSelectedNodes(mode) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     showAlignHint('Please select at least one node to perform an expansion.');
     return;
@@ -9384,7 +9405,7 @@ async function expandSelectedNodes(mode) {
 async function findOntologyChildren() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     showAlignHint('Please select at least one node to find ontology children.');
     return;
@@ -9449,7 +9470,7 @@ var _FIND_DRUGS_EFFECT_LABEL = { positive: 'agonists (Effect=positive)', negativ
 async function findDrugs(relTypes, effect) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     showAlignHint('Please select at least one node to find drugs upstream of it.');
     return;
@@ -9970,7 +9991,7 @@ function closeCommonNeighborsConfigModal(e) {
 // as before; only its internals now go through the shared opener.
 async function openCommonNeighborsConfigDialog(mode) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length < 2) {
     alert('Please select at least two nodes to find common neighbors of them.');
     return;
@@ -9999,7 +10020,7 @@ async function openCommonNeighborsConfigDialog(mode) {
 // and keep running immediately exactly as before.
 async function openFindBetweenAllDialog() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     alert('Please select at least one node to find relations.');
     return;
@@ -10026,7 +10047,7 @@ async function openFindBetweenAllDialog() {
 
 async function openConnectSelectedAllDialog() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length < 2) {
     alert('Please select at least two nodes to find connections between them.');
     return;
@@ -10047,7 +10068,7 @@ async function openConnectSelectedAllDialog() {
 
 async function openExpandAllDialog() {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     showAlignHint('Please select at least one node to perform an expansion.');
     return;
@@ -10191,7 +10212,7 @@ async function runExploreConfigQuery() {
 async function findOntologyParents(maxDepth) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
 
-  var selectedNodes = cy.nodes(':selected').not('[?isClone]');
+  var selectedNodes = _selectedRealNodes();
   if (selectedNodes.length === 0) {
     showAlignHint('Please select at least one node to find ontology parents.');
     return;
@@ -11130,16 +11151,20 @@ function rcUpdateMenuState(selNodes, selEdges) {
     }
   });
 
-  // Explore menu items that require at least 2 selected (non-clone) nodes:
+  // Explore menu items that require at least 2 selected DISTINCT entities:
   // Connect Selected Nodes, Shortest path…, Find common neighbors. Dimmed as
   // an early warning when fewer than 2 are selected — but deliberately kept
   // fully clickable (no pointer-events:none, no onclick removal) so clicking
   // through still runs the real function and shows its own "select at least
-  // two nodes" alert, rather than just silently doing nothing. Recomputes
-  // the non-clone count itself (rather than trusting the selNodes argument,
-  // which includes clones) so the dimming exactly matches what each of
-  // those functions itself checks.
-  var realSelNodes = cy ? cy.nodes(':selected').not('[?isClone]').length : 0;
+  // two nodes" alert, rather than just silently doing nothing. Uses
+  // _selectedRealNodes() (dedupes by URN, so a selected clone still counts as
+  // its underlying entity unless the original is ALSO selected) rather than
+  // the selNodes argument (raw selection count, which would double-count an
+  // original+its own clone) or a blanket clone exclusion (which underexcluded
+  // a clone of a DIFFERENT, otherwise-unselected node -- see that function's
+  // own comment) -- so the dimming exactly matches what each of those
+  // functions itself checks.
+  var realSelNodes = cy ? _selectedRealNodes().length : 0;
   var need2 = realSelNodes >= 2;
   var dimColor = '#3a4060';
   ['me-connect-selected', 'mi-connect-all', 'mi-connect-direct', 'mi-connect-biomarker', 'mi-connect-indirect',
@@ -17112,9 +17137,10 @@ var _agentResumeRetryCount = 0;     // caps automatic resume retries so a persis
 
 // ── Panel open/close ─────────────────────────────────────────────────────────
 function _initAgenticAI() {
-  // Show AI Agent button for non-admin roles; LLM settings visible to all
-  var btn = document.getElementById('agentic-ai-btn');
-  if (btn) btn.style.display = (currentRole === 'admin') ? 'none' : 'inline-block';
+  // Show the AI menu for non-admin roles only — same restriction the old
+  // floating "🤖 AI Agent" button had; LLM settings visible to all.
+  var aiMenu = document.getElementById('me-ai');
+  if (aiMenu) aiMenu.style.display = (currentRole === 'admin') ? 'none' : '';
   var llmItem = document.getElementById('settings-llm-item');
   if (llmItem) llmItem.style.display = 'block';
 
@@ -17173,6 +17199,273 @@ function toggleAgenticPanel() {
   }
 }
 
+// Opens the panel (without closing it if already open, unlike the plain
+// toggle above) and switches it to the given agent mode — this is what each
+// AI submenu item calls, so picking Text2Cypher/Summarize/Curate/AI help
+// always ends up showing that agent, rather than sometimes closing the panel
+// if it happened to already be open on a different mode.
+var _agentMode = 'text2cypher';
+var AGENT_MODE_LABELS = {
+  text2cypher: {
+    title: '🤖 Text2Cypher',
+    placeholder: 'Ask a question or describe a task…',
+    intro: 'Ask anything about your graph — I can translate natural language to Cypher, run queries, and chain multi-step workflows.',
+  },
+  summarize: {
+    title: '🤖 Summarize',
+    placeholder: 'Ask a follow-up, or ask to re-focus on a specific context…',
+    intro: 'Summarizes the literature evidence behind your graph’s relations — pick a scope below to get started.',
+  },
+  curate: {
+    title: '🤖 Curate',
+    placeholder: 'Coming soon…',
+    intro: 'Curate is coming soon — it will validate a relation’s assertion against its supporting sentences and suggest a more precise one where possible.',
+  },
+  help: {
+    title: '🤖 AI help',
+    placeholder: 'Coming soon…',
+    intro: 'AI help is coming soon — it will explain how to use this app’s own features and buttons, aware of what you currently have open.',
+  },
+};
+
+function openAgenticPanel(mode) {
+  if (!_agentPanelOpen) toggleAgenticPanel();
+  if (mode) switchAgentMode(mode);
+}
+
+function switchAgentMode(mode) {
+  var labels = AGENT_MODE_LABELS[mode];
+  if (!labels) return;
+  _agentMode = mode;
+  document.querySelectorAll('.agent-mode-tab').forEach(function(el) {
+    el.classList.toggle('active', el.dataset.mode === mode);
+  });
+  var titleEl = document.getElementById('agent-panel-title');
+  if (titleEl) titleEl.textContent = labels.title;
+  var inputEl = document.getElementById('agent-input');
+  if (inputEl) inputEl.placeholder = labels.placeholder;
+  // Only swap the intro line when the chat is still empty — once a real
+  // conversation has started, overwriting agent-chat-messages here would
+  // wipe it out from underneath the user.
+  var intro = document.getElementById('agent-chat-intro');
+  if (intro && !_agentChatHistory.length) intro.textContent = labels.intro;
+  if (mode === 'summarize' && !_agentChatHistory.length) _summarizeShowScopePicker();
+}
+
+// ── Summarize agent ──────────────────────────────────────────────────────────
+// Structured, single-shot-then-conversational agent (see /summarize-chat in
+// agent_service.py) — separate send path from Text2Cypher's agentSend()
+// since it talks to a different backend endpoint with a different request/
+// response shape (no cypher/render/write_relation actions, but a scope pick
+// on the first turn and REQ-6 "resummarize" context switches on later ones).
+var _summarizeFetchedRows        = [];
+var _summarizeOriginalRelationIds = [];
+var _summarizeNodeAliases        = [];     // Name/Alias table, computed turn 1, echoed by every later turn
+var _summarizeScope              = null;   // 'selected' | 'all' — set once, on the first turn
+
+function _summarizeReset() {
+  _summarizeFetchedRows = [];
+  _summarizeOriginalRelationIds = [];
+  _summarizeNodeAliases = [];
+  _summarizeScope = null;
+}
+
+function _agentDispatchSend() {
+  if (_agentMode === 'summarize') summarizeSend();
+  else agentSend();
+}
+
+// Shown instead of free-text input the first time Summarize is opened with an
+// empty chat (REQ-2.2) — lets the user pick "selected relations" vs "all
+// visible relations" rather than the agent guessing from ambiguous free text.
+// Counts come from the exact same _currentGraphSummary() Text2Cypher already
+// sends every turn, so they always match what's actually on screen.
+function _summarizeShowScopePicker() {
+  var container = document.getElementById('agent-chat-messages');
+  if (!container) return;
+  container.querySelectorAll('[data-summarize-picker]').forEach(function(el) { el.remove(); });
+
+  var cg = _currentGraphSummary();
+  var wrap = document.createElement('div');
+  wrap.setAttribute('data-summarize-picker', '1');
+  wrap.style.cssText = 'align-self:center;display:flex;flex-direction:column;gap:8px;padding:14px;'
+    + 'background:#1e2a45;border-radius:10px;font-size:12px;color:#c8d0e8;max-width:96%';
+  var label = document.createElement('div');
+  label.textContent = 'Summarize which relations?';
+  wrap.appendChild(label);
+
+  var btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex;gap:8px';
+
+  function makeScopeBtn(text, count, scope) {
+    var btn = document.createElement('button');
+    btn.textContent = text + ' (' + count + ')';
+    btn.disabled = !count;
+    btn.style.cssText = 'flex:1;padding:8px;background:#2a4a7f;border:none;border-radius:6px;'
+      + 'color:#e0e8ff;font-size:12px;cursor:pointer' + (count ? '' : ';opacity:0.4;cursor:default');
+    btn.onclick = function() { _summarizeStart(scope); };
+    return btn;
+  }
+  btnRow.appendChild(makeScopeBtn('Selected relations', cg.selectedEdgeCount || 0, 'selected'));
+  btnRow.appendChild(makeScopeBtn('All visible relations', cg.edgeCount || 0, 'all'));
+  wrap.appendChild(btnRow);
+
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+}
+
+function _summarizeStart(scope) {
+  _summarizeScope = scope;
+  var container = document.getElementById('agent-chat-messages');
+  if (container) container.querySelectorAll('[data-summarize-picker]').forEach(function(el) { el.remove(); });
+  var label = scope === 'selected' ? 'Summarize the selected relations' : 'Summarize all visible relations';
+  _agentAppendMessage('user', label);
+  _agentChatHistory.push({ role: 'user', content: label });
+  _summarizeSendRequest(label);
+}
+
+function summarizeSend() {
+  var input = document.getElementById('agent-input');
+  var msg = (input.value || '').trim();
+  if (!msg) return;
+  input.value = '';
+  _agentAppendMessage('user', msg);
+  _agentChatHistory.push({ role: 'user', content: msg });
+  _summarizeSendRequest(msg);
+}
+
+// Pulls the FULL (untruncated) inline references off graphData.edges for a
+// given set of relationIds -- these are the sentences carried directly
+// inside an RNEF-converted pathway file (see the "Supplement with inline
+// references stored in the JSON" comment above in this file), independent
+// of whatever PostgreSQL does or doesn't have for the same RelationID. Only
+// used for the first turn of a Summarize conversation, sent alongside
+// current_graph so the backend can merge file-sourced sentences with
+// whatever it fetches from Postgres instead of relying on Postgres alone.
+function _inlineReferencesForRelationIds(relIds) {
+  var wanted = {};
+  (relIds || []).forEach(function(id) { if (id != null) wanted[String(id)] = true; });
+  if (!Object.keys(wanted).length) return [];
+  var out = [];
+  var edges = (graphData && graphData.edges) || [];
+  for (var i = 0; i < edges.length; i++) {
+    var p = edges[i].properties || {};
+    var relId = p.RelationID != null ? String(p.RelationID) : null;
+    if (relId && wanted[relId] && Array.isArray(p.references) && p.references.length) {
+      out.push({ relationId: relId, references: p.references });
+    }
+  }
+  return out;
+}
+
+// Name + Alias for every node that's an endpoint of an edge in the given
+// scope ('selected' or 'all') -- read directly off the live cy nodes rather
+// than the capped current_graph summary (which only keeps a display label,
+// not the node's own Alias property). This is what lets the Summarize agent
+// tell that a sentence's "Smac" and the graph's "DIABLO" node are the same
+// entity: the sentence text itself never carries that information, only the
+// node's own Alias property does. Deduped by canonical Name (a node can be
+// an endpoint of many edges in scope); capped at _AGENT_GRAPH_STATE_NODE_CAP
+// for the same reason current_graph's own node list is capped there.
+function _nodeAliasesForScope(scope) {
+  if (!cy) return [];
+  var edges = (scope === 'selected') ? cy.edges(':selected') : cy.edges();
+  var seenNames = {};
+  var out = [];
+  edges.forEach(function(e) {
+    [e.data('source'), e.data('target')].forEach(function(cyId) {
+      if (out.length >= _AGENT_GRAPH_STATE_NODE_CAP) return;
+      var n = cy.$id(cyId);
+      if (!n || !n.length) return;
+      var name = n.data('Name') || n.data('name') || n.data('label') || '';
+      if (!name || seenNames[name]) return;
+      seenNames[name] = true;
+      var alias = n.data('Alias') || n.data('alias') || '';
+      if (alias) out.push({ name: String(name), alias: String(alias) });
+    });
+  });
+  return out;
+}
+
+async function _summarizeSendRequest(message) {
+  var sendBtn  = document.getElementById('agent-send-btn');
+  var thinking = document.getElementById('agent-thinking-indicator');
+  if (sendBtn) sendBtn.disabled = true;
+  if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'inline'; }
+
+  var _abort = new AbortController();
+  var _abortTimer = setTimeout(function() { _abort.abort(); }, 130000);
+
+  try {
+    var _cgSummary = _currentGraphSummary();
+    var _isFirstSummarizeTurn = _agentChatHistory.slice(0, -1).length === 0;
+    var _inlineRefs = [];
+    if (_isFirstSummarizeTurn) {
+      var _scopeEdges = (_summarizeScope === 'selected')
+        ? (_cgSummary.selectedEdges || []) : (_cgSummary.edges || []);
+      // A merged edge's relationIds (plural, all IDs it represents) matters
+      // here just as much as its single relationId -- flatten both together
+      // so a merged edge's file-embedded references are pulled for every
+      // relation it stands in for, not just the one that survived as anchor.
+      var _scopeRelIds = [];
+      _scopeEdges.forEach(function(e) {
+        if (e.relationId) _scopeRelIds.push(e.relationId);
+        if (Array.isArray(e.relationIds)) _scopeRelIds = _scopeRelIds.concat(e.relationIds);
+      });
+      _inlineRefs = _inlineReferencesForRelationIds(_scopeRelIds);
+      // Computed once, turn 1 -- carried forward on later turns the same way
+      // fetched_rows/original_relation_ids are (see result.node_aliases below),
+      // since the system prompt needs this table rebuilt on EVERY turn, not
+      // just the first.
+      _summarizeNodeAliases = _nodeAliasesForScope(_summarizeScope);
+    }
+
+    var res = await fetch('/api/agent/summarize-chat', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
+      body: JSON.stringify({
+        message:               message,
+        history:                _agentChatHistory.slice(0, -1),
+        llm:                    _agentConfig,
+        current_graph:          _cgSummary,
+        scope:                  _summarizeScope,
+        fetched_rows:           _summarizeFetchedRows,
+        original_relation_ids:  _summarizeOriginalRelationIds,
+        inline_references:      _inlineRefs,
+        node_aliases:           _summarizeNodeAliases,
+      }),
+      signal: _abort.signal,
+    });
+    var result = await res.json().catch(function() { return {}; });
+    if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status));
+
+    if (result.fetched_rows)           _summarizeFetchedRows = result.fetched_rows;
+    if (result.original_relation_ids)  _summarizeOriginalRelationIds = result.original_relation_ids;
+
+    var reply = result.reply || '(no reply)';
+    _agentChatHistory.push({ role: 'assistant', content: reply });
+    _agentAppendMessage('assistant', reply);
+
+    if (result.resummarized) {
+      var note = document.createElement('div');
+      note.style.cssText = 'align-self:center;font-size:11px;color:#7a8099';
+      note.textContent = 'Re-focused (' + result.context_type + ') — '
+        + _summarizeFetchedRows.length + ' supporting sentence(s) now in scope';
+      var container = document.getElementById('agent-chat-messages');
+      if (container) { container.appendChild(note); container.scrollTop = container.scrollHeight; }
+    }
+  } catch (err) {
+    var errMsg = err.name === 'AbortError'
+      ? 'Request timed out after 130 seconds. The LLM may be overloaded — please retry.'
+      : 'Error: ' + (err.message || String(err));
+    _agentAppendMessage('error', errMsg);
+  } finally {
+    clearTimeout(_abortTimer);
+    if (sendBtn) sendBtn.disabled = false;
+    if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'none'; }
+  }
+}
+
 function _agentPollStatus() {
   api('/api/agent/health', null, 'GET')
     .then(function(r) {
@@ -17212,7 +17505,7 @@ function _agentSetStatus(ok, label) {
 
 // ── Chat ─────────────────────────────────────────────────────────────────────
 function agentInputKeydown(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); agentSend(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _agentDispatchSend(); }
 }
 
 // Shown whenever the backend had to drop the oldest turns of a long conversation
@@ -17279,6 +17572,16 @@ function _currentGraphSummary() {
       type:       e.type || '',
       effect:     effect
     };
+    // A "Merge similar relations" anchor edge legitimately carries MORE than
+    // one real RelationID (RelationIDs, plural -- see mergeSimilarRelations())
+    // -- its own relationId above is only the single anchor ID that survived
+    // the merge visually, not every relation it now represents. Sent as a
+    // separate array (never folded into relationId itself, which stays a
+    // plain scalar for every other consumer of this edge shape) so Summarize
+    // can pull evidence for ALL of a merged edge's relations, not just one.
+    if (Array.isArray(p.RelationIDs) && p.RelationIDs.length) {
+      edgeInfo.relationIds = p.RelationIDs.map(String);
+    }
     // If this edge's supporting sentences are already sitting in refsCache (fetched
     // earlier — via a tooltip hover, "Colorize sentences", loading a saved subgraph
     // with inline references, etc.) or inline on the edge itself, include them here
@@ -17314,12 +17617,19 @@ function _currentGraphSummary() {
     });
     cy.edges(':selected').forEach(function(e) {
       var d = e.data();
-      selectedEdges.push({
+      var edgeInfo = {
         relationId: d.relId || null,
         source: cy.$id(d.source).data('label') || '?',
         target: cy.$id(d.target).data('label') || '?',
         type:   d.relType || ''
-      });
+      };
+      // See the identical relationIds field on cappedEdges above -- a merged
+      // anchor edge's cy data carries relIds (plural) with every RelationID
+      // it represents, not just its own single relId.
+      if (Array.isArray(d.relIds) && d.relIds.length) {
+        edgeInfo.relationIds = d.relIds.map(String);
+      }
+      selectedEdges.push(edgeInfo);
     });
   }
 
@@ -17807,8 +18117,18 @@ function agentClearChat() {
   _agentChatHistory = [];
   _agentLastCypher  = null;
   _agentActionLog   = [];
+  _summarizeReset();
   var container = document.getElementById('agent-chat-messages');
-  if (container) container.innerHTML = '<div style="text-align:center;color:#5a6080;font-size:12px;padding:20px 0">Ask anything about your graph &mdash; I can translate natural language to Cypher, run queries, and chain multi-step workflows.</div>';
+  if (container) {
+    var labels = AGENT_MODE_LABELS[_agentMode] || AGENT_MODE_LABELS.text2cypher;
+    var intro = document.createElement('div');
+    intro.id = 'agent-chat-intro';
+    intro.style.cssText = 'text-align:center;color:#5a6080;font-size:12px;padding:20px 0';
+    intro.textContent = labels.intro;
+    container.innerHTML = '';
+    container.appendChild(intro);
+    if (_agentMode === 'summarize') _summarizeShowScopePicker();
+  }
 }
 
 // ── Save / load conversation to a local file ──────────────────────────────────
