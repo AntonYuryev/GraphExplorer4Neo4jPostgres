@@ -376,12 +376,21 @@
   },
   {
     "question": "Find nodes by name",
-    "cypher": "WITH $batch AS rows\\n\n              UNWIND rows AS row\\n\n              MATCH ({node})\n              WHERE toLower({letter}.Name) = toLower(row) OR toLower(row) IN [x IN {letter}.Alias | toLower(x)]\n              RETURN {letter}",
-    "notes": "use batch parameter to input a list of names.  Query should be executed in multithread mode with batch size = 10.  Split input list into chunks for multithread retrieval.",
+    "cypher": "WITH $batch AS rows\\n\n              UNWIND rows AS row\\n\n              MATCH (n)\n              WHERE toLower(n.Name) = toLower(row) OR toLower(row) IN [x IN n.Alias | toLower(x)]\n              RETURN n AS hit\nUNION\nMATCH (n) \nWHERE toLower(n.Name) CONTAINS 'cancer' \n   OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'cancer') \nRETURN n AS hit",
+    "notes": "use batch parameter to input a list of names.  Query should be executed in multithread mode with batch size = 10.  Split input list into chunks for multithread retrieval.  Second query can be used as fallback if exact match found nothing",
     "tags": [
       "search nodes",
       "find entities",
       "lookup concepts"
+    ]
+  },
+  {
+    "question": "Find  cancer-related anatomical concepts with keywords",
+    "cypher": "MATCH (n:CellType|CellLineName|Tissue|Organ|CellObject|SemanticConcept) WHERE toLower(n.Name) CONTAINS 'cancer' OR toLower(n.Name) CONTAINS 'tumor' OR toLower(n.Name) CONTAINS 'carcinoma' OR toLower(n.Name) CONTAINS 'sarcoma' OR toLower(n.Name) CONTAINS 'neoplasm' OR toLower(n.Name) CONTAINS 'malignancy' OR toLower(n.Name) CONTAINS 'oncology' OR toLower(n.Name) CONTAINS 'metastasis' OR toLower(n.Name) CONTAINS 'leukemia' OR toLower(n.Name) CONTAINS 'lymphoma' OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'cancer') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'tumor') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'carcinoma') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'sarcoma') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'neoplasm') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'malignancy') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'oncology') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'metastasis') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'leukemia') OR any(alias IN n.Alias WHERE toLower(alias) CONTAINS 'lymphoma') RETURN DISTINCT n.Name AS AnatomicalConceptName, labels(n)[0] AS Label ORDER BY Label, AnatomicalConceptName",
+    "notes": "This query is example of node labels list used to find anatomical concepts.  SemanticConcept is the only ambiguous label that may contain not only anatomical  terms but disease and cell process related concepts.  Use discretion when including SemanticConcept into the search for anatomical concepts.   Only if a search keyword itself implies anatomical name SemanticConcept can be included.  All other labels CellType|CellLineName|Tissue|Organ|CellObject unambiguously define anatomical concepts.",
+    "tags": [
+      "anatomical concepts; anatomy; cells; organ",
+      "tissue"
     ]
   }
 ]
