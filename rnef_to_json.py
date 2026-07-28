@@ -193,7 +193,11 @@ def convert_resnet(resnet, out_dir):
                     'pubyear': r.get('PubYear', ''),
                     'authors': r.get('Authors', ''),
                     'journal': r.get('Journal', ''),
-                    'msrc':    r.get('Sentence', '')
+                    'msrc':    r.get('Sentence', ''),
+                    'celltype': r.get('CellType', ''),
+                    'celllinename': r.get('CellLineName', ''),
+                    'tissue': r.get('Tissue', ''),
+                    'organ': r.get('Organ', '')
                 })
 
             # Hyperedge = a control connecting MORE THAN TWO nodes -- Cytoscape
