@@ -1662,8 +1662,13 @@
 
       <!-- Node types / Relation types as tabs, not one long scrolling page —
            having both visible as tabs up front is what makes it obvious
-           relation filtering exists at all, not just node filtering. -->
-      <div style="display:flex;gap:2px;border-bottom:1px solid #232840;margin-bottom:12px;flex-shrink:0">
+           relation filtering exists at all, not just node filtering.
+           Hidden entirely (via #cnc-tabs-bar) for actions like Connect
+           Selected Nodes that only ever find RELATIONS, never new nodes —
+           there's nothing to switch between in that case, so the dialog
+           opens straight on the Relation Types content below with no tab
+           bar at all. -->
+      <div id="cnc-tabs-bar" style="display:flex;gap:2px;border-bottom:1px solid #232840;margin-bottom:12px;flex-shrink:0">
         <button id="cnc-tab-btn-node" onclick="_cncSwitchTab('node')"
           style="background:none;border:none;border-bottom:2px solid #4f8ef7;color:#fff;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer">Node Types</button>
         <button id="cnc-tab-btn-rel" onclick="_cncSwitchTab('rel')"
@@ -1752,6 +1757,29 @@
         <button class="btn-ghost" onclick="closeConnectivityReportModal()">Cancel</button>
         <button class="btn-ghost" onclick="_crCommitNewTab()">Open in another graph</button>
         <button class="btn-primary" onclick="_crCommit()">Add to current graph</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════ Connect Selected Nodes — Results ══════════════
+       Simplified sibling of the Connectivity Report used ONLY by "Connect
+       Selected Nodes → All Relations": that action only ever adds EDGES
+       between nodes the user already selected — it never introduces new
+       entities — so there's nothing per-row to pick. Just relation-type
+       statistics plus Cancel / Add to current graph / Open in another graph. -->
+  <div id="connect-selected-result-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-box" style="min-width:420px;max-width:90vw" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3 style="margin:0">Connect Selected Nodes — Results</h3>
+        <button onclick="closeConnectSelectedResultModal()" title="Close" style="background:none;border:none;color:#7a8099;font-size:22px;cursor:pointer;line-height:1;padding:0 4px">×</button>
+      </div>
+      <div id="csr-summary" style="font-size:11px;color:#7a8099;margin:8px 0 6px"></div>
+      <div id="csr-breakdown" style="font-size:12px;color:#c8ccdc;white-space:pre-line;margin-bottom:6px"></div>
+      <div id="csr-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">No relations found between the selected nodes.</div>
+      <div class="modal-actions">
+        <button class="btn-ghost" onclick="closeConnectSelectedResultModal()">Cancel</button>
+        <button class="btn-ghost" onclick="_csrCommitNewTab()">Open in another graph</button>
+        <button class="btn-primary" onclick="_csrCommit()">Add to current graph</button>
       </div>
     </div>
   </div>
