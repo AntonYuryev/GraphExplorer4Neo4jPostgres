@@ -17,6 +17,7 @@ import hashlib
 import logging
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -27,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
+# Note: register_summarize_routes is imported lazily in startup handler to improve initial startup speed
 
 # ── Optional heavy deps — imported lazily so the service starts even if missing ──
 try:
@@ -57,7 +59,8 @@ except ImportError:
 # indefinitely — Neo4j has no default per-query timeout of its own. Wrapping the
 # query text in neo4j.Query(..., timeout=N) asks the SERVER to abort the query
 # after N seconds with a clean, catchable error instead of hanging the request.
-CYPHER_QUERY_TIMEOUT_SECONDS = 25
+# Increased for debugging: was 25, now 120 to accommodate debugger inspection.
+CYPHER_QUERY_TIMEOUT_SECONDS = 120
 
 try:
     import psycopg2
@@ -118,6 +121,7 @@ class _SanitizeLogFilter(logging.Filter):
 log.addFilter(_SanitizeLogFilter())
 
 app = FastAPI(title="Graph Explorer Agent Service", version="1.0.0")
+
 # This service is only ever called by server.js's own reverse proxy
 # (127.0.0.1, see the AGENT_PORT/uvicorn.run() setup at the bottom of this
 # file) — no browser talks to it directly, so a wide-open CORS policy serves
@@ -714,41 +718,6 @@ class ChatRequest(BaseModel):
     # from conversation history. See _current_graph_prompt_section().
     current_graph: Optional[Dict[str, Any]] = None
 
-class SummarizeRequest(BaseModel):
-    message: str
-    history: List[ChatMessage] = []
-    llm: Optional[Dict[str, Any]] = None
-    current_graph: Optional[Dict[str, Any]] = None
-    # REQ-2.2: which relations to summarize — 'selected' or 'all' (visible in
-    # the graph). Only meaningful/required on the very first turn of a
-    # Summarize conversation; ignored afterwards.
-    scope: Optional[str] = None
-    # This service is stateless between requests (like /chat) — the frontend
-    # resends whatever sentence rows it already fetched on turn 1 so later
-    # turns (REQ-4.3 follow-up Q&A) don't need to re-hit PostgreSQL, and so a
-    # REQ-6 resummarize action can tell what the "original input relations"
-    # restriction actually was.
-    fetched_rows: List[Dict[str, Any]] = []
-    original_relation_ids: List[Any] = []
-    # Sentences carried INSIDE the currently-opened pathway file itself (RNEF
-    # <attr name="Sentence">), rather than looked up from PostgreSQL. A curated
-    # RNEF pathway's relations can be topologically matched to real Neo4j
-    # RelationIDs (so relation_ids resolve fine) while still citing literature
-    # PostgreSQL was never loaded with -- Postgres and the file are separate,
-    # independently-curated sources of truth. Sent only on the first turn, one
-    # entry per edge that has inline references: {relationId, references: [...]}
-    # where each reference has the same shape as a Postgres row (pmid, doi,
-    # title, pubyear, authors, journal, msrc).
-    inline_references: List[Dict[str, Any]] = []
-    # Name + Alias for every node that's an endpoint of a relation in scope
-    # (see app.js's _nodeAliasesForScope()) -- the ONLY source the model can
-    # ever learn "Smac and DIABLO are the same graph node" from, since that
-    # fact lives on the node's own Alias property, never in the sentence text
-    # itself. Computed once on turn 1, echoed back by the frontend on every
-    # later turn (same pattern as fetched_rows/original_relation_ids) since
-    # the system prompt is rebuilt on every turn, not just the first.
-    node_aliases: List[Dict[str, Any]] = []
-
 class LibraryFile(BaseModel):
     name: str
     description: str = ""
@@ -999,7 +968,7 @@ def run_postgres(sql: str, params: tuple = ()) -> List[Dict]:
         user=cfg["username"],
         password=cfg.get("password", ""),
         options=f"-c search_path={schema}",
-        connect_timeout=10,
+        connect_timeout=20,
     )
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1181,511 +1150,7 @@ LIMIT 25
         raise ValueError(f"Unknown ontology sub_action: {sub_action!r}. "
                          "Use 'alias_search', 'broaden', or 'narrow'.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Summarize agent — data-retrieval helpers (FDR REQ-3, REQ-6)
-# ─────────────────────────────────────────────────────────────────────────────
-# Everything here is plain Python doing deterministic, backend-driven fetches
-# -- the Summarize LLM itself never gets its own Cypher/Postgres tool access
-# (unlike Text2Cypher). This is what REQ-4.1's strict no-hallucination
-# grounding actually rests on: the model can only ever see sentence text this
-# code handed it, never anything it queried on its own initiative.
-
-def _coerce_relation_ids(relation_ids) -> List[int]:
-    """Neo4j's RelationID travels as a string (or list of strings); the
-    Postgres reference.id column is a real bigint. Coerce defensively,
-    silently dropping anything that isn't a clean integer literal rather
-    than raising -- one malformed id should never block fetching sentences
-    for the rest of a relation list.
-
-    A "Merge similar relations" anchor edge carries its full set of
-    represented RelationIDs as a LIST (RelationIDs, plural -- see
-    _currentGraphSummary()'s own comment in app.js), and that list can arrive
-    here either as one element of `relation_ids` (e.g. a caller passed
-    e["relationIds"] straight through as a single item) or, per an earlier
-    version of this function, get silently str()'d into something like
-    "['-123', '456']" and dropped as unparseable -- UNPACKING one level here
-    so every id in a nested list is coerced individually, instead of the
-    whole list being discarded as a single malformed entry."""
-    if relation_ids is None:
-        return []
-    if not isinstance(relation_ids, list):
-        relation_ids = [relation_ids]
-    out = []
-    for rid in relation_ids:
-        candidates = rid if isinstance(rid, list) else [rid]
-        for c in candidates:
-            try:
-                out.append(int(str(c).strip()))
-            except (TypeError, ValueError):
-                continue
-    return out
-
-_PG_REFERENCE_COLUMNS_CACHE: Dict[str, set] = {}
-
-# Optional reference-table columns the FDR's REQ-6.2/6.3 rules depend on.
-# Presence varies by deployment (see agent_service.py's existing "Additional
-# columns vary" note in the Text2Cypher system prompt) -- always check via
-# _pg_reference_columns() before referencing one of these in a query rather
-# than assuming it exists.
-_SUMMARIZE_OPTIONAL_COLUMNS = ("celllinename", "celltype", "organ", "tissue", "organism", "doi")
-
-def _pg_reference_columns() -> set:
-    """Discovers which of _SUMMARIZE_OPTIONAL_COLUMNS actually exist on this
-    deployment's reference table (Postgres folds unquoted identifiers to
-    lowercase, so comparisons here are all lowercase regardless of how a
-    column name is written elsewhere). Cached per (host, database, schema)
-    for the process lifetime -- the table's shape doesn't change at runtime,
-    unlike its row contents."""
-    cfg = _resolve_pg_cfg(_current_username.get())
-    cache_key = f"{cfg.get('host')}/{cfg.get('database')}/{cfg.get('schema')}"
-    if cache_key in _PG_REFERENCE_COLUMNS_CACHE:
-        return _PG_REFERENCE_COLUMNS_CACHE[cache_key]
-    schema = cfg.get("schema", "public")
-    try:
-        rows = run_postgres(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = %s AND table_name = 'reference'",
-            (schema,)
-        )
-        cols = {r["column_name"].lower() for r in rows}
-    except Exception as e:
-        log.warning("Could not discover reference table columns: %s", e)
-        cols = set()
-    _PG_REFERENCE_COLUMNS_CACHE[cache_key] = cols
-    return cols
-
-def _summarize_select_columns() -> List[str]:
-    """Core columns (always present, per the Text2Cypher prompt's own
-    'Reference table' section) plus whichever optional anatomical/organism/
-    doi columns this deployment actually has."""
-    cols = _pg_reference_columns()
-    extra = [c for c in _SUMMARIZE_OPTIONAL_COLUMNS if c in cols]
-    return ["id", "unique_id", "title", "authors", "pubyear", "journal", "pmid", "msrc"] + extra
-
-def _fetch_sentences_for_relation_ids(relation_ids) -> List[Dict]:
-    """REQ-3.1: standard fetch -- every reference row supporting the given
-    RelationIds, run through the SAME per-user connection/schema resolution
-    (via search_path) as every other Postgres call in this service. Queries
-    execute with proper parameter binding (psycopg2 adapts a Python list to
-    a Postgres ARRAY for `= ANY(%s)`) -- relation_ids are never interpolated
-    into the SQL text."""
-    ids = _coerce_relation_ids(relation_ids)
-    if not ids:
-        return []
-    select_cols = ", ".join(_summarize_select_columns())
-    return run_postgres(f"SELECT {select_cols} FROM reference WHERE id = ANY(%s)", (ids,))
-
-def _rows_from_inline_references(inline_references) -> List[Dict]:
-    """Converts frontend-supplied inline references (sentences carried inside
-    the currently-opened RNEF pathway file, see app.js's own "Supplement with
-    inline references stored in the JSON (RNEF-converted pathways)" comment)
-    into the same row shape _summarize_sentence_context() expects from
-    Postgres: id, pmid, doi, title, pubyear, authors, journal, msrc. This is
-    what lets Summarize work for a pathway whose relations resolve fine
-    against Neo4j (real RelationIDs) but whose specific citations were never
-    loaded into the PostgreSQL sentence store -- the file already has the
-    sentence text, so there's no reason to require a database round-trip for
-    it. Rows without any actual sentence text are dropped -- an empty msrc
-    would just be dead weight in the evidence block."""
-    rows: List[Dict] = []
-    for entry in (inline_references or []):
-        if not isinstance(entry, dict):
-            continue
-        # Neo4j's RelationID always travels as a string (see app.js's own
-        # String(p.RelationID)), while Postgres's reference.id is a real
-        # bigint -- normalize here the same way _coerce_relation_ids() does
-        # for the Postgres-fetch path, so a row's "id" is the same type
-        # (int) regardless of which of the two sources it came from. Falls
-        # back to the raw string for a relation that never matched Neo4j at
-        # all (a hyperedge sub-id, or an RNEF local_id like "urn:agi-..."),
-        # since those genuinely aren't numeric and coercing them would just
-        # silently discard a citation that's still valid to show.
-        raw_rel_id = entry.get("relationId")
-        try:
-            rel_id = int(str(raw_rel_id).strip())
-        except (TypeError, ValueError):
-            rel_id = raw_rel_id
-        for ref in (entry.get("references") or []):
-            if not isinstance(ref, dict):
-                continue
-            msrc = str(ref.get("msrc") or "").strip()
-            if not msrc:
-                continue
-            rows.append({
-                "id":      rel_id,
-                "pmid":    ref.get("pmid", ""),
-                "doi":     ref.get("doi", ""),
-                "title":   ref.get("title", ""),
-                "pubyear": ref.get("pubyear", ""),
-                "authors": ref.get("authors", ""),
-                "journal": ref.get("journal", ""),
-                "msrc":    msrc,
-                "_source": "file",
-            })
-    return rows
-
-def _merge_pg_and_inline_rows(pg_rows: List[Dict], inline_rows: List[Dict]) -> List[Dict]:
-    """Combines PostgreSQL rows with file-embedded rows, deduplicating so the
-    same sentence isn't shown twice when it happens to exist in both (e.g. a
-    relation that PostgreSQL DOES have, but the file also carries a copy of).
-    Dedup key is (doi or pmid, msrc) rather than 'id' -- Postgres id and a
-    file relationId are different ID spaces and can coincidentally collide."""
-    seen = set()
-    out: List[Dict] = []
-    for r in pg_rows + inline_rows:
-        key = (str(r.get("doi") or "").strip().lower(),
-               str(r.get("pmid") or "").strip(),
-               str(r.get("msrc") or "").strip().lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-    return out
-
-def _fetch_sentences_by_article(titles=None, dois=None, pmids=None) -> List[Dict]:
-    """REQ-6.1 'Title' rule: once an article has been identified as matching
-    the user's context (its title/doi/pmid matched), fetch EVERY sentence row
-    from that article -- not just the ones tied to the original input
-    relations. Title matching is a case-insensitive substring match (the same
-    article's title can be stored with trivially different whitespace/
-    punctuation across its own sentence rows); doi/pmid matches are exact."""
-    cols = _pg_reference_columns()
-    select_cols = ", ".join(_summarize_select_columns())
-    clauses, params = [], []
-    for t in (titles or []):
-        t = str(t or "").strip()
-        if not t:
-            continue
-        clauses.append("LOWER(COALESCE(title,'')) LIKE %s")
-        params.append(f"%{t.lower()}%")
-    if dois and "doi" in cols:
-        clean_dois = [str(d).strip() for d in dois if str(d or "").strip()]
-        if clean_dois:
-            clauses.append("doi = ANY(%s)")
-            params.append(clean_dois)
-    if pmids:
-        clean_pmids = [str(p).strip() for p in pmids if str(p or "").strip()]
-        if clean_pmids:
-            clauses.append("pmid = ANY(%s)")
-            params.append(clean_pmids)
-    if not clauses:
-        return []
-    where = " OR ".join(clauses)
-    return run_postgres(f"SELECT {select_cols} FROM reference WHERE {where} LIMIT 500", tuple(params))
-
-def _resolve_context_terms(term: str) -> List[Dict]:
-    """Finds Neo4j nodes matching a user-supplied context term (disease, cell
-    process, drug, anatomical concept, organism, ...) by Name OR Alias --
-    per the FDR's explicit instruction that context terms must be searched
-    against BOTH attributes, not Name alone. Reuses the exact same matching
-    or run_ontology_lookup('alias_search', ...) rather than duplicating it."""
-    return run_ontology_lookup("alias_search", term=term).get("matches", [])
-
-def _ontology_children_unbounded(term_matches: List[Dict]) -> List[str]:
-    """REQ-3.2 / REQ-6.2 / REQ-6.3: full, UNBOUNDED is_a|part_of* descendant
-    walk for each resolved context term -- mirrors server.js's own
-    /api/graph/ontology-children endpoint exactly (menu: Ontology -> Find
-    ontology children), which the FDR explicitly names as the query to reuse.
-    Deliberately NOT run_ontology_lookup('narrow', ...) above, which caps
-    depth at 5 for the general-purpose ontology-navigation action -- the FDR
-    wants the SAME unbounded expansion the menu command performs, so a term
-    with a deep hierarchy doesn't silently miss real descendants.
-    Returns the flattened, deduplicated list of descendant Names (including
-    each input term's own name, since a context term itself should also
-    match its own mentions)."""
-    names = set()
-    for m in term_matches:
-        name = m.get("name")
-        if name:
-            names.add(name)
-    for m in term_matches:
-        urn = m.get("name")  # this deployment's alias_search matches by Name, not a separate urn field
-        label = m.get("label")
-        if not urn or not label or not _REL_TOKEN_RE.match(label):
-            continue
-        try:
-            rows = run_cypher(
-                "MATCH (p) WHERE p.Name = $name AND $label IN labels(p) "
-                "OPTIONAL MATCH (child)-[:is_a|part_of*]->(p) "
-                "RETURN DISTINCT child.Name AS name",
-                {"name": urn, "label": label},
-            )
-        except Exception as e:
-            log.warning("ontology_children_unbounded failed for %s: %s", urn, e)
-            continue
-        for r in rows:
-            n = r.get("name")
-            if n:
-                names.add(n)
-    return sorted(names)
-
-def _filter_rows_by_terms(rows: List[Dict], terms: List[str], columns: List[str]) -> List[Dict]:
-    """REQ-6.2 'Anatomical' / REQ-6.3 'Organism' rules: keep only rows whose
-    value in one of `columns` (whichever anatomical/organism columns this
-    deployment actually has) matches one of `terms` (the user's context term
-    plus its ontology children), OR whose sentence text (`msrc`)/title
-    mentions one of those terms -- the FDR's "but also re-inspect sentences
-    from input sentences for presence of the anatomical concepts" clause.
-    Both checks are case-insensitive substring matches. Always restricted to
-    the rows already passed in (the original input relations' sentences) --
-    this never fetches anything new, unlike the Title rule above."""
-    if not terms:
-        return rows
-    lowered_terms = [t.lower() for t in terms if t]
-    if not lowered_terms:
-        return rows
-    kept = []
-    for row in rows:
-        hit = False
-        for col in columns:
-            val = str(row.get(col) or "").lower()
-            if val and any(t in val for t in lowered_terms):
-                hit = True
-                break
-        if not hit:
-            text = (str(row.get("msrc") or "") + " " + str(row.get("title") or "")).lower()
-            hit = any(t in text for t in lowered_terms)
-        if hit:
-            kept.append(row)
-    return kept
-
-# Summarize's own, deliberately tiny action vocabulary -- just "resummarize"
-# (REQ-6) -- kept fully separate from Text2Cypher's _extract_action()/
-# _KNOWN_ACTIONS so a Summarize LLM call can never accidentally trigger a
-# cypher/write_relation/etc action meant for a completely different agent
-# with completely different tool access.
-_SUMMARIZE_ACTION_BLOCK_RE = re.compile(
-    r'```json\s*(\{[^`]*?"action"\s*:\s*"resummarize"[^`]*?\})\s*```',
-    re.DOTALL,
-)
-
-def _extract_summarize_action(text: str):
-    """Returns (action_dict, matched_span_text) or (None, None)."""
-    m = _SUMMARIZE_ACTION_BLOCK_RE.search(text)
-    if m:
-        try:
-            parsed = json.loads(m.group(1))
-            if parsed.get("action") == "resummarize":
-                return parsed, m.group(0)
-        except Exception:
-            pass
-    for start in range(len(text)):
-        if text[start] != '{':
-            continue
-        depth = 0
-        for end in range(start, len(text)):
-            if text[end] == '{':
-                depth += 1
-            elif text[end] == '}':
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start:end + 1]
-                    try:
-                        parsed = json.loads(candidate)
-                        if isinstance(parsed, dict) and parsed.get("action") == "resummarize":
-                            return parsed, candidate
-                    except Exception:
-                        pass
-                    break
-    return None, None
-
-def _strip_summarize_action(text: str, matched_span: Optional[str]) -> str:
-    if not matched_span:
-        return text.strip()
-    return text.replace(matched_span, "").strip()
-
-
-# Hard caps on the evidence block's size. "Load similar relations" +
-# "Merge similar relations" can leave a single merged edge citing hundreds of
-# references (confirmed in production: one relation alone carried 271), and a
-# pathway can have dozens of such merged relations in scope at once -- with no
-# cap, the resulting evidence text can run to several MB, which exceeds every
-# real LLM provider's context window. That doesn't fail cleanly: the provider
-# call errors out, gets retried a few times by _call_llm_with_retries(), and
-# once retries are exhausted the whole request surfaces to the user as a bare
-# "HTTP 502" with no indication the actual problem was evidence size. Capping
-# here means Summarize degrades gracefully (fewer sentences, clearly marked as
-# such) instead of failing outright for any sufficiently merged pathway.
-_SUMMARIZE_MAX_ROWS = 500
-_SUMMARIZE_MAX_EVIDENCE_CHARS = 120_000  # ~30k tokens at ~4 chars/token
-
-def _summarize_sentence_context(rows: List[Dict]) -> str:
-    """Formats fetched reference rows as the ground-truth evidence block the
-    Summarize system prompt embeds directly -- this is the ONLY source of
-    information the model is given tool-free access to (see REQ-4.1)."""
-    if not rows:
-        return "(no supporting sentences were found)"
-    lines = []
-    total_chars = 0
-    omitted = 0
-    for i, r in enumerate(rows):
-        if i >= _SUMMARIZE_MAX_ROWS or total_chars >= _SUMMARIZE_MAX_EVIDENCE_CHARS:
-            omitted = len(rows) - i
-            break
-        cite_bits = []
-        if r.get("id") is not None:
-            cite_bits.append(f"RelationID {r['id']}")
-        elif r.get("_source") == "file":
-            cite_bits.append("from opened pathway file")
-        if r.get("pmid"):    cite_bits.append(f"PMID {r['pmid']}")
-        if r.get("pubyear"): cite_bits.append(str(r["pubyear"]))
-        if r.get("journal"): cite_bits.append(r["journal"])
-        extra_bits = []
-        for col in _SUMMARIZE_OPTIONAL_COLUMNS:
-            val = r.get(col)
-            if val:
-                extra_bits.append(f"{col}={val}")
-        cite = ", ".join(cite_bits) + (f" [{', '.join(extra_bits)}]" if extra_bits else "")
-        title = r.get("title") or ""
-        sentence = r.get("msrc") or ""
-        line = f'- ({cite}) "{title}": "{sentence}"'
-        lines.append(line)
-        total_chars += len(line)
-    if omitted > 0:
-        lines.append(
-            f"... ({omitted} more supporting sentence(s) omitted here to stay within the model's "
-            "context limit -- mention in your reply that the evidence set was too large to show in "
-            "full, if relevant, but do not guess at what the omitted sentences might say)"
-        )
-    return "\n".join(lines)
-
-def _summarize_alias_section(node_aliases: List[Dict]) -> str:
-    """Builds the "use canonical Names, not aliases" instruction block plus a
-    Name/Alias lookup table for the nodes actually in scope. Sentences are raw
-    literature text -- they call an entity whatever the paper's authors called
-    it ("Smac", "Akt", "Survivin"), which frequently differs from the graph
-    node's own canonical Name ("DIABLO", "AKT1", "BIRC5"). The model has no way
-    to know these refer to the same node from the sentence text alone; the
-    node's own Alias property is the ONLY source of that fact, so it has to be
-    handed over explicitly rather than left for the model to infer or recall
-    from pre-trained knowledge (which would violate the no-pre-trained-
-    knowledge grounding rule just as much as inventing a claim would)."""
-    if not node_aliases:
-        return ""
-    lines = []
-    for entry in node_aliases:
-        name = str(entry.get("name") or "").strip()
-        alias = str(entry.get("alias") or "").strip()
-        if name and alias:
-            lines.append(f"- {name} (aliases: {alias})")
-    if not lines:
-        return ""
-    table = "\n".join(lines)
-    return f"""
-## Entity naming (use canonical Names, never aliases)
-The sentences below are raw literature text, so they call entities whatever the original paper
-called them -- which is very often NOT this graph's canonical name for that same node (e.g. a
-sentence saying "Smac" may be this pathway's "DIABLO" node; "Akt" may be "AKT1"; "Survivin" may be
-"BIRC5"). The table below maps every node in scope to its known alias(es), straight from that
-node's own Alias property:
-{table}
-Whenever a supporting sentence uses one of these aliases, you MUST refer to that entity by its
-canonical Name in your summary instead -- never repeat the alias as written in the sentence, even
-though it's the term the literature itself uses. This applies to every mention, not just the first.
-If an entity you want to mention isn't in this table at all, use whatever name the sentence gives it
-(there's nothing to normalize it against).
-"""
-
-def _summarize_system_prompt(rows: List[Dict], is_followup: bool, node_aliases: Optional[List[Dict]] = None) -> str:
-    """Builds the Summarize agent's system prompt. Unlike Text2Cypher, this
-    agent gets NO cypher/postgres/render/write tool access at all -- every
-    sentence it can ever see is embedded directly below, fetched by this
-    service's own deterministic Python code (see the helpers above), never
-    queried by the model itself. That is the actual mechanism behind REQ-4.1
-    ("strictly prohibited from using general pre-trained knowledge... must
-    only use information present in the fetched sentences")."""
-    skills_section = _skills_prompt_section("summarize", "")
-
-    evidence = _summarize_sentence_context(rows)
-    alias_section = _summarize_alias_section(node_aliases or [])
-
-    structure_rules = """
-## Default Output Structure (REQ-5) — unless the user asks for something else
-Organize your summary into these sections, IN THIS ORDER, using each one's heading verbatim:
-
-### Molecular Cell
-Molecular interactions: proteins, small molecules, cell organelles, and cellular-level processes.
-Use your own biological judgement to keep this to genuinely CELLULAR-level events, not broader
-physiological/systemic entities (Disease, ClinicalParameter, whole-organ or whole-organism
-processes) even if they're mentioned in the same sentence — those belong in Physiology/Organ System
-below instead.
-
-### Physiology
-Interactions between anatomical concepts (cell types, tissues, organs); molecular signaling that
-mediates intercellular communication (hormones/ligands, secreted proteins, membrane receptors);
-physiological processes and localized effector mechanisms (e.g. vasoconstriction, nerve outgrowth).
-
-### Organ System
-Systemic phenotypes, organismal states, and macroscopic biological processes affecting integrated
-body function — whole-body responses like pregnancy, memory, learning, endurance.
-
-### Experimental Methods
-Experimental/statistical methods EXPLICITLY named in the sentence text.
-
-### Medical Procedures
-Medical procedures, ClinicalParameter data, and clinical methods mentioned in the text.
-
-Rules that apply to EVERY section above:
-- Omission (REQ-4.2): if the fetched sentences have nothing applicable to a section, leave that
-  section OUT of your reply entirely — never write "No information available" or similar for it.
-- Length cap (REQ-5): no more than 5 sentences per section. Be as succinct as possible.
-- Long list truncation: if a section would otherwise list many concepts, name only the first 3 and
-  then say "... and N more" (or similar) rather than listing everything — the user can always ask
-  you to expand a specific section's full list afterward, and you should do so in full when asked.
-"""
-
-    grounding_rules = """
-## Strict grounding (REQ-4.1) — read this before writing anything
-You are NOT permitted to use general pre-trained/background biomedical knowledge to fill in,
-embellish, or "complete" this summary. Every claim must trace back to one of the sentences listed
-in "Supporting Sentences" below. If something isn't in those sentences, it does not go in your
-answer, full stop — not even something you're confident is true from training.
-"""
-
-    followup_rules = """
-## Conversational follow-up (REQ-4.3)
-After your initial structured summary, the user may ask follow-up questions.
-- If the answer is present in the Supporting Sentences below, answer it directly, citing which
-  sentence(s) it comes from.
-- If it is NOT present, say so explicitly ("the supporting sentences don't address that") rather
-  than answering from general knowledge or guessing.
-""" if is_followup else ""
-
-    resummarize_rules = """
-## Context-specific re-summarization (REQ-6)
-If the user asks you to re-focus the summary on a specific context (a disease, cell process, drug,
-anatomical concept, or organism), emit this action block INSTEAD OF answering directly — the
-backend will re-fetch the right evidence and hand it back to you to summarize on your next turn:
-
-```json
-{"action": "resummarize", "term": "<the context word(s) the user gave>", "contextType": "title|anatomical|organism"}
-```
-
-Decide contextType yourself, using your own biological/domain judgement:
-- "anatomical" — the term names a cell line, cell type, organ, or tissue (REQ-6.2). The backend
-  will restrict to the ORIGINAL input relations' sentences, filtered to ones whose anatomical
-  columns or sentence text mention the term or its ontology descendants.
-- "organism" — the term names an organism/species (REQ-6.3). Same restriction as anatomical, but
-  filtered on the organism column/sentence text instead.
-- "title" — the term identifies a SPECIFIC ARTICLE rather than a biological category (e.g. it
-  matches wording from one of the article titles already shown to you below, or the user is
-  clearly asking about "that paper"/"the study titled..."). The backend will fetch EVERY sentence
-  from that article — broadening beyond the original input relations entirely (REQ-6.1) — rather
-  than restricting to them.
-If you're not confident the user is asking for a re-summarization at all (as opposed to a normal
-follow-up question), just answer the question directly instead of emitting this action.
-"""
-
-    return f"""You are the Summarize agent for Graph Explorer — a biological knowledge-graph \
-application. Your ONLY job is to summarize the literature evidence (sentences) already fetched \
-for the relation(s) the user selected or had visible in their graph -- from PostgreSQL and/or \
-embedded directly in the currently-opened pathway file -- you do not have Cypher, Postgres, or \
-any other database tool access; everything you can know is in the "Supporting Sentences" section \
-below.
-{grounding_rules}
-## Supporting Sentences (the ONLY information you may use)
-{evidence}
-{alias_section}{structure_rules}{followup_rules}{resummarize_rules}{skills_section}"""
+# Summarize agent implementation lives in summarize_agent.py.
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RelationID calculation  (mirrors server.js calcRelationId / _myhash exactly)
@@ -1794,12 +1259,14 @@ def _openai_client(llm: Dict):
     """OpenAI-compatible client — used for Gemini and any OpenAI-compatible endpoint."""
     if not HAS_OPENAI:
         raise RuntimeError("openai package not installed — run: pip install openai")
-    model = llm.get("model_name", "")
+    model    = llm.get("model_name", "")
+    url      = llm.get("url", "") or ""
+    is_gemini = _is_gemini_model(model) or "generativelanguage.googleapis.com" in url
     # Auto-select Gemini base URL when model is gemini-* and no custom URL was set
-    default_url = GEMINI_BASE_URL if _is_gemini_model(model) else None
+    default_url = GEMINI_BASE_URL if is_gemini else None
     base_url = llm.get("url") or default_url
-    env_key   = "GEMINI_API_KEY" if _is_gemini_model(model) else "OPENAI_API_KEY"
-    api_key   = llm.get("apikey") or os.environ.get(env_key, "")
+    env_key  = "GEMINI_API_KEY" if is_gemini else "OPENAI_API_KEY"
+    api_key  = llm.get("apikey") or os.environ.get(env_key, "")
     if not api_key:
         raise RuntimeError(f"API key not set — configure in Settings → Agentic AI (env: {env_key})")
     kwargs: Dict[str, Any] = {"api_key": api_key}
@@ -3330,7 +2797,8 @@ this turn (whether or not it found anything) — in that case follow the "From t
 def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple:
     """Call the configured LLM and return (text_reply, was_truncated).
 
-    Routes to Anthropic SDK for claude-* models and OpenAI-compatible SDK for gemini-* / others.
+    Routes to Anthropic SDK for claude-* models / anthropic.com URLs and
+    OpenAI-compatible SDK for everything else (Gemini, OpenAI, Groq, Together…).
 
     `was_truncated` is True when the provider stopped generating because it hit the
     max-tokens cap (Anthropic `stop_reason == "max_tokens"` / OpenAI-compatible
@@ -3339,15 +2807,57 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
     that neither executes nor gets stripped from the visible text — so callers use this
     flag to retry instead of showing broken JSON to the user.
     """
-    model        = llm.get("model_name") or "claude-sonnet-4-6"
+    url          = llm.get("url", "")
+    model        = llm.get("model_name") or ""
     temperature  = float(llm.get("temperature", 0.2))
     top_p        = float(llm.get("top_p", 0.9))
-    call_timeout = float(llm.get("call_timeout", 90))
-    # Cypher queries for multi-concept ontology questions (e.g. "common regulators of
-    # X and Y, including ontological children") plus a narrative explanation can run
-    # long — 4096 was cutting off complex render/cypher blocks mid-JSON. 8192 gives
-    # much more headroom while still bounding worst-case latency/cost.
+    call_timeout = float(llm.get("call_timeout", 180))
     max_tokens   = int(llm.get("max_tokens", 8192))
+
+    # Gemini 2.5 models have "thinking" enabled by default, and on the
+    # OpenAI-compatible endpoint the invisible reasoning tokens are drawn from
+    # the SAME max_tokens budget as the visible answer. With only the default
+    # 8192-token budget, a long internal reasoning pass can consume nearly all
+    # of it, leaving the visible reply cut off after just a couple hundred
+    # tokens even though the provider reports finish_reason == "length"
+    # (truncated). Raise the effective ceiling for these models (unless the
+    # user explicitly configured a larger one already) so there's enough room
+    # left for the actual answer after reasoning.
+    if not llm.get("max_tokens") and model.startswith("gemini-2.5"):
+        max_tokens = max(max_tokens, 32768)
+
+    # Determine provider from URL first (reliable), fall back to model name.
+    # This prevents routing to Anthropic when the URL is Gemini/OpenAI but the
+    # model name hasn't been saved yet — will raise a clear error below.
+    is_anthropic = (
+        "anthropic.com" in url
+        or (not url and model.startswith("claude"))
+    )
+
+    # Detect provider-model mismatch: e.g. user previously saved a Claude model
+    # but has since switched to a Gemini/OpenAI/Groq provider URL.  Clear the
+    # stale model so the user is prompted to pick a correct one.
+    if model and not is_anthropic:
+        if "generativelanguage.googleapis.com" in url and not model.startswith("gemini"):
+            model = ""
+        elif "openai.com" in url and model.startswith("claude"):
+            model = ""
+        elif "groq.com" in url and model.startswith("claude"):
+            model = ""
+        elif "together.xyz" in url and model.startswith("claude"):
+            model = ""
+        elif "replicate.com" in url and model.startswith("claude"):
+            model = ""
+
+    # If model still not set, try the user's saved model from users.json
+    if not model:
+        model = _resolve_llm_cfg(_current_username.get()).get("model_name", "")
+
+    if not model:
+        raise RuntimeError(
+            "No model selected. Please open Settings → Agentic AI / LLM, "
+            "choose a provider and select a model, then click Save."
+        )
 
     if system_prompt:
         sp = system_prompt
@@ -3362,8 +2872,8 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
     t0 = time.time()
     truncated = False
 
-    if _is_gemini_model(model):
-        # ── OpenAI-compatible path (Gemini, or any custom OpenAI endpoint) ────
+    if not is_anthropic:
+        # ── OpenAI-compatible path (Gemini, OpenAI, Groq, Together, etc.) ────
         # Run in a daemon thread so the synchronous httpx call can't freeze
         # uvicorn's async event loop — mirrors the entity-lookup timeout pattern.
         client = _openai_client(llm)
@@ -3377,6 +2887,10 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
         )
         if top_p < 1.0:
             kwargs_oai["top_p"] = top_p
+        if model.startswith("gemini-2.5"):
+            # Trim how much of the token budget goes to invisible reasoning so
+            # more is left for the visible answer (see max_tokens note above).
+            kwargs_oai["reasoning_effort"] = "low"
 
         result_holder: List = []
         error_holder:  List = []
@@ -3402,7 +2916,7 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
         text  = (resp.choices[0].message.content or "") if resp else ""
         truncated = bool(resp) and getattr(resp.choices[0], "finish_reason", "") == "length"
     else:
-        # ── Anthropic SDK path (Claude models) ────────────────────────────────
+        # ── Anthropic SDK path (Claude models / anthropic.com URL) ───────────
         client = _anthropic_client(llm)
         kwargs = dict(
             model=model,
@@ -3433,7 +2947,7 @@ def health():
         "schema_chars":  len(_state["schema_text"]),
         "neo4j_url":     _state["neo4j"].get("url", ""),
         "postgres_host": _state["postgres"].get("host", ""),
-        "llm_model":     _state["llm"].get("model_name", "claude-sonnet-4-6"),
+        "llm_model":     _state["llm"].get("model_name") or _resolve_llm_cfg(_current_username.get()).get("model_name") or "(not configured)",
         "has_anthropic": HAS_ANTHROPIC,
         "has_openai":    HAS_OPENAI,
         "has_neo4j":     HAS_NEO4J,
@@ -3442,7 +2956,12 @@ def health():
     }
 
 class PingRequest(BaseModel):
-    llm: Optional[Dict[str, Any]] = None   # frontend passes its current _agentConfig
+    llm: Optional[Dict[str, Any]] = None   # preferred: { url, apikey, model_name, ... }
+    # flat fields accepted as fallback for backwards-compat
+    url:        Optional[str] = None
+    apikey:     Optional[str] = None
+    model_name: Optional[str] = None
+    test_message: Optional[str] = None
 
 @app.post("/ping-llm")
 def ping_llm(req: PingRequest = None):
@@ -3450,8 +2969,24 @@ def ping_llm(req: PingRequest = None):
     import urllib.request as _urllib_req
     import urllib.error  as _urllib_err
 
-    llm   = _effective_llm(req.llm if req else None)
-    model = llm.get("model_name") or "claude-sonnet-4-6"
+    # Merge flat top-level fields into llm dict (for backwards-compat with old frontend)
+    req_llm = dict(req.llm or {}) if req else {}
+    if req and req.url        and not req_llm.get("url"):        req_llm["url"]        = req.url
+    if req and req.apikey     and not req_llm.get("apikey"):     req_llm["apikey"]     = req.apikey
+    if req and req.model_name and not req_llm.get("model_name"): req_llm["model_name"] = req.model_name
+
+    llm   = _effective_llm(req_llm or None)
+    url   = llm.get("url", "")
+    model = llm.get("model_name") or ""
+
+    # If model not set, try user's saved settings then raise a clear error
+    if not model:
+        model = _resolve_llm_cfg(_current_username.get()).get("model_name", "")
+    if not model:
+        raise HTTPException(status_code=400, detail=(
+            "No model selected. Please open Settings → Agentic AI / LLM, "
+            "choose a provider and select a model, then click Save."
+        ))
     sp    = _system_prompt()
     t0    = time.time()
     try:
@@ -3513,7 +3048,8 @@ def ping_llm(req: PingRequest = None):
                               .get("content", {})
                               .get("parts", [{}])[0]
                               .get("text", "PONG"))
-        else:
+        elif "anthropic.com" in url or (not url and HAS_ANTHROPIC):
+            # Anthropic (native SDK)
             if not HAS_ANTHROPIC:
                 return {"ok": False, "error": "anthropic package not installed — run: pip install anthropic"}
             client   = _anthropic_client(llm)
@@ -3524,8 +3060,27 @@ def ping_llm(req: PingRequest = None):
                 timeout=30,
             )
             reply = response.content[0].text.strip()
+        else:
+            # OpenAI-compatible endpoint (OpenAI, Groq, Together, Replicate, etc.)
+            if not HAS_OPENAI:
+                return {"ok": False, "error": "openai package not installed — run: pip install openai"}
+            client   = _openai_client(llm)
+            response = client.chat.completions.create(
+                model=model, max_tokens=16,
+                messages=[
+                    {"role": "system", "content": "Reply with only the word PONG."},
+                    {"role": "user",   "content": "ping"},
+                ],
+                timeout=30,
+            )
+            reply = response.choices[0].message.content.strip()
         elapsed  = time.time() - t0
-        provider = "gemini" if _is_gemini_model(model) else "anthropic"
+        if "anthropic.com" in url:
+            provider = "anthropic"
+        elif _is_gemini_model(model):
+            provider = "gemini"
+        else:
+            provider = "openai-compatible"
         log.info("Ping OK: model=%s elapsed=%.1fs reply=%r", model, elapsed, reply)
         return {"ok": True, "model": model, "provider": provider,
                 "elapsed_s": round(elapsed, 2),
@@ -3932,7 +3487,7 @@ def chat(req: ChatRequest):
             )
 
             # Stamp source = LLM model name
-            llm_model = _state["llm"].get("model_name") or "claude-sonnet-4-6"
+            llm_model = _state["llm"].get("model_name") or _resolve_llm_cfg(_current_username.get()).get("model_name") or "unknown"
             props["source"] = llm_model
 
             # Clean references: strip id/unique_id so server does fresh INSERTs
@@ -4195,136 +3750,26 @@ def _call_llm_with_retries(messages: List[Dict], llm: Dict, system_prompt: str, 
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Route — Summarize agent (AI -> Summarize)
-# ─────────────────────────────────────────────────────────────────────────────
-# Deliberately a separate, much simpler endpoint from /chat above rather than
-# a `mode` flag threaded through that already-large handler: Summarize has a
-# completely different (and much narrower) action vocabulary -- no cypher,
-# postgres, render, or write_relation actions at all, just an optional
-# "resummarize" action (REQ-6) -- and a different control flow shape
-# (deterministic backend fetch on turn 1, then constrained Q&A) that doesn't
-# share much with Text2Cypher's agentic tool-calling loop.
-
-@app.post("/summarize-chat")
-def summarize_chat(req: SummarizeRequest):
-    llm = _effective_llm(req.llm)
-    is_first_turn = not req.history
-
-    rows = req.fetched_rows
-    original_relation_ids = _coerce_relation_ids(req.original_relation_ids)
-    resummarized = False
-    context_type = None
-
-    if is_first_turn:
-        # REQ-2.2: scope must be explicit on the first turn -- the frontend is
-        # expected to ask the user "selected relations" vs "all visible
-        # relations" before ever sending this request, rather than this
-        # endpoint guessing from ambiguous free text.
-        if req.scope not in ("selected", "all"):
-            raise HTTPException(
-                status_code=400,
-                detail="scope ('selected' or 'all') is required to start a Summarize conversation"
-            )
-        cg = req.current_graph or {}
-        edges = (cg.get("selectedEdges") or []) if req.scope == "selected" else (cg.get("edges") or [])
-        # A "Merge similar relations" anchor edge carries BOTH a single
-        # relationId (whichever relation survived as the visual anchor) and a
-        # relationIds array (every relation it now represents -- see
-        # _currentGraphSummary()'s own comment on this in app.js). Collecting
-        # only relationId would silently drop every OTHER relation folded into
-        # that merge from the summary; unpacking relationId itself defensively
-        # too (flattening one level if the frontend ever sends it as a list
-        # directly) since _coerce_relation_ids() downstream expects a flat
-        # list of scalars, not a list that itself contains lists.
-        relation_ids: List[Any] = []
-        for e in edges:
-            rid = e.get("relationId")
-            if isinstance(rid, list):
-                relation_ids.extend(rid)
-            elif rid:
-                relation_ids.append(rid)
-            rids = e.get("relationIds")
-            if isinstance(rids, list):
-                relation_ids.extend(rids)
-        if not relation_ids:
-            scope_label = "selected relations" if req.scope == "selected" else "relations visible in the graph"
-            raise HTTPException(status_code=400, detail=f"No {scope_label} found to summarize.")
-
-        pg_rows = _fetch_sentences_for_relation_ids(relation_ids)
-        file_rows = _rows_from_inline_references(req.inline_references)
-        rows = _merge_pg_and_inline_rows(pg_rows, file_rows)
-        original_relation_ids = _coerce_relation_ids(relation_ids)
-        if not rows:
-            raise HTTPException(
-                status_code=404,
-                detail="No supporting sentences were found in PostgreSQL or in the opened "
-                       "pathway file for these relations."
-            )
-
-    messages: List[Dict] = [{"role": m.role, "content": m.content} for m in req.history]
-    messages.append({"role": "user", "content": req.message})
-
-    system_prompt = _summarize_system_prompt(rows, is_followup=not is_first_turn, node_aliases=req.node_aliases)
-    reply_text, was_truncated = _call_llm_with_retries(messages, llm, system_prompt)
-
-    action, matched_span = _extract_summarize_action(reply_text)
-    reply_text = _strip_summarize_action(reply_text, matched_span)
-
-    if action and action.get("action") == "resummarize":
-        term = str(action.get("term") or "").strip()
-        context_type_raw = str(action.get("contextType") or "").strip().lower()
-        if term and context_type_raw in ("title", "anatomical", "organism"):
-            context_type = context_type_raw
-            if context_type == "title":
-                # REQ-6.1: broaden to EVERY sentence from the matched article,
-                # ignoring the original RelationID restriction entirely.
-                new_rows = _fetch_sentences_by_article(titles=[term])
-            else:
-                # REQ-6.2/6.3: restricted to the ORIGINAL input relations'
-                # sentences, filtered to ones whose anatomical/organism
-                # column or sentence text mentions the term or its
-                # (unbounded) ontology descendants.
-                term_matches = _resolve_context_terms(term)
-                children = _ontology_children_unbounded(term_matches) or [term]
-                cols = _pg_reference_columns()
-                if context_type == "anatomical":
-                    filter_cols = [c for c in ("celllinename", "celltype", "organ", "tissue") if c in cols]
-                else:
-                    filter_cols = [c for c in ("organism",) if c in cols]
-                base_rows = (_merge_pg_and_inline_rows(
-                                 _fetch_sentences_for_relation_ids(original_relation_ids),
-                                 [r for r in rows if r.get("_source") == "file"])
-                             if original_relation_ids else rows)
-                new_rows = _filter_rows_by_terms(base_rows, children, filter_cols)
-
-            if new_rows:
-                rows = new_rows
-                resummarized = True
-                followup_prompt = _summarize_system_prompt(rows, is_followup=False, node_aliases=req.node_aliases)
-                reply_text, was_truncated = _call_llm_with_retries(
-                    messages + [
-                        {"role": "assistant", "content": "(preparing the re-focused summary)"},
-                        {"role": "user", "content":
-                            f"Please produce the re-focused summary now, using the refreshed "
-                            f"evidence above for context '{term}'."},
-                    ],
-                    llm, followup_prompt,
-                )
-            else:
-                context_label = "matching article" if context_type == "title" else context_type
-                reply_text = (f"I couldn't find any supporting sentences for \"{term}\" under the "
-                              f"{context_label} context — the previous summary's evidence is still "
-                              "shown above; ask about a different context or rephrase.")
-
-    return {
-        "reply": reply_text,
-        "fetched_rows": rows,
-        "original_relation_ids": original_relation_ids,
-        "resummarized": resummarized,
-        "context_type": context_type,
-        "was_truncated": was_truncated,
-    }
+# Lazy import of summarize routes — deferred to improve startup speed
+try:
+    from summarize_agent import register_summarize_routes
+    register_summarize_routes(
+        app,
+        {
+            "effective_llm": _effective_llm,
+            "call_llm_with_retries": _call_llm_with_retries,
+            "skills_prompt_section": _skills_prompt_section,
+            "run_postgres": run_postgres,
+            "run_cypher": run_cypher,
+            "run_ontology_lookup": run_ontology_lookup,
+            "resolve_pg_cfg": _resolve_pg_cfg,
+            "current_username": _current_username,
+            "log": log,
+        },
+    )
+    log.info("Summarize routes registered successfully")
+except Exception as e:
+    log.warning("Failed to register summarize routes: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4364,7 +3809,14 @@ def _resolve_allowlisted_provider_url(base_url: str) -> str:
     normalized = (base_url or "").rstrip("/").lower()
     if not normalized:
         raise ValueError("No URL provided")
-    for p in (_state.get("llm", {}).get("providers") or []):
+    
+    # Combine default_providers and custom_providers into a single list
+    llm_config = _state.get("llm", {})
+    default_providers = llm_config.get("default_providers") or []
+    custom_providers = llm_config.get("custom_providers") or []
+    all_providers = list(default_providers) + list(custom_providers)
+    
+    for p in all_providers:
         allowed = (p.get("url") or "").rstrip("/").lower()
         if allowed and allowed == normalized:
             # Return the CONFIGURED literal (p["url"]), not `normalized` —
@@ -4782,6 +4234,22 @@ def save_examples(payload: ExamplesPayload):
 if __name__ == "__main__":
     port = int(os.environ.get("AGENT_PORT", 7071))
     log.info("Graph Explorer Agent Service starting on port %d", port)
+
+    # Kill any stale process holding the port before binding.
+    # This avoids the "address already in use" error when restarting under
+    # a debugger or after an unclean shutdown, since the previous process
+    # may still be running (e.g. auto-restarted by server.js).
+    import subprocess, sys as _sys
+    if _sys.platform == "win32":
+        subprocess.call(
+            f'FOR /F "tokens=5" %a IN (\'netstat -ano ^| findstr :{port} ^| findstr LISTENING\') DO taskkill /F /PID %a',
+            shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
+        )
+    else:
+        subprocess.call(f'lsof -ti tcp:{port} | xargs kill -9', shell=True,
+                        stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    import time as _time; _time.sleep(0.5)  # brief pause after kill
+
     # 127.0.0.1 only — this service is an internal sidecar for server.js's own
     # reverse proxy (which always connects via 127.0.0.1; see server.js's
     # AGENT_PORT usage). It has no independent auth of its own beyond trusting
