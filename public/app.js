@@ -10043,15 +10043,26 @@ async function _cncOpenDialog(action, context, title) {
   // rather than a misleading "everything selected" master checkbox.
   var maxLenRow = document.getElementById('cnc-sp-maxlen-row');
   if (maxLenRow) maxLenRow.style.display = (action === 'shortestPath') ? 'flex' : 'none';
-  _cncSwitchTab('node');  // always open on the Node Types tab
+
+  // Connect Selected Nodes only ever looks for RELATIONS between nodes the
+  // user already picked — it can't return a new node of any type, so a
+  // "Node Types" tab to filter by would just be misleading. Hide the tab
+  // bar entirely and open straight on Relation Types for that one action;
+  // every other action keeps both tabs, opening on Node Types as before.
+  var nodeTabApplicable = (action !== 'connectSelected');
+  var tabsBar = document.getElementById('cnc-tabs-bar');
+  if (tabsBar) tabsBar.style.display = nodeTabApplicable ? 'flex' : 'none';
+  _cncSwitchTab(nodeTabApplicable ? 'node' : 'rel');
 
   try {
     await _loadSchema();
   } catch (e) { /* fall through — subsections just stay empty (no filter applied either way) */ }
   var schema = _schemaCache || { labels: [], relTypes: [], propKeys: [] };
 
-  var nodeGroups = _exploreBuildGroups(EXPLORE_NODE_GROUPS, schema.labels || [], EXPLORE_NODE_EXCLUDED);
-  _cncRenderSubsections('cnc-nodetypes-groups', 'node', nodeGroups, 'cnc-nodepropkey-datalist');
+  if (nodeTabApplicable) {
+    var nodeGroups = _exploreBuildGroups(EXPLORE_NODE_GROUPS, schema.labels || [], EXPLORE_NODE_EXCLUDED);
+    _cncRenderSubsections('cnc-nodetypes-groups', 'node', nodeGroups, 'cnc-nodepropkey-datalist');
+  }
 
   // Non-directional relation types (Binding/FunctionalAssociation/CellExpression)
   // don't have a meaningful "regulator"/"target" side, so for commonNeighbors'
@@ -10075,9 +10086,11 @@ async function _cncOpenDialog(action, context, title) {
 
   // Node property names are DB-wide (not scoped to the current pathway) —
   // candidate nodes for these actions can come from anywhere in the
-  // database, not just what's already loaded.
+  // database, not just what's already loaded. Skipped entirely when the
+  // Node Types tab itself is hidden (Connect Selected Nodes) — nothing
+  // would ever use this datalist in that case.
   var nodePropDatalist = document.getElementById('cnc-nodepropkey-datalist');
-  if (nodePropDatalist) {
+  if (nodeTabApplicable && nodePropDatalist) {
     try {
       var nodePropNames = await api('/api/nodes/property-names-all', null, 'GET');
       nodePropDatalist.innerHTML = (nodePropNames || []).slice().sort().map(function(k) {
@@ -10296,13 +10309,27 @@ async function runExploreConfigQuery() {
     if (result.error) { alert('Query error: ' + result.error); return; }
 
     var groups = result.groups || [];
-    openConnectivityReport({
-      title: dialogTitle,
-      columnLabel: _CNC_MODE_COLUMN_LABEL[action === 'commonNeighbors' ? ctx.direction : action] || 'Name',
-      summary: (ctx.summaryText || '') + ' — filter: ' + filterLabel + ' — ' +
-               groups.length + ' result' + (groups.length !== 1 ? 's' : '') + ' found',
-      groups: groups
-    });
+
+    // Connect Selected Nodes never introduces new entities — every node it
+    // could possibly touch was already picked by the user (and is therefore
+    // already on canvas), so there's nothing to list/select per-row. Skip
+    // the shared Connectivity Report (built for picking through candidate
+    // ENTITIES) in favor of a plain "here's what was found, add it or not"
+    // confirmation.
+    if (action === 'connectSelected') {
+      openConnectSelectedResultDialog({
+        summary: (ctx.summaryText || '') + ' — filter: ' + filterLabel,
+        groups: groups
+      });
+    } else {
+      openConnectivityReport({
+        title: dialogTitle,
+        columnLabel: _CNC_MODE_COLUMN_LABEL[action === 'commonNeighbors' ? ctx.direction : action] || 'Name',
+        summary: (ctx.summaryText || '') + ' — filter: ' + filterLabel + ' — ' +
+                 groups.length + ' result' + (groups.length !== 1 ? 's' : '') + ' found',
+        groups: groups
+      });
+    }
   } catch (err) {
     setProgressMsg(null);
     alert('Query failed: ' + (err.message || err));
@@ -12745,6 +12772,84 @@ function _expandCommitNewTab() {
   var result = mergeGraphData(pending);
   console.log('[expand→new tab] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
 
+  updateStats();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONNECT SELECTED NODES — RESULT DIALOG
+//  "Connect Selected Nodes → All Relations" only ever ADDS EDGES between
+//  nodes the user already selected — every endpoint it can possibly return
+//  was one of those selections, so (unlike the shared Connectivity Report)
+//  there's no per-row entity to pick: just show relation-type statistics for
+//  everything found and let the user commit all of it, or cancel.
+// ═══════════════════════════════════════════════════════════════════════════════
+var _csrPending = null;  // { nodes, edges } staged for commit — same shape as _expandPending
+
+function openConnectSelectedResultDialog(options) {
+  document.getElementById('csr-summary').textContent = options.summary || '';
+
+  // Server groups connectSelected results per anchor node (see
+  // explore-relations-report), so the SAME edge and the SAME node can each
+  // show up in more than one group (once per endpoint) — dedupe both by id
+  // before tallying/committing.
+  var nodesById = new Map();
+  var edgesById = new Map();
+  (options.groups || []).forEach(function(g) {
+    if (g.node) nodesById.set(g.node.id, g.node);
+    (g.targets || []).forEach(function(t) { nodesById.set(t.id, t); });
+    (g.edges || []).forEach(function(e) { edgesById.set(e.id, e); });
+  });
+  var edges = Array.from(edgesById.values());
+
+  var typeCounts = {};
+  edges.forEach(function(e) { var t = e.type || 'Unknown'; typeCounts[t] = (typeCounts[t] || 0) + 1; });
+  var breakdownEl = document.getElementById('csr-breakdown');
+  var emptyMsg = document.getElementById('csr-empty-msg');
+  if (edges.length) {
+    var lines = ['Found ' + edges.length + ' relation' + (edges.length === 1 ? '' : 's') + ' by type:'];
+    Object.keys(typeCounts).sort(function(a, b) { return typeCounts[b] - typeCounts[a]; })
+      .forEach(function(t) { lines.push('  • ' + t + ': ' + typeCounts[t]); });
+    breakdownEl.textContent = lines.join('\n');
+    breakdownEl.style.display = 'block';
+    emptyMsg.style.display = 'none';
+  } else {
+    breakdownEl.textContent = '';
+    breakdownEl.style.display = 'none';
+    emptyMsg.style.display = 'block';
+  }
+
+  // Nodes are included too (even though this action adds no NEW entities)
+  // so "Open in another graph" has something to anchor the edges to in a
+  // brand-new, otherwise-empty tab; merging into the CURRENT graph just
+  // dedupes them straight back out via mergeGraphData's URN matching.
+  _csrPending = { nodes: Array.from(nodesById.values()), edges: edges };
+  document.getElementById('connect-selected-result-modal').style.display = 'flex';
+}
+
+function closeConnectSelectedResultModal() {
+  document.getElementById('connect-selected-result-modal').style.display = 'none';
+}
+
+function _csrCommit() {
+  document.getElementById('connect-selected-result-modal').style.display = 'none';
+  if (!_csrPending) return;
+  var pending = _csrPending;
+  _csrPending = null;
+
+  var result = mergeGraphData(pending);
+  console.log('[connectSelected] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
+  updateStats();
+}
+
+function _csrCommitNewTab() {
+  document.getElementById('connect-selected-result-modal').style.display = 'none';
+  if (!_csrPending) return;
+  var pending = _csrPending;
+  _csrPending = null;
+
+  createNewTab('Connect Selected ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  var result = mergeGraphData(pending);
+  console.log('[connectSelected→new tab] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
   updateStats();
 }
 
