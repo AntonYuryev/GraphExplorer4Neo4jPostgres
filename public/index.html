@@ -355,6 +355,26 @@
 
     <div id="menubar-right">
       <span id="selection-info"></span>
+      <!-- Quick Node Search — finds any node in the database by exact Name
+           or Alias (case-insensitive), independent of the currently loaded
+           pathway. Semicolon-separate multiple names to search for several
+           at once. Matches are added directly to the current graph. -->
+      <div id="quick-node-search" style="position:relative;display:flex;align-items:center;gap:4px;margin-left:16px">
+        <input type="text" id="qns-input" placeholder="Quick node search…" spellcheck="true" autocomplete="off"
+          oninput="_qnsOnInput(this)" onkeydown="_qnsHandleKeydown(event)" onblur="setTimeout(_qnsHideSuggestions,150)"
+          style="width:190px;background:#12162a;border:1px solid #2d3452;border-radius:4px;color:#c8ccdc;font-size:11px;padding:4px 8px">
+        <button onclick="quickNodeSearch()" title="Search for these node name(s)/alias(es)"
+          style="background:none;border:none;color:#7a8099;cursor:pointer;font-size:14px;padding:2px 4px;line-height:1">🔍</button>
+        <!-- Fixed width (not min-width) is deliberate: some matched node
+             Names are very long (e.g. peptide sequences), and with only a
+             min-width the box would shrink-to-fit around whatever row is
+             widest, growing way past the input toward the left (it's
+             anchored via right:0) and stranding short suggestions like
+             "AKT2" alone in a huge box. A fixed width forces each row's
+             existing overflow:hidden/text-overflow:ellipsis to actually
+             truncate long names instead. -->
+        <div id="qns-autocomplete" style="display:none;position:absolute;top:100%;right:0;width:260px;max-height:240px;overflow-y:auto;overflow-x:hidden;background:#1e2340;border:1px solid #3a4060;border-radius:5px;box-shadow:0 6px 18px rgba(0,0,0,.55);z-index:1500;margin-top:2px"></div>
+      </div>
     </div>
 
   </div><!-- /menubar -->
