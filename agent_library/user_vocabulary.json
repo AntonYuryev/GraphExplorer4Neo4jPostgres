@@ -503,6 +503,46 @@
       "use_count": 1,
       "confirmed": false,
       "last_used": "2026-07-08"
+    },
+    {
+      "user_term": "cancer",
+      "neo4j_name": "cancer stem cell selection",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-28"
+    },
+    {
+      "user_term": "cancer",
+      "neo4j_name": "cancer stem cell count",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-28"
+    },
+    {
+      "user_term": "cancer",
+      "neo4j_name": "cancer stem cell population",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-28"
+    },
+    {
+      "user_term": "cancer",
+      "neo4j_name": "cancer-associated fibroblast death",
+      "neo4j_label": "CellProcess",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-28"
+    },
+    {
+      "user_term": "cancer",
+      "neo4j_name": "cancer-related fatigue",
+      "neo4j_label": "Disease",
+      "use_count": 1,
+      "confirmed": false,
+      "last_used": "2026-07-28"
     }
   ]
 }
