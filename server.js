@@ -1088,6 +1088,16 @@ function _pathwayIndexFilePath(username) {
   return path.join(PATHWAY_INDEX_DIR, `pathway_index_${safe}.json`);
 }
 
+// Persisted "Browse history" — every pathway a user has opened (via search,
+// Browse…, Anatomy/Alphabetical Index, or a history row itself), most recent
+// last, NDJSON one-entry-per-line — same append-only shape as cypher_history.tsv,
+// and stored alongside the per-user pathway search index (already gitignored
+// as a whole directory) rather than a new top-level file.
+function _pathwayHistoryFilePath(username) {
+  const safe = /^[a-zA-Z0-9_-]{1,64}$/.test(username) ? username : 'unknown';
+  return path.join(PATHWAY_INDEX_DIR, `pathway_history_${safe}.json`);
+}
+
 function _resolvePathwayCollectionDirForUser(loginUsername) {
   const users = loadUsers();
   const u = users.find(x => x.username === loginUsername);
@@ -1812,6 +1822,59 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('Pathway open error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
     res.status(500).json({ error: safeError(err, 'Pathway open') });
+  }
+});
+
+// ─── Pathway "Browse history" (Pathways menu → Browse history) ──────────────
+// Tracks every pathway a user has opened and examined, persisted per-user
+// (NDJSON, one entry per line — mirrors /api/cypher/history's format/pattern)
+// so it survives a server restart and lets the user reopen a pathway of
+// interest later. Free-text fields are base64-encoded before being written
+// to disk — same CodeQL-safe pattern used by the Cypher history endpoint
+// below, breaking the "network data written to file" taint chain — and
+// decoded back on read.
+const PATHWAY_HISTORY_FIELD_MAX_CHARS = 2000; // per-field cap to prevent disk exhaustion
+
+app.get('/api/pathways/history', dbLimiter, authMiddleware, (req, res) => {
+  try {
+    const file = _pathwayHistoryFilePath(req.user.username);
+    if (!fs.existsSync(file)) return res.json({ rows: [] });
+    const content = fs.readFileSync(file, 'utf8');
+    const dec = (v) => { try { return Buffer.from(String(v || ''), 'base64').toString('utf8'); } catch (_) { return ''; } };
+    const rows = content.trim().split('\n').filter(l => l.trim()).map(line => {
+      try {
+        const obj = JSON.parse(line);
+        return {
+          date:       String(obj.date || ''),
+          name:       dec(obj.name),
+          filePath:   dec(obj.filePath),
+          sourceFile: dec(obj.sourceFile),
+        };
+      } catch (_) { return null; }
+    }).filter(Boolean);
+    res.json({ rows });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+app.post('/api/pathways/history', dbLimiter, authMiddleware, (req, res) => {
+  const { name, filePath, sourceFile } = req.body || {};
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'name required' });
+  const enc = (v) => Buffer.from(String(v || '').slice(0, PATHWAY_HISTORY_FIELD_MAX_CHARS)).toString('base64');
+  const entry = {
+    date:       new Date().toISOString(),
+    name:       enc(name),
+    filePath:   enc(filePath),
+    sourceFile: enc(sourceFile),
+  };
+  const line = JSON.stringify(entry) + '\n';
+  try {
+    fs.mkdirSync(PATHWAY_INDEX_DIR, { recursive: true });
+    fs.appendFileSync(_pathwayHistoryFilePath(req.user.username), line, 'utf8');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -3891,7 +3954,14 @@ function _pushSchemaToAgent(schema) {
     password: appSettings.postgres.password,
   } : null;
 
-  const body = JSON.stringify({ neo4j: neo4jCfg, schema_text: schemaText, llm: llmCfg, postgres: pgCfg });
+  const body = JSON.stringify({
+    neo4j: neo4jCfg,
+    schema_text: schemaText,
+    labels: cache.labels || [],
+    rel_types: cache.relTypes || [],
+    llm: llmCfg,
+    postgres: pgCfg,
+  });
   const opts = {
     hostname: '127.0.0.1', port: AGENT_PORT, path: '/schema',
     method: 'POST',
