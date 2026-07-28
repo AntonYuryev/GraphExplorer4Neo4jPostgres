@@ -147,11 +147,16 @@ async function agentSend() {
                       ' references.length=' + (currentGraph.edges[0] && Array.isArray(currentGraph.edges[0].references) ? currentGraph.edges[0].references.length : 0);
       }
 
-      _agentAppendMessage('assistant',
-        'Graph to analyze: ' + currentGraph.nodes.length + ' nodes, ' +
-        currentGraph.edges.length + ' edges. ' +
-        '('+edgesWithRefs + ' edges are supported by '+totalRefs+ ' references)'
-      );
+      // Graph-size status message — only useful once, at the start of a new
+      // Summarize conversation; repeating it on every turn just adds noise
+      // once the user is already mid-conversation about the same graph.
+      if (_agentChatHistory.length === 1) {
+        _agentAppendMessage('assistant',
+          'Graph to analyze: ' + currentGraph.nodes.length + ' nodes, ' +
+          currentGraph.edges.length + ' edges. ' +
+          '('+edgesWithRefs + ' edges are supported by '+totalRefs+ ' references)'
+        );
+      }
       // ─────────────────────────────────────────────────────────────────────
 
       var relationIds = _extractRelationIds(currentGraph.edges);
@@ -540,7 +545,13 @@ function switchAgentMode(mode) {
   tabs.forEach(function(tab) {
     tab.classList.toggle('active', tab.getAttribute('data-mode') === mode);
   });
-  
+
+  // Update panel title so it doesn't keep showing "Text2Cypher" while in Summarize mode
+  var title = document.getElementById('agent-panel-title');
+  if (title) {
+    title.textContent = mode === 'summarize' ? '🤖 Summarize' : '🤖 Text2Cypher';
+  }
+
   // Update message placeholder and action buttons based on mode
   var input = document.getElementById('agent-input');
   var actionBtns = document.getElementById('agent-action-buttons');
