@@ -59,7 +59,7 @@ class Cypher:
     cypher = f"""WITH $batch AS rows\n
               UNWIND rows AS row\n
               MATCH ({node})
-              WHERE {letter}.Name = row OR row IN {letter}.Alias
+              WHERE toLower({letter}.Name) = toLower(row) OR toLower(row) IN [x IN {letter}.Alias | toLower(x)]
               RETURN {letter}
               """
     parameter = {'batch':names}
