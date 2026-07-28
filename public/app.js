@@ -35,6 +35,33 @@ var _rc = {
 // Relation types that carry no directionality — displayed as a plain line (no arrow)
 var RC_NONDIRECTIONAL_TYPES = new Set(['Binding', 'FunctionalAssociation', 'CellExpression']);
 
+// ─── Agentic AI stubs (deferred to agentic_ai_block.js when loaded) ───────────
+// These are called from inline onclick handlers in index.html before agentic_ai_block.js loads.
+function openAgenticPanel(mode) {
+  // Stub: will be overridden by agentic_ai_block.js
+  if (typeof window._agentPanelOpen === 'undefined') {
+    console.error('[openAgenticPanel] agentic_ai_block.js has not loaded yet');
+    return;
+  }
+  // If agentic_ai_block.js has loaded, this function will be redefined there
+  // and this stub will be overridden. If somehow we get here after it's loaded,
+  // forward to the real implementation.
+  if (window.__openAgenticPanel_real) {
+    return window.__openAgenticPanel_real(mode);
+  }
+}
+
+function closeMenus() {
+  var menu = document.getElementById('context-menu');
+  if (menu) menu.style.display = 'none';
+}
+
+// ─── Agentic AI Debug Helper ──────────────────────────────────────────────────
+console.log('%c[GraphExplorer Agentic AI Debug]', 'color: #4f8ef7; font-weight: bold; font-size: 12px;');
+console.log('%cOpen F12 console and look for [openAgenticPanel], [agentSend], [_buildCurrentGraphFromCy], etc.', 'color: #7a8099; font-size: 11px;');
+console.log('%cData flow: Menu click → openAgenticPanel() → switchAgentMode() → toggleAgenticPanel() → user sends message → agentSend() → API call', 'color: #7a8099; font-size: 11px;');
+
+
 // Same 5-type non-directional set /api/relations/match-rnef (server.js) uses
 // to decide whether to MATCH a relation with an undirected Cypher pattern —
 // used here for the equivalent decision when computing a RelationID
@@ -203,9 +230,6 @@ let tooltipCurrentEdge = null;   // cy edge element currently shown in tooltip
 let pendingMatchSpan = null;     // #match-rnef-status span waiting to be cleared after tooltip renders
 let matchedRelIds = new Set();   // relIds newly matched by matchRnefRelationsToNeo4j
 let matchingInProgress = false;  // true while matchRnefRelationsToNeo4j API call is in flight
-
-// How many of the CURRENT tab's nodes/relations were actually recognized
-// against the database — enrichNodesFromNeo4j sets the node count,
 // matchRnefRelationsToNeo4j sets the relation count. null (not a number)
 // means "not applicable yet" (e.g. a graph built from a Cypher query rather
 // than opened from a file, or a fresh tab before either has run) — in that
@@ -464,6 +488,8 @@ const DEFAULT_NODE_COLUMNS = [
   { key: 'nodeType',   label: 'Node Type', visible: true, source: 'node_graph' },
   { key: 'urn',        label: 'URN',       visible: true, source: 'node_graph' },
   { key: 'nodeIdProp', label: 'NodeID',    visible: true, source: 'node_graph' },
+  { key: 'connectivityDb',    label: 'Connectivity in database', visible: true, source: 'node_graph', numeric: true },
+  { key: 'connectivityGraph', label: 'Connectivity in graph',    visible: true, source: 'node_graph', numeric: true },
 ];
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -5129,7 +5155,9 @@ async function openCypherHistory() {
   _chSuppressSave = true;
   document.getElementById('cypher-history-tbody').innerHTML = '';
   document.getElementById('ch-search-input').value = '';
-  document.getElementById('ch-dedupe').checked = false;
+  // Restore checkbox state from localStorage, default to false if not set
+  var savedDedupe = localStorage.getItem('ch-dedupe-pref');
+  document.getElementById('ch-dedupe').checked = (savedDedupe === 'true');
   _chRange     = 'all';
   _chSortField = 'date';
   _chSortDir   = 'desc';
@@ -5212,6 +5240,9 @@ function _chRender() {
   var tbody  = document.getElementById('cypher-history-tbody');
   var search = (document.getElementById('ch-search-input').value || '').trim().toLowerCase();
   var dedupe = document.getElementById('ch-dedupe').checked;
+
+  // Save checkbox preference to localStorage
+  localStorage.setItem('ch-dedupe-pref', dedupe ? 'true' : 'false');
 
   var rows  = _chAllRows;
   var total = rows.length;
@@ -5589,7 +5620,21 @@ function renderRefsHtml(refs, asc) {
       var metaParts = [];
       if (year) metaParts.push(escHtml(year));
       if (journal) metaParts.push(escHtml(journal));
-      if (idLabel) metaParts.push('<span style="color:#8a9ab8">' + escHtml(idLabel) + ':</span> ' + escHtml(idValue));
+      if (idLabel) {
+        var idHtml = '<span style="color:#8a9ab8">' + escHtml(idLabel) + ':</span> ' + escHtml(idValue);
+        if (idLabel === 'DOI') {
+          idHtml = '<span style="color:#8a9ab8">DOI:</span> '
+            + '<a href="https://doi.org/' + encodeURIComponent(idValue)
+            + '" target="_blank" rel="noopener noreferrer" style="color:#8ec5ff;text-decoration:underline">'
+            + escHtml(idValue) + '</a>';
+        } else if (idLabel === 'PMID') {
+          idHtml = '<span style="color:#8a9ab8">PMID:</span> '
+            + '<a href="https://pubmed.ncbi.nlm.nih.gov/' + encodeURIComponent(idValue)
+            + '/" target="_blank" rel="noopener noreferrer" style="color:#8ec5ff;text-decoration:underline">'
+            + escHtml(idValue) + '</a>';
+        }
+        metaParts.push(idHtml);
+      }
       out += '<div class="tooltip-meta">' + metaParts.join(' · ') + '</div>';
       if (sentence) out += '<div class="tooltip-sentence">' + escHtml(sentence) + '</div>';
       out += '</div>';
@@ -6311,6 +6356,63 @@ async function loadTableData() {
 async function loadNodeData() {
   var msg = document.getElementById('table-loading-msg');
 
+  // Collapse clones into one logical node row for Nodes view.
+  // Prefer URN, then NodeID, then cloneOf as a stable dedupe key.
+  var displayNodesByKey = {};
+  graphData.nodes.forEach(function(n) {
+    var urnKey = n.properties && n.properties.URN != null ? String(n.properties.URN) : '';
+    var nodeIdKey = n.properties && n.properties.NodeID != null ? String(n.properties.NodeID) : '';
+    var cloneOfKey = n.cloneOf != null ? String(n.cloneOf) : '';
+    var logicalKey = urnKey || nodeIdKey || cloneOfKey || String(n.id || '');
+    var existing = displayNodesByKey[logicalKey];
+    if (!existing) {
+      displayNodesByKey[logicalKey] = n;
+      return;
+    }
+    // If we already have a clone but now see the original, keep the original.
+    if (existing.isClone && !n.isClone) displayNodesByKey[logicalKey] = n;
+  });
+  var displayNodes = Object.keys(displayNodesByKey).map(function(k) { return displayNodesByKey[k]; });
+
+  // Current graph connectivity (degree in the active graph tab) keyed by URN.
+  var graphConnectivityByUrn = {};
+  if (cy) {
+    var graphEdgeSetsByUrn = {};
+    cy.nodes().forEach(function(cyNode) {
+      var urn = cyNode.data('URN');
+      if (!urn) return;
+      var urnKey = String(urn);
+      if (!graphEdgeSetsByUrn[urnKey]) graphEdgeSetsByUrn[urnKey] = new Set();
+      cyNode.connectedEdges().forEach(function(e) { graphEdgeSetsByUrn[urnKey].add(e.id()); });
+    });
+    Object.keys(graphEdgeSetsByUrn).forEach(function(urnKey) {
+      graphConnectivityByUrn[urnKey] = graphEdgeSetsByUrn[urnKey].size;
+    });
+  }
+
+  // Database connectivity (total Neo4j degree) keyed by URN.
+  var dbConnectivityByUrn = {};
+  var connUrns = [];
+  displayNodes.forEach(function(n) {
+    var urn = n.properties && n.properties.URN ? String(n.properties.URN) : '';
+    if (urn) connUrns.push(urn);
+  });
+  if (connUrns.length > 0) {
+    try {
+      msg.style.display = 'inline';
+      msg.textContent = 'Loading node connectivity from database…';
+      var connResult = await api('/api/nodes/connectivity', { urns: connUrns });
+      Object.keys(connResult || {}).forEach(function(urn) {
+        var rec = connResult[urn] || {};
+        dbConnectivityByUrn[String(urn)] = Number(rec.degree || 0);
+      });
+    } catch(e) {
+      console.warn('Node connectivity fetch failed:', e.message);
+    } finally {
+      msg.style.display = 'none';
+    }
+  }
+
   var nodeColCols = columnDefs.filter(function(c) { return c.source === 'node_col' && c.visible; });
   if (nodeColCols.length > 0) {
     var npNodeIds = [], npUrns = [];
@@ -6362,14 +6464,17 @@ async function loadNodeData() {
     return getNodeLabel(node);
   }
 
-  nodeRows = graphData.nodes.map(function(n) {
+  nodeRows = displayNodes.map(function(n) {
+    var urn = (n.properties && n.properties.URN != null) ? String(n.properties.URN) : '';
     var row = {
       nodeId:     n.id,   // matches the live Cytoscape element id — used for selection sync
       elementId:  n.elementId || n.id,
       name:       nodeLabel(n),
       nodeType:   (n.labels && n.labels[0]) || '',
-      urn:        (n.properties && n.properties.URN != null) ? String(n.properties.URN) : '',
+      urn:        urn,
       nodeIdProp: (n.properties && n.properties.NodeID != null) ? String(n.properties.NodeID) : '',
+      connectivityDb:    dbConnectivityByUrn[urn] != null ? dbConnectivityByUrn[urn] : '',
+      connectivityGraph: graphConnectivityByUrn[urn] != null ? graphConnectivityByUrn[urn] : '',
     };
     columnDefs.forEach(function(col) {
       if (col.source === 'node_col') {
@@ -8871,12 +8976,12 @@ async function mergeSimilarRelations() {
     'Biomarker':        new Set(['QuantitativeChange','StateChange','FunctionalAssociation']),
     'QuantitativeChange': new Set(['Biomarker','Regulation']),
     'StateChange':      new Set(['Biomarker']),
-    'FunctionalAssociation': new Set(['Biomarker','Regulation','DirectRegulation','ProtModification','MolTransport','MolSynthesis']),
+    'FunctionalAssociation': new Set(['Biomarker','Regulation','DirectRegulation','ProtModification','MolTransport','MolSynthesis','QuantitativeChange','Expression','PromoterBinding','StateChange']),
     'MolSynthesis':     new Set(['Regulation','FunctionalAssociation']),
     'MolTransport':     new Set(['Regulation','FunctionalAssociation']),
     'PromoterBinding':  new Set(['Expression','Regulation']),
-    'Expression':       new Set(['PromoterBinding']),
-    'Regulation':       new Set(['DirectRegulation','FunctionalAssociation','PromoterBinding','MolSynthesis','MolTransport','ProtModification','QuantitativeChange']),
+    'Expression':       new Set(['PromoterBinding','Regulation']),
+    'Regulation':       new Set(['DirectRegulation','PromoterBinding','MolSynthesis','MolTransport','ProtModification','QuantitativeChange','Expression','StateChange','FunctionalAssociation']),
   };
 
   // ── Anchor class precedence (FRD 3.2): higher = preferred anchor ─────────────
@@ -17135,6 +17240,11 @@ var _agentLastStatusOk    = null;   // null = unknown yet, true/false = last pol
 var _agentPendingResume   = false;  // true when a loaded conversation still needs auto-confirmation
 var _agentResumeRetryCount = 0;     // caps automatic resume retries so a persistent failure doesn't loop forever
 
+// Keep client-side abort windows aligned with server/proxy timeouts.
+// Summarize chat has a dedicated longer proxy timeout in server.js.
+var _AGENT_CHAT_TIMEOUT_MS = 180000;
+var _SUMMARIZE_CHAT_TIMEOUT_MS = 610000;
+
 // ── Panel open/close ─────────────────────────────────────────────────────────
 function _initAgenticAI() {
   // Show the AI menu for non-admin roles only — same restriction the old
@@ -17350,12 +17460,40 @@ function _inlineReferencesForRelationIds(relIds) {
   var edges = (graphData && graphData.edges) || [];
   for (var i = 0; i < edges.length; i++) {
     var p = edges[i].properties || {};
-    var relId = p.RelationID != null ? String(p.RelationID) : null;
-    if (relId && wanted[relId] && Array.isArray(p.references) && p.references.length) {
-      out.push({ relationId: relId, references: p.references });
-    }
+    var edgeIds = Array.isArray(p.RelationIDs) ? p.RelationIDs.map(String) : (p.RelationID != null ? [String(p.RelationID)] : []);
+    if (!edgeIds.length || !Array.isArray(p.references) || !p.references.length) continue;
+
+    var matchedIds = edgeIds.filter(function(id) { return !!wanted[id]; });
+    if (!matchedIds.length) continue;
+
+    var dbRows = [];
+    matchedIds.forEach(function(id) {
+      var rows = refsCache && refsCache[id];
+      if (Array.isArray(rows) && rows.length) dbRows = dbRows.concat(rows);
+    });
+    var merged = _mergeInlineAndDbRefs(p.references, dbRows);
+    var fileOnly = merged.filter(function(r) {
+      return !(r && r.unique_id != null && String(r.unique_id).trim() !== '');
+    });
+    if (!fileOnly.length) continue;
+
+    matchedIds.forEach(function(id) {
+      out.push({ relationId: id, references: fileOnly });
+    });
   }
   return out;
+}
+
+function _sleep(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+async function _fetchSummarizeWithRetry(url, options) {
+  var first = await fetch(url, options);
+  if (first.status !== 502 && first.status !== 503) return first;
+  // Agent sidecar may be auto-restarting after a transient crash.
+  await _sleep(1200);
+  return fetch(url, options);
 }
 
 // Name + Alias for every node that's an endpoint of an edge in the given
@@ -17390,29 +17528,57 @@ function _nodeAliasesForScope(scope) {
 async function _summarizeSendRequest(message) {
   var sendBtn  = document.getElementById('agent-send-btn');
   var thinking = document.getElementById('agent-thinking-indicator');
+  function _setSummarizeThinking(text) {
+    if (!thinking) return;
+    thinking.textContent = '⏳ ' + text;
+    thinking.style.display = 'inline';
+  }
   if (sendBtn) sendBtn.disabled = true;
-  if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'inline'; }
+  _setSummarizeThinking('Gathering context entities...');
 
   var _abort = new AbortController();
-  var _abortTimer = setTimeout(function() { _abort.abort(); }, 130000);
+  var _abortTimer = setTimeout(function() { _abort.abort(); }, _SUMMARIZE_CHAT_TIMEOUT_MS);
+  var _progressTimer = null;
 
   try {
     var _cgSummary = _currentGraphSummary();
+    // Summarize gets evidence via inline_references + DB fetch by RelationID.
+    // Do not duplicate large per-edge reference arrays inside current_graph
+    // for this endpoint; keeping only graph topology avoids oversized payloads
+    // and reduces proxy/agent disconnect risk on "Analyze all relations".
+    var _cgForSummarize = JSON.parse(JSON.stringify(_cgSummary || {}));
+    (_cgForSummarize.edges || []).forEach(function(e) { if (e && e.references) delete e.references; });
+    (_cgForSummarize.selectedEdges || []).forEach(function(e) { if (e && e.references) delete e.references; });
     var _isFirstSummarizeTurn = _agentChatHistory.slice(0, -1).length === 0;
-    var _inlineRefs = [];
+    var _knownSentenceCount = Array.isArray(_summarizeFetchedRows) ? _summarizeFetchedRows.length : 0;
+    var _progressPhases = [
+      'Gathering context entities...',
+      'Fetching supporting sentences from database...',
+      _knownSentenceCount > 0
+        ? ('Analyzing ' + _knownSentenceCount + ' supporting sentence(s)...')
+        : 'Analyzing supporting sentences (exact count will be shown in chat)...'
+    ];
+    var _phaseIndex = 0;
+    _setSummarizeThinking(_progressPhases[_phaseIndex]);
+    _progressTimer = setInterval(function() {
+      _phaseIndex = Math.min(_phaseIndex + 1, _progressPhases.length - 1);
+      _setSummarizeThinking(_progressPhases[_phaseIndex]);
+    }, 2500);
+
+    var _scopeEdges = (_summarizeScope === 'selected')
+      ? (_cgSummary.selectedEdges || []) : (_cgSummary.edges || []);
+    // A merged edge's relationIds (plural, all IDs it represents) matters
+    // here just as much as its single relationId -- flatten both together
+    // so a merged edge's file-embedded references are pulled for every
+    // relation it stands in for, not just the one that survived as anchor.
+    var _scopeRelIds = [];
+    _scopeEdges.forEach(function(e) {
+      if (e.relationId) _scopeRelIds.push(e.relationId);
+      if (Array.isArray(e.relationIds)) _scopeRelIds = _scopeRelIds.concat(e.relationIds);
+    });
+    await _prefetchAgentGraphReferences();
+    var _inlineRefs = _inlineReferencesForRelationIds(_scopeRelIds);
     if (_isFirstSummarizeTurn) {
-      var _scopeEdges = (_summarizeScope === 'selected')
-        ? (_cgSummary.selectedEdges || []) : (_cgSummary.edges || []);
-      // A merged edge's relationIds (plural, all IDs it represents) matters
-      // here just as much as its single relationId -- flatten both together
-      // so a merged edge's file-embedded references are pulled for every
-      // relation it stands in for, not just the one that survived as anchor.
-      var _scopeRelIds = [];
-      _scopeEdges.forEach(function(e) {
-        if (e.relationId) _scopeRelIds.push(e.relationId);
-        if (Array.isArray(e.relationIds)) _scopeRelIds = _scopeRelIds.concat(e.relationIds);
-      });
-      _inlineRefs = _inlineReferencesForRelationIds(_scopeRelIds);
       // Computed once, turn 1 -- carried forward on later turns the same way
       // fetched_rows/original_relation_ids are (see result.node_aliases below),
       // since the system prompt needs this table rebuilt on EVERY turn, not
@@ -17420,24 +17586,43 @@ async function _summarizeSendRequest(message) {
       _summarizeNodeAliases = _nodeAliasesForScope(_summarizeScope);
     }
 
-    var res = await fetch('/api/agent/summarize-chat', {
+    var reqBody = JSON.stringify({
+      message:               message,
+      history:                _agentChatHistory.slice(0, -1),
+      llm:                    _agentConfig,
+      current_graph:          _cgForSummarize,
+      scope:                  _summarizeScope,
+      fetched_rows:           _summarizeFetchedRows,
+      original_relation_ids:  _summarizeOriginalRelationIds,
+      inline_references:      _inlineRefs,
+      node_aliases:           _summarizeNodeAliases,
+    });
+
+    var res = await _fetchSummarizeWithRetry('/api/agent/summarize-chat', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
-      body: JSON.stringify({
-        message:               message,
-        history:                _agentChatHistory.slice(0, -1),
-        llm:                    _agentConfig,
-        current_graph:          _cgSummary,
-        scope:                  _summarizeScope,
-        fetched_rows:           _summarizeFetchedRows,
-        original_relation_ids:  _summarizeOriginalRelationIds,
-        inline_references:      _inlineRefs,
-        node_aliases:           _summarizeNodeAliases,
-      }),
+      body: reqBody,
       signal: _abort.signal,
     });
     var result = await res.json().catch(function() { return {}; });
     if (!res.ok) throw new Error(result.error || ('HTTP ' + res.status));
+
+    if (_progressTimer) {
+      clearInterval(_progressTimer);
+      _progressTimer = null;
+    }
+    var _exactSentenceCount = null;
+    if (result.llm_sentence_count != null && Number.isFinite(Number(result.llm_sentence_count))) {
+      _exactSentenceCount = Number(result.llm_sentence_count);
+    } else if (Array.isArray(result.fetched_rows)) {
+      _exactSentenceCount = result.fetched_rows.length;
+    } else if (Array.isArray(_summarizeFetchedRows)) {
+      _exactSentenceCount = _summarizeFetchedRows.length;
+    }
+
+    if (_exactSentenceCount != null) {
+      _setSummarizeThinking('Analyzing ' + _exactSentenceCount + ' supporting sentence(s)...');
+    }
 
     if (result.fetched_rows)           _summarizeFetchedRows = result.fetched_rows;
     if (result.original_relation_ids)  _summarizeOriginalRelationIds = result.original_relation_ids;
@@ -17445,6 +17630,14 @@ async function _summarizeSendRequest(message) {
     var reply = result.reply || '(no reply)';
     _agentChatHistory.push({ role: 'assistant', content: reply });
     _agentAppendMessage('assistant', reply);
+
+    if (_exactSentenceCount != null) {
+      var analyzeNote = document.createElement('div');
+      analyzeNote.style.cssText = 'align-self:center;font-size:11px;color:#7a8099';
+      analyzeNote.textContent = 'Evidence sent to LLM: ' + _exactSentenceCount + ' supporting sentence(s).';
+      var noteContainer = document.getElementById('agent-chat-messages');
+      if (noteContainer) { noteContainer.appendChild(analyzeNote); noteContainer.scrollTop = noteContainer.scrollHeight; }
+    }
 
     if (result.resummarized) {
       var note = document.createElement('div');
@@ -17455,11 +17648,20 @@ async function _summarizeSendRequest(message) {
       if (container) { container.appendChild(note); container.scrollTop = container.scrollHeight; }
     }
   } catch (err) {
+    if (_progressTimer) {
+      clearInterval(_progressTimer);
+      _progressTimer = null;
+    }
+    var _summarizeTimeoutSec = Math.floor(_SUMMARIZE_CHAT_TIMEOUT_MS / 1000);
     var errMsg = err.name === 'AbortError'
-      ? 'Request timed out after 130 seconds. The LLM may be overloaded — please retry.'
+      ? ('Request timed out after ' + _summarizeTimeoutSec + ' seconds. The service may still be processing a heavy summarize request; please retry.')
       : 'Error: ' + (err.message || String(err));
     _agentAppendMessage('error', errMsg);
   } finally {
+    if (_progressTimer) {
+      clearInterval(_progressTimer);
+      _progressTimer = null;
+    }
     clearTimeout(_abortTimer);
     if (sendBtn) sendBtn.disabled = false;
     if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'none'; }
@@ -17545,9 +17747,20 @@ function _agentNoteHistoryTrim(result) {
 // graph, never a partial view of what the user is actually looking at.
 var _AGENT_GRAPH_STATE_NODE_CAP = 1000;
 var _AGENT_GRAPH_STATE_EDGE_CAP = 1000;
+var _AGENT_GRAPH_STATE_REF_CAP = 3;
 function _currentGraphSummary() {
   var nodes = (graphData && graphData.nodes) || [];
   var edges = (graphData && graphData.edges) || [];
+
+  // Include the active graph/pathway/tab name in every agent request payload.
+  // This is the same user-visible title shown in the tab strip (span.tab-name)
+  // and in graph stats (currentSubgraphName prefix when present).
+  var activeTabName = '';
+  if (Array.isArray(tabs) && tabs[activeTabIdx] && tabs[activeTabIdx].name) {
+    activeTabName = String(tabs[activeTabIdx].name || '').trim();
+  }
+  var pathwayName = String(currentSubgraphName || '').trim();
+  var graphName = pathwayName || activeTabName;
 
   var nodeById = {};
   nodes.forEach(function(n) { nodeById[n.id] = n; });
@@ -17556,21 +17769,134 @@ function _currentGraphSummary() {
     var p = n.properties || {};
     return p.Name || p.name || '?';
   }
+  function _firstNonEmpty(obj, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      var v = obj && obj[keys[i]];
+      if (v != null && String(v).trim() !== '') return String(v).trim();
+    }
+    return null;
+  }
+  function _nodeAliasesForAgent(obj) {
+    var keys = ['Aliases', 'aliases', 'Alias', 'alias'];
+    for (var i = 0; i < keys.length; i++) {
+      var raw = obj && obj[keys[i]];
+      if (raw == null || raw === '') continue;
+      var values = [];
+      if (Array.isArray(raw)) {
+        values = raw;
+      } else {
+        var text = String(raw).trim();
+        if (!text) continue;
+        values = /[|,;]/.test(text) ? text.split(/[|,;]/) : [text];
+      }
+      var seen = new Set();
+      var out = values
+        .map(function(v) { return String(v).trim(); })
+        .filter(function(v) {
+          if (!v) return false;
+          var key = v.toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+      if (out.length) return out;
+    }
+    return null;
+  }
+  function _normalizeRefForAgent(ref) {
+    if (!ref) return null;
+    var sentence = _firstNonEmpty(ref, ['msrc', 'sentence', 'Sentence']);
+    var pmid = _firstNonEmpty(ref, ['pmid', 'PMID']);
+    var doi = _firstNonEmpty(ref, ['doi', 'DOI']);
+    var pui = _firstNonEmpty(ref, ['pui', 'PUI']);
+    var pii = _firstNonEmpty(ref, ['pii', 'PII']);
+    var embase = _firstNonEmpty(ref, ['embase', 'EMBASE']);
+    var textRef = _firstNonEmpty(ref, ['textref', 'TextRef']);
+    var title = _firstNonEmpty(ref, ['title', 'Title']);
+    var pubyear = _firstNonEmpty(ref, ['pubyear', 'PubYear', 'year', 'Year']);
+    var journal = _firstNonEmpty(ref, ['journal', 'Journal', 'journalname', 'journaltitle', 'source']);
+
+    if (!sentence && !pmid && !doi && !pui && !pii && !embase && !textRef && !title && !pubyear && !journal) return null;
+
+    var out = {};
+    if (sentence) {
+      out.sentence = sentence.slice(0, 600);
+    }
+    if (pmid) out.pmid = pmid;
+    if (doi) out.doi = doi;
+    if (pui) out.pui = pui;
+    if (pii) out.pii = pii;
+    if (embase) out.embase = embase;
+    if (textRef) out.TextRef = textRef;
+    if (title) out.title = title;
+    if (pubyear) out.pubyear = pubyear;
+    if (journal) out.Journal = journal;
+    return out;
+  }
+  function _refsForGraphEdge(relIds, inlineRefs) {
+    // For summarize payloads, send all available evidence rows (DB + file)
+    // and let backend context filtering keep only relevant sentences.
+    var dbRefs = [];
+    var ids = Array.isArray(relIds) ? relIds : [];
+    for (var i = 0; i < ids.length; i++) {
+      var key = ids[i] != null ? String(ids[i]) : '';
+      if (!key) continue;
+      var rows = refsCache && refsCache[key];
+      if (Array.isArray(rows) && rows.length) dbRefs = dbRefs.concat(rows);
+    }
+    var fileRefs = Array.isArray(inlineRefs) ? inlineRefs : [];
+    var merged = _mergeInlineAndDbRefs(fileRefs, dbRefs);
+    if (!merged.length) return null;
+
+    var normalized = [];
+    var seen = new Set();
+    for (var j = 0; j < merged.length; j++) {
+      var item = _normalizeRefForAgent(merged[j]);
+      if (!item) continue;
+      var dedupeKey = [item.sentence || '', item.pmid || '', item.doi || '', item.pui || '', item.pii || '', item.embase || ''].join('|').toLowerCase();
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      normalized.push(item);
+    }
+    return normalized.length ? normalized : null;
+  }
 
   var cappedNodes = nodes.slice(0, _AGENT_GRAPH_STATE_NODE_CAP).map(function(n) {
     var p = n.properties || {};
-    return { name: p.Name || p.name || '', label: (n.labels && n.labels[0]) || '' };
+    var nodeInfo = {
+      name: p.Name || p.name || '',
+      label: (n.labels && n.labels[0]) || '',
+      urn: p.URN || p.urn || '',
+      nodeId: p.NodeID || p.nodeId || p.nodeID || null
+    };
+    var aliases = _nodeAliasesForAgent(p);
+    if (aliases && aliases.length) nodeInfo.aliases = aliases;
+    return nodeInfo;
   });
   var cappedEdges = edges.slice(0, _AGENT_GRAPH_STATE_EDGE_CAP).map(function(e) {
     var p        = e.properties || {};
     var relId    = p.RelationID != null ? String(p.RelationID) : null;
+    var relUrn   = p.URN != null ? String(p.URN) : (p.urn != null ? String(p.urn) : null);
+    var relIds   = Array.isArray(p.RelationIDs) ? p.RelationIDs.map(String) : [];
+    if (relId && relIds.indexOf(relId) === -1) relIds.unshift(relId);
     var effect   = p.Effect || p.effect || null;
+    var srcNode  = nodeById[e.startNodeId] || null;
+    var tgtNode  = nodeById[e.endNodeId] || null;
+    var srcProps = (srcNode && srcNode.properties) || {};
+    var tgtProps = (tgtNode && tgtNode.properties) || {};
     var edgeInfo = {
       relationId: relId,
-      source:     nameOf(nodeById[e.startNodeId]),
-      target:     nameOf(nodeById[e.endNodeId]),
+      source:     nameOf(srcNode),
+      target:     nameOf(tgtNode),
+      sourceType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      sourceURN:  srcProps.URN || srcProps.urn || null,
+      targetURN:  tgtProps.URN || tgtProps.urn || null,
+      sourceNodeId: srcProps.NodeID || srcProps.nodeId || srcProps.nodeID || null,
+      targetNodeId: tgtProps.NodeID || tgtProps.nodeId || tgtProps.nodeID || null,
       type:       e.type || '',
-      effect:     effect
+      effect:     effect,
+      mechanism:  p.Mechanism || p.mechanism || null
     };
     // A "Merge similar relations" anchor edge legitimately carries MORE than
     // one real RelationID (RelationIDs, plural -- see mergeSimilarRelations())
@@ -17582,22 +17908,13 @@ function _currentGraphSummary() {
     if (Array.isArray(p.RelationIDs) && p.RelationIDs.length) {
       edgeInfo.relationIds = p.RelationIDs.map(String);
     }
-    // If this edge's supporting sentences are already sitting in refsCache (fetched
-    // earlier — via a tooltip hover, "Colorize sentences", loading a saved subgraph
-    // with inline references, etc.) or inline on the edge itself, include them here
-    // for edges missing Effect. This is opportunistic only — never triggers a new
-    // fetch — so the agent can use what's already loaded instead of re-querying
-    // Postgres for data the app already has in memory. Capped per-edge so this
-    // doesn't balloon the payload for a graph with hundreds of missing-Effect edges.
-    if (!effect && relId) {
-      var cachedRefs = (refsCache && refsCache[relId]) ||
-                        (Array.isArray(p.references) ? p.references : null);
-      if (cachedRefs && cachedRefs.length) {
-        edgeInfo.sentences = cachedRefs.slice(0, 2)
-          .map(function(r) { return (r && r.msrc) ? String(r.msrc).slice(0, 300) : null; })
-          .filter(Boolean);
-        if (!edgeInfo.sentences.length) delete edgeInfo.sentences;
-      }
+    if (!relId && relUrn) {
+      edgeInfo.relationUrn = relUrn;
+    }
+    // Add evidence from already-loaded references (cache and/or inline), never fetching.
+    var edgeRefs = _refsForGraphEdge(relIds, Array.isArray(p.references) ? p.references : null);
+    if (edgeRefs && edgeRefs.length) {
+      edgeInfo.references = edgeRefs;
     }
     return edgeInfo;
   });
@@ -17613,14 +17930,35 @@ function _currentGraphSummary() {
   if (cy) {
     cy.nodes(':selected').forEach(function(n) {
       var d = n.data();
-      selectedNodes.push({ name: d.Name || d.name || d.label || '', label: d.nodeType || '' });
+      var nodeInfo = {
+        name: d.Name || d.name || d.label || '',
+        label: d.nodeType || '',
+        urn: d.URN || d.urn || '',
+        nodeId: d.NodeID || d.nodeId || d.nodeID || null
+      };
+      var aliases = _nodeAliasesForAgent(d);
+      if (aliases && aliases.length) nodeInfo.aliases = aliases;
+      selectedNodes.push(nodeInfo);
     });
     cy.edges(':selected').forEach(function(e) {
       var d = e.data();
+      var srcCy = cy.$id(d.source);
+      var tgtCy = cy.$id(d.target);
+      var relId = d.relId != null ? String(d.relId) : null;
+      var relUrn = (d.edgeURN != null && String(d.edgeURN).trim() !== '') ? String(d.edgeURN) : null;
+      var relIds = Array.isArray(d.relIds) ? d.relIds.map(String) : [];
+      if (relId && relIds.indexOf(relId) === -1) relIds.unshift(relId);
       var edgeInfo = {
-        relationId: d.relId || null,
-        source: cy.$id(d.source).data('label') || '?',
-        target: cy.$id(d.target).data('label') || '?',
+        relationId: relId,
+        source: (srcCy && srcCy.length ? srcCy.data('label') : null) || '?',
+        target: (tgtCy && tgtCy.length ? tgtCy.data('label') : null) || '?',
+        sourceType: (srcCy && srcCy.length ? (srcCy.data('nodeType') || '') : ''),
+        targetType: (tgtCy && tgtCy.length ? (tgtCy.data('nodeType') || '') : ''),
+        sourceURN: (srcCy && srcCy.length ? (srcCy.data('URN') || srcCy.data('urn')) : null) || null,
+        targetURN: (tgtCy && tgtCy.length ? (tgtCy.data('URN') || tgtCy.data('urn')) : null) || null,
+        sourceNodeId: (srcCy && srcCy.length ? (srcCy.data('NodeID') || srcCy.data('nodeId') || srcCy.data('nodeID')) : null) || null,
+        targetNodeId: (tgtCy && tgtCy.length ? (tgtCy.data('NodeID') || tgtCy.data('nodeId') || tgtCy.data('nodeID')) : null) || null,
+        mechanism: (d.mechanism != null ? d.mechanism : null),
         type:   d.relType || ''
       };
       // See the identical relationIds field on cappedEdges above -- a merged
@@ -17629,11 +17967,22 @@ function _currentGraphSummary() {
       if (Array.isArray(d.relIds) && d.relIds.length) {
         edgeInfo.relationIds = d.relIds.map(String);
       }
+      if (!relId && relUrn) {
+        edgeInfo.relationUrn = relUrn;
+      }
+      var selectedRefs = _refsForGraphEdge(relIds, _inlineReferencesForEdge(e));
+      if (selectedRefs && selectedRefs.length) {
+        edgeInfo.references = selectedRefs;
+      }
       selectedEdges.push(edgeInfo);
     });
   }
 
   return {
+    graphName: graphName,
+    pathwayName: pathwayName,
+    tabName: activeTabName,
+    currentSubgraphName: pathwayName,
     nodeCount:     nodes.length,
     edgeCount:     edges.length,
     nodes:         cappedNodes,
@@ -17645,6 +17994,62 @@ function _currentGraphSummary() {
     selectedNodes: selectedNodes.slice(0, _AGENT_GRAPH_STATE_NODE_CAP),
     selectedEdges: selectedEdges.slice(0, _AGENT_GRAPH_STATE_EDGE_CAP)
   };
+}
+
+async function _prefetchAgentGraphReferences() {
+  var edges = (graphData && graphData.edges) || [];
+  if (!edges.length) return;
+
+  var relIdSet = new Set();
+  edges.slice(0, _AGENT_GRAPH_STATE_EDGE_CAP).forEach(function(e) {
+    var p = (e && e.properties) || {};
+    if (Array.isArray(p.RelationIDs)) {
+      p.RelationIDs.forEach(function(id) {
+        if (id != null) relIdSet.add(String(id));
+      });
+    }
+    if (p.RelationID != null) relIdSet.add(String(p.RelationID));
+  });
+
+  var relIds = Array.from(relIdSet);
+  if (!relIds.length) return;
+
+  var missingIds = relIds.filter(function(id) {
+    return !(refsCache && Object.prototype.hasOwnProperty.call(refsCache, id));
+  });
+  if (!missingIds.length) return;
+
+  var CHUNK = 200;
+  var CONCURRENCY = 3;
+  var chunks = [];
+  for (var i = 0; i < missingIds.length; i += CHUNK) {
+    chunks.push(missingIds.slice(i, i + CHUNK));
+  }
+
+  var qIdx = 0;
+  async function worker() {
+    while (qIdx < chunks.length) {
+      var idx = qIdx++;
+      var chunk = chunks[idx];
+      try {
+        var grouped = await api('/api/references/batch', { relationIds: chunk, scopusColumns: [] });
+        chunk.forEach(function(id) {
+          if (grouped && Array.isArray(grouped[id])) refsCache[id] = grouped[id];
+          else if (refsCache[id] === undefined) refsCache[id] = [];
+        });
+      } catch (err) {
+        chunk.forEach(function(id) {
+          if (refsCache[id] === undefined) refsCache[id] = [];
+        });
+      }
+    }
+  }
+
+  var workers = [];
+  for (var w = 0; w < Math.min(CONCURRENCY, chunks.length); w++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
 }
 
 async function agentSend() {
@@ -17671,16 +18076,18 @@ async function agentSend() {
   }, 1000);
   if (thinking) { thinking.textContent = '⏳ Thinking…'; thinking.style.display = 'inline'; }
 
-  // Abort the request if the server takes longer than 130 s
+  // Abort the request if the server takes longer than the configured window.
   var _agentAbort = new AbortController();
-  var _agentAbortTimer = setTimeout(function() { _agentAbort.abort(); }, 130000);
+  var _agentAbortTimer = setTimeout(function() { _agentAbort.abort(); }, _AGENT_CHAT_TIMEOUT_MS);
 
   try {
+    await _prefetchAgentGraphReferences();
+    var currentGraphSummary = _currentGraphSummary();
     var res = await fetch('/api/agent/chat', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
       body:    JSON.stringify({ message: msg, history: _agentChatHistory.slice(0, -1), llm: _agentConfig,
-                                 current_graph: _currentGraphSummary() }),
+                                 current_graph: currentGraphSummary }),
       signal:  _agentAbort.signal,
     });
     var result = await res.json().catch(function() { return {}; });
@@ -17722,8 +18129,9 @@ async function agentSend() {
     }
 
   } catch(err) {
+    var _agentTimeoutSec = Math.floor(_AGENT_CHAT_TIMEOUT_MS / 1000);
     var errMsg = err.name === 'AbortError'
-      ? 'Request timed out after 130 seconds. The LLM may be overloaded — please retry.'
+      ? ('Request timed out after ' + _agentTimeoutSec + ' seconds. The LLM may be overloaded; please retry.')
       : 'Error: ' + (err.message || String(err));
     _agentAppendMessage('error', errMsg);
   } finally {
@@ -17744,7 +18152,177 @@ function _agentAppendMessage(role, content, cypher, results) {
   else if (role === 'error')  bubble.style.cssText = baseStyle + 'align-self:flex-start;background:#4a1c1c;color:#ffaaaa;border-bottom-left-radius:3px';
   else                        bubble.style.cssText = baseStyle + 'align-self:flex-start;background:#1e2a45;color:#c8d0e8;border-bottom-left-radius:3px';
 
-  bubble.textContent = content;
+  function appendCitationLink(textNodeParent, label, value, href) {
+    var labelNode = document.createTextNode(label + ' ');
+    var link = document.createElement('a');
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.style.cssText = 'color:#8ec5ff;text-decoration:underline';
+    link.textContent = value;
+    textNodeParent.appendChild(labelNode);
+    textNodeParent.appendChild(link);
+  }
+
+  function _agentGraphNodeNameIndex() {
+    if (!cy || !cy.nodes) return [];
+    var byKey = {};
+    cy.nodes().forEach(function(n) {
+      var name = String(n.data('Name') || n.data('name') || n.data('label') || '').trim();
+      if (!name) return;
+      var key = name.toLowerCase();
+      if (!byKey[key]) byKey[key] = { name: name };
+    });
+    return Object.keys(byKey)
+      .map(function(k) { return { key: k, name: byKey[k].name }; })
+      .filter(function(x) { return x.name.length >= 3; })
+      .sort(function(a, b) { return b.name.length - a.name.length; });
+  }
+
+  function _isNodeTokenChar(ch) {
+    return !!ch && /[A-Za-z0-9]/.test(ch);
+  }
+
+  function _selectGraphNodesByName(nodeName) {
+    var target = String(nodeName || '').trim().toLowerCase();
+    if (!cy || !target) return;
+    var run = function() {
+      var selected = cy.collection();
+      cy.elements().unselect();
+      cy.nodes().forEach(function(n) {
+        var name = String(n.data('Name') || n.data('name') || n.data('label') || '').trim().toLowerCase();
+        if (name === target) selected = selected.union(n);
+      });
+      if (!selected.length) return;
+      selected.select();
+      cy.animate({ center: { eles: selected }, zoom: cy.zoom() < 1 ? 1 : cy.zoom() }, { duration: 300 });
+    };
+
+    var graphView = document.getElementById('graph-view');
+    if (graphView && graphView.style.display === 'none' && typeof switchView === 'function') {
+      Promise.resolve(switchView('graph')).then(run);
+      return;
+    }
+    run();
+  }
+
+  function appendNodeLinkedText(textNodeParent, text) {
+    var source = String(text || '');
+    if (!source) return;
+    var names = _agentGraphNodeNameIndex();
+    if (!names.length) {
+      textNodeParent.appendChild(document.createTextNode(source));
+      return;
+    }
+
+    var lower = source.toLowerCase();
+    var matches = [];
+
+    names.forEach(function(entry) {
+      var term = entry.key;
+      var startAt = 0;
+      while (startAt < lower.length) {
+        var idx = lower.indexOf(term, startAt);
+        if (idx < 0) break;
+        var end = idx + term.length;
+        var before = idx > 0 ? source.charAt(idx - 1) : '';
+        var after = end < source.length ? source.charAt(end) : '';
+        if (!_isNodeTokenChar(before) && !_isNodeTokenChar(after)) {
+          matches.push({ start: idx, end: end, text: source.slice(idx, end), name: entry.name });
+        }
+        startAt = idx + term.length;
+      }
+    });
+
+    if (!matches.length) {
+      textNodeParent.appendChild(document.createTextNode(source));
+      return;
+    }
+
+    matches.sort(function(a, b) {
+      if (a.start !== b.start) return a.start - b.start;
+      return (b.end - b.start) - (a.end - a.start);
+    });
+
+    var pruned = [];
+    var cursor = 0;
+    matches.forEach(function(m) {
+      if (m.start < cursor) return;
+      pruned.push(m);
+      cursor = m.end;
+    });
+
+    var last = 0;
+    pruned.forEach(function(m) {
+      if (m.start > last) {
+        textNodeParent.appendChild(document.createTextNode(source.slice(last, m.start)));
+      }
+      var link = document.createElement('a');
+      link.href = '#';
+      link.style.cssText = 'color:#5dd6c5;text-decoration:underline;cursor:pointer';
+      link.textContent = m.text;
+      link.onclick = function(ev) {
+        ev.preventDefault();
+        _selectGraphNodesByName(m.name);
+      };
+      textNodeParent.appendChild(link);
+      last = m.end;
+    });
+    if (last < source.length) {
+      textNodeParent.appendChild(document.createTextNode(source.slice(last)));
+    }
+  }
+
+  function appendLinkifiedText(textNodeParent, text) {
+    var re = /\b(PMID)\s*:?\s*(\d+)\b|\b(DOI)\s*:?\s*([^\s<>"]+)/gi;
+    var lastIndex = 0;
+    var match;
+
+    while ((match = re.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        appendNodeLinkedText(textNodeParent, text.slice(lastIndex, match.index));
+      }
+
+      if (match[1] && match[2]) {
+        // Support PMID lists like "PMID 12345678, 23456789" by linking each id.
+        var pmidIds = [String(match[2])];
+        var baseEnd = re.lastIndex;
+        var tailText = text.slice(baseEnd);
+        var tailMatch = tailText.match(/^(\s*[,;]\s*\d+\b)+/);
+        if (tailMatch && tailMatch[0]) {
+          var extraIds = tailMatch[0].match(/\d+/g) || [];
+          pmidIds = pmidIds.concat(extraIds);
+          re.lastIndex = baseEnd + tailMatch[0].length;
+        }
+
+        textNodeParent.appendChild(document.createTextNode('PMID '));
+        pmidIds.forEach(function(id, idx) {
+          var link = document.createElement('a');
+          link.href = 'https://pubmed.ncbi.nlm.nih.gov/' + id + '/';
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.style.cssText = 'color:#8ec5ff;text-decoration:underline';
+          link.textContent = id;
+          textNodeParent.appendChild(link);
+          if (idx < pmidIds.length - 1) textNodeParent.appendChild(document.createTextNode(', '));
+        });
+      } else if (match[3] && match[4]) {
+        var doiValue = String(match[4] || '').replace(/[\]\)\},.;:!?]+$/, '');
+        var doiSuffix = match[4].slice(doiValue.length);
+        appendCitationLink(textNodeParent, 'DOI', doiValue, 'https://doi.org/' + encodeURI(doiValue));
+        if (doiSuffix) textNodeParent.appendChild(document.createTextNode(doiSuffix));
+      }
+
+      lastIndex = re.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      appendNodeLinkedText(textNodeParent, text.slice(lastIndex));
+    }
+  }
+
+  if (role === 'user') bubble.textContent = content;
+  else appendLinkifiedText(bubble, String(content || ''));
 
   if (cypher) {
     var cypherBox = document.createElement('div');
