@@ -57,6 +57,7 @@ try { helmet = require('helmet'); } catch(e) {
   console.warn('[warn] helmet not installed — run `npm install` to enable security headers');
 }
 const app = express();
+const REQUEST_BODY_LIMIT = '50mb';
 // Security headers: X-Content-Type-Options, X-Frame-Options, Referrer-Policy, etc.
 if (helmet) app.use(helmet({
   contentSecurityPolicy: {
@@ -73,7 +74,16 @@ if (helmet) app.use(helmet({
     },
   },
 }));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: REQUEST_BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: REQUEST_BODY_LIMIT }));
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({
+      error: `Request payload is too large. Please reduce graph scope or evidence size and retry (server limit: ${REQUEST_BODY_LIMIT}).`
+    });
+  }
+  next(err);
+});
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
@@ -450,6 +460,27 @@ function saveUsers(users) {
     return { directory: dir };
   };
 
+  const API_KEY_MAX = 1000;
+  const MODEL_MAX   = 300;
+  const URL_MAX     = 500;
+  const cleanLlm = (llm) => {
+    if (!llm || typeof llm !== 'object') return undefined;
+    const out = {};
+    const s = (v, max) => (typeof v === 'string' && v.length <= max) ? v : undefined;
+    const pn  = s(llm.provider_name, MODEL_MAX);
+    const url = s(llm.url,           URL_MAX);
+    const key = s(llm.apikey,        API_KEY_MAX);
+    const mn  = s(llm.model_name,    MODEL_MAX);
+    if (pn  !== undefined) out.provider_name = pn;
+    if (url !== undefined) out.url           = url;
+    if (key !== undefined) out.apikey        = key;
+    if (mn  !== undefined) out.model_name    = mn;
+    if (typeof llm.temperature === 'number' && isFinite(llm.temperature)) out.temperature = llm.temperature;
+    if (typeof llm.top_p       === 'number' && isFinite(llm.top_p))       out.top_p       = llm.top_p;
+    if (typeof llm.json_mode   === 'boolean')                              out.json_mode   = llm.json_mode;
+    return Object.keys(out).length ? out : undefined;
+  };
+
   const safe = [];
   for (const u of users) {
     const nameMatch  = NAME_RE.exec(typeof u.username === 'string' ? u.username : '');
@@ -461,9 +492,11 @@ function saveUsers(users) {
       const neo4j    = cleanConn(u.neo4j,    ['database', 'username', 'password']);
       const postgres = cleanConn(u.postgres, ['database', 'schema', 'username', 'password']);
       const pathwayCollection = cleanPathwayCollection(u.pathwayCollection);
+      const llm = cleanLlm(u.llm);
       if (neo4j)    entry.neo4j    = neo4j;
       if (postgres) entry.postgres = postgres;
       if (pathwayCollection) entry.pathwayCollection = pathwayCollection;
+      if (llm)      entry.llm      = llm;
       safe.push(entry);
     }
   }
@@ -553,6 +586,39 @@ function _relationIdsOf(relOrValue) {
     : relOrValue;
   if (raw == null) return [];
   return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
+}
+
+// Normalizes caller-provided RelationID input into bigint-safe decimal strings.
+// Accepts any of:
+//   - ['123', '456']
+//   - [123, 456]
+//   - '123,456' (legacy comma-joined scalar)
+//   - mixed nested arrays/scalars
+// Returns deduplicated ['123','456'] (still as strings to preserve 64-bit precision
+// until SQL casts to bigint).
+function _normalizeRelationIdInputs(input) {
+  if (input == null) return [];
+
+  const out = [];
+  const stack = Array.isArray(input) ? input.slice() : [input];
+  while (stack.length) {
+    const item = stack.pop();
+    if (item == null) continue;
+    if (Array.isArray(item)) {
+      item.forEach(x => stack.push(x));
+      continue;
+    }
+
+    const s = String(toPlain(item)).trim();
+    if (!s) continue;
+    const parts = s.includes(',') ? s.split(',') : [s];
+    parts.forEach(p => {
+      const trimmed = p.trim();
+      if (/^-?\d+$/.test(trimmed)) out.push(trimmed);
+    });
+  }
+
+  return Array.from(new Set(out));
 }
 
 function processValue(val, nodesMap, edgesMap) {
@@ -912,27 +978,35 @@ app.post('/api/settings/list-pg-schemas', dbLimiter, authMiddleware, async (req,
 // Admin-only POST for write.
 app.get('/api/settings/llm', dbLimiter, authMiddleware, (req, res) => {
   const s = appSettings.llm || {};
-  // Migrate legacy single-url config to providers array on the fly
-  const providers = Array.isArray(s.providers) && s.providers.length
-    ? s.providers
-    : (s.url ? [{ name: 'Default', url: s.url }] : []);
+  
+  // Combine default providers (always available) + custom providers (admin-added)
+  const defaultProviders = Array.isArray(s.default_providers) ? s.default_providers : [];
+  const customProviders = Array.isArray(s.custom_providers) ? s.custom_providers : [];
+  const allProviders = [...defaultProviders, ...customProviders];
+  
+  // Return different data based on user role
+  const isAdmin = req.user && req.user.role === 'admin';
+  
   res.json({
-    providers:   providers,
+    providers:   allProviders,
     temperature: s.temperature !== undefined ? s.temperature : 0.2,
     top_p:       s.top_p      !== undefined ? s.top_p      : 0.9,
     json_mode:   s.json_mode  || false,
+    // Only include custom_providers for admins
+    ...(isAdmin && { custom_providers: customProviders }),
   });
 });
 
 app.post('/api/settings/llm', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
-  const { providers, temperature, top_p, json_mode } = req.body || {};
+  const { custom_providers, temperature, top_p, json_mode } = req.body || {};
   const existing = appSettings.llm || {};
 
   const cfg = {
-    ...existing,  // preserve apikey, model_name, url (server-side fallbacks for agent push)
-    providers:   Array.isArray(providers)
-                   ? providers.filter(p => p && typeof p.name === 'string' && typeof p.url === 'string' && p.name.trim() && p.url.trim())
-                   : (existing.providers || []),
+    ...existing,
+    default_providers: existing.default_providers || [],  // preserve default providers
+    custom_providers: Array.isArray(custom_providers)
+                        ? custom_providers.filter(p => p && typeof p.name === 'string' && typeof p.url === 'string' && p.name.trim() && p.url.trim())
+                        : (existing.custom_providers || []),
     temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : (existing.temperature !== undefined ? existing.temperature : 0.2),
     top_p:       Number.isFinite(Number(top_p))       ? Number(top_p)       : (existing.top_p      !== undefined ? existing.top_p      : 0.9),
     json_mode:   json_mode === true || json_mode === 'true',
@@ -941,6 +1015,26 @@ app.post('/api/settings/llm', dbLimiter, authMiddleware, adminMiddleware, async 
   appSettings.llm = cfg;
   saveAppSettings(appSettings);
   res.json({ success: true });
+});
+
+// Get database credentials for the agent (Neo4j + PostgreSQL)
+app.get('/api/db-credentials', dbLimiter, authMiddleware, (req, res) => {
+  const neo4jCfg = _resolveNeo4jCfgForUser(req.user.username);
+  const pgCfg = _resolvePgCfgForUser(req.user.username);
+  
+  res.json({
+    postgreSQLdb: pgCfg.database || '',
+    postgreSQschema: pgCfg.schema || '',
+    postgreSQLhost: pgCfg.host || '',
+    postgreSQLport: String(pgCfg.port || 5432),
+    postgreSQLuser: pgCfg.username || '',
+    postgreSQLpswd: pgCfg.password || '',
+    neo4jURL: appSettings.neo4j.url || '',
+    neo4juri: appSettings.neo4j.url || '',
+    neo4jdb: neo4jCfg.database || '',
+    neo4juser: neo4jCfg.username || '',
+    neo4jpswd: neo4jCfg.password || ''
+  });
 });
 
 // ─── Pathway Collection Search ────────────────────────────────────────────────
@@ -2274,6 +2368,31 @@ app.get('/api/settings/my-llm', dbLimiter, authMiddleware, (req, res) => {
   });
 });
 
+// ─── DEBUG: Test user auth (remove after testing) ─────────────────────────────
+app.get('/api/test/user-auth', dbLimiter, authMiddleware, (req, res) => {
+  res.json({
+    user: req.user.username || 'unknown',
+    role: req.user.role || 'unknown',
+    authenticated: !!req.user
+  });
+});
+
+app.get('/api/settings/my-llm', dbLimiter, authMiddleware, (req, res) => {
+  const users = loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  const llm = u.llm || {};
+  res.json({
+    provider_name: llm.provider_name || '',
+    url:           llm.url || '',
+    apikey:        '',  // never return actual key — client keeps it private or re-enters it
+    model_name:    llm.model_name || '',
+    temperature:   llm.temperature !== undefined ? llm.temperature : 0.2,
+    top_p:         llm.top_p !== undefined ? llm.top_p : 0.9,
+    json_mode:     llm.json_mode || false,
+  });
+});
+
 app.post('/api/settings/my-llm', dbLimiter, authMiddleware, (req, res) => {
   const { provider_name, url, apikey, model_name, temperature, top_p, json_mode } = req.body || {};
   const users = loadUsers();
@@ -2284,7 +2403,7 @@ app.post('/api/settings/my-llm', dbLimiter, authMiddleware, (req, res) => {
     provider_name: typeof provider_name === 'string' ? provider_name.trim() : (current.provider_name || ''),
     url:           typeof url === 'string' ? url.trim() : (current.url || ''),
     apikey:        (apikey && apikey !== '••••••••') ? String(apikey) : (current.apikey || ''),
-    model_name:    typeof model_name === 'string' ? model_name.trim() : (current.model_name || ''),
+    model_name:    (typeof model_name === 'string' && model_name.trim()) ? model_name.trim() : (current.model_name || ''),
     temperature:   Number.isFinite(Number(temperature)) ? Number(temperature) : (current.temperature !== undefined ? current.temperature : 0.2),
     top_p:         Number.isFinite(Number(top_p))       ? Number(top_p)       : (current.top_p       !== undefined ? current.top_p       : 0.9),
     json_mode:     json_mode === true || json_mode === 'true',
@@ -2439,7 +2558,8 @@ app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
 
   // Keep as strings and use ::bigint[] cast in SQL — preserves full 64-bit precision.
   // Number() conversion loses digits for IDs > 2^53 (JavaScript safe integer limit).
-  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id.trim()));
+  // Also accept legacy comma-joined ids ("123,456") and flatten nested arrays.
+  const validIds = _normalizeRelationIdInputs(relationIds);
   if (!validIds.length) return res.json([]);
 
   try {
@@ -2497,7 +2617,7 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
   // Keep as strings and use ::bigint[] cast in SQL — this preserves full 64-bit
   // precision. JavaScript Number loses precision for integers > 2^53, so converting
   // to Number first would corrupt large RelationIDs.
-  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id.trim()));
+  const validIds = _normalizeRelationIdInputs(relationIds);
   if (!validIds.length) return res.json({});
 
   // Look up each requested column in the hardcoded map.
@@ -2678,26 +2798,48 @@ app.post('/api/nodes/connectivity', dbLimiter, authMiddleware, async (req, res) 
   const safeUrns = urns.map(String).filter(u => u.length > 0 && u.length < 500);
   if (!safeUrns.length) return res.json({});
 
-  const session = req.neo4j.driver.session({ database: req.neo4j.database });
-  try {
-    const result = await session.run(
-      `UNWIND $urns AS urn
+  // Run connectivity as one task per node (URN) so typical pathway sizes
+  // (<= ~300 nodes) fully benefit from parallelism.
+  const uniqueUrns = Array.from(new Set(safeUrns));
+  const MAX_PARALLEL_CONNECTIVITY_QUERIES = 24;
+  const urnChunks = uniqueUrns.map(u => [u]);
+
+  const query = `UNWIND $urns AS urn
        MATCH (n {URN: urn})-[r]-(neighbor)
-       RETURN urn, count(r) AS degree, count(DISTINCT neighbor) AS neighborCount`,
-      { urns: safeUrns }
-    );
+       RETURN urn, count(r) AS degree, count(DISTINCT neighbor) AS neighborCount`;
+
+  const toN = v => v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v);
+  const runConnectivityChunk = async (chunkUrns) => {
+    const session = req.neo4j.driver.session({ database: req.neo4j.database });
+    try {
+      const result = await session.run(query, { urns: chunkUrns });
+      return result.records;
+    } finally {
+      await session.close();
+    }
+  };
+
+  try {
     const out = Object.create(null); // null prototype prevents remote property injection
-    result.records.forEach(rec => {
-      const urn = rec.get('urn');
-      const toN = v => v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v);
-      out[urn] = { degree: toN(rec.get('degree')), neighborCount: toN(rec.get('neighborCount')) };
-    });
+
+    for (let i = 0; i < urnChunks.length; i += MAX_PARALLEL_CONNECTIVITY_QUERIES) {
+      const batch = urnChunks.slice(i, i + MAX_PARALLEL_CONNECTIVITY_QUERIES);
+      const batchResults = await Promise.all(batch.map(chunk => runConnectivityChunk(chunk)));
+      for (const records of batchResults) {
+        records.forEach(rec => {
+          const urn = rec.get('urn');
+          out[urn] = {
+            degree: toN(rec.get('degree')),
+            neighborCount: toN(rec.get('neighborCount'))
+          };
+        });
+      }
+    }
+
     res.json(out);
   } catch (err) {
     console.error('connectivity error:', err.message);
     res.status(500).json({ error: safeError(err) });
-  } finally {
-    await session.close();
   }
 });
 
@@ -2993,7 +3135,7 @@ const NEO4J_EDGE_PROP_WHITELIST = new Set([
 
 app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res) => {
   const { relationIds = [], properties = [] } = req.body || {};
-  const validIds = relationIds.map(String).filter(id => /^-?\d+$/.test(id));
+  const validIds = _normalizeRelationIdInputs(relationIds);
   const safeProps = properties.filter(p => NEO4J_EDGE_PROP_WHITELIST.has(p));
   if (!validIds.length || !safeProps.length) return res.json({});
 
@@ -3138,39 +3280,50 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
       return g;
     }
 
-    // Runs one query PER GROUP concurrently, each on its OWN session, and
-    // returns the combined list of result records. A Neo4j Session serializes
-    // every query run through it -- awaiting session.run() in a for-loop, one
-    // relType group at a time, meant a large pathway with many distinct
-    // relation types (common) paid for N sequential network round trips per
-    // check instead of overlapping them. Since each group's rows are a
-    // disjoint idx partition (a relation belongs to exactly one relType), the
-    // groups have no cross-dependency and are safe to run in parallel -- only
-    // the 3 CHECK STAGES themselves must stay sequential, since Check 2/3 need
-    // to know which idx values Check 1/2 already matched. Each query gets its
-    // own session (closed as soon as it's done) rather than sharing one,
-    // since that's what actually lets them execute concurrently against Neo4j
-    // instead of just queuing up on a single connection.
+    // Runs one query PER ROW concurrently (throttled), each on its OWN
+    // session, and returns the combined list of result records.
+    //
+    // For this endpoint, typical input size is small (< 100 rows), but each
+    // individual row lookup can be slow. Running one query per relType group
+    // still leaves that slow work serialized inside each query. Executing each
+    // row independently provides better overlap of slow network/DB latency.
+    //
+    // The 3 CHECK STAGES remain sequential because Check 2/3 depend on what
+    // Check 1/2 already matched. Inside a check, row tasks are independent and
+    // can run in parallel. Concurrency is capped to avoid saturating the Neo4j
+    // driver connection pool and to keep tail latency predictable.
+    //
     // NOTE: `groups` keys are NOT necessarily bare relationship-type strings
     // (Check 3 uses "relType#groupIndex" to keep a type's undirected/directed
-    // equivalence groups separate) -- so no REL_TYPE_RE re-check happens here.
-    // Every caller already validates the real relType(s) before this point:
-    // groupByType() only admits rows whose relType passes REL_TYPE_RE, and
-    // Check 3's compound keys are built from those already-validated groups.
+    // equivalence groups separate).
     async function runGrouped(groups, buildCypher, extraParams) {
-      const entries = Object.entries(groups);
-      const perGroupRecords = await Promise.all(entries.map(async ([relType, rows]) => {
+      const MAX_PARALLEL_ROW_QUERIES = 12;
+
+      const tasks = [];
+      for (const [relType, rows] of Object.entries(groups)) {
         const cypher = buildCypher(relType);
-        const groupSession = req.neo4j.driver.session({ database: req.neo4j.database });
-        try {
-          const params = Object.assign({ rows }, extraParams ? extraParams(relType) : null);
-          const result = await groupSession.run(cypher, params);
-          return result.records;
-        } finally {
-          await groupSession.close();
+        const extras = extraParams ? extraParams(relType) : null;
+        for (const row of rows) {
+          tasks.push(async () => {
+            const rowSession = req.neo4j.driver.session({ database: req.neo4j.database });
+            try {
+              const params = Object.assign({ rows: [row] }, extras);
+              const result = await rowSession.run(cypher, params);
+              return result.records;
+            } finally {
+              await rowSession.close();
+            }
+          });
         }
-      }));
-      return perGroupRecords.flat();
+      }
+
+      const allRecords = [];
+      for (let i = 0; i < tasks.length; i += MAX_PARALLEL_ROW_QUERIES) {
+        const batch = tasks.slice(i, i + MAX_PARALLEL_ROW_QUERIES);
+        const batchResults = await Promise.all(batch.map(run => run()));
+        for (const records of batchResults) allRecords.push(...records);
+      }
+      return allRecords;
     }
 
     // Prepare rows with normalised effect
@@ -3597,22 +3750,40 @@ app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
 // ─── Agentic AI — Python service lifecycle & proxy ───────────────────────────
 const AGENT_PORT     = parseInt(process.env.AGENT_PORT || '3001', 10);
 const AGENT_SCRIPT   = path.join(__dirname, 'agent_service.py');
+const AGENT_AUTOSTART = !/^(0|false|no)$/i.test(
+  String(process.env.AGENT_AUTOSTART || '1').trim()
+);
+const PYTHON_DEBUGPY_PORT = (() => {
+  const explicit = parseInt(process.env.PYTHON_DEBUGPY_PORT || '0', 10);
+  // Debug attach must be opt-in only. Auto-enabling debugpy in development can
+  // keep the Agentic AI service in a permanent "starting" state when debugpy
+  // is missing or waiting for a debugger attach.
+  return Number.isFinite(explicit) && explicit > 0 ? explicit : 0;
+})();
+const PYTHON_DEBUGPY_WAIT_FOR_CLIENT = /^(1|true|yes)$/i.test(
+  String(process.env.PYTHON_DEBUGPY_WAIT_FOR_CLIENT || '').trim()
+);
 let   _agentProc     = null;
 let   _agentReady    = false;
+let   _agentRestarting = false;
 
 function _killPortProcess(port, cb) {
-  // Kill any existing process on the agent port (stale Python from a previous run).
-  // Uses netstat on Windows, lsof on Unix.
+  // Kill any existing process LISTENING on the agent port (stale Python from a previous run).
+  // Filters for LISTENING state only to avoid killing unrelated processes that merely
+  // have ESTABLISHED connections to the port (e.g. the Node proxy itself).
   const isWin = process.platform === 'win32';
   const cmd   = isWin
-    ? `FOR /F "tokens=5" %a IN ('netstat -ano ^| findstr :${port}') DO taskkill /F /PID %a`
+    ? `FOR /F "tokens=5" %a IN ('netstat -ano ^| findstr :${port} ^| findstr LISTENING') DO taskkill /F /PID %a`
     : `lsof -ti tcp:${port} | xargs kill -9`;
   require('child_process').exec(cmd, () => cb && cb());
 }
 
 function _startAgentService() {
+  if (_agentRestarting) return;
+  _agentRestarting = true;
   if (!fs.existsSync(AGENT_SCRIPT)) {
     console.warn('[agent] agent_service.py not found — Agentic AI disabled');
+    _agentRestarting = false;
     return;
   }
   // Kill any stale process from a previous run before spawning a fresh one.
@@ -3623,14 +3794,30 @@ function _startAgentService() {
 
 function _doSpawnAgent() {
   const py = process.env.PYTHON_CMD || PYTHON_CMD;
-  _agentProc = spawn(py, [AGENT_SCRIPT], {
-    env: { ...process.env, AGENT_PORT: String(AGENT_PORT) },
+  let agentArgs = [AGENT_SCRIPT];
+  if (Number.isFinite(PYTHON_DEBUGPY_PORT) && PYTHON_DEBUGPY_PORT > 0) {
+    agentArgs = ['-m', 'debugpy', '--listen', String(PYTHON_DEBUGPY_PORT)];
+    if (PYTHON_DEBUGPY_WAIT_FOR_CLIENT) {
+      // Opt-in only: this blocks service startup until a debugger attaches.
+      agentArgs.push('--wait-for-client');
+    }
+    agentArgs.push(AGENT_SCRIPT);
+  }
+  _agentProc = spawn(py, agentArgs, {
+    env: { ...process.env, AGENT_PORT: String(AGENT_PORT), PYTHONUNBUFFERED: '1' },
     stdio: ['ignore', 'pipe', 'pipe']
+  });
+  _agentProc.on('error', (err) => {
+    _agentReady = false;
+    _agentRestarting = false;
+    console.error('[agent] failed to spawn:', String((err && err.message) || err));
+    setTimeout(_startAgentService, 3000);
   });
   _agentProc.stdout.on('data', d => process.stdout.write('[agent] ' + d));
   _agentProc.stderr.on('data', d => process.stderr.write('[agent] ' + d));
   _agentProc.on('exit', (code) => {
     _agentReady = false;
+    _agentRestarting = false;
     console.log(`[agent] process exited (code ${code})`);
     // Auto-restart after 5 s unless we killed it intentionally
     if (code !== null && code !== 0) {
@@ -3646,6 +3833,7 @@ function _doSpawnAgent() {
       if (r.statusCode === 200) {
         clearInterval(poll);
         _agentReady = true;
+        _agentRestarting = false;
         console.log(`[agent] ready on port ${AGENT_PORT}`);
         // Push schema + LLM/Neo4j config to agent.
         // Always push credentials immediately (empty schema) so /health shows the
@@ -3662,7 +3850,18 @@ function _doSpawnAgent() {
         }, 500);
       }
     }).on('error', () => {});
-    if (attempts > 60) clearInterval(poll);
+    if (attempts > 60) {
+      clearInterval(poll);
+      if (!_agentReady) {
+        console.error('[agent] startup timeout: /health did not become ready within 30s; restarting sidecar');
+        _agentReady = false;
+        _agentRestarting = false;
+        try {
+          if (_agentProc) _agentProc.kill();
+        } catch (_) {}
+        setTimeout(_startAgentService, 2000);
+      }
+    }
   }, 500);
 }
 
@@ -3753,12 +3952,60 @@ app.post('/api/agent/llm-config', dbLimiter, authMiddleware, (req, res, next) =>
   next();                          // continue to the generic proxy below
 });
 
+// Enrich current_graph edges with references before sending to agent
+function _enrichCurrentGraphWithReferences(body) {
+  if (!body || !body.current_graph || !body.current_graph.edges) return body;
+  
+  const cg = body.current_graph;
+  
+  // Try multiple sources for references:
+  // 1. Direct references from inline edge properties (if frontend sends full edge data)
+  // 2. From _graphData.edges (if frontend sends both current_graph and full graph data)
+  
+  const refsByEdgeId = {};
+  
+  // Source 1: Extract from _graphData if provided
+  if (body._graphData && body._graphData.edges && Array.isArray(body._graphData.edges)) {
+    body._graphData.edges.forEach(gde => {
+      if (gde.id && gde.properties && Array.isArray(gde.properties.references)) {
+        refsByEdgeId[gde.id] = gde.properties.references;
+      }
+    });
+  }
+  
+  // Source 2: Look for references nested in edge data that might already be present
+  // For edges that already have properties, check if references are there
+  cg.edges.forEach(cge => {
+    if (!cge.references) {
+      // Check if properties object has references
+      if (cge.properties && Array.isArray(cge.properties.references)) {
+        cge.references = cge.properties.references;
+      }
+      // Check if references are at top level
+      else if (cge.id && refsByEdgeId[cge.id]) {
+        cge.references = refsByEdgeId[cge.id];
+      }
+    }
+  });
+  
+  return body;
+}
+
 // Proxy all /api/agent/* requests to the Python service
 app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
   if (!_agentReady) {
+    if (AGENT_AUTOSTART && !_agentRestarting) {
+      _startAgentService();
+    }
     return res.status(503).json({ error: 'Agentic AI service is starting — please wait a moment and retry' });
   }
   const agentPath = req.url.replace(/^\/api\/agent/, '');
+  
+  // Enrich current_graph with references from inline edge data before proxying
+  if (req.body && agentPath.includes('/summarize-chat')) {
+    req.body = _enrichCurrentGraphWithReferences(req.body);
+  }
+  
   // Express body-parser has already consumed req's stream, so we must re-serialise
   // req.body and set an accurate Content-Length instead of piping the raw stream.
   const bodyStr = (req.method !== 'GET' && req.method !== 'HEAD' && req.body !== undefined)
@@ -3782,7 +4029,7 @@ app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
     path:     agentPath || '/',
     method:   req.method,
     headers,
-    timeout:  120_000,
+    timeout:  agentPath && agentPath.includes('/summarize-chat') ? 1200_000 : 600_000,
   };
   const proxy = http.request(opts, (agentRes) => {
     res.status(agentRes.statusCode);
@@ -3803,6 +4050,10 @@ app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
     // spot), so the literal .replace() chain has to live directly in the
     // console.error() argument list itself.
     console.error('[agent proxy] error:', String(e && e.message).replace(/[\r\n]+/g, ' '));
+    _agentReady = false;
+    // Kick the sidecar back up immediately if the upstream socket broke.
+    // This covers cases where the process died after initial readiness.
+    _startAgentService();
     if (!res.headersSent)
       res.status(502).json({ error: 'Agent service unavailable' });
   });
@@ -3815,9 +4066,36 @@ app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
 // ─── Start server ─────────────────────────────────────────────────────────────
 // Vendor libraries must be pre-downloaded by running: node scripts/vendor-libs.js
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Graph Explorer running on http://localhost:${PORT}`);
-  _startAgentService();
+
+// Kill any stale process holding the port before binding (handles unclean restarts / debugger sessions).
+_killPortProcess(PORT, () => {
+  setTimeout(() => {
+    app.listen(PORT, () => {
+      console.log(`Graph Explorer running on http://localhost:${PORT}`);
+      if (AGENT_AUTOSTART) {
+        _startAgentService();
+      } else {
+        console.log(`[agent] autostart disabled; expecting external agent on 127.0.0.1:${AGENT_PORT}`);
+        // In external-agent mode, mark ready once /health responds.
+        let attempts = 0;
+        const poll = setInterval(() => {
+          attempts++;
+          http.get(`http://127.0.0.1:${AGENT_PORT}/health`, (r) => {
+            if (r.statusCode === 200) {
+              clearInterval(poll);
+              _agentReady = true;
+              console.log(`[agent] external agent detected on port ${AGENT_PORT}`);
+              setTimeout(async () => {
+                _pushSchemaToAgent({ labels: [], relTypes: [], propKeys: [] });
+                if (!_schemaServerCache) await _fetchSchemaFromNeo4j().catch(() => null);
+              }, 500);
+            }
+          }).on('error', () => {});
+          if (attempts > 120) clearInterval(poll);
+        }, 500);
+      }
+    });
+  }, 500);  // brief pause after kill
 });
 
 process.on('exit',    () => { if (_agentProc) _agentProc.kill(); });
@@ -4324,6 +4602,18 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
   if (!sourceNode || !targetNode)
     return res.status(400).json({ error: 'Source (→) and target (←) nodes are required.' });
 
+  // Curation writes are for one relation at a time, so RelationID must resolve
+  // to exactly one numeric id even if callers pass legacy shapes such as
+  // ["123"] or "123,456".
+  const normalizedRelIds = _normalizeRelationIdInputs(relationId);
+  if (normalizedRelIds.length !== 1) {
+    return res.status(400).json({
+      error: 'relationId must resolve to exactly one numeric RelationID'
+    });
+  }
+  const canonicalRelationId = normalizedRelIds[0];
+  const canonicalRelationIdBigInt = BigInt(canonicalRelationId);
+
   // Validate identifiers used in Cypher interpolation
   const safeId = s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
   if (!safeId(relationType))       return res.status(400).json({ error: `Unsafe relation type: "${relationType}"` });
@@ -4361,7 +4651,7 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
     `;
     const result = await session.run(cypher, {
       srcId: sourceNode.nodeId, tgtId: targetNode.nodeId,
-      relId: relationId, username, relProps
+      relId: canonicalRelationId, username, relProps
     });
 
     if (!result.records.length)
@@ -4414,13 +4704,13 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
             if (ref.pmid) {
               const dupCheck = await client.query(
                 `SELECT 1 FROM ${req.pg.schema}.reference WHERE id = $1 AND pmid = $2 LIMIT 1`,
-                [BigInt(relationId), String(ref.pmid)]
+                [canonicalRelationIdBigInt, String(ref.pmid)]
               );
               if (dupCheck.rowCount > 0) continue; // already in DB — skip
             }
 
             const allCols = ['id', ...cols];
-            const vals    = [BigInt(relationId), ...cols.map(k => ref[k])];
+            const vals    = [canonicalRelationIdBigInt, ...cols.map(k => ref[k])];
             const ph      = vals.map((_, i) => `$${i + 1}`).join(', ');
             await client.query(
               `INSERT INTO ${req.pg.schema}.reference (${allCols.map(c => `"${c}"`).join(', ')})
@@ -4440,7 +4730,7 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
     res.json({
       success: true,
       elementId:             rec.get('eid'),
-      relationId,
+      relationId:            canonicalRelationId,
       relationType,
       sourceNodeInternalId:  rec.get('aId').toString(),
       targetNodeInternalId:  rec.get('bId').toString(),
