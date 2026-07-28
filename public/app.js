@@ -3429,6 +3429,160 @@ function mergeGraphData(newData) {
   return { addedNodes: addedNodes, addedEdges: addedEdges };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  QUICK NODE SEARCH (menu bar, top-right)
+//  Finds nodes by exact Name or Alias match (case-insensitive), independent
+//  of whatever pathway happens to be loaded — same query shape as
+//  Cypher.match_node_by_names() in the Python ElsevierAPI. Accepts a single
+//  name or a semicolon-separated list; matches are merged straight into the
+//  current graph (there's nothing to pick between — it's "add these exact
+//  nodes", not a candidate list like the Connectivity Report).
+// ═══════════════════════════════════════════════════════════════════════════════
+var _qnsSuggestions      = [];
+var _qnsSelectedIdx      = -1;
+var _qnsSuggestDebounce  = null;
+
+// Suggestions apply to whatever the user is typing AFTER the last ';' —
+// everything before that is already a finished, separate search term.
+function _qnsCurrentSegment(input) {
+  var val = input.value;
+  var lastSemi = val.lastIndexOf(';');
+  return val.substring(lastSemi + 1).trim();
+}
+
+function _qnsOnInput(input) {
+  if (_qnsSuggestDebounce) clearTimeout(_qnsSuggestDebounce);
+  var term = _qnsCurrentSegment(input);
+  if (term.length < 2) { _qnsHideSuggestions(); return; }
+  _qnsSuggestDebounce = setTimeout(function() {
+    _qnsSuggestDebounce = null;
+    api('/api/nodes/name-suggestions?q=' + encodeURIComponent(term), null, 'GET')
+      .then(function(names) { _qnsShowSuggestions(names || [], input); })
+      .catch(function() { _qnsHideSuggestions(); });
+  }, 250);
+}
+
+function _qnsShowSuggestions(names, input) {
+  var box = document.getElementById('qns-autocomplete');
+  if (!box) return;
+  _qnsSuggestions = names;
+  _qnsSelectedIdx = -1;
+  if (!names.length) { _qnsHideSuggestions(); return; }
+  box.innerHTML = '';
+  names.forEach(function(name, i) {
+    var row = document.createElement('div');
+    row.textContent = name;
+    row.title = name;  // full text on hover — row itself truncates long names (e.g. peptide sequences) with an ellipsis
+    row.style.cssText = 'padding:5px 10px;cursor:pointer;color:#c4cbe0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+    row.dataset.idx = i;
+    // mousedown (not click) fires before the input's blur, so the
+    // suggestion can still be applied to it.
+    row.addEventListener('mousedown', function(e) {
+      e.preventDefault();
+      _qnsAcceptSuggestion(input, name);
+    });
+    row.addEventListener('mouseover', function() { _qnsSetIdx(i, box); });
+    box.appendChild(row);
+  });
+  box.style.display = 'block';
+}
+
+function _qnsSetIdx(idx, box) {
+  if (!box) box = document.getElementById('qns-autocomplete');
+  if (!box) return;
+  _qnsSelectedIdx = idx;
+  Array.from(box.children).forEach(function(row, i) {
+    row.style.background = (i === idx) ? '#2a3050' : 'transparent';
+  });
+}
+
+function _qnsHideSuggestions() {
+  var box = document.getElementById('qns-autocomplete');
+  if (box) box.style.display = 'none';
+  _qnsSuggestions = [];
+  _qnsSelectedIdx = -1;
+}
+
+function _qnsAcceptSuggestion(input, name) {
+  var val = input.value;
+  var lastSemi = val.lastIndexOf(';');
+  var prefix = lastSemi >= 0 ? val.substring(0, lastSemi + 1) + ' ' : '';
+  input.value = prefix + name;
+  _qnsHideSuggestions();
+  input.focus();
+}
+
+function _qnsHandleKeydown(e) {
+  var box = document.getElementById('qns-autocomplete');
+  var hasSuggestions = box && box.style.display !== 'none' && _qnsSuggestions.length;
+  if (hasSuggestions) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); _qnsSetIdx(Math.min(_qnsSelectedIdx + 1, _qnsSuggestions.length - 1), box); return; }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); _qnsSetIdx(Math.max(_qnsSelectedIdx - 1, 0), box); return; }
+    if (e.key === 'Tab' || (e.key === 'Enter' && _qnsSelectedIdx >= 0)) {
+      e.preventDefault();
+      _qnsAcceptSuggestion(e.target, _qnsSuggestions[_qnsSelectedIdx >= 0 ? _qnsSelectedIdx : 0]);
+      return;
+    }
+    if (e.key === 'Escape') { _qnsHideSuggestions(); return; }
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    _qnsHideSuggestions();
+    quickNodeSearch();
+  }
+}
+
+async function quickNodeSearch() {
+  var input = document.getElementById('qns-input');
+  if (!input) return;
+  var names = input.value.split(';').map(function(s) { return s.trim(); }).filter(Boolean);
+  if (!names.length) { alert('Type a node name (or semicolon-separated list of names) first.'); return; }
+  _qnsHideSuggestions();
+
+  setProgressMsg('⏳ Searching…');
+  try {
+    var result = await api('/api/nodes/search-by-name', { names: names });
+    setProgressMsg(null);
+    if (result.error) { alert('Search error: ' + result.error); return; }
+
+    var nodes = result.nodes || [];
+    if (!nodes.length) {
+      alert('No nodes found matching (exact or substring): ' + names.join(', '));
+      return;
+    }
+
+    var mergeResult = mergeGraphData({ nodes: nodes, edges: [] });
+    updateStats();
+
+    var msg = 'Quick search: added ' + mergeResult.addedNodes + ' node' + (mergeResult.addedNodes === 1 ? '' : 's') + '.';
+    if (result.matchType === 'contains') {
+      // Fallback substring search — every returned node just CONTAINS one of
+      // the search terms somewhere in Name/Alias, so comparing back against
+      // the typed terms for an exact "not found" list wouldn't mean much;
+      // just make clear these are partial matches, not exact ones.
+      msg += ' (No exact match — showing nodes containing your search term(s).)';
+    } else {
+      // Exact match — report any requested names that matched nothing,
+      // without blocking the ones that DID match from being added.
+      var foundLower = new Set();
+      nodes.forEach(function(n) {
+        var p = n.properties || {};
+        if (p.Name) foundLower.add(String(p.Name).toLowerCase());
+        (Array.isArray(p.Alias) ? p.Alias : (p.Alias ? [p.Alias] : [])).forEach(function(a) {
+          foundLower.add(String(a).toLowerCase());
+        });
+      });
+      var notFound = names.filter(function(n) { return !foundLower.has(n.toLowerCase()); });
+      if (notFound.length) msg += ' Not found: ' + notFound.join(', ');
+    }
+    setProgressMsg(msg);
+    setTimeout(function() { setProgressMsg(null); }, 5000);
+  } catch (err) {
+    setProgressMsg(null);
+    alert('Search failed: ' + (err.message || err));
+  }
+}
+
 
 function renderGraph(data, savedPositions) {
   graphData = data;
