@@ -8,6 +8,7 @@ var _agentPanelOpen    = false;
 var _agentChatHistory  = [];   // [{role,content}]
 var _agentLastCypher   = null;
 var _agentLibraryFiles = [];
+var _agentCurrentMode  = 'text2cypher';  // 'text2cypher' or 'summarize'
 var _agentConfig       = {
   model_name:  '',
   temperature: 0.2,
@@ -18,9 +19,20 @@ var _agentWorkflow     = [];
 var _agentStatusTimer  = null;
 
 // ── Panel open/close ─────────────────────────────────────────────────────────
+function openAgenticPanel(mode) {
+  // Called from menu (e.g., onclick="openAgenticPanel('summarize')")
+  // Switch mode and open the panel
+  console.log('[openAgenticPanel] Called with mode:', mode);
+  if (mode === 'summarize' || mode === 'text2cypher') {
+    switchAgentMode(mode);
+  }
+  toggleAgenticPanel();
+}
+
 function toggleAgenticPanel() {
   var panel = document.getElementById('agentic-panel');
   _agentPanelOpen = !_agentPanelOpen;
+  console.log('[toggleAgenticPanel] Panel now:', _agentPanelOpen ? 'OPEN' : 'CLOSED');
   panel.style.display = _agentPanelOpen ? 'flex' : 'none';
   if (_agentPanelOpen) {
     _agentPollStatus();
@@ -52,7 +64,11 @@ function agentInputKeydown(e) {
 async function agentSend() {
   var input = document.getElementById('agent-input');
   var msg = (input.value || '').trim();
-  if (!msg) return;
+  console.log('[agentSend] Starting send, current mode:', _agentCurrentMode);
+  if (!msg) {
+    console.log('[agentSend] Empty message, aborting');
+    return;
+  }
   input.value = '';
 
   _agentAppendMessage('user', msg);
@@ -64,12 +80,89 @@ async function agentSend() {
   if (thinking) thinking.style.display = 'inline';
 
   try {
-    var result = await api('/api/agent/chat', {
-      message: msg,
-      history: _agentChatHistory.slice(0, -1),
-      llm:     _agentConfig,
-    });
+    var result;
+    if (_agentCurrentMode === 'summarize') {
+      console.log('[agentSend] SUMMARIZE mode - building graph from Cytoscape');
+      // Summarize mode: include current graph
+      var currentGraph = _buildCurrentGraphFromCy();
+      console.log('[agentSend] Built graph:', { nodes: currentGraph.nodes.length, edges: currentGraph.edges.length });
+
+      // ── Debug: collect first 5 inline refs across all edges ──────────────
+      var allInlineRefs = [];
+      currentGraph.edges.forEach(function(e) {
+        if (Array.isArray(e.references)) {
+          e.references.forEach(function(r) {
+            // Inject the edge's relationId into each ref so Python can echo it back
+            var enriched = Object.assign({}, r, { relationId: e.relationId, relationIds: e.relationIds });
+            allInlineRefs.push(enriched);
+          });
+        }
+      });
+      var edgesWithRefs = currentGraph.edges.filter(function(e) { return Array.isArray(e.references) && e.references.length > 0; }).length;
+      var debugSampleRefs = allInlineRefs.slice(0, 5);
+      console.log('[agentSend] Collected refs:', { total: allInlineRefs.length, edgesWithRefs: edgesWithRefs, sampleCount: debugSampleRefs.length });
+      console.log('[agentSend] Sample refs (first 5):', debugSampleRefs);
+
+      // Dump first raw graphData edge to diagnose field names
+      var rawEdgeDump = '';
+      if (graphData && graphData.edges && graphData.edges.length > 0) {
+        var re0 = graphData.edges[0];
+        var p0 = re0.properties || {};
+        rawEdgeDump = '\nRaw graphData.edges[0] keys: ' + Object.keys(re0).join(', ') +
+                      '\n  .properties keys: ' + Object.keys(p0).join(', ') +
+                      '\n  RelationID=' + p0.RelationID + ' RelationIDs=' + JSON.stringify(p0.RelationIDs) +
+                      '\n  has inline refs: ' + (Array.isArray(p0.references) ? p0.references.length : 'no') +
+                      '\nBuilt edge[0] keys: ' + (currentGraph.edges[0] ? Object.keys(currentGraph.edges[0]).join(', ') : 'none') +
+                      '\n  relationId=' + (currentGraph.edges[0] && currentGraph.edges[0].relationId) +
+                      ' references.length=' + (currentGraph.edges[0] && Array.isArray(currentGraph.edges[0].references) ? currentGraph.edges[0].references.length : 0);
+      }
+
+      _agentAppendMessage('assistant',
+        '[DEBUG] Graph snapshot: ' + currentGraph.nodes.length + ' nodes, ' +
+        currentGraph.edges.length + ' edges. ' +
+        edgesWithRefs + ' edges have inline references (' + allInlineRefs.length + ' total). ' +
+        'Sending first ' + debugSampleRefs.length + ' refs separately as debug_inline_refs.' +
+        rawEdgeDump
+      );
+      // ─────────────────────────────────────────────────────────────────────
+
+      var relationIds = _extractRelationIds(currentGraph.edges);
+      console.log('[agentSend] Extracted relation_ids:', relationIds);
+
+      var payload = {
+        message: msg,
+        history: _agentChatHistory.slice(0, -1),
+        llm:     _agentConfig,
+        current_graph: currentGraph,
+        relation_ids: relationIds,
+        debug_inline_refs: debugSampleRefs,
+      };
+      console.log('[agentSend] Full payload being sent to /api/agent/summarize-chat:');
+      console.log('  - message:', payload.message);
+      console.log('  - history length:', payload.history.length);
+      console.log('  - llm config:', payload.llm);
+      console.log('  - current_graph nodes:', payload.current_graph.nodes.length);
+      console.log('  - current_graph edges:', payload.current_graph.edges.length);
+      console.log('  - relation_ids:', payload.relation_ids);
+      console.log('  - debug_inline_refs:', payload.debug_inline_refs);
+      
+      result = await api('/api/agent/summarize-chat', payload);
+      console.log('[agentSend] Response received from /api/agent/summarize-chat:', result);
+    } else {
+      // Text2Cypher mode (default)
+      console.log('[agentSend] TEXT2CYPHER mode');
+      var payload = {
+        message: msg,
+        history: _agentChatHistory.slice(0, -1),
+        llm:     _agentConfig,
+      };
+      console.log('[agentSend] Payload sent to /api/agent/chat:', payload);
+      result = await api('/api/agent/chat', payload);
+      console.log('[agentSend] Response received from /api/agent/chat:', result);
+    }
+    
     var reply = result.reply || '(no reply)';
+    console.log('[agentSend] Appending assistant reply:', reply.slice(0, 100) + '...');
     _agentChatHistory.push({ role: 'assistant', content: reply });
     _agentAppendMessage('assistant', reply, result.generated_cypher, result.cypher_results);
 
@@ -81,6 +174,7 @@ async function agentSend() {
       if (pre) pre.textContent = result.generated_cypher;
     }
   } catch(err) {
+    console.error('[agentSend] ERROR:', err);
     _agentAppendMessage('error', 'Error: ' + (err.message || String(err)));
   } finally {
     sendBtn.disabled = false;
@@ -133,6 +227,148 @@ function agentClearChat() {
   if (bar) bar.style.display = 'none';
   var container = document.getElementById('agent-chat-messages');
   if (container) container.innerHTML = '<div style="text-align:center;color:#5a6080;font-size:12px;padding:20px 0">Ask anything about your graph &mdash; I can translate natural language to Cypher, run queries, and chain multi-step workflows.</div>';
+}
+
+// ── Agent mode switching ─────────────────────────────────────────────────────
+function switchAgentMode(mode) {
+  if (!mode || (mode !== 'text2cypher' && mode !== 'summarize')) {
+    console.log('[switchAgentMode] Invalid mode:', mode);
+    return;
+  }
+  
+  console.log('[switchAgentMode] Switching to mode:', mode);
+  _agentCurrentMode = mode;
+  agentClearChat();
+  
+  // Update tab highlighting
+  var tabs = document.querySelectorAll('.agent-mode-tab');
+  tabs.forEach(function(tab) {
+    tab.classList.toggle('active', tab.getAttribute('data-mode') === mode);
+  });
+  
+  // Update message placeholder based on mode
+  var input = document.getElementById('agent-input');
+  if (input) {
+    if (mode === 'summarize') {
+      input.placeholder = 'Ask a question about the current graph and its references…';
+    } else {
+      input.placeholder = 'Ask anything about your graph…';
+    }
+  }
+}
+
+// ── Graph building for agent ─────────────────────────────────────────────────
+
+// Collect all unique integer relation IDs from an array of built edges.
+function _extractRelationIds(edges) {
+  var seen = {};
+  var ids = [];
+  (edges || []).forEach(function(e) {
+    var candidates = [];
+    if (e.relationId != null && e.relationId !== '') candidates.push(e.relationId);
+    if (Array.isArray(e.relationIds)) e.relationIds.forEach(function(r) { candidates.push(r); });
+    candidates.forEach(function(r) {
+      var n = parseInt(String(r), 10);
+      if (!isNaN(n) && !seen[n]) { seen[n] = true; ids.push(n); }
+    });
+  });
+  console.log('[_extractRelationIds] Extracted IDs from', edges.length, 'edges:', ids);
+  return ids;
+}
+
+function _buildCurrentGraphFromCy() {
+  // Extract current Cytoscape data and merge with graphData references.
+  // Field names must match what summarize_agent.py expects:
+  //   Nodes: urn, aliases, label, type
+  //   Edges: source/target (names), sourceURN/targetURN, sourceType/targetType,
+  //          sourceNodeId/targetNodeId, type, effect, mechanism,
+  //          relationId, relationIds, references (array)
+  console.log('[_buildCurrentGraphFromCy] Starting graph build...');
+  if (!window.cy) {
+    console.log('[_buildCurrentGraphFromCy] No Cytoscape instance, returning empty graph');
+    return { nodes: [], edges: [] };
+  }
+
+  // Index graphData nodes by id for fast URN / alias lookup
+  var gdNodeById = {};
+  if (graphData && Array.isArray(graphData.nodes)) {
+    graphData.nodes.forEach(function(n) { if (n.id != null) gdNodeById[String(n.id)] = n; });
+    console.log('[_buildCurrentGraphFromCy] Indexed', graphData.nodes.length, 'nodes from graphData');
+  }
+
+  // Index graphData edges by id for fast reference lookup
+  var gdEdgeById = {};
+  if (graphData && Array.isArray(graphData.edges)) {
+    graphData.edges.forEach(function(e) { if (e.id != null) gdEdgeById[String(e.id)] = e; });
+    console.log('[_buildCurrentGraphFromCy] Indexed', graphData.edges.length, 'edges from graphData');
+  }
+
+  // Build nodes array
+  var nodes = [];
+  cy.nodes().forEach(function(cyNode) {
+    var d = cyNode.data();
+    // Cytoscape node data has all n.properties spread in (see _buildCyNodeData)
+    // so URN, Alias, Name etc. are directly on `d`.
+    var urn = d.URN || d.urn || '';
+    var gdn = gdNodeById[String(d.id)] || {};
+    var gdProps = (gdn.properties) || {};
+    nodes.push({
+      id:      d.id,
+      urn:     urn,
+      label:   d.label || d.Name || d.id,
+      type:    d.nodeType || d.NodeType || '',
+      aliases: d.Alias ? (Array.isArray(d.Alias) ? d.Alias : String(d.Alias).split(',')) : (gdProps.Alias ? String(gdProps.Alias).split(',') : [])
+    });
+  });
+  console.log('[_buildCurrentGraphFromCy] Built', nodes.length, 'nodes');
+
+  // Build edges array
+  var edges = [];
+  cy.edges().forEach(function(cyEdge) {
+    var d = cyEdge.data();
+    // Cytoscape edge data fields come from _buildCyEdgeData:
+    //   relId (string), relIds (array|null), relType, effect, mechanism
+    //   source/target are Cytoscape node IDs — we need names from those nodes
+    var srcNode = cy.getElementById(d.source);
+    var tgtNode = cy.getElementById(d.target);
+    var srcData = srcNode.length ? srcNode.data() : {};
+    var tgtData = tgtNode.length ? tgtNode.data() : {};
+
+    // Get raw graphData edge for properties.references and full property access
+    var gde = gdEdgeById[String(d.id)] || {};
+    var gdeProps = gde.properties || {};
+
+    // Build relation IDs — Python expects camelCase: relationId / relationIds
+    var relId = d.relId || (gdeProps.RelationID != null ? String(gdeProps.RelationID) : null);
+    var relIds = d.relIds || (Array.isArray(gdeProps.RelationIDs) ? gdeProps.RelationIDs : null);
+
+    // References: only present for RNEF/file-loaded edges (properties.references)
+    var refs = (gdeProps.references && Array.isArray(gdeProps.references)) ? gdeProps.references : [];
+
+    edges.push({
+      id:           d.id,
+      source:       srcData.Name || srcData.label || d.source,
+      target:       tgtData.Name || tgtData.label || d.target,
+      sourceURN:    srcData.URN  || srcData.urn  || '',
+      targetURN:    tgtData.URN  || tgtData.urn  || '',
+      sourceType:   srcData.nodeType || srcData.NodeType || '',
+      targetType:   tgtData.nodeType || tgtData.NodeType || '',
+      sourceNodeId: d.source,
+      targetNodeId: d.target,
+      type:         d.relType || gde.type || '',
+      effect:       d.effect  || gdeProps.Effect || gdeProps.effect || '',
+      mechanism:    d.mechanism || gdeProps.Mechanism || gdeProps.mechanism || '',
+      relationId:   relId,
+      relationIds:  relIds,
+      references:   refs
+    });
+  });
+  console.log('[_buildCurrentGraphFromCy] Built', edges.length, 'edges');
+  if (edges.length > 0) {
+    console.log('[_buildCurrentGraphFromCy] First edge details:', edges[0]);
+  }
+
+  return { nodes: nodes, edges: edges };
 }
 
 // ── Library browser ───────────────────────────────────────────────────────────
