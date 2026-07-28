@@ -15,19 +15,35 @@
   },
   "jwtSecret": "GENERATE_A_LONG_RANDOM_SECRET_HERE",
   "llm": {
-    "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-    "apikey": "YOUR_LLM_API_KEY",
-    "username": "",
-    "password": "",
-    "model_name": "gemini-2.5-flash",
     "temperature": 0.2,
     "top_p": 0.9,
     "json_mode": false,
-    "providers": [
+    "default_providers": [
       {
         "name": "Google Gemini",
         "url": "https://generativelanguage.googleapis.com/v1beta/openai/"
+      },
+      {
+        "name": "OpenAI GPT",
+        "url": "https://api.openai.com/v1"
+      },
+      {
+        "name": "Anthropic Claude",
+        "url": "https://api.anthropic.com"
+      },
+      {
+        "name": "MetaAI Llama (Replicate)",
+        "url": "https://api.replicate.com"
+      },
+      {
+        "name": "MetaAI Llama (Together AI)",
+        "url": "https://api.together.xyz"
+      },
+      {
+        "name": "Groq LLaMA",
+        "url": "https://api.groq.com/openai/v1"
       }
-    ]
+    ],
+    "custom_providers": []
   }
 }
