@@ -7711,6 +7711,7 @@ function openRnefPathway(data, filePath, sourceFileAbs) {
   currentPathwayUrn = data.urn || null;
   renderGraph(data.graphData, data.positions || null);
   updateCurrentTabName(currentSubgraphName || 'Pathway');
+  appendPathwayHistory(currentSubgraphName || 'Pathway', filePath, sourceFileAbs);
 
   // Pre-populate refsCache with inline references
   (data.graphData.edges || []).forEach(function(e) {
@@ -13627,6 +13628,178 @@ function _pathwayRelativePath(row) {
   var subfolder = (row.subfolder || '').replace(/\\/g, '/');
   return subfolder ? (subfolder + '/' + filename) : filename;
 }
+
+// ─── Pathway "Browse history" (Pathways menu → Browse history) ──────────────
+// Tracks every pathway opened/examined (via Text/Entity/Combined Search,
+// Browse…, Anatomy/Alphabetical Index, or reopened from history itself) so
+// the user can come back to a pathway of interest later — persisted
+// server-side per-user, the same way Edit → Cypher History persists queries.
+function appendPathwayHistory(name, filePath, sourceFile) {
+  // Fire-and-forget — never blocks the UI. Pathways loaded from a local file
+  // (File → Load, drag/drop) have no sourceFile — still logged so the name/
+  // date show up in the list, but they won't offer a "Reopen" action since
+  // there's no server-side path to re-fetch them from.
+  api('/api/pathways/history', { name: name || 'Pathway', filePath: filePath || '', sourceFile: sourceFile || '' }, 'POST').catch(function() {});
+}
+
+var _phAllRows = [];
+
+async function openPathwayHistory() {
+  var modal  = document.getElementById('pathway-history-modal');
+  var status = document.getElementById('pathway-history-status');
+  document.getElementById('pathway-history-tbody').innerHTML = '';
+  document.getElementById('ph-search-input').value = '';
+  // Restore checkbox state from localStorage, default to CHECKED (unlike
+  // Cypher History's dedupe, which defaults unchecked) when no preference
+  // has been saved yet.
+  var savedDedupe = localStorage.getItem('ph-dedupe-pref');
+  document.getElementById('ph-dedupe').checked = (savedDedupe === null) ? true : (savedDedupe === 'true');
+  status.textContent = 'Loading…';
+  modal.style.display = 'flex';
+  try {
+    var data = await api('/api/pathways/history');
+    _phAllRows = (data.rows || []).map(function(r) {
+      var t = new Date(r.date).getTime();
+      return { date: r.date, name: r.name, filePath: r.filePath, sourceFile: r.sourceFile, _time: isNaN(t) ? 0 : t };
+    });
+    _phRender();
+  } catch(e) {
+    status.textContent = 'Error loading history: ' + e.message;
+  }
+}
+
+function _phCloseModal() {
+  document.getElementById('pathway-history-modal').style.display = 'none';
+}
+
+function _phEscHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Same escape-both-sides-first approach as _chHighlight() — highlighting can
+// never re-inject raw HTML from stored pathway names/paths.
+function _phHighlight(text, term) {
+  var escaped = _phEscHtml(text);
+  if (!term) return escaped;
+  var escTerm = _phEscHtml(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!escTerm) return escaped;
+  var re = new RegExp('(' + escTerm + ')', 'ig');
+  return escaped.replace(re, '<mark class="ch-hit">$1</mark>');
+}
+
+function _phRender() {
+  var status = document.getElementById('pathway-history-status');
+  var tbody  = document.getElementById('pathway-history-tbody');
+  var search = (document.getElementById('ph-search-input').value || '').trim().toLowerCase();
+  var dedupe = document.getElementById('ph-dedupe').checked;
+
+  // Save checkbox preference to localStorage
+  localStorage.setItem('ph-dedupe-pref', dedupe ? 'true' : 'false');
+
+  var rows  = _phAllRows;
+  var total = rows.length;
+
+  if (search) {
+    rows = rows.filter(function(r) {
+      return (r.name || '').toLowerCase().indexOf(search) !== -1 ||
+             (r.filePath || '').toLowerCase().indexOf(search) !== -1;
+    });
+  }
+
+  // Dedupe: keep only the most recent open of each distinct pathway —
+  // identified by sourceFile (unique within a user's collection), falling
+  // back to name for pathways loaded from a local file (no sourceFile).
+  if (dedupe) {
+    var latestByKey = {};
+    rows.forEach(function(r) {
+      var key = r.sourceFile || r.name;
+      var existing = latestByKey[key];
+      if (!existing || r._time > existing._time) latestByKey[key] = r;
+    });
+    rows = Object.keys(latestByKey).map(function(k) { return latestByKey[k]; });
+  }
+
+  var shown = rows.length;
+
+  // Newest first, always — mirrors the default (and most useful) sort for
+  // Cypher History without needing its own sortable-column UI.
+  rows = rows.slice().sort(function(a, b) { return b._time - a._time; });
+
+  status.textContent = total === 0
+    ? 'No pathways opened yet.'
+    : 'Showing ' + shown.toLocaleString() + ' of ' + total.toLocaleString() + ' pathway' + (total === 1 ? '' : 's') +
+      (shown === 0 ? ' — no matches.' : '');
+
+  tbody.innerHTML = '';
+  rows.forEach(function(r) {
+    var tr = document.createElement('tr');
+    var dt = '';
+    try { dt = new Date(r.date).toLocaleString(); } catch(e) { dt = r.date; }
+
+    var tdDate = document.createElement('td');
+    tdDate.textContent = dt;
+    tdDate.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;color:#a0aec0;font-size:12px;vertical-align:top';
+
+    var tdName = document.createElement('td');
+    tdName.innerHTML = _phHighlight(r.name, search);
+    tdName.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;font-size:12px;color:#e2e8f0;vertical-align:top' + (r.sourceFile ? ';cursor:pointer' : '');
+    if (r.sourceFile) {
+      tdName.title = 'Click to reopen this pathway';
+      tdName.addEventListener('click', function() { _phReopen(r); });
+    }
+
+    var tdPath = document.createElement('td');
+    tdPath.innerHTML = _phHighlight(r.filePath || '', search);
+    tdPath.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;color:#7a8099;font-size:11px;word-break:break-all;vertical-align:top';
+
+    var tdOpen = document.createElement('td');
+    tdOpen.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:center;vertical-align:top';
+    if (r.sourceFile) {
+      var btn = document.createElement('button');
+      btn.className = 'btn-ghost';
+      btn.style.cssText = 'font-size:11px;padding:3px 10px';
+      btn.textContent = 'Reopen';
+      btn.addEventListener('click', function() { _phReopen(r); });
+      tdOpen.appendChild(btn);
+    } else {
+      tdOpen.innerHTML = '<span style="color:#4a5070;font-size:11px" title="Loaded from a local file, not your indexed collection — it can\'t be reopened automatically">—</span>';
+    }
+
+    tr.appendChild(tdDate);
+    tr.appendChild(tdName);
+    tr.appendChild(tdPath);
+    tr.appendChild(tdOpen);
+    tbody.appendChild(tr);
+  });
+}
+
+// Reopen a pathway from its history entry — same fetch + size-guard as
+// openPathwaySearchResult() (a pathway with >1000 edges goes to the Sankey/
+// Excel-only large-result modal instead of straight into the graph viewer).
+async function _phReopen(r) {
+  if (!r.sourceFile) return;
+  try {
+    var result = await api('/api/pathways/open', { sourceFile: r.sourceFile, pathwayName: r.name }, 'POST');
+    if (!result.data || !result.data.graphData) { alert('Invalid pathway data returned for ' + r.name); return; }
+
+    var edgeCount = result.data.graphData.edges.length;
+    if (edgeCount > 1000) {
+      _phCloseModal();
+      _showLargeResultModal(
+        { type: 'pathway', data: result.data, name: result.name || r.name, filePath: r.filePath, sourceFile: r.sourceFile },
+        'This pathway has ' + edgeCount.toLocaleString() + ' edges.'
+      );
+      return;
+    }
+
+    _phCloseModal();
+    createNewTab(result.name || r.name);
+    openRnefPathway(result.data, r.filePath, r.sourceFile);
+  } catch (err) {
+    alert('Could not reopen pathway: ' + err.message);
+  }
+}
+
 async function openPathwaySearchResult(row, overlapUrns) {
   try {
     var result = await api('/api/pathways/open', { sourceFile: row.sourceFile, pathwayName: row.name }, 'POST');
