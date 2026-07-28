@@ -177,16 +177,32 @@ def _safe_exc_str(exc: BaseException, max_len: int = 300) -> str:
     HTTP response, because driver/library exceptions can incidentally embed a
     password, API key, or full connection string. This is the single place
     that sanitizes an exception before it's shown to a user: redact anything
-    that looks like embedded credentials, cap the length so a huge driver
-    stack-trace-like message never reaches the client, and drop file paths /
-    internal frame info that str(exc) alone won't include anyway. Every place
-    in this file that surfaces an exception to a chat reply or an API response
+    that looks like embedded credentials and cap the length so a huge driver
+    stack-trace-like message never reaches the client. Every place in this
+    file that surfaces an exception to a chat reply or an API response
     (tool_msg text, /ping-llm, /list-models, /workflow/execute, /batch-write)
     should go through this instead of str(exc)/f"{exc}" directly — the goal is
     to keep the message genuinely useful for debugging (e.g. a Neo4j syntax
     error, a timeout notice) without the credential-leak risk of the raw
-    exception text."""
-    return f"{type(exc).__name__}: {_sanitize_public_text(str(exc), max_len)}"
+    exception text.
+
+    Prefixed with "<line>@<file>: " — just the SOURCE FILE'S BASENAME (never
+    the full server-side path) and the line number of the single deepest
+    traceback frame (where the exception actually occurred), not a full
+    stack trace. This intentionally stops short of str(traceback.format_exc())
+    or an absolute path, which would hand a client the server's directory
+    layout and every call frame in between — still information disclosure
+    (OWASP A05), just narrowed to the one detail that actually speeds up
+    debugging a chat-visible error."""
+    where = ""
+    tb = exc.__traceback__
+    if tb is not None:
+        frames = traceback.extract_tb(tb)
+        if frames:
+            last = frames[-1]
+            where = f"{last.lineno}@{os.path.basename(last.filename)}: "
+    return f"{where}{type(exc).__name__}: {_sanitize_public_text(str(exc), max_len)}"
+
 
 def _safe_http_error_str(he, max_len: int = 300) -> str:
     """Render an urllib HTTPError as a short, user-facing string — same
@@ -631,6 +647,8 @@ _state: Dict[str, Any] = {
     "postgres":    {},   # host, port, database, schema, username, password — LEGACY/FALLBACK
     "llm":         {},   # apikey, url, model_name, temperature, top_p, json_mode
     "schema_text": "",   # human-readable schema for LLM system prompt
+    "schema_labels":   [],  # Neo4j node labels (structured list, alongside schema_text above)
+    "schema_rel_types": [], # Neo4j relationship types (structured list, alongside schema_text above)
 }
 
 # ── Per-user Neo4j/Postgres credentials ────────────────────────────────────────
@@ -696,6 +714,8 @@ def _resolve_llm_cfg(username: str) -> Dict[str, Any]:
 class SchemaPayload(BaseModel):
     neo4j: Dict[str, Any]
     schema_text: str
+    labels: List[str] = []      # Neo4j node labels, structured (mirrors schema_text)
+    rel_types: List[str] = []   # Neo4j relationship types, structured (mirrors schema_text)
     llm: Optional[Dict[str, Any]] = None
     postgres: Optional[Dict[str, Any]] = None
 
@@ -3094,6 +3114,8 @@ def ping_llm(req: PingRequest = None):
 def update_schema(payload: SchemaPayload):
     _state["neo4j"]       = payload.neo4j
     _state["schema_text"] = payload.schema_text
+    _state["schema_labels"]    = payload.labels
+    _state["schema_rel_types"] = payload.rel_types
     if payload.llm:
         _state["llm"].update({k: v for k, v in payload.llm.items() if v is not None})
     if payload.postgres:
@@ -3765,6 +3787,8 @@ try:
             "resolve_pg_cfg": _resolve_pg_cfg,
             "current_username": _current_username,
             "log": log,
+            "neo4j_node_types": lambda: list(_state.get("schema_labels") or []),
+            "neo4j_relation_types": lambda: list(_state.get("schema_rel_types") or []),
         },
     )
     log.info("Summarize routes registered successfully")
