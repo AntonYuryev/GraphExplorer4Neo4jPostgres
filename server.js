@@ -2906,6 +2906,101 @@ app.post('/api/nodes/connectivity', dbLimiter, authMiddleware, async (req, res) 
   }
 });
 
+// ─── Quick Node Search — exact Name/Alias lookup (menu bar, top-right) ────────
+// POST /api/nodes/search-by-name
+// Body: { names: [...] }  — one or more node names/aliases, matched
+// case-insensitively (same query shape as Cypher.match_node_by_names() in
+// the Python ElsevierAPI). Not scoped to the current pathway — this can find
+// ANY node in the database. Returns plain nodes in the same shape
+// /api/graph/explore-relations-report uses, so the client can feed the
+// result straight into mergeGraphData().
+app.post('/api/nodes/search-by-name', dbLimiter, authMiddleware, async (req, res) => {
+  const { names } = req.body || {};
+  const safeNames = (Array.isArray(names) ? names : [])
+    .map(n => (typeof n === 'string' ? n.trim() : ''))
+    .filter(n => n.length > 0 && n.length < 500)
+    .slice(0, 200); // sane upper bound on one search
+  if (!safeNames.length) return res.json({ nodes: [] });
+
+  const exactCypher = `
+    UNWIND $batch AS row
+    MATCH (n)
+    WHERE toLower(n.Name) = toLower(row)
+       OR toLower(row) IN [x IN coalesce(n.Alias, []) | toLower(x)]
+    RETURN DISTINCT n
+  `;
+
+  // Fallback when the exact match above finds nothing at all — a looser
+  // substring search against the same two properties, e.g. so searching
+  // "cancer" still surfaces "Breast cancer", "Lung cancer", etc. Only runs
+  // when the exact pass is completely empty (not per-unmatched-name) to
+  // keep this a cheap, rare second query rather than the common case.
+  // LIMIT keeps a broad/common substring from returning huge result sets.
+  const containsCypher = `
+    UNWIND $batch AS row
+    MATCH (n)
+    WHERE toLower(n.Name) CONTAINS toLower(row)
+       OR any(alias IN coalesce(n.Alias, []) WHERE toLower(alias) CONTAINS toLower(row))
+    RETURN DISTINCT n
+    LIMIT 200
+  `;
+
+  const nodeToPlain = (n) => ({
+    id: n.identity.toString(),
+    elementId: n.elementId || n.identity.toString(),
+    labels: n.labels,
+    properties: toPlain(n.properties),
+  });
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    const exactResult = await session.run(exactCypher, { batch: safeNames });
+    let nodes = exactResult.records.map(rec => nodeToPlain(rec.get('n')));
+    let matchType = 'exact';
+
+    if (!nodes.length) {
+      const containsResult = await session.run(containsCypher, { batch: safeNames });
+      nodes = containsResult.records.map(rec => nodeToPlain(rec.get('n')));
+      matchType = 'contains';
+    }
+
+    res.json({ nodes, matchType });
+  } catch (err) {
+    console.error('nodes/search-by-name Neo4j error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+// ─── Quick Node Search — typeahead suggestions ────────────────────────────────
+// GET /api/nodes/name-suggestions?q=...
+// Lightweight CONTAINS lookup against Name only (not Alias — keeps this fast
+// enough to run on every keystroke); the actual search above still matches
+// Name OR Alias exactly. Just a list of candidate strings for the dropdown.
+app.get('/api/nodes/name-suggestions', dbLimiter, authMiddleware, async (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  if (!q || q.length > 200) return res.json([]);
+
+  const cypher = `
+    MATCH (n)
+    WHERE toLower(n.Name) CONTAINS toLower($q)
+    RETURN DISTINCT n.Name AS name
+    LIMIT 15
+  `;
+
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    const result = await session.run(cypher, { q });
+    res.json(result.records.map(rec => rec.get('name')).filter(Boolean));
+  } catch (err) {
+    console.error('nodes/name-suggestions Neo4j error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
 // ─── PostgreSQL reference update (curation) ───────────────────────────────────
 app.post('/api/references/update', dbLimiter, authMiddleware, async (req, res) => {
   const { id, msrc } = req.body || {};
