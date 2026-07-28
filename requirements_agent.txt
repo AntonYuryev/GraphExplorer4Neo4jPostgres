@@ -14,6 +14,19 @@ openai>=1.30.0
 # Neo4j Python driver (for Cypher execution inside the agent service)
 neo4j>=5.20.0
 
+# Graph/ResnetGraph runtime dependencies required at import time
+networkx>=3.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+matplotlib>=3.8.0
+plotly>=5.0.0
+colorcet>=3.0.0
+datashader>=0.16.0
+rdfpandas>=1.1.7
+lxml>=4.9.0
+titlecase>=2.4.1
+
 # neo4j-graphrag — official Neo4j GenAI toolkit (Text2Cypher, GraphRAG)
 neo4j-graphrag>=0.6.0
 
@@ -25,3 +38,4 @@ psycopg2-binary>=2.9.9
 
 # Utility
 python-multipart>=0.0.9   # for FastAPI form uploads (library file imports)
+debugpy>=1.8.0            # optional: enables VS Code attach debugging for the spawned agent process
