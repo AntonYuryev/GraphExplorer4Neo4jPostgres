@@ -373,5 +373,15 @@
       "query returned nothing",
       "apoc"
     ]
+  },
+  {
+    "question": "Find nodes by name",
+    "cypher": "WITH $batch AS rows\\n\n              UNWIND rows AS row\\n\n              MATCH ({node})\n              WHERE toLower({letter}.Name) = toLower(row) OR toLower(row) IN [x IN {letter}.Alias | toLower(x)]\n              RETURN {letter}",
+    "notes": "use batch parameter to input a list of names.  Query should be executed in multithread mode with batch size = 10.  Split input list into chunks for multithread retrieval.",
+    "tags": [
+      "search nodes",
+      "find entities",
+      "lookup concepts"
+    ]
   }
 ]
