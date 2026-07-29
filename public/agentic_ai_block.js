@@ -376,8 +376,9 @@ function _agentAppendMessage(role, content, cypher, results) {
 }
 
 // ── Rich rendering for summarize-mode LLM replies ────────────────────────────
-// Renders markdown headings/bold/bullets, makes PMIDs into PubMed links,
-// and wraps graph entity names in clickable spans that select them on the graph.
+// Renders markdown headings/bold/bullets, makes PMIDs into PubMed links and DOIs
+// into doi.org links, and wraps graph entity names in clickable spans that select
+// them on the graph.
 function _renderSummarizeReply(text, container) {
   // Collect node names from current graph for entity linking
   var nodeNames = [];  // [{label, id}]
@@ -390,15 +391,22 @@ function _renderSummarizeReply(text, container) {
     nodeNames.sort(function(a, b) { return b.label.length - a.label.length; });
   }
 
-  var PMID_RE = /PMID[:\s]+(\d{5,8})/gi;
+  // Matches "PMID 12345678", "PMID: 12345678, 23456789, 34567890", "PMIDs 12345678, 23456789", etc.
+  // — the leading PMID/PMIDs keyword is required only once; any comma-separated run of bare
+  // numbers that immediately follows is treated as part of the same citation list.
+  var PMID_RE = /PMIDs?[:\s]+\d{4,9}(?:\s*,\s*\d{4,9})*/gi;
 
-  // Build a regex that matches PMIDs OR any entity name (escaped)
+  // Matches "DOI:10.1016/j.jcpa.2017.10.109" / "DOI 10.1016/j.jcpa.2017.10.109" — DOI suffixes
+  // routinely contain dots, so we only stop at whitespace/comma/bracket/quote characters.
+  var DOI_RE = /DOIs?[:\s]+10\.\d{4,9}\/[^\s,\]\)"']+/gi;
+
+  // Build a regex that matches PMIDs, DOIs, OR any entity name (escaped)
   var entityParts = nodeNames.map(function(n) {
     return n.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   });
   var combinedRE = entityParts.length
-    ? new RegExp('(PMID[:\\s]+\\d{5,8})|(' + entityParts.join('|') + ')', 'gi')
-    : PMID_RE;
+    ? new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')|(' + entityParts.join('|') + ')', 'gi')
+    : new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')', 'gi');
 
   // Map label (lowercase) → node id for click handler
   var labelToId = {};
@@ -415,16 +423,30 @@ function _renderSummarizeReply(text, container) {
         parentEl.appendChild(document.createTextNode(rawText.slice(lastIndex, m.index)));
       }
       var matched = m[0];
-      var pmidMatch = /^PMID/i.test(matched);
+      var pmidMatch = /^PMIDs?\b/i.test(matched);
+      var doiMatch = !pmidMatch && /^DOIs?\b/i.test(matched);
       if (pmidMatch) {
-        var pmid = matched.replace(/\D/g, '');
+        var pmids = matched.match(/\d{4,9}/g) || [];
         var a = document.createElement('a');
-        a.href = 'https://pubmed.ncbi.nlm.nih.gov/' + pmid + '/';
+        // Single PMID → direct article page; multiple PMIDs → one link that opens
+        // all matching abstracts at once via PubMed's multi-UID search syntax.
+        a.href = pmids.length > 1
+          ? 'https://pubmed.ncbi.nlm.nih.gov/?term=' + pmids.join('%2C+') + '%5Buid%5D'
+          : 'https://pubmed.ncbi.nlm.nih.gov/' + pmids[0] + '/';
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
         a.textContent = matched;
         a.style.cssText = 'color:#6ab4ff;text-decoration:underline;cursor:pointer';
         parentEl.appendChild(a);
+      } else if (doiMatch) {
+        var doiId = (matched.match(/10\.\d{4,9}\/[^\s,\]\)"']+/i) || [matched])[0];
+        var doiLink = document.createElement('a');
+        doiLink.href = 'https://doi.org/' + doiId;
+        doiLink.target = '_blank';
+        doiLink.rel = 'noopener noreferrer';
+        doiLink.textContent = matched;
+        doiLink.style.cssText = 'color:#6ab4ff;text-decoration:underline;cursor:pointer';
+        parentEl.appendChild(doiLink);
       } else {
         // Entity name
         var nodeId = labelToId[matched.toLowerCase()];
@@ -621,10 +643,17 @@ function _buildCurrentGraphFromCy() {
   //   Edges: source/target (names), sourceURN/targetURN, sourceType/targetType,
   //          sourceNodeId/targetNodeId, type, effect, mechanism,
   //          relationId, relationIds, references (array)
+  //   Graph/pathway name: tabName / graphName — summarize_agent.py's
+  //     get_graph_names() reads these (among a few other synonyms) to seed
+  //     anatomy/context lookups from the graph's title (e.g. "lung cancer"
+  //     tab name -> "lung" anatomy token). The only app-side value that's
+  //     actually kept up to date today is the active tab's name (tabs[]),
+  //     so that's what we send.
   console.log('[_buildCurrentGraphFromCy] Starting graph build...');
+  var currentTabName = (Array.isArray(tabs) && tabs[activeTabIdx] && tabs[activeTabIdx].name) || '';
   if (!cy || typeof cy.nodes !== 'function') {
     console.log('[_buildCurrentGraphFromCy] No Cytoscape instance, returning empty graph');
-    return { nodes: [], edges: [] };
+    return { nodes: [], edges: [], tabName: currentTabName, graphName: currentTabName };
   }
 
   // Index graphData nodes by id for fast URN / alias lookup
@@ -718,7 +747,10 @@ function _buildCurrentGraphFromCy() {
     console.log('[_buildCurrentGraphFromCy] First edge details:', edges[0]);
   }
 
-  return { nodes: nodes, edges: edges, selectedNodes: selectedNodes, selectedEdges: selectedEdges };
+  return {
+    nodes: nodes, edges: edges, selectedNodes: selectedNodes, selectedEdges: selectedEdges,
+    tabName: currentTabName, graphName: currentTabName
+  };
 }
 
 // ── Library browser ───────────────────────────────────────────────────────────
