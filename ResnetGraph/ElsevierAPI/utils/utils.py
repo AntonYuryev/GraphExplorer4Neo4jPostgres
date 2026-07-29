@@ -342,10 +342,16 @@ def tokenize(s:str):
   return tokens
 
 
+def tokenize2str(s:str):
+  text = normalize(s)
+  tokens = text.lower().split()  # Split into words and convert to lowercase
+  return " ".join(tokens)
+
+
 def match_tokens(tokens1:list,tokens2:list):
   if len(tokens1) == len(tokens2):
     for i, token1 in enumerate(tokens1):
-      if token1 != tokens2[1]:
+      if token1 != tokens2[i]:
           return False
     return True
   else:
