@@ -13,6 +13,37 @@ from ResnetGraph.ElsevierAPI.utils.utils import tokenize, match_tokens, unpack
 _RUNTIME: Dict[str, Any] = {} # runtime dependencies are injected at startup
 _REL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _NLP_MARKUP_RE = re.compile(r'ID\{[^{}=]+=(.*?)\}')
+# CONTEXT{8803117}-style markup carries no user-facing text (unlike ID{...=text}) —
+# strip it out entirely, including the number inside the braces, along with any
+# leading whitespace so it doesn't leave a dangling space behind.
+_CONTEXT_MARKUP_RE = re.compile(r'\s*CONTEXT\{[^{}]*\}')
+
+# Standard English stop words to keep out of context_dict — without this, a node
+# whose name/alias happens to be a single common word (e.g. a gene symbol that
+# collides with an English word) would make every occurrence of that word in the
+# user's message match the node, flooding the summary context with irrelevant hits.
+_STOP_WORDS = frozenset({
+    "a", "about", "after", "all", "an", "and", "any", "are", "as", "at",
+    "be", "because", "been", "before", "being", "between", "both", "but", "by",
+    "can", "could", "did", "do", "does", "doing", "down", "during",
+    "each", "few", "for", "from", "further",
+    "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
+    "him", "himself", "his", "how",
+    "i", "if", "in", "into", "is", "it", "its", "itself",
+    "just",
+    "me", "more", "most", "my", "myself",
+    "no", "nor", "not", "now",
+    "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves",
+    "out", "over", "own",
+    "same", "she", "should", "so", "some", "such",
+    "than", "that", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "these", "they", "this", "those", "through", "to", "too",
+    "under", "until", "up",
+    "very",
+    "was", "we", "were", "what", "when", "where", "which", "while", "who",
+    "whom", "why", "will", "with", "would",
+    "you", "your", "yours", "yourself", "yourselves",
+})
 
 def _runtime_(name: str):
     value = _RUNTIME.get(name)
@@ -22,8 +53,11 @@ def _runtime_(name: str):
 
 
 def _strip_nlp_markup(text: Any) -> str:
-    """Convert NLP markup like ID{4444444,66666=text} into plain text."""
+    """Convert NLP markup like ID{4444444,66666=text} into plain text, and
+    remove CONTEXT{...} markup (e.g. CONTEXT{8803117}) entirely, braces and all."""
     value = str(text or "")
+    if "CONTEXT{" in value:
+        value = _CONTEXT_MARKUP_RE.sub("", value)
     if "ID{" not in value:
         return value
     return _NLP_MARKUP_RE.sub(lambda m: m.group(1).strip(), value)
@@ -205,13 +239,13 @@ class SummarizeRequest(BaseModel):
 
     def get_graph_names(self) -> List[str]:
         cg = self.current_graph or {}
-        vals: List[str] = []
+        vals = set()
         for k in ["graphName", "pathwayName", "subgraphName", 
                   "currentSubgraphName","tabName", "name", "title"]:
             v = cg.get(k)
             if isinstance(v, str) and v.strip():
-                vals.append(v.strip())
-        return vals
+                vals.add(v.strip())
+        return list(vals)
 
 
     def graph_nodes(self) -> List[PSObject]:
@@ -220,23 +254,27 @@ class SummarizeRequest(BaseModel):
         return []
 
 
+
     def _default_context_(self) -> tuple[List[str], List[str]]:
         if self.default_anatomy or self.default_context: 
             return list(self.default_anatomy), list(self.default_context)
         
         anatomy_nodes = set() # {PSObject} of anatomical concepts in the graph
         other_context = set() # {PSObject} of other context concepts in the graph (CellProcess, Disease, ClinicalParameter, Treatment)
+
+
+        central_nodes_counter = 0 # {PSObject} of the two most central nodes in the graph, by closeness and degree
         graph_nodes = self.graph_nodes()
+        graph_nodes = sorted(graph_nodes, key=lambda n: (self.resnet_graph.degree(n.uid()), n[CLOSENESS]), reverse=True) if graph_nodes else []
         for node in graph_nodes:
             node_type = node.objtype()
             if node_type in ANATOMICAL_CONCEPTS_NEO4J:
                 anatomy_nodes.add(node)
             elif node_type in ['CellProcess','Disease','ClinicalParameter','Treatment']:
                 other_context.add(node)
-
-        graph_nodes = sorted(graph_nodes, key=lambda n: (self.resnet_graph.degree(n.uid()), n[CLOSENESS]), reverse=True) if graph_nodes else []
-        central_nodes = graph_nodes[:2] if graph_nodes else []
-        other_context.update(central_nodes)
+            elif central_nodes_counter < 2:
+                other_context.add(node)
+                central_nodes_counter += 1
 
         # obtaining additional anatomy terms from other context, e.g. "lung cancer" -> "lung"
         other_context_tokens = set(unpack([tokenize(n) for n in self.get_graph_names()]))
@@ -268,13 +306,14 @@ class SummarizeRequest(BaseModel):
             if node_name:
                 tokenized_name = tokenize(node_name)
                 tokenized_name_str = " ".join(tokenized_name)
-                self.context_dict[tokenized_name_str].append(node)
+                if tokenized_name_str and tokenized_name_str not in _STOP_WORDS:
+                    self.context_dict[tokenized_name_str].append(node)
             for alias in node['Alias']:
                 if alias:
-                    tokenized_alias = tokenize(alias)
-                    if len(tokenized_alias) >=2:
-                        tokenized_alias_str = " ".join(tokenized_alias)
-                        if not tokenized_alias_str.isnumeric():
+                    tokenized_aliases = tokenize(alias)
+                    if len(tokenized_aliases) >=2:
+                        tokenized_alias_str = " ".join(tokenized_aliases)
+                        if not tokenized_alias_str.isnumeric() and tokenized_alias_str not in _STOP_WORDS:
                             self.context_dict[tokenized_alias_str].append(node)
         
         return self.default_anatomy, self.default_context
