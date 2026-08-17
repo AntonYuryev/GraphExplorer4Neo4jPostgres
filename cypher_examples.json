@@ -392,5 +392,15 @@
       "anatomical concepts; anatomy; cells; organ",
       "tissue"
     ]
+  },
+  {
+    "question": "Find family members of BCL2-family",
+    "cypher": "WITH 'BCL-2 family' as search_term\nMATCH (n:FunctionalClass|Protein|Complex)\nWHERE toLower(n.Name) = toLower(search_term) OR toLower(search_term) IN [x IN n.Alias | toLower(x)]\nOPTIONAL MATCH (child)-[:is_a|part_of*]->(n)\nRETURN n AS parent, collect(DISTINCT child) AS children",
+    "notes": "Use this query as example when user asks to find members of the family, ontology children or proteins that belong to BCL-2 family",
+    "tags": [
+      "ontology",
+      "family member",
+      "family members"
+    ]
   }
 ]
