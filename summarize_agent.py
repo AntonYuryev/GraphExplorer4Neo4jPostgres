@@ -92,7 +92,7 @@ class SummarizeRequest(BaseModel):
     message: str
     history: List[ChatMessage] = []
     
-    CurrentNodeJSGraph: Optional[Dict[str, Any]] = None # input graph from the app, including nodes, edges, and selected nodes/edges
+    NodeJSGraph: Optional[Dict[str, Any]] = None # input graph from the app, including nodes, edges, and selected nodes/edges
     _ResnetGraph_: Optional[PSPathway] = None
     
     default_context: List[PSObject] = []
@@ -113,7 +113,7 @@ class SummarizeRequest(BaseModel):
 
 
     def edges4(self, node_urns: List[str]) -> List[Dict[str, Any]]:
-        """Return CurrentNodeJSGraph edges where either endpoint's URN is among node_urns.
+        """Return NodeJSGraph edges where either endpoint's URN is among node_urns.
 
         Used by relationIDs() to pull in edges connecting selected NODES even
         when the user selected only the nodes on canvas (not the edge between
@@ -122,7 +122,7 @@ class SummarizeRequest(BaseModel):
         if not node_urns:
             return []
         urns = set(node_urns)
-        cg = self.CurrentNodeJSGraph if isinstance(self.CurrentNodeJSGraph, dict) else {}
+        cg = self.NodeJSGraph if isinstance(self.NodeJSGraph, dict) else {}
         all_edges = cg.get("edges") or []
         return [
             e for e in all_edges
@@ -131,7 +131,7 @@ class SummarizeRequest(BaseModel):
 
 
     @staticmethod
-    def edge2psrel(edge: Dict[str, Any]) -> Optional[PSRelation]:
+    def nodeJSedge2psrel(edge: Dict[str, Any]) -> Optional[PSRelation]:
         regulator_name = str(edge.get("source") or "").strip()
         regulator_urn = str(edge.get("sourceURN") or {})
         regulator_type = str(edge.get("sourceType") or "").strip()
@@ -201,53 +201,48 @@ class SummarizeRequest(BaseModel):
         for edge in edges:
             if not isinstance(edge, dict):
                 continue
-            ps_rel = SummarizeRequest.edge2psrel(edge)
+            ps_rel = SummarizeRequest.nodeJSedge2psrel(edge)
             if ps_rel:
                 ps_rels.append(ps_rel)
         return ps_rels
 
 
     def init_resnet_graph(self) -> ResnetGraph:
-        if self._ResnetGraph_:
-            return self._ResnetGraph_
+      if self._ResnetGraph_:
+          return self._ResnetGraph_
 
-        self.neo4j = neo4j_nx(self.db_credentials or {})
-        cg = self.CurrentNodeJSGraph if isinstance(self.CurrentNodeJSGraph, dict) else {}
-
-        # !!!App sends aliases as list already!!!
-        urn2aliases = {
-            n.get("urn"): n.get("aliases")
-            for n in (cg.get("nodes") or [])
-            if isinstance(n, dict)
+      self.neo4j = neo4j_nx(self.db_credentials or {})
+      urn2aliases = { # !!!App sends aliases as list already!!!
+          n.get("urn"): n.get("aliases")
+          for n in (self.NodeJSGraph.get("nodes") or [])
+          if isinstance(n, dict)
         }
 
-        ps_rels = []
-        for edge in (cg.get("edges") or []):
-            if not isinstance(edge, dict):
-                continue
-            ps_rel = SummarizeRequest.edge2psrel(edge)
-            ps_rels.append(ps_rel)
+      ps_rels = []
+      for edge in (self.NodeJSGraph.get("edges") or []):
+        ps_rel = SummarizeRequest.nodeJSedge2psrel(edge)
+        ps_rels.append(ps_rel)
 
-        resnet_graph = ResnetGraph.from_rels(ps_rels)
-        resnet_graph.set_node_annotation(urn2aliases, "Alias")
-        resnet_graph.annotate_closeness()
-        
-        pathway_names = self.get_graph_names()
-        pathway_name = ','.join(pathway_names)
-        pathway_props = {'Name': [pathway_name]}
-        for prop, val in cg.items():
-            if prop not in {'nodes', 'edges', 'selectedNodes', 'selectedEdges', 'graphName', 'pathwayName','tabName','subgraphName', 'currentSubgraphName','name','title'}:
-                pathway_props[prop_to_title(prop)] = [val]
-        self._ResnetGraph_ = PSPathway(pathway_props, resnet_graph)
-        return self._ResnetGraph_
+      resnet_graph = ResnetGraph.from_rels([SummarizeRequest.nodeJSedge2psrel(e) for e in self.NodeJSGraph.get("edges")])
+      resnet_graph.set_node_annotation(urn2aliases, "Alias")
+      resnet_graph.annotate_closeness()
+      
+      pathway_names = self.get_graph_names()
+      pathway_name = ','.join(pathway_names)
+      pathway_props = {'Name': [pathway_name]}
+      for prop, val in self.NodeJSGraph.items():
+          if prop not in {'nodes', 'edges', 'selectedNodes', 'selectedEdges', 'graphName', 'pathwayName','tabName','subgraphName', 'currentSubgraphName','name','title'}:
+              pathway_props[prop_to_title(prop)] = [val]
+      self._ResnetGraph_ = PSPathway(pathway_props, resnet_graph)
+      return self._ResnetGraph_
         
     
     def graph2analyze(self) -> PSPathway:
       '''
-      Converts CurrentNodeJSGraph to PSPathway object for summarization.
+      Converts NodeJSGraph to PSPathway object for summarization.
       If self.scope is "selected", only selected edges and nodes are included.
       '''
-      cg = self.CurrentNodeJSGraph or {}
+      cg = self.NodeJSGraph or {}
 
       my_edges = []
       if self.scope == "selected":
@@ -271,7 +266,7 @@ class SummarizeRequest(BaseModel):
 
 
     def get_graph_names(self) -> List[str]:
-        cg = self.CurrentNodeJSGraph or {}
+        cg = self.NodeJSGraph or {}
         vals = set()
         for k in ["graphName", "tabName", "pathwayName", "subgraphName", 
                   "currentSubgraphName", "name", "title"]:
@@ -511,9 +506,13 @@ class SummarizeRequest(BaseModel):
     def prompt_introduction(graph2analyze: PSPathway, use_general_knowledge: bool = False) -> str:
       introduction = "## Summary Task Rules\n"
       if 'Description' in graph2analyze:
-          introduction += f"\n## This pathway has description\n{graph2analyze.graph}.  Use it in your introduction and summary if relevant.\n"
+          _desc = graph2analyze['Description']
+          _desc_str = _desc[0] if isinstance(_desc, list) and _desc else str(_desc)
+          introduction += f"\n## This pathway has description\n{_desc_str}  Use it in your introduction and summary if relevant.\n"
       if 'Notes' in graph2analyze:
-          introduction += f"\n## This pathway has manually curated notes\n{graph2analyze.graph}. Use it in your introduction and summary if relevant.\n"
+          _notes = graph2analyze['Notes']
+          _notes_str = _notes[0] if isinstance(_notes, list) and _notes else str(_notes)
+          introduction += f"\n## This pathway has manually curated notes\n{_notes_str} Use it in your introduction and summary if relevant.\n"
 
       introduction += "Each sentence in Supporting Sentences starts with a symbolic relation name indicating what kind of interaction it describes. "
       introduction += "Write in flowing prose — do not list or enumerate relation type names. "
@@ -882,7 +881,12 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
                         prompt_reply, prompt_reply_was_truncated = future.result()
                         if prompt_reply_was_truncated:
                             was_truncated = True
-                        if prompt_reply and not prompt_reply.strip().startswith("No information available"):
+                        # Strip leading markdown section headers (## Organ System\n etc.)
+                        # before checking for the "No information available" sentinel,
+                        # because the LLM wraps the sentinel in a header line.
+                        _reply_body = re.sub(r'^#+[^\n]*\n?', '', prompt_reply.strip(),
+                                             flags=re.MULTILINE).strip()
+                        if prompt_reply and not _reply_body.lower().startswith("no information available"):
                             reply_text += "\n\n" + prompt_reply
                     except Exception as section_exc:
                         log.error("Section LLM call failed: %s", section_exc, exc_info=True)
