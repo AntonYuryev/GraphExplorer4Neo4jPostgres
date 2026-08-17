@@ -751,7 +751,7 @@ class VocabEntry(BaseModel):
     confirmed:   bool = False
 
 class BatchUpdateItem(BaseModel):
-    relationId:   Any          # RelationID as stored in Neo4j — string or numeric, matched as text
+    relationId:   Any          # RelationID string (kept as Any to accept both str and int from callers)
     value:        str          # new property value, e.g. "Positive" / "Negative" / "Unknown"
     relationType: str = ""     # optional — lets the write scope its MATCH to one rel type instead
                                 # of scanning every relationship in the database
@@ -1168,7 +1168,9 @@ def _rid_py_repr(val) -> str:
     return "'" + s.replace('\\', '\\\\').replace("'", "\\'") + "'"
 
 def _rid_myhash(text: str) -> str:
-    """MD5-based hash matching server.js _myhash."""
+    """MD5-based hash matching server.js _myhash. Returns string to preserve
+    full 64-bit precision — JavaScript Number (float64) would corrupt values
+    above 2^53-1, so all RelationIDs are handled as strings end-to-end."""
     d = hashlib.md5(text.encode('utf-8')).digest()
     high, = struct.unpack_from('>Q', d, 0)   # bytes 0-7 as unsigned 64-bit BE
     low,  = struct.unpack_from('>Q', d, 8)   # bytes 8-15
@@ -1184,6 +1186,7 @@ def calc_relation_id(inref=None, inoutref=None, outref=None,
                      mechanism: str = '') -> str:
     """
     Calculate RelationID — identical to server.js calcRelationId.
+    Returns string to preserve full 64-bit precision.
     inref    : NodeID values of source nodes  (direction →), sorted desc
     inoutref : NodeID values of bidirectional nodes
     outref   : NodeID values of target nodes  (direction ←), sorted desc
@@ -2050,13 +2053,13 @@ def delete_vocabulary(user_term: str):
 _BATCH_WRITABLE_PROPERTIES = frozenset({"Effect", "Mechanism", "Ontology", "Relationship"})
 _REL_TYPE_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
-# Shared WHERE fragment: safely resolves RelationID (string OR list-of-strings,
-# per this database's schema) to a list of strings, then checks membership.
+# Shared WHERE fragment: safely resolves RelationID (integer or list-of-integers)
+# to a list of integers, then checks membership.
 _RELID_MATCH_CYPHER = """
         WITH r, u,
              CASE WHEN apoc.meta.cypher.type(r.RelationID) CONTAINS 'LIST'
-                  THEN [x IN r.RelationID | toString(x)]
-                  ELSE [toString(r.RelationID)]
+                  THEN [x IN r.RelationID | toString(toInteger(x))]
+                  ELSE [toString(toInteger(r.RelationID))]
              END AS relIdList
         WHERE u.relationId IN relIdList
 """
