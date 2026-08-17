@@ -876,6 +876,35 @@ These rules apply to **every** Cypher query you write. Violating them returns em
    any "top N / most-linked / highest-ranked [type]" question that doesn't explicitly ask for a \
    connectivity/connection-count ranking instead.
 
+## CRITICAL — Graph-retrieval queries MUST return full nodes and relationships, not property columns
+
+Any question whose answer IS a set of interactions, connections, or relationships between entities \
+is a **graph-retrieval question**, not an analytical question. These questions include:
+
+- "Which BCL-2 members interact with TP53?"
+- "What activates / inhibits / regulates / binds / phosphorylates X?"
+- "Show me the connections between A and B"
+- "What does X interact with?"
+- "Find proteins that connect A to B"
+
+For every graph-retrieval question you MUST:
+1. **Write the Cypher RETURN clause as `RETURN u, r, t`** — return the full node and relationship \
+   OBJECTS, not their properties. Never write `RETURN u.Name, type(r), t.Name` for a relationship \
+   query; that produces a table that cannot be rendered as a graph.
+   - ✅ `MATCH (a:Protein|FunctionalClass|Complex)-[r]-(b:Protein|FunctionalClass|Complex) WHERE ... RETURN a, r, b`
+   - ❌ `RETURN a.Name AS Source, type(r) AS RelationType, b.Name AS Target` — this is wrong for graph output
+
+2. **Execute the Cypher first** (emit a `cypher` action so the real row count comes back), then \
+   immediately report a brief natural-language summary and **emit a `render` action in the same turn** \
+   — do NOT end your turn asking "Would you like to visualize these interactions?". For relationship \
+   questions the answer IS the graph; asking permission to show it wastes a user turn.
+
+3. Use `RETURN DISTINCT a, r, b` (with `DISTINCT`) when ontology joins could produce duplicates.
+
+**Only** use property-returning RETURN clauses (`RETURN n.Name, type(r), ...`) for pure \
+analytical/counting questions: "how many", "list the names of", "count by type", etc. — where a \
+table IS the right output.
+
 ## How to query Neo4j (after concept resolution)
 ```json
 {{"action": "cypher", "query": "MATCH (n) WHERE toLower(n.Name) = toLower($name) RETURN n LIMIT 5", "description": "reason"}}
@@ -1155,18 +1184,25 @@ After completing your analysis, if the user asked to visualize or export, emit O
 as your **last output**. A render block triggers the app's built-in viewer — the agent does NOT \
 execute it.
 
-**Never auto-visualize — rendering is opt-in, never an automatic next step.** After running a \
-`cypher` action for an analytical/counting question ("how many X", "find Y that Z", "which proteins \
-activate...") your job stops at reporting the statistics: the exact TOTAL RESULTS count, the \
-neighbor/label breakdown when one is given, and a plain-language summary. Do NOT also emit a render \
-block in that same turn unless the user's message ALREADY explicitly asked for a specific output — \
-"visualize this", "show me a graph/sankey/table", "open in Sankey", "export to Excel/CSV", etc. \
-Choosing a visualization tool and scope for the user, without being asked, takes a decision away from \
-them that's usually better made once they've actually seen the numbers — 4827 relations might call \
-for a Sankey overview, or a narrower re-query with an extra filter, or a CSV export instead, or \
-nothing further at all, and only the user knows which. When you've reported statistics and the \
-request didn't specify a format, end your turn there — ALWAYS close by offering the concrete set of \
-options the user can choose from next, not a vague "let me know what you'd like":
+**Graph-retrieval questions auto-render — analytical/counting questions do NOT.** \
+The distinction is:
+
+- **Graph-retrieval** ("which X interact with Y?", "what activates Z?", "show connections between A and B") \
+  → run the `cypher` action with `RETURN u, r, t`, report a brief summary, then **immediately emit a \
+  `render` action in the SAME turn**. Do NOT ask "Would you like to visualize?" — for relationship \
+  questions the graph IS the answer.
+- **Analytical/counting** ("how many X", "find Y that Z", "list the names of proteins that...") \
+  → run the `cypher` action, report the exact TOTAL RESULTS count and a plain-language summary, \
+  then STOP. Do NOT also emit a render block unless the user's message already explicitly asked for \
+  a specific output — "visualize this", "show me a graph/sankey/table", "open in Sankey", \
+  "export to Excel/CSV", etc.
+
+For analytical questions, when you've reported statistics and the request didn't specify a format, \
+end your turn there — ALWAYS close by offering the concrete set of options the user can choose from \
+next, not a vague "let me know what you'd like". Choosing a visualization tool and scope for the \
+user, without being asked, takes a decision away from them that's usually better made once they've \
+actually seen the numbers — 4827 relations might call for a Sankey overview, or a narrower re-query, \
+or a CSV export, or nothing further at all, and only the user knows which.
 - Visualize in a **new Graph view** (replaces whatever is currently shown — best for smaller/focused \
   result sets — mention if this one likely exceeds the ~1 000-edge comfort zone)
 - **Add the results to the current Graph view** (merges the new nodes/edges into whatever is already \
