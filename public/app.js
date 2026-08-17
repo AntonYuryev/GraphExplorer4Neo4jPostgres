@@ -325,7 +325,7 @@ let rnefPathways = [];       // pathways stored when the RNEF selection modal is
  * Graph — lightweight JS mirror of the Python PSPathway object.
  *
  * A dictionary-based class that consolidates all pathway state into a single
- * object.  Instances are assigned to SummarizeRequest.CurrentNodeJSGraph on
+ * object.  Instances are assigned to SummarizeRequest.NodeJSGraph on
  * every graph load (RNEF or Cypher).  The object is serialised and sent to
  * the Python backend as the authoritative graph payload.
  *
@@ -447,11 +447,11 @@ class Graph {
 }
 
 /**
- * Central request object whose CurrentNodeJSGraph property is replaced on
+ * Central request object whose NodeJSGraph property is replaced on
  * every graph load or Cypher query (REQ-2.1).
  */
 var SummarizeRequest = {
-  CurrentNodeJSGraph: /** @type {Graph|null} */ null
+  NodeJSGraph: /** @type {Graph|null} */ null
 };
 
 // ─── Table column state ───────────────────────────────────────────────────────
@@ -5365,7 +5365,7 @@ async function runQuery(mergeIntoExisting) {
         // Build the central Graph object from the Cypher result (REQ-2.1, REQ-3.2.x).
         // Name starts as the 40-char query truncation; _nameGraphFromCypher()
         // will overwrite it asynchronously with an AI-generated name (REQ-3.2.3/4).
-        SummarizeRequest.CurrentNodeJSGraph = Graph.fromCypher(data, query, shortQ);
+        SummarizeRequest.NodeJSGraph = Graph.fromCypher(data, query, shortQ);
         _nameGraphFromCypher(query, tabs[startTabIdx].id, startTabIdx);
         if (document.getElementById('table-view').style.display !== 'none') {
           await loadTableData();
@@ -5399,7 +5399,7 @@ async function runQuery(mergeIntoExisting) {
 /**
  * Fire-and-forget: ask the Text2Cypher AI agent to produce a short Name and a
  * one-sentence Description for the graph that the given Cypher query produced.
- * On success, updates SummarizeRequest.CurrentNodeJSGraph and the tab label.
+ * On success, updates SummarizeRequest.NodeJSGraph and the tab label.
  * On any failure (agent down, timeout, parse error) the existing 40-char
  * query-truncation name is silently kept in place (REQ-3.2.4 fallback).
  *
@@ -5440,7 +5440,7 @@ async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
     // Guard: only update if we're still looking at the same graph
     var currentTabIdx = tabs.findIndex(function(t) { return t.id === tabId; });
     if (currentTabIdx < 0) return;
-    var g = SummarizeRequest.CurrentNodeJSGraph;
+    var g = SummarizeRequest.NodeJSGraph;
     if (!g || g.cypher !== cypher) return;   // user loaded a different graph
 
     var aiName = parsed.name.trim();
@@ -8030,11 +8030,11 @@ function loadSubgraph(event) {
       currentPathwayUrn = data.urn || null;
       // Build the central Graph object from the saved JSON (same RNEF-derived
       // format, no filePath since this came from File → Load subgraph).
-      SummarizeRequest.CurrentNodeJSGraph = Graph.fromRnef(data);
-      if (!SummarizeRequest.CurrentNodeJSGraph.Name)
-        SummarizeRequest.CurrentNodeJSGraph.Name = file.name.replace(/\.json$/i, '');
+      SummarizeRequest.NodeJSGraph = Graph.fromRnef(data);
+      if (!SummarizeRequest.NodeJSGraph.Name)
+        SummarizeRequest.NodeJSGraph.Name = file.name.replace(/\.json$/i, '');
       renderGraph(data.graphData, data.positions || null);
-      updateCurrentTabName(SummarizeRequest.CurrentNodeJSGraph.Name || file.name.replace(/\.json$/i, ''));
+      updateCurrentTabName(SummarizeRequest.NodeJSGraph.Name || file.name.replace(/\.json$/i, ''));
 
       // Pre-populate refsCache with inline references from JSON so edge
       // tooltips work without a PostgreSQL lookup.
@@ -8149,9 +8149,9 @@ function openRnefPathway(data, filePath, sourceFileAbs) {
   currentPathwayUrn = data.urn || null;
   // Build the central Graph object from RNEF data (REQ-2.1, REQ-3.1.x).
   // filePath provides the file stem for REQ-3.1.3 (name fallback).
-  SummarizeRequest.CurrentNodeJSGraph = Graph.fromRnef(data, filePath);
+  SummarizeRequest.NodeJSGraph = Graph.fromRnef(data, filePath);
   renderGraph(data.graphData, data.positions || null);
-  updateCurrentTabName(SummarizeRequest.CurrentNodeJSGraph.Name || 'Pathway');
+  updateCurrentTabName(SummarizeRequest.NodeJSGraph.Name || 'Pathway');
   appendPathwayHistory(currentSubgraphName || 'Pathway', filePath, sourceFileAbs);
 
   // Pre-populate refsCache with inline references
@@ -18538,7 +18538,7 @@ async function _summarizeSendRequest(message) {
       message:               message,
       history:                _agentChatHistory.slice(0, -1),
       llm:                    _agentConfig,
-      CurrentNodeJSGraph:     _cgForSummarize,
+      NodeJSGraph:     _cgForSummarize,
       scope:                  _summarizeScope,
       fetched_rows:           _summarizeFetchedRows,
       original_relation_ids:  _summarizeOriginalRelationIds,
@@ -18934,8 +18934,8 @@ function _currentGraphSummary() {
   // instance alongside the standard ones, so we copy every own (non-collection,
   // non-function) property rather than an explicit whitelist.
   var graphMeta = {};
-  if (SummarizeRequest.CurrentNodeJSGraph) {
-    var _g = SummarizeRequest.CurrentNodeJSGraph;
+  if (SummarizeRequest.NodeJSGraph) {
+    var _g = SummarizeRequest.NodeJSGraph;
     var _skip = new Set(['Nodes', 'edges', 'nodeCount', 'edgeCount',
                          '_setProperties', '_populateNodes']);
     Object.keys(_g).forEach(function(k) {
@@ -18969,8 +18969,8 @@ function _currentGraphSummary() {
   // into the top-level payload.  Standard scalar fields land directly;
   // the Nodes dict is included as a separate key for the Python backend.
   Object.assign(payload, graphMeta);
-  if (SummarizeRequest.CurrentNodeJSGraph) {
-    payload.Nodes = SummarizeRequest.CurrentNodeJSGraph.Nodes;
+  if (SummarizeRequest.NodeJSGraph) {
+    payload.Nodes = SummarizeRequest.NodeJSGraph.Nodes;
   }
 
   return payload;
