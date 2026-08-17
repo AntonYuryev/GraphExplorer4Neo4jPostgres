@@ -865,7 +865,7 @@ class PSRelation(PSObject):
     input:
       relid2refs - optional dictionary {RelationID:[Reference]} to use when graph is loaded from Neo4j
     output:
-      self.references sorted by PUBYEAR
+      self.references sorted by PUBYEAR in descending order
     '''
     if refresh: self.references.clear()     
     if not self.references: # making self.references from self.PropSetToProps:
@@ -987,6 +987,20 @@ class PSRelation(PSObject):
               return self
       else:
           return PSRelation()
+      
+
+  def filter_refs_by_year(self, min_year=None, max_year=None):
+      '''
+      output:
+        copy of self with references filtered by year range.
+        if all references are filtered out, the copy will have an empty reference list
+      '''
+      mycopy = self.copy()
+      filtered_refs = [ref for ref in self.refs()
+                        if (min_year is None or ref.pubyear() >= min_year)
+                        and (max_year is None or ref.pubyear() <= max_year)]
+      mycopy.references = filtered_refs
+      return mycopy
       
 
   def is_from_abstract(self):
