@@ -27,7 +27,8 @@ var _rc = {
   refCols: [],          // reference table column names (from /api/schema/columns)
   relTypes: [],         // all Neo4j relation types (cached)
   propKeys: [],         // all Neo4j relation property keys (cached)
-  currentRelId: '',     // live-calculated RelationID
+  currentRelId: null,   // live-calculated RelationID (string, to preserve 64-bit precision)
+  nondirectional: false,// true → save directed:false, display without arrowhead
   _pid: 0,              // auto-incrementing property row ID
   _debounce: null       // debounce timer for RelationID recalc
 };
@@ -72,6 +73,34 @@ console.log('%cData flow: Menu click → openAgenticPanel() → switchAgentMode(
 // serve different purposes and diverging by 2 types (Metabolization, Paralog)
 // is intentional, not a typo.
 var RELID_NONDIRECTIONAL_TYPES = new Set(['Binding', 'CellExpression', 'FunctionalAssociation', 'Metabolization', 'Paralog']);
+
+// ─── RelationID normalization helpers ─────────────────────────────────────────
+// Neo4j stores RelationID as a scalar in most cases but can also store it as a
+// list (StringArray) on some relations. Calling String() on a JS array produces
+// a comma-joined garbage string (e.g. "-654,273") that never matches a real
+// Postgres id, silently causing 0 references / empty tooltips everywhere.
+//
+// _relId(v)  — returns the first (canonical) id as an integer, or null if absent.
+// _relIds(v) — returns ALL ids as an integer array (for batch Postgres lookups).
+//
+// Pass either the raw property value or a full edge-properties object; the
+// helpers accept both forms.
+// RelationIDs are kept as strings throughout the client to preserve full
+// 64-bit precision. JavaScript Number (float64) can only represent integers
+// exactly up to 2^53-1; the MD5-based hash can produce values up to 2^63-1,
+// so Number() would silently corrupt those values.
+function _relId(v) {
+  if (v == null) return null;
+  var s = Array.isArray(v) ? (v.length ? String(v[0]) : null) : String(v);
+  return (s != null && /^-?\d+$/.test(s)) ? s : null;
+}
+function _relIds(v) {
+  if (v == null) return [];
+  return (Array.isArray(v) ? v : [v])
+    .filter(function(x) { return x != null; })
+    .map(String)
+    .filter(function(s) { return /^-?\d+$/.test(s); });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Client-side RelationID calculation — mirrors server.js's calcRelationId /
@@ -154,8 +183,9 @@ function _md5Bytes(str) {
 }
 
 // Mirrors server.js's _myhash(): MD5 the string, then XOR-fold the 16-byte
-// digest into a signed 63-bit integer (as a string, since it can exceed
-// JS's safe integer range) — same big-endian high/low split, same mask.
+// digest into a signed 63-bit integer — same big-endian high/low split, same mask.
+// Returns the result as a decimal string to preserve full 64-bit precision
+// (Number() would corrupt values above 2^53-1 = 9,007,199,254,740,991).
 function _myhashClient(text) {
   var bytes = _md5Bytes(String(text));
   var view  = new DataView(bytes.buffer);
@@ -164,6 +194,7 @@ function _myhashClient(text) {
   var MASK  = 0x7FFFFFFFFFFFFFFFn;
   var r = high ^ low;
   if (r > MASK) r = -(r & MASK);
+  // Return as string — Number() would corrupt values > 2^53-1
   return r.toString();
 }
 
@@ -208,13 +239,14 @@ var _rcPair = {
   nodeA: null,        // {cyId, label, nodeType, nodeId}
   nodeB: null,
   flipped: false,     // false: A→B (A is regulator), true: B→A
-  isNonDir: false,    // true for Binding / FunctionalAssociation / CellExpression
+  isNonDir: false,    // true for Binding / FunctionalAssociation / CellExpression (type-based)
+  nondirectional: false, // manual toggle: true → save directed:false regardless of type
   props: [],
   refs: [],
   refIdx: 0,
   refsVisible: false,
   refsLoaded: false,
-  currentRelId: '',
+  currentRelId: null,
   existingEdge: null,  // the cy edge being edited, if any -- used to pull in
                         // its file-embedded references (see rcPairLoadRefs)
   _pid: 0,
@@ -287,6 +319,140 @@ let tabs = [];               // [{id, name, snapshot}]
 let activeTabIdx = 0;
 let graphClipboard = null;   // {nodes, edges, positions} copied from a tab
 let rnefPathways = [];       // pathways stored when the RNEF selection modal is open
+
+// ─── Graph class & SummarizeRequest ────────────────────────────────────────────
+/**
+ * Graph — lightweight JS mirror of the Python PSPathway object.
+ *
+ * A dictionary-based class that consolidates all pathway state into a single
+ * object.  Instances are assigned to SummarizeRequest.CurrentNodeJSGraph on
+ * every graph load (RNEF or Cypher).  The object is serialised and sent to
+ * the Python backend as the authoritative graph payload.
+ *
+ * Collections
+ *   Nodes  {object}  — dict keyed by raw node id; each entry carries all node
+ *                      properties (name, label, urn, nodeId, …) in a flat map.
+ *   edges  {Array}   — raw edge objects in the same shape as graphData.edges.
+ *
+ * Metadata keys mirror PSPathway's property dict.  Any additional key–value
+ * pair from an RNEF <properties> section or URN is stored directly on the
+ * instance (like a Python dict subclass) via _setProperties().
+ */
+class Graph {
+  constructor() {
+    // ── Standard metadata keys (REQ-2.3) ─────────────────────────────────────
+    this.Name          = '';
+    this.Description   = '';
+    this.Notes         = '';
+    this.Organ         = '';
+    this.Tissue        = '';
+    this['Organ system'] = '';
+    this.CellType      = '';
+    this.cypher        = '';   // set for Neo4j-originated graphs (REQ-3.2.2)
+    this.URN           = '';
+
+    // ── Collections (REQ-2.2) ─────────────────────────────────────────────────
+    this.Nodes = {};   // { [nodeId]: { name, label, urn, nodeId, ...allProps } }
+    this.edges = [];   // raw edge objects (same shape as graphData.edges)
+  }
+
+  get nodeCount() { return Object.keys(this.Nodes).length; }
+  get edgeCount()  { return this.edges.length; }
+
+  /**
+   * Copy arbitrary key→value pairs onto this Graph instance.
+   * Used for RNEF <properties> entries and URN-derived attributes (REQ-2.3).
+   * Standard collection keys (Nodes, edges) and functions are never overwritten.
+   */
+  _setProperties(props) {
+    var reserved = new Set(['Nodes', 'edges', 'nodeCount', 'edgeCount',
+                            '_setProperties', '_populateNodes']);
+    Object.keys(props || {}).forEach(function(k) {
+      if (!reserved.has(k) && props[k] != null && props[k] !== '') {
+        this[k] = props[k];
+      }
+    }, this);
+  }
+
+  /**
+   * Fill this.Nodes from a raw nodes array (format from server or rnef_to_json.py).
+   * Each entry carries all original properties plus normalised name/label/urn/nodeId.
+   */
+  _populateNodes(rawNodes) {
+    (rawNodes || []).forEach(function(n) {
+      var p = n.properties || {};
+      this.Nodes[n.id] = Object.assign({}, p, {
+        nodeId:    p.NodeID || p.nodeId || p.nodeID || null,
+        name:      p.Name   || p.name   || '',
+        label:     (n.labels && n.labels[0]) || '',
+        urn:       p.URN    || p.urn    || '',
+        elementId: n.elementId || n.id
+      });
+    }, this);
+  }
+
+  /**
+   * Workflow A — build a Graph from RNEF-converted data (REQ-3.1.x).
+   *
+   * @param {object} data      output of rnef_to_json.py:
+   *                           { name, urn, properties, graphData:{nodes,edges} }
+   * @param {string} [filePath] used to derive Name when the RNEF has none (REQ-3.1.3)
+   */
+  static fromRnef(data, filePath) {
+    var g = new Graph();
+
+    // REQ-3.1.3: fall back to file stem when RNEF name is absent/unnamed
+    var fileName = filePath
+      ? filePath.split(/[/\\]/).pop().replace(/\.[^.]+$/, '')
+      : '';
+    g.Name = (data.name && data.name !== 'unnamed' && data.name !== '')
+      ? data.name
+      : (fileName || 'Pathway');
+    g.URN = data.urn || '';
+
+    // REQ-3.1.2: copy ALL <properties> entries, then promote known standard keys
+    var props = data.properties || {};
+    g._setProperties(props);
+    if (props.Description)     g.Description      = props.Description;
+    if (props.Notes)           g.Notes            = props.Notes;
+    if (props.Organ)           g.Organ            = props.Organ;
+    if (props.Tissue)          g.Tissue           = props.Tissue;
+    if (props['Organ system']) g['Organ system']  = props['Organ system'];
+    if (props.CellType)        g.CellType         = props.CellType;
+
+    g._populateNodes((data.graphData && data.graphData.nodes) || []);
+    g.edges = (data.graphData && data.graphData.edges) || [];
+    return g;
+  }
+
+  /**
+   * Workflow B — build a Graph from a Neo4j Cypher query result (REQ-3.2.x).
+   * Name and Description start as fallbacks; _nameGraphFromCypher() will
+   * overwrite them asynchronously with AI-generated values (REQ-3.2.3/4).
+   *
+   * @param {object} queryResult  { nodes, edges } from /api/graph/query
+   * @param {string} cypher       the original query string (REQ-3.2.2)
+   * @param {string} [name]       initial fallback name (40-char query truncation)
+   */
+  static fromCypher(queryResult, cypher, name) {
+    var g = new Graph();
+    g.cypher = cypher || '';
+    g.Name   = name  || (cypher
+      ? (cypher.length > 60 ? cypher.substring(0, 60) + '…' : cypher)
+      : 'Query result');
+    g._populateNodes((queryResult && queryResult.nodes) || []);
+    g.edges = (queryResult && queryResult.edges) || [];
+    return g;
+  }
+}
+
+/**
+ * Central request object whose CurrentNodeJSGraph property is replaced on
+ * every graph load or Cypher query (REQ-2.1).
+ */
+var SummarizeRequest = {
+  CurrentNodeJSGraph: /** @type {Graph|null} */ null
+};
 
 // ─── Table column state ───────────────────────────────────────────────────────
 let columnDefs = [];         // [{key,label,visible,source,dbField}] — current order
@@ -539,13 +705,12 @@ window.addEventListener('DOMContentLoaded', function() {
       var el = document.getElementById(id);
       return el && el.style.display !== 'none';
     })) return;
-    // Allow native Ctrl+C when the user has text selected in the agent chat panel
+    // Allow native Ctrl+C whenever the user has any text selected (tooltip,
+    // agent panel, table cells, etc.) — only override with copySelection()
+    // when nothing is selected as DOM text (i.e. the intent is graph-node copy).
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
       var sel = window.getSelection();
-      if (sel && sel.toString().length > 0) {
-        var agentPanel = document.getElementById('agentic-panel');
-        if (agentPanel && agentPanel.contains(sel.anchorNode)) return;
-      }
+      if (sel && sel.toString().length > 0) return;
     }
 
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
@@ -963,6 +1128,9 @@ function initCytoscape() {
     document.getElementById('tooltip').style.display = 'none';
   });
   cy.on('unselect', function() { updateSelectionInfo(); });
+  cy.on('select unselect', function() {
+    if (typeof _updateSummarizeSelectedBtn === 'function') _updateSummarizeSelectedBtn();
+  });
 
   // Cytoscape native box-select: fires after selection is complete.
   // Defer our state reset one tick so Cytoscape finishes its own cleanup
@@ -3239,7 +3407,7 @@ function _buildCyEdgeData(e, srcCyId, tgtCyId) {
     source:       srcCyId,
     target:       tgtCyId,
     relType:      e.type || '',
-    relId:        p.RelationID != null ? String(p.RelationID) : '',
+    relId:        _relId(p.RelationID),
     relIds:       Array.isArray(p.RelationIDs) ? p.RelationIDs : null,
     edgeURN:      p.URN != null ? String(p.URN) : '',
     numRefs:      numRefs,
@@ -3675,7 +3843,7 @@ function renderGraph(data, savedPositions) {
         source: e.startNodeId,
         target: e.endNodeId,
         relType: e.type,
-        relId: e.properties.RelationID != null ? String(e.properties.RelationID) : '',
+        relId: _relId(e.properties.RelationID),
         relIds: Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs : null,
         edgeURN: e.properties.URN != null ? String(e.properties.URN) : '',
         numRefs: numRefs,
@@ -4304,8 +4472,8 @@ async function exportQueryCSVReferences(query) {
     batchEdges.forEach(function(e) {
       if (Array.isArray(e.properties.RelationIDs))
         e.properties.RelationIDs.forEach(function(id) { if (id != null) batchRelIds.push(String(id)); });
-      else if (e.properties.RelationID != null)
-        batchRelIds.push(String(e.properties.RelationID));
+      else
+        _relIds(e.properties.RelationID).forEach(function(id) { batchRelIds.push(id); });
     });
 
     setProgressMsg('⏳ Fetching references… (' + (batchStart + 1).toLocaleString() + '–' + doneEdges.toLocaleString() +
@@ -4345,7 +4513,7 @@ async function exportQueryCSVReferences(query) {
     batchEdges.forEach(function(edge) {
       var srcNode   = nodeById[edge.startNodeId];
       var tgtNode   = nodeById[edge.endNodeId];
-      var relId     = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+      var relId     = _relId(edge.properties.RelationID);
       var relIdsArr = Array.isArray(edge.properties.RelationIDs)
                     ? edge.properties.RelationIDs : (relId ? [relId] : []);
 
@@ -4463,7 +4631,7 @@ async function exportQueryCSVRelations(query) {
   var rows = qEdges.map(function(edge) {
     var srcNode   = nodeById[edge.startNodeId];
     var tgtNode   = nodeById[edge.endNodeId];
-    var relId     = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relId     = _relId(edge.properties.RelationID);
     var relIdsArr = Array.isArray(edge.properties.RelationIDs)
                   ? edge.properties.RelationIDs : (relId ? [relId] : []);
     var row = {
@@ -4538,7 +4706,7 @@ async function exportQueryReferences(query) {
   qEdges.forEach(function(e) {
     if (Array.isArray(e.properties.RelationIDs))
       e.properties.RelationIDs.forEach(function(id) { if (id != null) relIds.push(String(id)); });
-    else if (e.properties.RelationID != null) relIds.push(String(e.properties.RelationID));
+    else _relIds(e.properties.RelationID).forEach(function(id) { relIds.push(id); });
   });
 
   var refsGrouped = {};
@@ -4605,7 +4773,7 @@ async function exportQueryReferences(query) {
   qEdges.forEach(function(edge) {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
-    var relId = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relId = _relId(edge.properties.RelationID);
     var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
     var refs = [];
     for (var ri = 0; ri < relIdsArr.length; ri++) {
@@ -4766,7 +4934,7 @@ async function exportQueryRelations(query) {
   var rows = qEdges.map(function(edge) {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
-    var relId = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relId = _relId(edge.properties.RelationID);
     var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
     var row = {
       edgeId: edge.id, elementId: edge.elementId || edge.id,
@@ -5194,6 +5362,11 @@ async function runQuery(mergeIntoExisting) {
         updateCurrentTabName(shortQ);
         hideQueryResultTable();
         renderGraph(data);
+        // Build the central Graph object from the Cypher result (REQ-2.1, REQ-3.2.x).
+        // Name starts as the 40-char query truncation; _nameGraphFromCypher()
+        // will overwrite it asynchronously with an AI-generated name (REQ-3.2.3/4).
+        SummarizeRequest.CurrentNodeJSGraph = Graph.fromCypher(data, query, shortQ);
+        _nameGraphFromCypher(query, tabs[startTabIdx].id, startTabIdx);
         if (document.getElementById('table-view').style.display !== 'none') {
           await loadTableData();
         }
@@ -5219,6 +5392,72 @@ async function runQuery(mergeIntoExisting) {
       document.getElementById('run-btn').disabled = false;
     }
     renderTabBar();
+  }
+}
+
+// ─── AI-generated graph name for Cypher results (REQ-3.2.3/3.2.4) ────────────
+/**
+ * Fire-and-forget: ask the Text2Cypher AI agent to produce a short Name and a
+ * one-sentence Description for the graph that the given Cypher query produced.
+ * On success, updates SummarizeRequest.CurrentNodeJSGraph and the tab label.
+ * On any failure (agent down, timeout, parse error) the existing 40-char
+ * query-truncation name is silently kept in place (REQ-3.2.4 fallback).
+ *
+ * @param {string} cypher      the Cypher query
+ * @param {number} tabId       id of the tab that triggered this query
+ * @param {number} tabIdx      index of that tab at query time
+ */
+async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
+  // Only attempt when the agent is configured
+  if (!_agentConfig || !_agentConfig.model) return;
+  try {
+    var prompt =
+      'Based on the following Neo4j Cypher query, generate a concise graph name ' +
+      '(5 words max) and a one-sentence description of what the graph represents. ' +
+      'Respond with ONLY valid JSON — no markdown, no extra text — in this exact ' +
+      'shape: {"name":"...","description":"..."}.\n\nQuery:\n' + cypher;
+    var resp = await api('/api/agent/chat', {
+      message:       prompt,
+      history:       [],
+      llm:           _agentConfig,
+      current_graph: _currentGraphSummary()
+    });
+
+    // Extract JSON from the reply (agent may wrap it in prose or code fences)
+    var parsed = null;
+    try {
+      var raw = (resp && resp.reply) ? String(resp.reply).trim() : '';
+      // Strip optional ```json … ``` wrapper
+      var m = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+      var jsonStr = m ? m[1] : raw;
+      // Find the first {...} object in the string
+      var objM = jsonStr.match(/\{[\s\S]*\}/);
+      if (objM) parsed = JSON.parse(objM[0]);
+    } catch (_) { /* parse failure → keep fallback */ }
+
+    if (!parsed || typeof parsed.name !== 'string' || !parsed.name.trim()) return;
+
+    // Guard: only update if we're still looking at the same graph
+    var currentTabIdx = tabs.findIndex(function(t) { return t.id === tabId; });
+    if (currentTabIdx < 0) return;
+    var g = SummarizeRequest.CurrentNodeJSGraph;
+    if (!g || g.cypher !== cypher) return;   // user loaded a different graph
+
+    var aiName = parsed.name.trim();
+    var aiDesc = (parsed.description || '').trim();
+    g.Name        = aiName;
+    g.Description = aiDesc;
+
+    // Update the tab label (REQ-4.1)
+    if (currentTabIdx === activeTabIdx) {
+      updateCurrentTabName(aiName);
+    } else {
+      tabs[currentTabIdx].name = aiName;
+      renderTabBar();
+    }
+  } catch (err) {
+    // REQ-3.2.4: any error is silently swallowed; fallback name stays in place
+    console.warn('_nameGraphFromCypher: AI name generation failed:', err && err.message);
   }
 }
 
@@ -5889,7 +6128,12 @@ function renderTooltip(edge, refs) {
   var relId   = edge.data('relId');
   var relIds  = edge.data('relIds') || (relId ? [relId] : []);
   var edgeURN = edge.data('edgeURN');
-  if (relIds.length > 0 || (edgeURN && edgeURN !== '')) {
+  // Audit fields (createdAt/By, updatedAt/By) live in graphData.edges properties,
+  // not in Cytoscape edge data, so look them up there.
+  var _rawEdge = graphData.edges.find(function(ge) { return ge.id === edge.id(); });
+  var _ep = (_rawEdge && _rawEdge.properties) || {};
+  if (relIds.length > 0 || (edgeURN && edgeURN !== '') ||
+      _ep.createdAt != null || _ep.createdBy || _ep.updatedAt != null || _ep.updatedBy) {
     html += '<div style="margin-top:8px;border-top:1px solid #2a2f4a;padding-top:4px">';
     if (relIds.length > 0) {
       html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
@@ -5899,6 +6143,26 @@ function renderTooltip(edge, refs) {
     if (edgeURN && edgeURN !== '') {
       html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
         + '<span style="color:#454d6a">URN:</span> ' + escHtml(String(edgeURN))
+        + '</div>';
+    }
+    if (_ep.createdAt != null) {
+      html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">createdAt:</span> ' + escHtml(_fmtTimestamp(_ep.createdAt))
+        + '</div>';
+    }
+    if (_ep.createdBy) {
+      html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">createdBy:</span> ' + escHtml(String(_ep.createdBy))
+        + '</div>';
+    }
+    if (_ep.updatedAt != null) {
+      html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">updatedAt:</span> ' + escHtml(_fmtTimestamp(_ep.updatedAt))
+        + '</div>';
+    }
+    if (_ep.updatedBy) {
+      html += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
+        + '<span style="color:#454d6a">updatedBy:</span> ' + escHtml(String(_ep.updatedBy))
         + '</div>';
     }
     html += '</div>';
@@ -5947,7 +6211,7 @@ function renderNodeTooltip(node) {
   // Priority fields shown immediately after description
   var PRIORITY_FIELDS = ['Localization', 'localization', 'Notes', 'notes', 'Aliases', 'aliases'];
   // Service fields shown at the very bottom
-  var SERVICE_FIELDS  = ['createdAt', 'updatedAt', 'NodeID', 'URN', 'urn'];
+  var SERVICE_FIELDS  = ['createdAt', 'createdBy', 'updatedAt', 'updatedBy', 'NodeID', 'URN', 'urn'];
   var SERVICE_SET = {};
   SERVICE_FIELDS.forEach(function(k) { SERVICE_SET[k] = 1; });
   var PRIORITY_SET = {};
@@ -6006,13 +6270,15 @@ function renderNodeTooltip(node) {
     html += '</div>';
   }
 
-  // 3. Service fields: createdAt, updatedAt, NodeID, URN
+  // 3. Service fields: createdAt, createdBy, updatedAt, updatedBy, NodeID, URN
+  var _TS_KEYS = { createdAt: 1, updatedAt: 1 };
   var serviceHtml = '';
   SERVICE_FIELDS.forEach(function(k) {
     var val = data[k];
     if (val != null && val !== '' && typeof val !== 'object') {
+      var display = _TS_KEYS[k] ? _fmtTimestamp(val) : String(val);
       serviceHtml += '<div style="font-size:10px;color:#5a6080;margin-top:2px">'
-        + '<span style="color:#454d6a">' + escHtml(k) + ':</span> ' + escHtml(String(val))
+        + '<span style="color:#454d6a">' + escHtml(k) + ':</span> ' + escHtml(display)
         + '</div>';
     }
   });
@@ -6066,6 +6332,18 @@ function colorSentence(text, regulatorMedScan, targetMedScan) {
   }
   result += escHtml(text.slice(lastIndex));
   return result;
+}
+
+// Format a Neo4j timestamp() value (Unix milliseconds) as a readable local date/time string.
+// Falls back to the raw value if it isn't a valid number.
+function _fmtTimestamp(ms) {
+  var n = Number(ms);
+  if (!isFinite(n) || n <= 0) return String(ms);
+  try {
+    return new Date(n).toLocaleString();
+  } catch(e) {
+    return String(ms);
+  }
 }
 
 function escHtml(s) {
@@ -6253,8 +6531,8 @@ async function loadTableData() {
   graphData.edges.forEach(function(e) {
     if (Array.isArray(e.properties.RelationIDs)) {
       e.properties.RelationIDs.forEach(function(id) { if (id != null) relIds.push(String(id)); });
-    } else if (e.properties.RelationID != null) {
-      relIds.push(String(e.properties.RelationID));
+    } else {
+      _relIds(e.properties.RelationID).forEach(function(id) { relIds.push(id); });
     }
   });
 
@@ -6291,7 +6569,7 @@ async function loadTableData() {
   var missingNosIds = relIds.filter(function(id) {
     var e = graphData.edges.find(function(ge) {
       var ids = Array.isArray(ge.properties.RelationIDs) ? ge.properties.RelationIDs
-              : (ge.properties.RelationID != null ? [String(ge.properties.RelationID)] : []);
+              : _relIds(ge.properties.RelationID);
       return ids.indexOf(id) >= 0;
     });
     return e && e.properties.RelationNumberOfSentences == null;
@@ -6302,7 +6580,7 @@ async function loadTableData() {
         { relationIds: missingNosIds, properties: ['RelationNumberOfSentences'] });
       graphData.edges.forEach(function(e) {
         var ids = Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs
-                : (e.properties.RelationID != null ? [String(e.properties.RelationID)] : []);
+                : _relIds(e.properties.RelationID);
         for (var i = 0; i < ids.length; i++) {
           var entry = nosMap[ids[i]];
           if (entry && entry.RelationNumberOfSentences != null) {
@@ -6319,7 +6597,7 @@ async function loadTableData() {
   // Supplement with inline references stored in the JSON (RNEF-converted pathways).
   // These have the same field names (pmid, doi, pubyear, title, msrc) as DB rows.
   graphData.edges.forEach(function(e) {
-    var relId = e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+    var relId = _relId(e.properties.RelationID);
     // For merged edges, also index refs under each of their RelationIDs
     var allIds = Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs : (relId ? [relId] : []);
     if (e.properties.references && e.properties.references.length) {
@@ -6420,7 +6698,7 @@ async function loadTableData() {
   graphData.edges.forEach(function(edge) {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
-    var relId = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+    var relId = _relId(edge.properties.RelationID);
     var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
     var relIdDisplay = relIdsArr.join(', ') || relId;
     var refs = [];
@@ -6678,13 +6956,14 @@ async function loadRelationData() {
   // Fetch RelationNumberOfSentences for edges that don't have it yet
   var relMissingIds = graphData.edges
     .filter(function(e) { return e.properties.RelationID != null && e.properties.RelationNumberOfSentences == null; })
-    .map(function(e) { return String(e.properties.RelationID); });
+    .reduce(function(acc, e) { return acc.concat(_relIds(e.properties.RelationID)); }, []);
   if (relMissingIds.length > 0) {
     try {
       var relNosMap = await api('/api/relations/properties',
         { relationIds: relMissingIds, properties: ['RelationNumberOfSentences'] });
       graphData.edges.forEach(function(e) {
-        var id = e.properties.RelationID != null ? String(e.properties.RelationID) : null;
+        var ids = _relIds(e.properties.RelationID);
+        var id = ids[0] || null;
         if (id && relNosMap[id] && relNosMap[id].RelationNumberOfSentences != null) {
           e.properties.RelationNumberOfSentences = relNosMap[id].RelationNumberOfSentences;
         }
@@ -6735,7 +7014,7 @@ async function loadRelationData() {
       elementId:        edge.elementId || edge.id,
       relId:            (function() {
                           var ids = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : null;
-                          var primary = edge.properties.RelationID != null ? String(edge.properties.RelationID) : '';
+                          var primary = _relId(edge.properties.RelationID);
                           return ids && ids.length > 1 ? ids.join(', ') : primary;
                         })(),
       regulator:        nodeLabel(srcNode),
@@ -7749,13 +8028,18 @@ function loadSubgraph(event) {
       currentPathwayFilePath = null;
       currentPathwaySourceFile = null;
       currentPathwayUrn = data.urn || null;
+      // Build the central Graph object from the saved JSON (same RNEF-derived
+      // format, no filePath since this came from File → Load subgraph).
+      SummarizeRequest.CurrentNodeJSGraph = Graph.fromRnef(data);
+      if (!SummarizeRequest.CurrentNodeJSGraph.Name)
+        SummarizeRequest.CurrentNodeJSGraph.Name = file.name.replace(/\.json$/i, '');
       renderGraph(data.graphData, data.positions || null);
-      updateCurrentTabName(currentSubgraphName || file.name.replace(/\.json$/i, ''));
+      updateCurrentTabName(SummarizeRequest.CurrentNodeJSGraph.Name || file.name.replace(/\.json$/i, ''));
 
       // Pre-populate refsCache with inline references from JSON so edge
       // tooltips work without a PostgreSQL lookup.
       (data.graphData.edges || []).forEach(function(e) {
-        var relId = e.properties && e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+        var relId = e.properties && _relId(e.properties.RelationID);
         if (relId && e.properties.references && e.properties.references.length) {
           refsCache[relId] = e.properties.references;
         }
@@ -7863,13 +8147,16 @@ function openRnefPathway(data, filePath, sourceFileAbs) {
   currentPathwayFilePath = filePath || null;
   currentPathwaySourceFile = sourceFileAbs || null;
   currentPathwayUrn = data.urn || null;
+  // Build the central Graph object from RNEF data (REQ-2.1, REQ-3.1.x).
+  // filePath provides the file stem for REQ-3.1.3 (name fallback).
+  SummarizeRequest.CurrentNodeJSGraph = Graph.fromRnef(data, filePath);
   renderGraph(data.graphData, data.positions || null);
-  updateCurrentTabName(currentSubgraphName || 'Pathway');
+  updateCurrentTabName(SummarizeRequest.CurrentNodeJSGraph.Name || 'Pathway');
   appendPathwayHistory(currentSubgraphName || 'Pathway', filePath, sourceFileAbs);
 
   // Pre-populate refsCache with inline references
   (data.graphData.edges || []).forEach(function(e) {
-    var relId = e.properties && e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+    var relId = e.properties && _relId(e.properties.RelationID);
     if (relId && e.properties.references && e.properties.references.length) {
       refsCache[relId] = e.properties.references;
     }
@@ -8100,13 +8387,13 @@ async function matchRnefRelationsToNeo4j() {
       if (Array.isArray(e.properties.references) && e.properties.references.length) return; // already has refs
       if (Array.isArray(e.properties.RelationIDs)) {
         e.properties.RelationIDs.forEach(function(id) { if (id != null) preRelIds.push(String(id)); });
-      } else if (e.properties.RelationID != null) {
-        preRelIds.push(String(e.properties.RelationID));
+      } else {
+        _relIds(e.properties.RelationID).forEach(function(id) { preRelIds.push(id); });
       }
     });
     // Also pre-populate refsCache from inline refs already present in graphData
     graphData.edges.forEach(function(e) {
-      var relId = e.properties && e.properties.RelationID != null ? String(e.properties.RelationID) : '';
+      var relId = e.properties && _relId(e.properties.RelationID);
       if (relId && Array.isArray(e.properties.references) && e.properties.references.length) {
         refsCache[relId] = e.properties.references;
       }
@@ -8139,7 +8426,7 @@ async function matchRnefRelationsToNeo4j() {
         if (targetGDpre) {
           targetGDpre.edges.forEach(function(e) {
             if (!e.properties || e.properties.RelationID == null) return;
-            var relId = String(e.properties.RelationID);
+            var relId = _relId(e.properties.RelationID);
             var dbRefs     = preRefsGrouped[relId] || [];
             var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
             // _mergeInlineAndDbRefs (not a first-wins concat+filter) so the
@@ -8253,8 +8540,8 @@ async function matchRnefRelationsToNeo4j() {
           if (!e.properties) return;
           if (Array.isArray(e.properties.RelationIDs)) {
             e.properties.RelationIDs.forEach(function(id) { if (id != null) bgRelIds.push(String(id)); });
-          } else if (e.properties.RelationID != null) {
-            bgRelIds.push(String(e.properties.RelationID));
+          } else {
+            _relIds(e.properties.RelationID).forEach(function(id) { bgRelIds.push(id); });
           }
         });
         if (bgRelIds.length) {
@@ -8274,7 +8561,7 @@ async function matchRnefRelationsToNeo4j() {
 
             targetGD.edges.forEach(function(e) {
               if (!e.properties || e.properties.RelationID == null) return;
-              var relId = String(e.properties.RelationID);
+              var relId = _relId(e.properties.RelationID);
               var dbRefs     = bgRefsGrouped[relId] || [];
               var inlineRefs = Array.isArray(e.properties.references) ? e.properties.references : [];
               // _mergeInlineAndDbRefs, not a first-wins concat+filter -- see
@@ -8405,7 +8692,7 @@ async function matchRnefRelationsToNeo4j() {
 
         targetGD.edges.forEach(function(e) {
           if (!e.properties || e.properties.RelationID == null) return;
-          var relId = String(e.properties.RelationID);
+          var relId = _relId(e.properties.RelationID);
           if (!matchedRelIds.has(relId)) return;
 
           var dbRefs     = matchedRefsGrouped[relId] || [];
@@ -8672,10 +8959,10 @@ async function loadSimilarRelations() {
       });
     } else {
       targetGD.edges.forEach(function(e) {
-        var rid = e.properties && e.properties.RelationID;
-        if (rid) existingRelIds.add(String(rid));
+        var rid = _relId(e.properties && e.properties.RelationID);
+        if (rid != null) existingRelIds.add(rid);
         var rids = e.properties && e.properties.RelationIDs;
-        if (Array.isArray(rids)) rids.forEach(function(id) { existingRelIds.add(String(id)); });
+        if (Array.isArray(rids)) _relIds(rids).forEach(function(id) { existingRelIds.add(id); });
       });
     }
 
@@ -8695,7 +8982,7 @@ async function loadSimilarRelations() {
       // overwrites the original relation's own RelationID. See this
       // function's header comment for why.
       entry.relations.forEach(function(rel) {
-        if (!rel.relationID || rel.relationID === 'null') return;
+        if (!rel.relationID) return;
         if (existingRelIds.has(rel.relationID)) return;
         existingRelIds.add(rel.relationID);
 
@@ -8876,7 +9163,7 @@ async function findRelationsBetweenGroups(filterType) {
   // Collect already-present RelationIDs to avoid duplicates
   var existingRelIds = new Set();
   cy.edges().forEach(function(e) {
-    var rid = e.data('relId'); if (rid) existingRelIds.add(String(rid));
+    var rid = e.data('relId'); if (rid != null) existingRelIds.add(rid);
   });
 
   var filterLabel = { all: 'All', direct: 'Direct physical interactions',
@@ -8898,7 +9185,7 @@ async function findRelationsBetweenGroups(filterType) {
 
   // Filter out already-present edges
   var newRelations = relations.filter(function(r) {
-    return r.relationID && !existingRelIds.has(String(r.relationID));
+    return !!r.relationID && !existingRelIds.has(r.relationID);
   });
 
   // Build breakdown by relation type for the confirmation dialog
@@ -9011,7 +9298,7 @@ async function connectSelectedNodes(filterType) {
   // Collect already-present RelationIDs to avoid duplicates
   var existingRelIds = new Set();
   cy.edges().forEach(function(e) {
-    var rid = e.data('relId'); if (rid) existingRelIds.add(String(rid));
+    var rid = e.data('relId'); if (rid != null) existingRelIds.add(rid);
   });
 
   var filterLabel = { all: 'All', direct: 'Direct physical interactions',
@@ -9030,7 +9317,7 @@ async function connectSelectedNodes(filterType) {
 
   var relations = (resp && resp.relations) || [];
   var newRelations = relations.filter(function(r) {
-    return r.relationID && !existingRelIds.has(String(r.relationID));
+    return !!r.relationID && !existingRelIds.has(r.relationID);
   });
 
   // Build breakdown by relation type
@@ -9220,7 +9507,7 @@ async function mergeSimilarRelations() {
     } else {
       var gEdge = edgeURN
         ? graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.URN) === edgeURN; })
-        : (relId ? graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.RelationID) === relId; }) : null);
+        : (relId ? graphData.edges.find(function(ge) { return ge.properties && _relIds(ge.properties.RelationID).indexOf(relId) >= 0; }) : null);
       if (!gEdge) gEdge = graphData.edges.find(function(ge) { return ge.id === e.id(); });
       if (gEdge && gEdge.properties && Array.isArray(gEdge.properties.references)) {
         refs = gEdge.properties.references.slice();
@@ -9354,7 +9641,7 @@ async function mergeSimilarRelations() {
       if (e) return e;
     }
     if (info.relId) {
-      var e = graphData.edges.find(function(ge) { return ge.properties && String(ge.properties.RelationID) === info.relId; });
+      var e = graphData.edges.find(function(ge) { return ge.properties && _relIds(ge.properties.RelationID).indexOf(info.relId) >= 0; });
       if (e) return e;
     }
     return graphData.edges.find(function(ge) { return ge.id === info.id; });
@@ -9544,7 +9831,7 @@ async function mergeSimilarRelations() {
       }
       var idx = graphData.edges.findIndex(function(ge) {
         if (e.edgeURN && ge.properties && String(ge.properties.URN) === e.edgeURN) return true;
-        if (e.relId  && ge.properties && String(ge.properties.RelationID) === e.relId) return true;
+        if (e.relId  && ge.properties && _relIds(ge.properties.RelationID).indexOf(e.relId) >= 0) return true;
         return ge.id === e.id;
       });
       if (idx >= 0) { graphData.edges.splice(idx, 1); }
@@ -10198,12 +10485,12 @@ async function _cncOpenDialog(action, context, title) {
   var maxLenRow = document.getElementById('cnc-sp-maxlen-row');
   if (maxLenRow) maxLenRow.style.display = (action === 'shortestPath') ? 'flex' : 'none';
 
-  // Connect Selected Nodes only ever looks for RELATIONS between nodes the
-  // user already picked — it can't return a new node of any type, so a
-  // "Node Types" tab to filter by would just be misleading. Hide the tab
-  // bar entirely and open straight on Relation Types for that one action;
-  // every other action keeps both tabs, opening on Node Types as before.
-  var nodeTabApplicable = (action !== 'connectSelected');
+  // Connect Selected Nodes and Find Between Selected/Unselected both search
+  // for RELATIONS only — neither introduces new nodes the user hasn't already
+  // chosen, so a "Node Types" tab to filter by would be misleading. Hide the
+  // tab bar entirely and open straight on Relation Types for both; every
+  // other action (commonNeighbors, expand, shortestPath) keeps both tabs.
+  var nodeTabApplicable = (action !== 'connectSelected' && action !== 'findBetween');
   var tabsBar = document.getElementById('cnc-tabs-bar');
   if (tabsBar) tabsBar.style.display = nodeTabApplicable ? 'flex' : 'none';
   _cncSwitchTab(nodeTabApplicable ? 'node' : 'rel');
@@ -10315,7 +10602,7 @@ async function openFindBetweenAllDialog() {
   await _cncOpenDialog('findBetween',
     { anchorURNs: selectedURNs, scopeURNs: allURNs,
       summaryText: selectedURNs.length + ' selected node(s), ' + Math.max(0, allURNs.length - selectedURNs.length) + ' unselected node(s) in this pathway' },
-    'Find Relations Between Selected and Unselected — All Relations');
+    'Connect Selected and Unselected — All Relations');
 }
 
 async function openConnectSelectedAllDialog() {
@@ -10475,6 +10762,28 @@ async function runExploreConfigQuery() {
         summary: (ctx.summaryText || '') + ' — filter: ' + filterLabel,
         groups: groups
       });
+    } else if (action === 'findBetween') {
+      // Like connectSelected, dedupe across groups then merge straight into
+      // the graph — no second dialog; the config dialog already served as the
+      // one user confirmation step.
+      var fbNodesById = new Map();
+      var fbEdgesById = new Map();
+      (groups || []).forEach(function(g) {
+        if (g.node) fbNodesById.set(g.node.id, g.node);
+        (g.targets || []).forEach(function(t) { fbNodesById.set(t.id, t); });
+        (g.edges || []).forEach(function(e) { fbEdgesById.set(e.id, e); });
+      });
+      var fbPending = { nodes: Array.from(fbNodesById.values()), edges: Array.from(fbEdgesById.values()) };
+      var fbResult = mergeGraphData(fbPending);
+      updateStats();
+      if (document.getElementById('table-view').style.display !== 'none') _reloadCurrentTableMode();
+      console.log('[findBetween] added ' + fbResult.addedNodes + ' node(s), ' + fbResult.addedEdges + ' edge(s)');
+      if (fbResult.addedEdges === 0 && fbResult.addedNodes === 0) {
+        showAlignHint('No new relations found between selected and unselected nodes.');
+      } else {
+        showAlignHint('Added ' + fbResult.addedEdges + ' relation(s)' +
+          (fbResult.addedNodes > 0 ? ' and ' + fbResult.addedNodes + ' node(s)' : '') + ' to the graph.');
+      }
     } else {
       openConnectivityReport({
         title: dialogTitle,
@@ -11481,7 +11790,7 @@ async function openRelationCurationDialog() {
   Object.assign(_rc, {
     mode: 'create', nodes: [], props: [], existingEdge: null,
     refs: [], refIdx: 0, refsVisible: false, refsLoaded: false,
-    currentRelId: '', _pid: 0
+    currentRelId: null, nondirectional: false, _pid: 0
   });
 
   if (selEdges.length === 1 && selNodes.length === 0) {
@@ -11504,7 +11813,10 @@ async function openRelationCurationDialog() {
     var EDGE_SKIP = { RelationID:1, RelationIDs:1, RelationNumberOfReferences:1,
                       RelationNumberOfSentences:1, createdAt:1, updatedAt:1,
                       createdBy:1, updatedBy:1, id:1, source:1, target:1,
-                      elementId:1, relType:1, relId:1, relIds:1, color:1, label:1 };
+                      elementId:1, relType:1, relId:1, relIds:1, color:1, label:1,
+                      directed:1,  // controlled by "Make nondirectional" button
+                      // cy-internal display attributes — must never reach Neo4j
+                      edgeURN:1, lineStyle:1, isHyperedge:1 };
     Object.keys(edge.data()).forEach(function(k) {
       if (EDGE_SKIP[k]) return;
       var v = edge.data(k);
@@ -11512,6 +11824,9 @@ async function openRelationCurationDialog() {
       _rc.props.push({ id: ++_rc._pid, key: k,
         value: Array.isArray(v) ? v.join(';') : String(v) });
     });
+
+    // Initialize nondirectional toggle from the edge's existing directed flag
+    _rc.nondirectional = edge.data('directed') === false || edge.hasClass('undirected');
 
   } else if (selNodes.length >= 2) {
     // ── CREATE new edge ────────────────────────────────────────────────────
@@ -11528,7 +11843,7 @@ async function openRelationCurationDialog() {
   }
 
   document.getElementById('rc-title').textContent =
-    _rc.mode === 'edit' ? 'Edit Relation' : 'Create/Edit Hyperedge';
+    _rc.mode === 'edit' ? 'Edit HyperEdge Relation' : 'Create/Edit HyperEdge Relation';
 
   // Show dialog immediately with whatever schema is already cached
   rcRenderNodes();
@@ -11536,6 +11851,7 @@ async function openRelationCurationDialog() {
   rcRenderPropKeyDropdown();
   rcRenderProps();
   rcHideRefsPanel();
+  rcUpdateNondirectionalBtn();
   document.getElementById('rel-curation-modal').style.display = 'flex';
 
   // Load schema caches in background and refresh dropdowns when done
@@ -11562,6 +11878,27 @@ async function openRelationCurationDialog() {
 
 function closeRelationCurationDialog() {
   document.getElementById('rel-curation-modal').style.display = 'none';
+}
+
+function rcToggleNondirectional() {
+  _rc.nondirectional = !_rc.nondirectional;
+  rcUpdateNondirectionalBtn();
+}
+
+function rcUpdateNondirectionalBtn() {
+  var btn = document.getElementById('rc-nondirectional-btn');
+  if (!btn) return;
+  if (_rc.nondirectional) {
+    btn.textContent = 'Make directional';
+    btn.style.background = '#2a4060';
+    btn.style.borderColor = '#4f8ef7';
+    btn.style.color = '#7fb8f7';
+  } else {
+    btn.textContent = 'Make nondirectional';
+    btn.style.background = '#1a2040';
+    btn.style.borderColor = '#3a3f55';
+    btn.style.color = '#c0c4d4';
+  }
 }
 
 // ── Nodes section ─────────────────────────────────────────────────────────────
@@ -11736,9 +12073,9 @@ async function rcCalcRelId() {
       effect:       getProp(['effect','Effect']),
       mechanism:    getProp(['mechanism','Mechanism'])
     });
-    _rc.currentRelId = r.relationId || '';
+    _rc.currentRelId = r.relationId != null ? String(r.relationId) : null;
     var relIdEl = document.getElementById('rc-rel-id');
-    relIdEl.textContent = _rc.currentRelId || '—';
+    relIdEl.textContent = _rc.currentRelId != null ? _rc.currentRelId : '—';
     relIdEl.title = r.existingFound
       ? 'Matched existing relation in database — Save will update it'
       : 'New relation — computed hash';
@@ -12101,6 +12438,14 @@ async function rcSaveToDatabase() {
   var props = {};
   _rc.props.forEach(function(p) { props[p.key] = p.value; });
 
+  // Apply nondirectional toggle — stored as directed:false in Neo4j.
+  // directed:true is the default so we omit it rather than writing it explicitly.
+  if (_rc.nondirectional) {
+    props['directed'] = false;
+  } else {
+    delete props['directed'];
+  }
+
   // Refs to send: all (server filters by _deleted / _new)
   var refsToSend = _rc.refs.filter(function(r) {
     if (r._deleted) return true;
@@ -12144,15 +12489,17 @@ async function rcSaveToDatabase() {
       // Existing edge — look it up by RelationID and update in-memory data directly.
       // (mergeGraphData ID-matching fails when the existing edge uses an integer ID
       //  while the server returns a Neo4j element-ID string.)
-      var relIdStr = String(_rc.currentRelId);
+      var relIdStr = _rc.currentRelId;
       var ge = graphData.edges.find(function(e) {
-        return e.properties && String(e.properties.RelationID) === relIdStr;
+        return e.properties && _relIds(e.properties.RelationID).indexOf(relIdStr) >= 0;
       });
       if (ge) {
         Object.assign(ge.properties, savedProps);
         var cyEdge = cy.getElementById(ge.id);
         if (cyEdge && cyEdge.length) {
           Object.keys(savedProps).forEach(function(k) { cyEdge.data(k, savedProps[k]); });
+          // Sync the undirected CSS class so the arrowhead appears/disappears immediately
+          cyEdge.toggleClass('undirected', !!_rc.nondirectional);
         }
       } else {
         // Fallback: try mergeGraphData in case IDs do happen to match
@@ -12189,21 +12536,23 @@ function openPairRelationDialog() {
   if (selNodes.length !== 2) return;
 
   var nA = selNodes[0], nB = selNodes[1];
-  _rcPair.nodeA      = { cyId: nA.id(), label: nA.data('label') || nA.id(), nodeType: nA.data('nodeType') || '', nodeId: nA.data('NodeID') || '' };
-  _rcPair.nodeB      = { cyId: nB.id(), label: nB.data('label') || nB.id(), nodeType: nB.data('nodeType') || '', nodeId: nB.data('NodeID') || '' };
+  _rcPair.nodeA      = { cyId: nA.id(), label: nA.data('label') || nA.id(), nodeType: nA.data('nodeType') || '', nodeId: nA.data('NodeID') || '', nodeURN: nA.data('URN') || '' };
+  _rcPair.nodeB      = { cyId: nB.id(), label: nB.data('label') || nB.id(), nodeType: nB.data('nodeType') || '', nodeId: nB.data('NodeID') || '', nodeURN: nB.data('URN') || '' };
   _rcPair.flipped    = false;
   _rcPair.isNonDir   = false;
+  _rcPair.nondirectional = false;
   _rcPair.props      = [];
   _rcPair.refs       = [];
   _rcPair.refIdx     = 0;
   _rcPair.refsVisible = false;
   _rcPair.refsLoaded  = false;
-  _rcPair.currentRelId = '';
+  _rcPair.currentRelId = null;
   _rcPair.existingEdge = null;  // creating a brand new relation — no source edge to pull inline refs from
   _rcPair._pid       = 0;
 
   document.getElementById('rcp-reltype').value = '';
   document.getElementById('rcp-rel-id').textContent = '—';
+  document.getElementById('rcp-edge-urn').textContent = '—';
 
   rcPairRenderVisual();
   rcPairRenderProps();
@@ -12242,13 +12591,16 @@ function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
   var relType = cyEdge.data('relType') || '';
 
   _rcPair.nodeA       = { cyId: srcCy.id(), label: srcCy.data('label') || srcCy.id(),
-                          nodeType: srcCy.data('nodeType') || '', nodeId: srcCy.data('NodeID') || '' };
+                          nodeType: srcCy.data('nodeType') || '', nodeId: srcCy.data('NodeID') || '',
+                          nodeURN: srcCy.data('URN') || '' };
   _rcPair.nodeB       = { cyId: tgtCy.id(), label: tgtCy.data('label') || tgtCy.id(),
-                          nodeType: tgtCy.data('nodeType') || '', nodeId: tgtCy.data('NodeID') || '' };
+                          nodeType: tgtCy.data('nodeType') || '', nodeId: tgtCy.data('NodeID') || '',
+                          nodeURN: tgtCy.data('URN') || '' };
   _rcPair.flipped     = false;
   _rcPair.relType     = relType;
   _rcPair.isNonDir    = RC_NONDIRECTIONAL_TYPES.has(relType);
-  _rcPair.currentRelId = '';
+  _rcPair.nondirectional = cyEdge.data('directed') === false || cyEdge.hasClass('undirected');
+  _rcPair.currentRelId = null;
   _rcPair.existingEdge = cyEdge;
   _rcPair.refs        = [];
   _rcPair.refIdx      = 0;
@@ -12264,7 +12616,9 @@ function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
                     RelationNumberOfSentences:1, createdAt:1, updatedAt:1,
                     createdBy:1, updatedBy:1, id:1, source:1, target:1,
                     elementId:1, relType:1, relId:1, relIds:1, color:1, label:1,
-                    numRefs:1, numSentences:1, thickness:1, directed:1 };
+                    numRefs:1, numSentences:1, thickness:1, directed:1,
+                    // cy-internal display attributes — must never reach Neo4j
+                    edgeURN:1, lineStyle:1, isHyperedge:1 };
   _rcPair.props = [];
   Object.keys(cyEdge.data()).forEach(function(k) {
     if (EDGE_SKIP[k]) return;
@@ -12276,7 +12630,8 @@ function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
 
   // Set relation type in dropdown after populating
   document.getElementById('rcp-rel-id').textContent = '—';
-  document.getElementById('rcp-title').textContent = 'Create/Edit Relation';
+  document.getElementById('rcp-edge-urn').textContent = '—';
+  document.getElementById('rcp-title').textContent = 'Create/Edit Binary Relation';
 
   rcPairRenderProps();
   rcPairHideRefsPanel();
@@ -12347,14 +12702,10 @@ function rcPairOnRelTypeChange() {
   _rcPair.isNonDir = RC_NONDIRECTIONAL_TYPES.has(relType);
   if (_rcPair.isNonDir) _rcPair.flipped = false;
   rcPairRenderVisual();
-  rcPairScheduleRelIdCalc();
+  rcPairCalcEdgeURN();  // instant
+  rcPairCalcRelId();    // async, no debounce for discrete type selection
 }
 
-function rcPairSwapDirection() {
-  _rcPair.flipped = !_rcPair.flipped;
-  rcPairRenderVisual();
-  rcPairScheduleRelIdCalc();
-}
 
 // ── Node pair visual ──────────────────────────────────────────────────────────
 function rcPairRenderVisual() {
@@ -12363,8 +12714,6 @@ function rcPairRenderVisual() {
   if (!nA || !nB) { c.innerHTML = ''; return; }
 
   var relType = document.getElementById('rcp-reltype').value || _rcPair.relType || '';
-  var src = _rcPair.flipped ? nB : nA;
-  var tgt = _rcPair.flipped ? nA : nB;
 
   function nodeBox(n, roleLabel) {
     return '<div style="display:flex;flex-direction:column;align-items:center;flex:1;min-width:0">'
@@ -12376,31 +12725,49 @@ function rcPairRenderVisual() {
     + '</div>';
   }
 
-  var connector, swapHtml = '';
+  var connector;
+  var aLabel = '', bLabel = '';
+
   if (!relType) {
     connector = '<div style="align-self:center;padding:0 8px;font-size:22px;color:#2a3050;flex-shrink:0">?</div>';
   } else if (_rcPair.isNonDir) {
+    // Type-based nondirectional (Binding etc.) — fixed plain line, no dropdown
     connector = '<div style="align-self:center;padding:0 8px;flex-shrink:0">'
       + '<div style="width:48px;height:2px;background:#5a6080"></div>'
     + '</div>';
   } else {
-    connector = '<div style="align-self:center;padding:0 4px;font-size:26px;color:#4f8ef7;flex-shrink:0;line-height:1">→</div>';
-    swapHtml = '<div style="display:flex;justify-content:center;margin-top:10px">'
-      + '<button onclick="rcPairSwapDirection()" '
-        + 'style="background:#1a2040;border:1px solid #3a3f55;border-radius:5px;color:#c0c4d4;'
-        + 'padding:5px 16px;font-size:12px;cursor:pointer">⇄ Swap regulator / target</button>'
+    // Direction dropdown: → (forward A→B), ← (reverse B→A), — (nondirectional)
+    var dirVal = _rcPair.nondirectional ? 'none' : (_rcPair.flipped ? 'reverse' : 'forward');
+    connector = '<div style="align-self:center;padding:0 4px;flex-shrink:0">'
+      + '<select id="rcp-dir-select" onchange="rcPairDirectionChanged(this.value)"'
+        + ' style="background:#0d1117;border:1px solid #3a4060;border-radius:6px;color:#4f8ef7;'
+        + 'font-size:22px;padding:2px 4px;cursor:pointer;text-align:center;line-height:1">'
+        + '<option value="forward"' + (dirVal === 'forward' ? ' selected' : '') + '>→</option>'
+        + '<option value="reverse"' + (dirVal === 'reverse' ? ' selected' : '') + '>←</option>'
+        + '<option value="none"'    + (dirVal === 'none'    ? ' selected' : '') + '>—</option>'
+      + '</select>'
     + '</div>';
+
+    if (!_rcPair.nondirectional) {
+      aLabel = _rcPair.flipped ? 'Target'    : 'Regulator';
+      bLabel = _rcPair.flipped ? 'Regulator' : 'Target';
+    }
   }
 
-  var regLabel  = _rcPair.isNonDir ? '' : 'Regulator';
-  var tgtLabel  = _rcPair.isNonDir ? '' : 'Target';
-
   c.innerHTML = '<div style="display:flex;align-items:flex-start;gap:8px;width:100%">'
-      + nodeBox(src, regLabel)
-      + connector
-      + nodeBox(tgt, tgtLabel)
-    + '</div>'
-    + swapHtml;
+    + nodeBox(nA, aLabel)
+    + connector
+    + nodeBox(nB, bLabel)
+  + '</div>';
+}
+
+function rcPairDirectionChanged(val) {
+  if (val === 'forward')  { _rcPair.flipped = false; _rcPair.nondirectional = false; }
+  else if (val === 'reverse') { _rcPair.flipped = true;  _rcPair.nondirectional = false; }
+  else                    { _rcPair.flipped = false; _rcPair.nondirectional = true;  }
+  rcPairRenderVisual();
+  rcPairCalcEdgeURN();   // instant client-side update
+  rcPairCalcRelId();     // async, fires immediately (no debounce for discrete actions)
 }
 
 // ── Properties ────────────────────────────────────────────────────────────────
@@ -12413,13 +12780,13 @@ function rcPairAddProperty() {
   _rcPair.props.push({ id: ++_rcPair._pid, key: key, value: val });
   valEl.value = ''; keyEl.value = '';
   rcPairRenderProps();
-  rcPairScheduleRelIdCalc();
+  rcPairCalcRelId();  // Effect/Mechanism affect RelationID — fire immediately
 }
 
 function rcPairDeleteProperty(pid) {
   _rcPair.props = _rcPair.props.filter(function(p) { return p.id !== pid; });
   rcPairRenderProps();
-  rcPairScheduleRelIdCalc();
+  rcPairCalcRelId();  // immediate recalc after property removal
 }
 
 function rcPairRenderProps() {
@@ -12440,10 +12807,33 @@ function rcPairRenderProps() {
   });
 }
 
-// ── RelationID ────────────────────────────────────────────────────────────────
+// ── RelationID + EdgeURN ──────────────────────────────────────────────────────
 function rcPairScheduleRelIdCalc() {
   if (_rcPair._debounce) clearTimeout(_rcPair._debounce);
   _rcPair._debounce = setTimeout(rcPairCalcRelId, 380);
+}
+
+// Compute the RNEF-format edge URN client-side (instant, no network call).
+// Format: urn:agi-{type}:in:{srcURN}:out:{tgtURN}   (directional)
+//         urn:agi-{type}:in-out:{urnA}:in-out:{urnB} (nondirectional — sorted)
+function rcPairCalcEdgeURN() {
+  var urnEl = document.getElementById('rcp-edge-urn');
+  if (!urnEl) return;
+  var relType = document.getElementById('rcp-reltype').value || _rcPair.relType || '';
+  if (!relType || (!_rcPair.nodeA.nodeURN && !_rcPair.nodeB.nodeURN)) {
+    urnEl.textContent = '—';
+    return;
+  }
+  var urn;
+  if (_rcPair.nondirectional || _rcPair.isNonDir) {
+    var sorted = [_rcPair.nodeA.nodeURN || '', _rcPair.nodeB.nodeURN || ''].sort();
+    urn = 'urn:agi-' + relType + ':in-out:' + sorted[0] + ':in-out:' + sorted[1];
+  } else {
+    var srcURN = _rcPair.flipped ? _rcPair.nodeB.nodeURN : _rcPair.nodeA.nodeURN;
+    var tgtURN = _rcPair.flipped ? _rcPair.nodeA.nodeURN : _rcPair.nodeB.nodeURN;
+    urn = 'urn:agi-' + relType + ':in:' + (srcURN || '') + ':out:' + (tgtURN || '');
+  }
+  urnEl.textContent = urn;
 }
 
 async function rcPairCalcRelId() {
@@ -12451,7 +12841,8 @@ async function rcPairCalcRelId() {
   var src = _rcPair.flipped ? _rcPair.nodeB : _rcPair.nodeA;
   var tgt = _rcPair.flipped ? _rcPair.nodeA : _rcPair.nodeB;
   var inref = [], outref = [], inoutref = [];
-  if (_rcPair.isNonDir) {
+  if (_rcPair.isNonDir || _rcPair.nondirectional) {
+    // Nondirectional: both nodes go into inoutref (order-independent hash)
     if (_rcPair.nodeA.nodeId) inoutref.push(_rcPair.nodeA.nodeId);
     if (_rcPair.nodeB.nodeId) inoutref.push(_rcPair.nodeB.nodeId);
   } else {
@@ -12464,6 +12855,8 @@ async function rcPairCalcRelId() {
         if (_rcPair.props[j].key.toLowerCase() === names[i].toLowerCase()) return _rcPair.props[j].value;
     return '';
   }
+  // EdgeURN is instant (client-side); update it together with RelationID
+  rcPairCalcEdgeURN();
   try {
     var r = await api('/api/curation/calculate-relation-id', {
       inref: inref, inoutref: inoutref, outref: outref,
@@ -12473,8 +12866,8 @@ async function rcPairCalcRelId() {
       effect:       getProp(['effect','Effect']),
       mechanism:    getProp(['mechanism','Mechanism'])
     });
-    _rcPair.currentRelId = r.relationId || '';
-    document.getElementById('rcp-rel-id').textContent = _rcPair.currentRelId || '—';
+    _rcPair.currentRelId = r.relationId != null ? String(r.relationId) : null;
+    document.getElementById('rcp-rel-id').textContent = _rcPair.currentRelId != null ? _rcPair.currentRelId : '—';
     // Right-clicked a specific row in the References table — auto-open the
     // References panel now that we have a RelationID to fetch refs for, so
     // the user lands directly on that reference instead of needing an extra
@@ -12771,39 +13164,114 @@ async function rcPairSaveToDatabase() {
 
   if (_rcPair.refsVisible && _rcPair.refs.length) rcPairSaveRefInputs();
 
+  // Always ensure refs are loaded before saving — the user may have not opened
+  // the References panel, but the relation may already have references (inline
+  // in the file or in Postgres) that must be preserved.
+  if (!_rcPair.refsLoaded) await rcPairLoadRefs();
+
   var props = {};
   _rcPair.props.forEach(function(p) { props[p.key] = p.value; });
+
+  // Apply nondirectional toggle — stored as directed:false in Neo4j.
+  if (_rcPair.nondirectional) {
+    props['directed'] = false;
+  } else {
+    delete props['directed'];
+  }
 
   var refsToSend = _rcPair.refs.filter(function(r) {
     if (r._deleted) return true;
     return Object.keys(r).some(function(k) { return !k.startsWith('_') && r[k]; });
   });
 
+  // When editing an existing relation, use its ORIGINAL RelationID as the MERGE
+  // key so the server updates the existing record instead of creating a duplicate.
+  // The newly-calculated RelationID only reflects any direction change but the
+  // underlying Neo4j relation must be found by its current ID first.
+  var origRelId = _rcPair.existingEdge ? (_rcPair.existingEdge.data('relId') || _rcPair.currentRelId) : _rcPair.currentRelId;
+
   setProgressMsg('⏳ Saving relation…');
   try {
     var result = await api('/api/curation/write-relation', {
-      sourceNode:   { nodeId: src.nodeId,  nodeLabel: src.nodeType  },
-      targetNode:   { nodeId: tgt.nodeId,  nodeLabel: tgt.nodeType  },
-      relationType: relType,
-      properties:   props,
-      relationId:   _rcPair.currentRelId,
-      isNew:        true,
-      references:   refsToSend
+      sourceNode:    { nodeId: src.nodeId,  nodeLabel: src.nodeType  },
+      targetNode:    { nodeId: tgt.nodeId,  nodeLabel: tgt.nodeType  },
+      relationType:  relType,
+      properties:    props,
+      relationId:    origRelId,
+      // When direction changed, newRelationId tells the server to update
+      // RelationID in Neo4j and migrate Postgres refs to the new hash.
+      newRelationId: (_rcPair.currentRelId && _rcPair.currentRelId !== origRelId)
+                       ? _rcPair.currentRelId : undefined,
+      isNew:         !_rcPair.existingEdge,
+      references:    refsToSend
     });
     setProgressMsg(null);
     if (result.error) { alert('Save failed: ' + result.error); return; }
 
     pushUndo();
-    mergeGraphData({
-      nodes: [],
-      edges: [{
-        id: result.elementId, elementId: result.elementId,
-        type: relType,
-        startNodeId: result.sourceNodeInternalId,
-        endNodeId:   result.targetNodeInternalId,
-        properties:  Object.assign({ RelationID: _rcPair.currentRelId }, result.properties)
-      }]
-    });
+    // savedProps uses the original RelationID (the one actually in Neo4j),
+    // not the re-calculated one, so the in-memory edge stays consistent.
+    var savedProps = Object.assign({ RelationID: origRelId }, result.properties);
+
+    if (_rcPair.existingEdge) {
+      // Editing an existing edge — use the direct reference we already hold.
+      // Do NOT search by RelationID here: if the direction changed the newly-
+      // calculated hash won't match the original edge, so the lookup would fail.
+      var cyEdge = _rcPair.existingEdge;
+      if (cyEdge && cyEdge.length) {
+        Object.keys(savedProps).forEach(function(k) { cyEdge.data(k, savedProps[k]); });
+        cyEdge.toggleClass('undirected', !!_rcPair.nondirectional);
+        // Keep relId and edgeURN cy-data attributes in sync with the newly
+        // calculated values so the tooltip reads them correctly.  relId may
+        // differ from origRelId when the user changed direction (which changes
+        // the hash).  We also migrate any cached refs to the new relId key so
+        // the tooltip doesn't have to re-fetch them from Postgres.
+        var newRelId   = _rcPair.currentRelId;
+        var newEdgeURN = (document.getElementById('rcp-edge-urn') || {}).textContent || '';
+        if (newEdgeURN === '—') newEdgeURN = '';
+        if (newRelId && newRelId !== origRelId) {
+          cyEdge.data('relId', newRelId);
+          cyEdge.data('RelationID', newRelId);
+          savedProps.RelationID = newRelId;
+          if (refsCache[origRelId] !== undefined) refsCache[newRelId] = refsCache[origRelId];
+        }
+        if (newEdgeURN) cyEdge.data('edgeURN', newEdgeURN);
+      }
+      // Keep graphData.edges in sync (match by cy edge id, not by RelationID).
+      // The lookup uses the CURRENT cy element id, which is still the old EdgeURN
+      // at this point — look it up before potentially changing it below.
+      var oldCyId = cyEdge.id();
+      var ge = graphData.edges.find(function(e) { return e.id === oldCyId; });
+      if (ge) {
+        Object.assign(ge.properties, savedProps);
+        // If EdgeURN changed (direction toggle), update id/elementId/URN in graphData
+        // so the saved JSON file and future lookups use the new nondirectional URN.
+        var newEdgeURN2 = cyEdge.data('edgeURN') || '';
+        if (newEdgeURN2 && newEdgeURN2 !== oldCyId) {
+          ge.id        = newEdgeURN2;
+          ge.elementId = newEdgeURN2;
+          if (ge.properties.URN != null) ge.properties.URN = newEdgeURN2;
+          // cy element id is immutable — but edgeURN data attr already updated above.
+          // Future saves will use ge.id (the graphData entry), which is now correct.
+        }
+      }
+      // Refresh tooltip if it's currently showing this edge
+      if (tooltipVisible && tooltipCurrentEdge && tooltipCurrentEdge.id() === cyEdge.id()) {
+        var _cachedRefs = refsCache[cyEdge.data('relId')] || null;
+        renderTooltip(cyEdge, _cachedRefs);
+      }
+    } else {
+      mergeGraphData({
+        nodes: [],
+        edges: [{
+          id: result.elementId, elementId: result.elementId,
+          type: relType,
+          startNodeId: result.sourceNodeInternalId,
+          endNodeId:   result.targetNodeInternalId,
+          properties:  savedProps
+        }]
+      });
+    }
     updateStats();
     closePairRelationDialog();
     showAlignHint('Relation saved to database.');
@@ -13574,7 +14042,7 @@ async function openPostgresSettings() {
   errEl.style.display = 'none'; okEl.style.display = 'none';
   try {
     var s = await api('/api/settings/postgres');
-    document.getElementById('pgs-host').value = s.host || '';
+    document.getElementById('pgs-url').value  = s.url  || '';
     document.getElementById('pgs-port').value = s.port || 5432;
   } catch(e) { /* show empty form */ }
   document.getElementById('postgres-settings-modal').style.display = 'flex';
@@ -13589,10 +14057,10 @@ async function savePostgresSettings() {
   var btn   = document.getElementById('pgs-save-btn');
   errEl.style.display = 'none'; okEl.style.display = 'none';
   var payload = {
-    host: document.getElementById('pgs-host').value.trim(),
+    url:  document.getElementById('pgs-url').value.trim(),
     port: parseInt(document.getElementById('pgs-port').value) || 5432
   };
-  if (!payload.host) { errEl.textContent = 'Host is required.'; errEl.style.display = 'block'; return; }
+  if (!payload.url) { errEl.textContent = 'URL is required.'; errEl.style.display = 'block'; return; }
 
   btn.disabled = true; btn.textContent = 'Saving…';
   try {
@@ -15433,7 +15901,7 @@ async function openMyPostgresSettings() {
   errEl.style.display = 'none'; okEl.style.display = 'none';
   try {
     var s = await api('/api/settings/my-postgres');
-    document.getElementById('mpgs-host').value     = s.host     || '';
+    document.getElementById('mpgs-url').value      = s.url      || '';
     document.getElementById('mpgs-port').value     = s.port     || 5432;
     document.getElementById('mpgs-database').value = s.database || '';
     document.getElementById('mpgs-schema').value   = s.schema   || '';
@@ -16705,7 +17173,9 @@ function emptyTabSnapshot() {
     selectedNodeKeys:     [],
     selectedEdgeKeys:     [],
     lastMatchedNodeCount: null,
-    lastMatchedEdgeCount: null
+    lastMatchedEdgeCount: null,
+    queryResultVisible:   false,
+    queryResultHtml:      ''
   };
 }
 
@@ -16792,11 +17262,26 @@ function captureTabState() {
     // previously-active tab last computed (these are plain globals, not
     // per-tab state, outside of this snapshot).
     lastMatchedNodeCount: _lastMatchedNodeCount,
-    lastMatchedEdgeCount: _lastMatchedEdgeCount
+    lastMatchedEdgeCount: _lastMatchedEdgeCount,
+    // Query-result overlay state — tab-scoped so switching tabs never bleeds a
+    // table from one tab's Cypher query onto another tab's graph view.
+    queryResultVisible: (function() {
+      var el = document.getElementById('query-result-overlay');
+      return !!(el && el.style.display === 'flex');
+    })(),
+    queryResultHtml: (function() {
+      var el = document.getElementById('query-result-overlay');
+      return (el && el.style.display === 'flex') ? el.innerHTML : '';
+    })()
   };
 }
 
 function applyTabState(snapshot) {
+  // Clear any query-result overlay that was left visible by the tab we're
+  // switching AWAY from — its HTML must never bleed into this tab's graph view.
+  // The correct overlay for THIS tab is restored from snapshot below.
+  hideQueryResultTable();
+
   // Always switch to Graph view when activating a tab so:
   //  (a) the user sees the graph of the tab they just switched to, and
   //  (b) Cytoscape renders into a visible container (hidden containers lose
@@ -16887,15 +17372,31 @@ function applyTabState(snapshot) {
     updateViewMenu('graph');
   }
 
-  // Apply results that arrived while this tab was in the background
+  // Apply results that arrived while this tab was in the background.
+  // Track whether pending data took ownership of the overlay so we don't
+  // clobber it with the (now-stale) snapshot html below.
+  var _pendingHandledOverlay = false;
   if (s.pendingGraphData) {
     var pd = s.pendingGraphData;
     delete s.pendingGraphData;
     if (pd.table && pd.nodes.length === 0 && pd.edges.length === 0) {
       showQueryResultTable(pd.table);
+      _pendingHandledOverlay = true;
     } else {
       hideQueryResultTable();
       renderGraph(pd);
+    }
+  }
+
+  // Restore the query-result overlay this tab had when it was last left
+  // (e.g. a Cypher query that returned table-only data).  Skip when pending
+  // data already populated the overlay with fresher content.
+  if (!_pendingHandledOverlay && s.queryResultVisible && s.queryResultHtml) {
+    var _qrEl = document.getElementById('query-result-overlay');
+    if (_qrEl) {
+      _qrEl.innerHTML = s.queryResultHtml;
+      _qrEl.style.display = 'flex';
+      document.getElementById('graph-empty-state').style.display = 'none';
     }
   }
   if (s.pendingQueryError) {
@@ -16955,11 +17456,18 @@ function closeTab(idx, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
   if (tabs.length <= 1) return;
   hideResizeHandles();
+  var wasActive = (idx === activeTabIdx);
   tabs.splice(idx, 1);
   if (activeTabIdx >= tabs.length) activeTabIdx = tabs.length - 1;
   else if (activeTabIdx > idx)     activeTabIdx--;
   renderTabBar();
-  applyTabState(tabs[activeTabIdx].snapshot);
+  // Only restore from snapshot when the closed tab was the active one —
+  // in that case we need to switch the displayed content to the new active
+  // tab. If a non-active tab was closed the live Cytoscape content is still
+  // the active tab's graph (snapshots are saved on switchTab, not on every
+  // render), so calling applyTabState here would overwrite the live graph
+  // with a stale empty snapshot.
+  if (wasActive) applyTabState(tabs[activeTabIdx].snapshot);
 }
 
 function renderTabBar() {
@@ -17188,6 +17696,7 @@ function copySelection() {
       var geRaw = graphData.edges.find(function(ge) { return ge.id === e.id(); });
       return {
         data: Object.assign({}, e.data()),
+        classes: e.classes(),   // preserve 'undirected' and any other visual classes
         raw: geRaw ? JSON.parse(JSON.stringify(geRaw)) : null
       };
     })
@@ -17320,7 +17829,14 @@ function pasteClipboard() {
     existingEdgeKeys.add(structKey);
 
     var newEid = e.data.id + '__paste__' + Date.now() + Math.random().toString(36).slice(2, 6);
+    // Determine if this edge is nondirectional: prefer the explicit raw property
+    // (directed:false) which is always set at save time; fall back to the
+    // clipboard's preserved Cytoscape classes (contains 'undirected') so that
+    // pasting from a tab where the edge was made nondirectional mid-session also works.
+    var pasteIsNonDir = (e.raw && e.raw.properties && e.raw.properties.directed === false)
+                      || (e.classes && e.classes.includes('undirected'));
     cy.add({ group: 'edges',
+      classes: pasteIsNonDir ? 'undirected' : (e.classes || ''),
       data: Object.assign({}, e.data, { id: newEid, elementId: newEid, source: newSrc, target: newTgt }) });
     if (e.raw) {
       var newRaw = JSON.parse(JSON.stringify(e.raw));
@@ -17892,7 +18408,7 @@ function _inlineReferencesForRelationIds(relIds) {
   var edges = (graphData && graphData.edges) || [];
   for (var i = 0; i < edges.length; i++) {
     var p = edges[i].properties || {};
-    var edgeIds = Array.isArray(p.RelationIDs) ? p.RelationIDs.map(String) : (p.RelationID != null ? [String(p.RelationID)] : []);
+    var edgeIds = Array.isArray(p.RelationIDs) ? p.RelationIDs.map(String) : _relIds(p.RelationID);
     if (!edgeIds.length || !Array.isArray(p.references) || !p.references.length) continue;
 
     var matchedIds = edgeIds.filter(function(id) { return !!wanted[id]; });
@@ -18022,7 +18538,7 @@ async function _summarizeSendRequest(message) {
       message:               message,
       history:                _agentChatHistory.slice(0, -1),
       llm:                    _agentConfig,
-      current_graph:          _cgForSummarize,
+      CurrentNodeJSGraph:     _cgForSummarize,
       scope:                  _summarizeScope,
       fetched_rows:           _summarizeFetchedRows,
       original_relation_ids:  _summarizeOriginalRelationIds,
@@ -18307,9 +18823,9 @@ function _currentGraphSummary() {
   });
   var cappedEdges = edges.slice(0, _AGENT_GRAPH_STATE_EDGE_CAP).map(function(e) {
     var p        = e.properties || {};
-    var relId    = p.RelationID != null ? String(p.RelationID) : null;
+    var relId    = _relId(p.RelationID) || null;
     var relUrn   = p.URN != null ? String(p.URN) : (p.urn != null ? String(p.urn) : null);
-    var relIds   = Array.isArray(p.RelationIDs) ? p.RelationIDs.map(String) : [];
+    var relIds   = Array.isArray(p.RelationIDs) ? p.RelationIDs.map(String) : _relIds(p.RelationID);
     if (relId && relIds.indexOf(relId) === -1) relIds.unshift(relId);
     var effect   = p.Effect || p.effect || null;
     var srcNode  = nodeById[e.startNodeId] || null;
@@ -18410,7 +18926,29 @@ function _currentGraphSummary() {
     });
   }
 
-  return {
+  // ── Graph-object metadata (REQ-4.2) ──────────────────────────────────────────
+  // When a Graph instance is available, attach all its metadata fields and its
+  // Nodes dictionary to the payload so the Python backend receives the fully
+  // formed Graph object "as is" alongside the legacy capped arrays it already
+  // understands.  Extra RNEF <properties> keys live directly on the Graph
+  // instance alongside the standard ones, so we copy every own (non-collection,
+  // non-function) property rather than an explicit whitelist.
+  var graphMeta = {};
+  if (SummarizeRequest.CurrentNodeJSGraph) {
+    var _g = SummarizeRequest.CurrentNodeJSGraph;
+    var _skip = new Set(['Nodes', 'edges', 'nodeCount', 'edgeCount',
+                         '_setProperties', '_populateNodes']);
+    Object.keys(_g).forEach(function(k) {
+      if (!_skip.has(k) && typeof _g[k] !== 'function') graphMeta[k] = _g[k];
+    });
+    // graphName and pathwayName should reflect the authoritative Graph.Name
+    if (_g.Name) {
+      graphName   = _g.Name;
+      pathwayName = _g.Name;
+    }
+  }
+
+  var payload = {
     graphName: graphName,
     pathwayName: pathwayName,
     tabName: activeTabName,
@@ -18426,6 +18964,16 @@ function _currentGraphSummary() {
     selectedNodes: selectedNodes.slice(0, _AGENT_GRAPH_STATE_NODE_CAP),
     selectedEdges: selectedEdges.slice(0, _AGENT_GRAPH_STATE_EDGE_CAP)
   };
+
+  // Merge Graph metadata fields (Name, Description, cypher, Organ, …)
+  // into the top-level payload.  Standard scalar fields land directly;
+  // the Nodes dict is included as a separate key for the Python backend.
+  Object.assign(payload, graphMeta);
+  if (SummarizeRequest.CurrentNodeJSGraph) {
+    payload.Nodes = SummarizeRequest.CurrentNodeJSGraph.Nodes;
+  }
+
+  return payload;
 }
 
 async function _prefetchAgentGraphReferences() {
@@ -18440,7 +18988,7 @@ async function _prefetchAgentGraphReferences() {
         if (id != null) relIdSet.add(String(id));
       });
     }
-    if (p.RelationID != null) relIdSet.add(String(p.RelationID));
+    _relIds(p.RelationID).forEach(function(id) { relIdSet.add(id); });
   });
 
   var relIds = Array.from(relIdSet);
@@ -19071,13 +19619,13 @@ async function _agentApplyBatchUpdate(cardId, btn, statusEl, card, dismissBtn, s
 function _applyBatchUpdateToLocalGraph(property, updates) {
   if (!updates || !updates.length) return;
   var byId = {};
-  updates.forEach(function(u) { byId[String(u.relationId)] = u.value; });
+  updates.forEach(function(u) { byId[u.relationId] = u.value; });
 
   function matchesAny(rid, ridList) {
-    if (rid != null && byId.hasOwnProperty(String(rid))) return byId[String(rid)];
+    if (rid != null && byId.hasOwnProperty(rid)) return byId[rid];
     if (Array.isArray(ridList)) {
       for (var i = 0; i < ridList.length; i++) {
-        if (byId.hasOwnProperty(String(ridList[i]))) return byId[String(ridList[i])];
+        if (byId.hasOwnProperty(ridList[i])) return byId[ridList[i]];
       }
     }
     return undefined;
@@ -20055,6 +20603,25 @@ async function fetchNeo4jDatabaseList() {
     var data = await api('/api/settings/list-neo4j-databases', { username: username, password: password });
     var names = data.databases || [];
     var dl = document.getElementById('mns-database-list');
+    dl.innerHTML = names.map(function(n) { return '<option value="' + escHtml(n) + '">'; }).join('');
+    statusEl.textContent = names.length + ' database' + (names.length !== 1 ? 's' : '') + ' available';
+  } catch (e) {
+    statusEl.textContent = 'Fetch failed: ' + e.message;
+  }
+}
+
+// Lists the PostgreSQL databases the entered username/password can connect to,
+// populating a datalist on the Database name field — mirrors fetchNeo4jDatabaseList().
+async function fetchPgDatabaseList() {
+  var statusEl = document.getElementById('mpgs-db-list-status');
+  var username = document.getElementById('mpgs-username').value.trim();
+  var password = document.getElementById('mpgs-password').value;
+  if (!username) { statusEl.textContent = 'Enter a username first.'; return; }
+  statusEl.textContent = 'Fetching…';
+  try {
+    var data = await api('/api/settings/list-pg-databases', { username: username, password: password }, 'POST');
+    var names = data.databases || [];
+    var dl = document.getElementById('mpgs-database-list');
     dl.innerHTML = names.map(function(n) { return '<option value="' + escHtml(n) + '">'; }).join('');
     statusEl.textContent = names.length + ' database' + (names.length !== 1 ? 's' : '') + ' available';
   } catch (e) {
