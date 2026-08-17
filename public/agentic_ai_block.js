@@ -151,10 +151,14 @@ async function agentSend() {
       // Summarize conversation; repeating it on every turn just adds noise
       // once the user is already mid-conversation about the same graph.
       if (_agentChatHistory.length === 1) {
+        var _graphLabel = currentGraph.tabName || currentGraph.graphName || '';
+        var _graphPrefix = _graphLabel
+          ? 'Analyzing graph “' + _graphLabel + '” with '
+          : 'Analyzing graph with ';
         _agentAppendMessage('assistant',
-          'Graph to analyze: ' + currentGraph.nodes.length + ' nodes, ' +
+          _graphPrefix + currentGraph.nodes.length + ' nodes, ' +
           currentGraph.edges.length + ' edges. ' +
-          '('+edgesWithRefs + ' edges are supported by '+totalRefs+ ' references)'
+          '(' + edgesWithRefs + ' edges are supported by ' + totalRefs + ' references)'
         );
       }
       // ─────────────────────────────────────────────────────────────────────
@@ -187,7 +191,7 @@ async function agentSend() {
         message: msg,
         history: _agentChatHistory.slice(0, -1),
         llm:     _agentConfig,
-        CurrentNodeJSGraph: currentGraph,
+        NodeJSGraph: currentGraph,
         scope: summaryScope,
         relation_ids: relationIds,
         db_credentials: dbCredentials,
@@ -197,8 +201,8 @@ async function agentSend() {
       console.log('  - message:', payload.message);
       console.log('  - history length:', payload.history.length);
       console.log('  - llm config:', payload.llm);
-      console.log('  - current_graph nodes:', payload.CurrentNodeJSGraph.nodes.length);
-      console.log('  - current_graph edges:', payload.CurrentNodeJSGraph.edges.length);
+      console.log('  - current_graph nodes:', payload.NodeJSGraph.nodes.length);
+      console.log('  - current_graph edges:', payload.NodeJSGraph.edges.length);
       console.log('  - relation_ids:', payload.relation_ids);
       console.log('  - db_credentials present:', !!payload.db_credentials);
       console.log('  - debug_inline_refs:', payload.debug_inline_refs);
@@ -909,10 +913,26 @@ function _buildCurrentGraphFromCy() {
     console.log('[_buildCurrentGraphFromCy] First edge details:', edges[0]);
   }
 
-  return {
+  // Merge pathway-level properties (Description, Notes, Organ, Tissue, etc.)
+  // from the currently open RNEF pathway so Python's init_resnet_graph() /
+  // graph2analyze() can populate PSPathway props and prompt_introduction()
+  // can include them in the LLM prompt.
+  // currentPathwayProperties is a let variable in app.js (same global scope).
+  var pathwayMeta = {};
+  if (typeof currentPathwayProperties !== 'undefined' && currentPathwayProperties &&
+      typeof currentPathwayProperties === 'object') {
+    Object.keys(currentPathwayProperties).forEach(function(k) {
+      var v = currentPathwayProperties[k];
+      if (v != null && v !== '' && typeof v === 'string') {
+        pathwayMeta[k] = v;
+      }
+    });
+  }
+
+  return Object.assign({
     nodes: nodes, edges: edges, selectedNodes: selectedNodes, selectedEdges: selectedEdges,
     tabName: currentTabName, graphName: currentTabName
-  };
+  }, pathwayMeta);
 }
 
 // ── Library browser ───────────────────────────────────────────────────────────
