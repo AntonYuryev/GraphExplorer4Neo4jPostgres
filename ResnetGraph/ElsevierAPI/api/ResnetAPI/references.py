@@ -611,21 +611,26 @@ class Reference(dict):
   
 
   def pubyear(self):
-      if PUBYEAR in self:
-        return int(self[PUBYEAR][0])
-      else:
-        if 'Start' in self: # Clinical trials case
-          year = str(self['Start'][0]) 
-          if len(year) >= 4 and year[-4:].isdigit(): # format: 20-Apr-2020; August 2004 
-              return int(year[-4:])
-          elif year[-2:].isdigit():
-              return int('20'+year[-2:]) # format: 20-Apr-20
-          elif year[:2].isdigit(): 
-              return int('20'+year[:2]) # format 20-May
-          else:
-              print(f'Unknown Clinical trial "Start" format: {year}')
-              return 1812
-        else: return 1812 # No PubYear case
+    '''
+    output:
+      int(PUBYEAR) if PUBYEAR or 'Start' exists in self\n
+      otherwise returns 1812
+    '''
+    if PUBYEAR in self:
+      return int(self[PUBYEAR][0])
+    else:
+      if 'Start' in self: # Clinical trials case
+        year = str(self['Start'][0]) 
+        if len(year) >= 4 and year[-4:].isdigit(): # format: 20-Apr-2020; August 2004 
+            return int(year[-4:])
+        elif year[-2:].isdigit():
+            return int('20'+year[-2:]) # format: 20-Apr-20
+        elif year[:2].isdigit(): 
+            return int('20'+year[:2]) # format 20-May
+        else:
+            print(f'Unknown Clinical trial "Start" format: {year}')
+            return 1812
+      else: return 1812 # No PubYear case
 
 
   def title(self):
