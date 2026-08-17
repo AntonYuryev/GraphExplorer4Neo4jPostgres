@@ -118,7 +118,14 @@ class neo4j_nx(GraphDatabase):
   @staticmethod
   def __record2psobj(node_record:neo4j.Record)->PSObject:
     props = node_record._properties if hasattr(node_record, '_properties') else dict(node_record)
-    psobj = PSObject({NODECOLUMN2ATTR.get(k,k):[v] for k,v in props.items() if v not in ['_','']})
+    for prop, val in props.items():
+      prop_name = NODECOLUMN2ATTR.get(prop,prop)
+      if isinstance(val, list):
+        props[prop_name] = [v for v in val if v not in ['_','']]
+      elif val not in ['_','']:
+          props[prop_name] = [val]
+        
+    psobj = PSObject({k:v for k,v in props.items() if v not in ['_','']})
     labels = node_record.labels if hasattr(node_record, 'labels') else []
     psobj[OBJECT_TYPE] = list(labels)
     return psobj
@@ -334,9 +341,8 @@ class neo4j_nx(GraphDatabase):
   def _load_children_(self,parents:list[PSObject],max_childs=None)->list[PSObject]:
     '''
     output:
-      list of parent annotated with CHILDS attributed
-      if max_childs is None or zero loads all children,
-      otherwise loads children only for parents with number of children less than max_childs
+      list of parents annotated with CHILDS attribute
+      if max_childs is None or 0 loads all children, otherwise loads children only for parents with number of children less than max_childs
       parents with number of children exceeding max_childs are annotated with 
       parent[CHILDS] = [PSObject()]*count
     '''
