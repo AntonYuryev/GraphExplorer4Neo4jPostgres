@@ -152,7 +152,7 @@ const DEFAULT_SETTINGS = {
     password: ''
   },
   postgres: {
-    host:     'your-postgres-host',
+    url:      'your-postgres-host',
     port:     5432,
     database: 'your-pg-database',
     schema:   'your-pg-schema',
@@ -219,6 +219,17 @@ let appSettings = loadAppSettings();
     // that has actually held up against CodeQL's js/log-injection check
     // in this file.
     console.log(`[INFO] Migrated LLM config: created providers array from url "${String(llm.url).replace(/[\r\n]+/g, ' ')}"`);
+  }
+})();
+
+// ── Migrate legacy Postgres config: rename host → url ─────────────────────────
+(function _migratePostgresHost() {
+  const pg = appSettings.postgres;
+  if (pg && !pg.url && pg.host) {
+    pg.url = pg.host;
+    delete pg.host;
+    saveAppSettings(appSettings);
+    console.log('[INFO] Migrated Postgres config: renamed host → url');
   }
 })();
 
@@ -348,7 +359,7 @@ function _resolvePgCfgForUser(loginUsername) {
   const u        = users.find(x => x.username === loginUsername);
   const override = (u && u.postgres) || {};
   return {
-    host:     appSettings.postgres.host,
+    host:     appSettings.postgres.url,
     port:     appSettings.postgres.port,
     database: override.database || appSettings.postgres.database || '',
     schema:   override.schema   || appSettings.postgres.schema   || 'public',
@@ -561,23 +572,21 @@ function toPlain(val) {
   return val;
 }
 
-// Neo4j's RelationID property can be a scalar (integer/string) OR a list
-// (StringArray) -- confirmed to happen on real relationships, independent of
-// anything this app itself does (e.g. mergeSimilarRelations()'s own
-// RelationIDs, plural, app-level convention). Every place that reads
-// RelationID off a relationship needs to handle both shapes, or a genuinely
-// list-valued one silently collapses into a useless comma-joined string via
-// naive String(value) -- not a crash, just a relation whose references,
-// tooltip counts, etc. permanently show nothing because that joined string
-// never matches any real Postgres id or Neo4j RelationID again.
+// Neo4j's RelationID property can be a scalar integer OR a list of integers —
+// both shapes exist in real data. Every place that reads RelationID off a
+// relationship needs to handle both shapes.
 //
 // Accepts EITHER shape callers already used before this helper existed:
 //   - the raw property value itself (e.g. from `RETURN r.RelationID AS relationID`)
 //   - a full Neo4j relationship/record object with a `.properties.RelationID`
 //     (e.g. from `RETURN r`)
-// Always returns a flat array of string ids (never nested, never empty-if-
+// Always returns a flat array of integers (never nested, never empty-if-
 // present), so callers needing "the" id can just take result[0] and callers
 // needing every id this relationship represents can use the whole array.
+// Returns RelationIDs as strings to preserve full 64-bit precision.
+// JavaScript Number (float64) can only represent integers exactly up to
+// 2^53-1 = 9,007,199,254,740,991; the MD5-derived RelationID hash can produce
+// values up to 2^63-1, so Number() would silently corrupt those values.
 function _relationIdsOf(relOrValue) {
   if (relOrValue == null) return [];
   const raw = (typeof relOrValue === 'object' && relOrValue.properties &&
@@ -585,40 +594,24 @@ function _relationIdsOf(relOrValue) {
     ? relOrValue.properties.RelationID
     : relOrValue;
   if (raw == null) return [];
-  return (Array.isArray(raw) ? raw : [raw]).map(x => String(toPlain(x)));
+  return (Array.isArray(raw) ? raw : [raw])
+    .map(x => { const v = toPlain(x); return v != null ? String(v) : null; })
+    .filter(s => s != null && /^-?\d+$/.test(s));
 }
 
-// Normalizes caller-provided RelationID input into bigint-safe decimal strings.
-// Accepts any of:
-//   - ['123', '456']
-//   - [123, 456]
-//   - '123,456' (legacy comma-joined scalar)
-//   - mixed nested arrays/scalars
-// Returns deduplicated ['123','456'] (still as strings to preserve 64-bit precision
-// until SQL casts to bigint).
+// Normalizes caller-provided RelationID input into a deduplicated string array.
+// Accepts arrays or single values (numbers, BigInts, or numeric strings).
 function _normalizeRelationIdInputs(input) {
   if (input == null) return [];
-
+  const arr = Array.isArray(input) ? input.flat(Infinity) : [input];
+  const seen = new Set();
   const out = [];
-  const stack = Array.isArray(input) ? input.slice() : [input];
-  while (stack.length) {
-    const item = stack.pop();
+  for (const item of arr) {
     if (item == null) continue;
-    if (Array.isArray(item)) {
-      item.forEach(x => stack.push(x));
-      continue;
-    }
-
-    const s = String(toPlain(item)).trim();
-    if (!s) continue;
-    const parts = s.includes(',') ? s.split(',') : [s];
-    parts.forEach(p => {
-      const trimmed = p.trim();
-      if (/^-?\d+$/.test(trimmed)) out.push(trimmed);
-    });
+    const s = String(toPlain(item));
+    if (/^-?\d+$/.test(s) && !seen.has(s)) { seen.add(s); out.push(s); }
   }
-
-  return Array.from(new Set(out));
+  return out;
 }
 
 function processValue(val, nodesMap, edgesMap) {
@@ -753,7 +746,10 @@ app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, asyn
   // The endpoint changed — every cached per-user driver was pointed at the old
   // one, so drop them all; each reconnects (with that user's own database/
   // username/password) against the new URL on next use.
+  // Also wipe all per-database schema caches — they're invalid against a new host.
   invalidateAllNeo4jConns();
+  _schemaCacheByDb.clear();
+  _schemaFetchByDb.clear();
 
   // Best-effort check using the saving admin's OWN personal Neo4j credentials
   // — there's no shared admin-level credential to test with anymore, so a
@@ -809,6 +805,10 @@ app.post('/api/settings/my-neo4j', dbLimiter, authMiddleware, async (req, res) =
   if (!u) return res.status(404).json({ error: 'User not found' });
   u.neo4j = { database: cfg.database, username: cfg.username, password: cfg.password };
   saveUsers(users);
+  // Also drop the cached schema for the old database (if any) so the next
+  // /api/graph/schema call re-fetches from the newly-configured database.
+  const oldDb = current.database;
+  if (oldDb && oldDb !== cfg.database) _invalidateSchemaForDb(oldDb);
   invalidateNeo4jConnForUser(req.user.username);
   res.json({ success: true });
 });
@@ -859,14 +859,14 @@ app.post('/api/settings/list-neo4j-databases', dbLimiter, authMiddleware, async 
 });
 
 app.get('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, (req, res) => {
-  res.json({ host: appSettings.postgres.host, port: appSettings.postgres.port });
+  res.json({ url: appSettings.postgres.url, port: appSettings.postgres.port });
 });
 
 app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, async (req, res) => {
-  const { host, port } = req.body || {};
-  if (!host) return res.status(400).json({ error: 'host is required' });
+  const { url, port } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url is required' });
 
-  appSettings.postgres.host = String(host).trim();
+  appSettings.postgres.url = String(url).trim();
   appSettings.postgres.port = parseInt(port) || 5432;
   saveAppSettings(appSettings);
   invalidateAllPgConns();
@@ -885,7 +885,7 @@ app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, a
 app.get('/api/settings/my-postgres', dbLimiter, authMiddleware, (req, res) => {
   const cfg = _resolvePgCfgForUser(req.user.username);
   res.json({
-    host:     cfg.host,   // read-only here — set by an admin
+    url:      cfg.host,   // read-only here — set by an admin
     port:     cfg.port,   // read-only here — set by an admin
     database: cfg.database,
     schema:   cfg.schema,
@@ -900,7 +900,7 @@ app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res
 
   const current = _resolvePgCfgForUser(req.user.username);
   const cfg = {
-    host:     appSettings.postgres.host,
+    host:     appSettings.postgres.url,
     port:     appSettings.postgres.port,
     database: String(database).trim(),
     schema:   String(schema).trim(),
@@ -942,13 +942,48 @@ app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res
 // by Postgres itself, so this simply surfaces whatever the database
 // administrator has already granted — a login restricted from a given schema
 // just won't see it here.
+
+// Lists the PostgreSQL databases the given (possibly not-yet-saved)
+// credentials can see — mirrors list-pg-schemas but queries pg_database
+// so the user can pick a database name from a real list instead of typing blind.
+app.post('/api/settings/list-pg-databases', dbLimiter, authMiddleware, async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username is required' });
+
+  const current = _resolvePgCfgForUser(req.user.username);
+  // Connect to the default 'postgres' maintenance database to list all databases.
+  const cfg = {
+    host:     appSettings.postgres.url,
+    port:     appSettings.postgres.port,
+    database: 'postgres',
+    username: String(username).trim(),
+    password: (password && password !== '••••••••') ? String(password) : current.password
+  };
+
+  const testPool = makePgPool(cfg);
+  try {
+    const result = await testPool.query(
+      `SELECT datname FROM pg_database
+       WHERE datistemplate = false
+         AND datallowconn = true
+       ORDER BY datname`
+    );
+    res.json({ databases: result.rows.map(r => r.datname) });
+  } catch (e) {
+    console.error('[settings/list-pg-databases] Failed for %s: %s', req.user.username, e.message);
+    res.status(400).json({ error: 'Could not list databases. Check credentials, or ask your PostgreSQL administrator.' });
+  } finally {
+    await testPool.end();
+  }
+});
+
 app.post('/api/settings/list-pg-schemas', dbLimiter, authMiddleware, async (req, res) => {
   const { database, username, password } = req.body || {};
   if (!database || !username) return res.status(400).json({ error: 'database and username are required' });
 
   const current = _resolvePgCfgForUser(req.user.username);
   const cfg = {
-    host:     appSettings.postgres.host,
+    host:     appSettings.postgres.url,
     port:     appSettings.postgres.port,
     database: String(database).trim(),
     username: String(username).trim(),
@@ -2613,15 +2648,11 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
 });
 
 // ─── PostgreSQL references (tooltip — single edge hover) ──────────────────────
-// RelationID in Neo4j is a string; id in Postgres is bigint.
-// Pass as strings and cast to bigint in SQL to preserve full 64-bit precision.
+// RelationID is integer in both Neo4j and Postgres.
 app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
   const { relationIds } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json([]);
 
-  // Keep as strings and use ::bigint[] cast in SQL — preserves full 64-bit precision.
-  // Number() conversion loses digits for IDs > 2^53 (JavaScript safe integer limit).
-  // Also accept legacy comma-joined ids ("123,456") and flatten nested arrays.
   const validIds = _normalizeRelationIdInputs(relationIds);
   if (!validIds.length) return res.json([]);
 
@@ -2677,9 +2708,6 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
   const { relationIds, scopusColumns } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json({});
 
-  // Keep as strings and use ::bigint[] cast in SQL — this preserves full 64-bit
-  // precision. JavaScript Number loses precision for integers > 2^53, so converting
-  // to Number first would corrupt large RelationIDs.
   const validIds = _normalizeRelationIdInputs(relationIds);
   if (!validIds.length) return res.json({});
 
@@ -2710,7 +2738,7 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
     }
     const result = await req.pg.pool.query(sql, [validIds]);
 
-    // Group by relation id (string key to match Neo4j RelationID strings)
+    // Group by relation id (string key to preserve full 64-bit precision)
     const grouped = {};
     result.rows.forEach(row => {
       const key = String(row.id);
@@ -3027,9 +3055,10 @@ app.post('/api/graph/update-node', dbLimiter, authMiddleware, async (req, res) =
   }
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
+    const username = req.user && req.user.username ? req.user.username : 'unknown';
     await session.run(
-      'MATCH (n) WHERE elementId(n) = $eid SET n += $props',
-      { eid: elementId, props: properties }
+      'MATCH (n) WHERE elementId(n) = $eid SET n += $props, n.updatedAt = timestamp(), n.updatedBy = $username',
+      { eid: elementId, props: properties, username }
     );
     res.json({ ok: true });
   } catch (err) {
@@ -3048,9 +3077,10 @@ app.post('/api/graph/update-relation', dbLimiter, authMiddleware, async (req, re
   }
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
+    const username = req.user && req.user.username ? req.user.username : 'unknown';
     await session.run(
-      'MATCH ()-[r]->() WHERE elementId(r) = $eid SET r += $props',
-      { eid: elementId, props: properties }
+      'MATCH ()-[r]->() WHERE elementId(r) = $eid SET r += $props, r.updatedAt = timestamp(), r.updatedBy = $username',
+      { eid: elementId, props: properties, username }
     );
     res.json({ ok: true });
   } catch (err) {
@@ -3300,17 +3330,16 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const propReturn = safeProps.map(p => `r.\`${p}\` AS \`${p}\``).join(', ');
-    // r.RelationID can be scalar (integer/string) OR a list (StringArray) in Neo4j.
-    // Type probe: toFloat() returns null for lists but a numeric value for integer/string
-    // scalars — safe across Neo4j versions.  CASE is lazy so the non-matching branch
-    // is never evaluated (toString on a list / list-comprehension on a scalar both throw).
+    // r.RelationID is integer in Neo4j (scalar or list). Type probe: toFloat()
+    // returns null for lists but non-null for scalar integers — CASE is lazy so
+    // the wrong branch is never evaluated.
     const result = await session.run(
       `MATCH ()-[r]->()
        WHERE r.RelationID IS NOT NULL
        WITH r,
             CASE WHEN toFloat(r.RelationID) IS NOT NULL
-                 THEN [toString(r.RelationID)]
-                 ELSE [x IN r.RelationID | toString(x)]
+                 THEN [toString(toInteger(r.RelationID))]
+                 ELSE [toString(toInteger(x)) | x IN r.RelationID]
             END AS relIdList
        WHERE ANY(id IN relIdList WHERE id IN $ids)
        UNWIND [id IN relIdList WHERE id IN $ids] AS relId
@@ -3319,8 +3348,8 @@ app.post('/api/relations/properties', dbLimiter, authMiddleware, async (req, res
     );
     const out = Object.create(null); // null prototype prevents remote property injection
     result.records.forEach(rec => {
-      const relId = rec.get('relId');
-      if (!relId) return;
+      const relId = toPlain(rec.get('relId'));
+      if (relId == null) return;
       out[relId] = Object.create(null); // codeql[js/remote-property-injection] null prototype prevents prototype pollution
       safeProps.forEach(p => {
         if (typeof p !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(p)) return;
@@ -3400,7 +3429,7 @@ app.post('/api/relations/find-similar', dbLimiter, authMiddleware, async (req, r
 
   function recordToRel(record) {
     return {
-      relationID: String(toPlain(record.get('relationID'))),
+      relationID: _relationIdsOf(record.get('relationID'))[0] || '',
       relType:    record.get('relType'),
       effect:     normDisplayEff(record.get('effect')),
       mechanism:  normDisplayEff(record.get('mechanism')),
@@ -3658,9 +3687,10 @@ RETURN
     const seen = new Set();
     const relations = [];
     for (const rec of result.records) {
-      const rid = String(toPlain(rec.get('relationID')));
-      if (seen.has(rid)) continue;
-      seen.add(rid);
+      const rids = _relationIdsOf(rec.get('relationID'));
+      const rid = rids[0] || '';
+      if (!rid || rids.some(id => seen.has(id))) continue;
+      rids.forEach(id => seen.add(id));
 
       const aIsStart = rec.get('aIsStart');
       const aURN = rec.get('aURN');
@@ -3748,9 +3778,10 @@ RETURN
     const seen = new Set();
     const relations = [];
     for (const rec of result.records) {
-      const rid = String(toPlain(rec.get('relationID')));
-      if (seen.has(rid)) continue;
-      seen.add(rid);
+      const rids = _relationIdsOf(rec.get('relationID'));
+      const rid = rids[0] || '';
+      if (!rid || rids.some(id => seen.has(id))) continue;
+      rids.forEach(id => seen.add(id));
 
       const aIsStart = rec.get('aIsStart');
       const aURN = rec.get('aURN'), bURN = rec.get('bURN');
@@ -4041,7 +4072,7 @@ function _pushSchemaToAgent(schema) {
   ].join('\n');
 
   const pgCfg = appSettings.postgres ? {
-    host:     appSettings.postgres.host,
+    host:     appSettings.postgres.url,
     port:     appSettings.postgres.port,
     database: appSettings.postgres.database,
     schema:   appSettings.postgres.schema,
@@ -4119,9 +4150,9 @@ app.post('/api/agent/llm-config', dbLimiter, authMiddleware, (req, res, next) =>
 
 // Enrich current_graph edges with references before sending to agent
 function _enrichCurrentGraphWithReferences(body) {
-  if (!body || !body.current_graph || !body.current_graph.edges) return body;
-  
-  const cg = body.current_graph;
+  if (!body) return body;
+  const cg = body.CurrentNodeJSGraph || body.current_graph;
+  if (!cg || !cg.edges) return body;
   
   // Try multiple sources for references:
   // 1. Direct references from inline edge properties (if frontend sends full edge data)
@@ -4268,36 +4299,25 @@ process.on('SIGINT',  () => { if (_agentProc) _agentProc.kill(); process.exit();
 process.on('SIGTERM', () => { if (_agentProc) _agentProc.kill(); process.exit(); });
 
 // ─── Neo4j schema introspection ───────────────────────────────────────────────
-// In-memory cache populated at startup and refreshed every 10 minutes.
+// Per-database cache: keyed by database name so users connecting to different
+// Neo4j databases each get accurate schema, and a misconfigured admin account
+// cannot poison the schema for a working user.
+const _schemaCacheByDb = new Map();  // dbName → { labels, relTypes, propKeys }
+const _schemaFetchByDb = new Map();  // dbName → in-flight Promise guard
+
+// Legacy alias kept current for agent-startup guards below.
 let _schemaServerCache = null;
-let _schemaFetchPromise = null; // in-flight promise guard — concurrent callers share one DB round-trip
 
-async function _fetchSchemaFromNeo4j() {
-  // If a fetch is already in progress, return the same promise so we don't hit Neo4j multiple times
-  if (_schemaFetchPromise) return _schemaFetchPromise;
-  _schemaFetchPromise = _doFetchSchemaFromNeo4j().finally(() => { _schemaFetchPromise = null; });
-  return _schemaFetchPromise;
+async function _fetchSchemaForConn(driver, database) {
+  if (_schemaCacheByDb.has(database)) return _schemaCacheByDb.get(database);
+  if (_schemaFetchByDb.has(database))  return _schemaFetchByDb.get(database);
+  const promise = _doFetchSchemaForConn(driver, database)
+    .finally(() => _schemaFetchByDb.delete(database));
+  _schemaFetchByDb.set(database, promise);
+  return promise;
 }
 
-// Schema introspection (autocomplete + the AI agent's system prompt) isn't
-// tied to one specific request, so there's no per-user req.neo4j to read here.
-// It uses the first admin account's own Neo4j connection as the "system"
-// connection — reasonable since this is just structural metadata (labels/
-// relationship types/property keys), and in practice everyone on a given
-// deployment points at the same underlying database. If a particular user's
-// personal credentials point at a genuinely different database, their
-// autocomplete/agent-prompt schema hints may not perfectly match what their
-// own queries see — only the schema HINTS are shared; actual query execution
-// always uses each user's own connection.
-function _getSystemNeo4jConn() {
-  const users = loadUsers();
-  const admin = users.find(u => u.role === 'admin') || users[0];
-  if (!admin) throw new Error('No users configured — cannot resolve a Neo4j connection for schema introspection');
-  return getNeo4jConnForUser(admin.username);
-}
-
-async function _doFetchSchemaFromNeo4j() {
-  const { driver, database } = _getSystemNeo4jConn();
+async function _doFetchSchemaForConn(driver, database) {
   const s1 = driver.session({ database });
   const s2 = driver.session({ database });
   const s3 = driver.session({ database });
@@ -4324,33 +4344,51 @@ async function _doFetchSchemaFromNeo4j() {
         propKeys = pkResult.records.map(r => r.get('k'));
       } catch (_2) {}
     }
-    _schemaServerCache = { labels, relTypes, propKeys };
-    console.log(`Schema cache refreshed: ${labels.length} labels, ${relTypes.length} relTypes, ${propKeys.length} propKeys`);
-    // Push to Agentic AI service so it can use the latest schema for text-to-Cypher
-    _pushSchemaToAgent(_schemaServerCache);
-    return _schemaServerCache;
+    const schema = { labels, relTypes, propKeys };
+    _schemaCacheByDb.set(database, schema);
+    _schemaServerCache = schema;   // keep legacy alias current for agent guards
+    console.log(`Schema cache refreshed [${database}]: ${labels.length} labels, ${relTypes.length} relTypes, ${propKeys.length} propKeys`);
+    _pushSchemaToAgent(schema);
+    return schema;
   } catch (err) {
-    console.error('Schema cache fetch error:', err.message);
+    console.error(`Schema cache fetch error [${database}]:`, err.message);
     return null;
   } finally {
     await Promise.all([s1.close(), s2.close(), s3.close()]);
   }
 }
 
-// Pre-warm cache 3 s after startup (gives Neo4j time to accept connections)
-setTimeout(function() {
-  _fetchSchemaFromNeo4j().catch(() => {});
-}, 3000);
-// Refresh every 10 minutes so new relation types / property keys appear automatically
-setInterval(function() {
-  _fetchSchemaFromNeo4j().catch(() => {});
-}, 10 * 60 * 1000);
+// Legacy wrapper for agent-startup code; resolves admin user's connection.
+// Silently skips if no admin has configured a Neo4j database yet.
+let _schemaFetchPromise = null;
+function _getSystemNeo4jConn() {
+  const users = loadUsers();
+  const admin = users.find(u => u.role === 'admin') || users[0];
+  if (!admin) throw new Error('No users configured');
+  return getNeo4jConnForUser(admin.username);
+}
+async function _fetchSchemaFromNeo4j() {
+  if (_schemaFetchPromise) return _schemaFetchPromise;
+  let conn;
+  try { conn = _getSystemNeo4jConn(); } catch(e) { return null; }
+  _schemaFetchPromise = _fetchSchemaForConn(conn.driver, conn.database)
+    .finally(() => { _schemaFetchPromise = null; });
+  return _schemaFetchPromise;
+}
+
+// Invalidate the cached schema for a specific database (called when a user
+// updates their My Neo4j connection so autocomplete reflects the new database).
+function _invalidateSchemaForDb(database) {
+  _schemaCacheByDb.delete(database);
+  _schemaFetchByDb.delete(database);
+}
 
 // GET /api/graph/schema — returns { labels, relTypes, propKeys }
+// Uses the calling user's own Neo4j connection so the schema always matches
+// the database that user's queries actually run against.
 app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
   try {
-    // Serve from cache (instant); if cache not ready yet, fetch now and cache result
-    const schema = _schemaServerCache || await _fetchSchemaFromNeo4j();
+    const schema = await _fetchSchemaForConn(req.neo4j.driver, req.neo4j.database);
     if (!schema) return res.status(503).json({ error: 'Schema not available yet' });
     res.json(schema);
   } catch (err) {
@@ -4692,6 +4730,57 @@ function _pyRepr(val) {
   return "'" + String(val).replace(/\\/g,'\\\\').replace(/'/g,"\\'") + "'";
 }
 
+// ── Reference unique_id computation (mirrors Python readresnet.py) ─────────────
+// Column order matches Python's REF_COLUMNS (positions 1..43; 0=unique_id, 44=id)
+const _REF_COLUMN_PG = [
+  'authors','biomarkertype','celllinename','cellobject','celltype',
+  'changetype','collaborator','company','condition',
+  'doi','embase','c','essn','experimental_system','intervention',
+  'issn','journal','medlineta','mode_of_action',
+  'mref','msrc','nct_id','organ','organism','percent',
+  'phase','phenotype','pii','pmid','pubversion','pubyear',
+  'pui','px','quantitativetype','source','start','studytype',
+  'textmods','textref','tissue','title','trialstatus','url',
+];
+
+// Reproduce Python's str(list) for the 45-element reference list.
+// Strings → Python single-quote repr (double-quote if string contains ' but not ").
+// BigInt at position 44 → bare integer literal.
+function _pyRefListStr(x) {
+  const parts = x.map(item => {
+    if (typeof item === 'bigint') return item.toString();
+    const s = String(item ?? '');
+    const hasSingle = s.includes("'");
+    const hasDouble  = s.includes('"');
+    const esc = s
+      .replace(/\\/g, '\\\\')
+      .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+    if (hasSingle && !hasDouble) return '"' + esc + '"';
+    return "'" + esc.replace(/'/g, "\\'") + "'";
+  });
+  return '[' + parts.join(', ') + ']';
+}
+
+// Build the 45-element list and compute unique_id (BigInt).
+function _computeRefUniqueId(ref, relIdBigInt) {
+  const x = new Array(45).fill('');
+  // x[0] = '' (cleared before hash — position 0 = unique_id placeholder)
+  for (let i = 0; i < _REF_COLUMN_PG.length; i++) {
+    const v = ref[_REF_COLUMN_PG[i]];
+    x[i + 1] = (v != null && v !== '') ? String(v) : '';
+  }
+  x[44] = relIdBigInt;                      // Python integer (chash)
+  return BigInt(_myhash(_pyRefListStr(x)));  // returns BigInt
+}
+
+// Derive unique_ref from TextRef (mirrors Python uniqueref()).
+function _computeUniqueRef(ref, uniqueIdBigInt) {
+  const textref = String(ref.textref || '');
+  const hashIdx = textref.indexOf('#');
+  const base = hashIdx >= 0 ? textref.slice(0, hashIdx) : textref;
+  return /\d/.test(base) ? base : uniqueIdBigInt.toString();
+}
+
 function calcRelationId({ inref=[], inoutref=[], outref=[], control_type='',
                           ontology='', relationship='', effect='', mechanism='' }) {
   // Lists sorted descending (matches Python .sort(reverse=True)) using BigInt for 64-bit NodeIDs
@@ -4752,7 +4841,7 @@ app.get('/api/schema/relation-properties', dbLimiter, authMiddleware, async (req
 // relation whose original hash happened to differ from this one.
 app.post('/api/curation/calculate-relation-id', dbLimiter, authMiddleware, async (req, res) => {
   const computed = calcRelationId(req.body || {});
-  res.json({ relationId: computed });
+  res.json({ relationId: String(computed) });
 });
 
 // POST /api/curation/write-relation  — MERGE to Neo4j + upsert references in Postgres
@@ -4761,7 +4850,7 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
   if (req.user.role !== 'user')
     return res.status(403).json({ error: 'Curation requires User role.' });
 
-  const { sourceNode, targetNode, relationType, properties = {}, relationId, references = [] } = req.body || {};
+  const { sourceNode, targetNode, relationType, properties = {}, relationId, newRelationId, references = [] } = req.body || {};
   if (!relationType)
     return res.status(400).json({ error: 'Please add relation type before adding relation to database.' });
   if (!sourceNode || !targetNode)
@@ -4778,6 +4867,15 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
   }
   const canonicalRelationId = normalizedRelIds[0];
   const canonicalRelationIdBigInt = BigInt(canonicalRelationId);
+
+  // newRelationId is supplied (and differs from relationId) when the user changed
+  // direction in the dialog — the MERGE key stays as the original ID so we find
+  // the existing Neo4j relation, but afterwards we SET RelationID to the new hash
+  // and migrate Postgres reference rows to the new ID.
+  const newRelIds = newRelationId ? _normalizeRelationIdInputs(newRelationId) : [];
+  const effectiveRelId       = (newRelIds.length === 1) ? newRelIds[0] : canonicalRelationId;
+  const effectiveRelIdBigInt = BigInt(effectiveRelId);
+  const relIdChanged = effectiveRelId !== canonicalRelationId;
 
   // Validate identifiers used in Cypher interpolation
   const safeId = s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
@@ -4801,23 +4899,53 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
 
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
-    const cypher = `
-      MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
-            (b:${targetNode.nodeLabel} {NodeID: $tgtId})
-      MERGE (a)-[r:${relationType} {RelationID: $relId}]->(b)
-      ON CREATE SET r.createdAt = timestamp(), r.updatedAt = timestamp(),
-                    r.createdBy = $username,   r.updatedBy = $username
-      ON MATCH  SET r.updatedAt = timestamp(), r.updatedBy = $username
-      SET r += $relProps
-      RETURN r,
-             elementId(r) AS eid,
-             id(a) AS aId, elementId(a) AS aEid,
-             id(b) AS bId, elementId(b) AS bEid
-    `;
-    const result = await session.run(cypher, {
-      srcId: sourceNode.nodeId, tgtId: targetNode.nodeId,
-      relId: canonicalRelationId, username, relProps
-    });
+    // When RelationID changed (direction was toggled in the dialog), the existing
+    // Neo4j relation must stay untouched — all Neo4j relations are inherently
+    // directional at the storage level, so a nondirectional relation is represented
+    // as a new relation with a "canonical" a→b direction and directed:false property.
+    // We CREATE it (keyed on the new RelationID) rather than MERGing into the old one.
+    // When RelationID did NOT change we MERGE as before to update properties in place.
+    let cypher, params;
+    // RelationID must be passed as a Neo4j integer (not a JS string) so the
+    // MERGE key matches the integer type stored in the database.
+    // neo4j.int() safely handles values outside JS Number precision (> 2^53).
+    const relIdInt          = neo4j.int(canonicalRelationId);
+    const effectiveRelIdInt = neo4j.int(effectiveRelId);
+
+    if (relIdChanged) {
+      cypher = `
+        MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
+              (b:${targetNode.nodeLabel} {NodeID: $tgtId})
+        MERGE (a)-[r:${relationType} {RelationID: $effectiveRelId}]->(b)
+        ON CREATE SET r.createdAt = timestamp(), r.updatedAt = timestamp(),
+                      r.createdBy = $username,   r.updatedBy = $username
+        ON MATCH  SET r.updatedAt = timestamp(), r.updatedBy = $username
+        SET r += $relProps
+        RETURN r,
+               elementId(r) AS eid,
+               id(a) AS aId, elementId(a) AS aEid,
+               id(b) AS bId, elementId(b) AS bEid
+      `;
+      params = { srcId: sourceNode.nodeId, tgtId: targetNode.nodeId,
+                 effectiveRelId: effectiveRelIdInt, username, relProps };
+    } else {
+      cypher = `
+        MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
+              (b:${targetNode.nodeLabel} {NodeID: $tgtId})
+        MERGE (a)-[r:${relationType} {RelationID: $relId}]->(b)
+        ON CREATE SET r.createdAt = timestamp(), r.updatedAt = timestamp(),
+                      r.createdBy = $username,   r.updatedBy = $username
+        ON MATCH  SET r.updatedAt = timestamp(), r.updatedBy = $username
+        SET r += $relProps
+        RETURN r,
+               elementId(r) AS eid,
+               id(a) AS aId, elementId(a) AS aEid,
+               id(b) AS bId, elementId(b) AS bEid
+      `;
+      params = { srcId: sourceNode.nodeId, tgtId: targetNode.nodeId,
+                 relId: relIdInt, username, relProps };
+    }
+    const result = await session.run(cypher, params);
 
     if (!result.records.length)
       return res.status(404).json({ error: 'Source or target node not found. Verify NodeID and label.' });
@@ -4848,34 +4976,38 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
             continue;
           }
 
-          // Collect writable columns
+          // Collect writable columns — exclude computed/key columns added explicitly below
           const cols = Object.keys(ref).filter(k =>
-            !k.startsWith('_') && k !== 'unique_id' && validCols.has(k) &&
+            !k.startsWith('_') &&
+            k !== 'unique_id' && k !== 'unique_ref' && k !== 'id' &&
+            validCols.has(k) &&
             ref[k] != null && ref[k] !== ''
           );
           if (!cols.length) continue;
 
-          if (ref.unique_id) {
-            // Update existing row
+          if (ref.unique_id && !relIdChanged) {
+            // RelationID unchanged — update the existing row in place
             const setParts = cols.map((c, i) => `"${c}" = $${i + 2}`).join(', ');
             await client.query(
               `UPDATE ${req.pg.schema}.reference SET ${setParts} WHERE unique_id = $1`,
               [ref.unique_id, ...cols.map(k => ref[k])]
             );
           } else {
-            // Insert new row — always set id = RelationID.
-            // Deduplicate by PMID: skip if a reference with the same PMID already exists
-            // for this RelationID (guards against the agent re-submitting existing refs).
-            if (ref.pmid) {
-              const dupCheck = await client.query(
-                `SELECT 1 FROM ${req.pg.schema}.reference WHERE id = $1 AND pmid = $2 LIMIT 1`,
-                [canonicalRelationIdBigInt, String(ref.pmid)]
-              );
-              if (dupCheck.rowCount > 0) continue; // already in DB — skip
-            }
+            // New row or RelationID changed — compute unique_id / unique_ref and INSERT.
+            // unique_id is a deterministic hash of all reference fields + effectiveRelId,
+            // so the same reference under the same relation always gets the same key.
+            const uid  = _computeRefUniqueId(ref, effectiveRelIdBigInt);
+            const uref = _computeUniqueRef(ref, uid);
 
-            const allCols = ['id', ...cols];
-            const vals    = [canonicalRelationIdBigInt, ...cols.map(k => ref[k])];
+            // Deduplicate: skip if a row with this unique_id already exists
+            const dup = await client.query(
+              `SELECT 1 FROM ${req.pg.schema}.reference WHERE unique_id = $1 LIMIT 1`,
+              [uid]
+            );
+            if (dup.rowCount > 0) continue;
+
+            const allCols = ['id', 'unique_id', 'unique_ref', ...cols];
+            const vals    = [effectiveRelIdBigInt, uid, uref, ...cols.map(k => ref[k])];
             const ph      = vals.map((_, i) => `$${i + 1}`).join(', ');
             await client.query(
               `INSERT INTO ${req.pg.schema}.reference (${allCols.map(c => `"${c}"`).join(', ')})
@@ -5159,7 +5291,7 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
   // drug (not one query per drug), then re-grouped back out per drug below —
   // avoids N round trips for a result set that can easily have dozens of drugs.
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(id => /^-?\d+$/.test(id));
+    .filter(s => /^\d+$/.test(String(s)));
   const rowsByRelId = new Map();
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
@@ -5372,7 +5504,7 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   // Same batched Postgres lookup as find-drugs-report: one query for every
   // RelationID across every group, re-aggregated per group below.
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(id => /^-?\d+$/.test(id));
+    .filter(s => /^\d+$/.test(String(s)));
   const rowsByRelId = new Map();
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
@@ -5666,7 +5798,7 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
 
   // Same batched Postgres reference/snippet lookup as common-neighbors-report.
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(id => /^-?\d+$/.test(id));
+    .filter(s => /^\d+$/.test(String(s)));
   const rowsByRelId = new Map();
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
