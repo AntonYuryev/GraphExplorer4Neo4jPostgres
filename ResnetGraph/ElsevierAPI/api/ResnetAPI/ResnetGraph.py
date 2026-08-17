@@ -1714,11 +1714,10 @@ class ResnetGraph (nx.MultiDiGraph):
 
   def get_prop2obj_dic(self, search_by_property:str, filter_by_values=[], case_insensitive=False)->tuple[dict[str,list[PSObject]],dict[int,list[str]]]:
       '''
-      Returns
-      -------
-      propval2objs = {search_by_property_value:[PSObject]}
-      objuid2propval = {id:[search_by_property_value]}\n
-      if filter_by_values empty returns dictionary keyed by all values in search_by_property
+      output:
+        propval2objs = {search_by_property_value:[PSObject]}
+        objuid2propval = {id:[search_by_property_value]}\n
+        if filter_by_values empty returns dictionary keyed by all values in search_by_property
       '''
       search_value2obj = defaultdict(list)
       objid2search_values = defaultdict(list)
@@ -4247,6 +4246,16 @@ class ResnetGraph (nx.MultiDiGraph):
     '''
     nodes = from_nodes if from_nodes else self._get_nodes()
     return self._make_map(using_props,nodes)
+
+
+  def filter_refs_by_year(self, min_year=None, max_year=None):
+    '''
+    output:
+      ResnetGraph with edges filtered by year.
+      some edges will have no references if all references are filtered out by year. In this case the edge will be kept but with empty reference list
+    '''
+    filtered_rels = [rel.filter_refs_by_year(min_year, max_year) for rel in self._psrels()]
+    return ResnetGraph.from_rels(filtered_rels)
   
 
 '''
@@ -4282,3 +4291,5 @@ class Regulome(ResnetGraph):
                 regulator_activation_score = np.nan
             return regulator_activation_score, effect_target_counter
 '''
+
+  
