@@ -4151,7 +4151,7 @@ app.post('/api/agent/llm-config', dbLimiter, authMiddleware, (req, res, next) =>
 // Enrich current_graph edges with references before sending to agent
 function _enrichCurrentGraphWithReferences(body) {
   if (!body) return body;
-  const cg = body.CurrentNodeJSGraph || body.current_graph;
+  const cg = body.NodeJSGraph || body.CurrentNodeJSGraph || body.current_graph;
   if (!cg || !cg.edges) return body;
   
   // Try multiple sources for references:
