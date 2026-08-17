@@ -187,7 +187,7 @@ async function agentSend() {
         message: msg,
         history: _agentChatHistory.slice(0, -1),
         llm:     _agentConfig,
-        current_graph: currentGraph,
+        CurrentNodeJSGraph: currentGraph,
         scope: summaryScope,
         relation_ids: relationIds,
         db_credentials: dbCredentials,
@@ -197,8 +197,8 @@ async function agentSend() {
       console.log('  - message:', payload.message);
       console.log('  - history length:', payload.history.length);
       console.log('  - llm config:', payload.llm);
-      console.log('  - current_graph nodes:', payload.current_graph.nodes.length);
-      console.log('  - current_graph edges:', payload.current_graph.edges.length);
+      console.log('  - current_graph nodes:', payload.CurrentNodeJSGraph.nodes.length);
+      console.log('  - current_graph edges:', payload.CurrentNodeJSGraph.edges.length);
       console.log('  - relation_ids:', payload.relation_ids);
       console.log('  - db_credentials present:', !!payload.db_credentials);
       console.log('  - debug_inline_refs:', payload.debug_inline_refs);
@@ -391,22 +391,103 @@ function _renderSummarizeReply(text, container) {
     nodeNames.sort(function(a, b) { return b.label.length - a.label.length; });
   }
 
-  // Matches "PMID 12345678", "PMID: 12345678, 23456789, 34567890", "PMIDs 12345678, 23456789", etc.
-  // — the leading PMID/PMIDs keyword is required only once; any comma-separated run of bare
-  // numbers that immediately follows is treated as part of the same citation list.
-  var PMID_RE = /PMIDs?[:\s]+\d{4,9}(?:\s*,\s*\d{4,9})*/gi;
+  // Normalise LLM citation tokens so PMID_RE / DOI_RE can match them cleanly.
+  //   Pass 0:   strip LLM-generated malformed citation wrappers
+  //   Pass 1:   flatten [PMID X](url)  → plain "PMID X"
+  //   Pass 1.5: consolidate mixed PMID+DOI blocks so PMIDs are never fragmented by DOIs
+  //   Pass 2:   merge residual adjacent "PMID X, PMID Y" → "PMID X, Y"
+  //   Pass 2.5: consolidate consecutive [DOI:d](url) links → one magic token for annotateText
 
-  // Matches "DOI:10.1016/j.jcpa.2017.10.109" / "DOI 10.1016/j.jcpa.2017.10.109" — DOI suffixes
-  // routinely contain dots, so we only stop at whitespace/comma/bracket/quote characters.
-  var DOI_RE = /DOIs?[:\s]+10\.\d{4,9}\/[^\s,\]\)"']+/gi;
+  // Pass 0A: [[DOI:xxx](url1)](url2) → [DOI:xxx](url1)
+  //   LLM sometimes double-wraps a DOI markdown link inside another markdown link.
+  //   The outer [ breaks _DM matching in Pass 1.5 and leaves stray characters in output.
+  text = text.replace(/\[\[DOI([^\]]*)\]\(([^)]*)\)\]\([^)]*\)/gi, '[DOI$1]($2)');
 
-  // Build a regex that matches PMIDs, DOIs, OR any entity name (escaped)
+  // Pass 0B: [DOI refs](https://doi.org/10.xxx) or [DOI ref](…) → DOI:10.xxx
+  //   LLM copies our rendered "DOI refs" link format into its next reply.
+  //   Convert to plain DOI text so Pass 1.5 _DP token can handle it normally.
+  text = text.replace(/\[DOI refs?\]\(https?:\/\/doi\.org\/([^)]+)\)/gi, 'DOI:$1');
+
+  // Pass 1: flatten markdown PMID links → plain text (case-insensitive, \d{1,9} for short PMIDs)
+  text = text.replace(/\[PMID[:\s]+(\d{1,9})\]\([^)]*\)/gi, 'PMID $1');
+
+  // Pass 1.5: consolidate mixed PMID+DOI citation blocks.
+  // After Pass 1, interleaved "PMID X, [DOI:...](url), PMID Y" blocks prevent Pass 2
+  // from merging all PMIDs into one cluster.  Extract every PMID and DOI from each
+  // block, then emit:
+  //   "PMID x1, x2, x3 [DOI:d1](url1) [DOI:d2](url2)"  when ≤ 25 PMIDs
+  //   "PMID x1, x2, ..., x25"                           when > 25 PMIDs (DOIs dropped)
+  (function() {
+    var _PT  = 'PMID[:\\s]+\\d{1,9}(?:\\s*,\\s*\\d{1,9})*';   // PMID cluster token
+    var _DM  = '\\[DOI[:\\s]+[^\\]]+\\]\\([^)]*\\)';           // DOI markdown link token
+    var _DP  = 'DOI[:\\s]+10\\.\\d{4,9}\\/[^\\s,\\]\\)"\']+';  // DOI plain-text token
+    var _ANY = '(?:' + _PT + '|' + _DM + '|' + _DP + ')';
+    var _SEP = '(?:\\s*,\\s*|\\s+)';
+    var _BLOCK = new RegExp(_ANY + '(?:' + _SEP + _ANY + ')+', 'gi');
+    var _TOK   = new RegExp(_PT + '|' + _DM + '|' + _DP, 'gi');
+    text = text.replace(_BLOCK, function(block) {
+      var pmids = [], dois = [], _m;
+      _TOK.lastIndex = 0;
+      while ((_m = _TOK.exec(block)) !== null) {
+        var tok = _m[0];
+        if (/^PMID/i.test(tok)) {
+          pmids = pmids.concat(tok.match(/\d{1,9}/g) || []);
+        } else {
+          var _mdM = tok.match(/^\[DOI[:\s]+([^\]]+)\]\(([^)]*)\)/i);
+          if (_mdM) {
+            dois.push({id: _mdM[1].replace(/^[:\s]+/, '').trim(), url: _mdM[2]});
+          } else {
+            var _plM = tok.match(/^DOI[:\s]+(10\.\d{4,9}\/[^\s,\]\)"']+)/i);
+            if (_plM) dois.push({id: _plM[1], url: 'https://doi.org/' + _plM[1]});
+          }
+        }
+      }
+      var MAX = 25, out = '';
+      if (pmids.length > 0) {
+        // PMIDs present — use them and drop DOIs.
+        // PMID links already cover the articles; mixing in DOI links produces
+        // redundant "(references [DOI:xxx])" output.
+        out = 'PMID ' + pmids.slice(0, MAX).join(', ');
+      } else if (dois.length > 0) {
+        // No PMIDs — DOIs are the only citation, so include them.
+        dois.forEach(function(d) { out += (out ? ' ' : '') + '[DOI:' + d.id + '](' + d.url + ')'; });
+      }
+      return out || block;
+    });
+  })();
+
+  // Pass 2: merge residual adjacent "PMID X, PMID Y" → "PMID X, Y"
+  text = text.replace(/PMID\s+\d{1,9}(?:,\s*PMID\s+\d{1,9})+/gi, function(match) {
+    var ids = match.match(/\d{1,9}/g) || [];
+    return 'PMID ' + ids.slice(0, 25).join(', ');
+  });
+
+  // Pass 2.5: consolidate consecutive [DOI:d](url) tokens (space-separated, emitted by
+  // Pass 1.5) into one magic token that annotateText decodes as a single "DOI refs" link.
+  // Format: [DOI refs](__DOISDAT__id1++id2__SEP__url1++url2)
+  text = text.replace(/(\[DOI[:\s]+[^\]]+\]\([^)]*\))(?:\s+(\[DOI[:\s]+[^\]]+\]\([^)]*\)))+/gi, function(block) {
+    var _doiRe = /\[DOI[:\s]+([^\]]+)\]\(([^)]*)\)/gi, _dm2, _ids = [], _urls = [];
+    while ((_dm2 = _doiRe.exec(block)) !== null) {
+      _ids.push(_dm2[1].trim().replace(/^[:\s]+/, ''));
+      _urls.push(_dm2[2]);
+    }
+    return '[DOI refs](__DOISDAT__' + _ids.join('++') + '__SEP__' + _urls.join('++') + ')';
+  });
+
+  var PMID_RE = /PMIDs?[:\s]+\d{1,9}(?:\s*,\s*(?:PMIDs?[:\s]+)?\d{1,9})*/gi;
+  var DOI_RE  = /DOIs?[:\s]+10\.\d{4,9}\/[^\s,\]\)"']+/gi;
+  // Matches the magic token emitted by Pass 2.5 — decoded in annotateText as one "DOI refs" link.
+  var DOIREFS_RE = /\[DOI refs\]\(__DOISDAT__[^)]+\)/gi;
+
   var entityParts = nodeNames.map(function(n) {
-    return n.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Escape regex special chars, then wrap with word boundaries so "ATR" does
+    // not match inside "treatments" or "latrunculin" (whole-token match only).
+    var escaped = n.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return '\\b' + escaped + '\\b';
   });
   var combinedRE = entityParts.length
-    ? new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')|(' + entityParts.join('|') + ')', 'gi')
-    : new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')', 'gi');
+    ? new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')|(' + DOIREFS_RE.source + ')|(' + entityParts.join('|') + ')', 'gi')
+    : new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')|(' + DOIREFS_RE.source + ')', 'gi');
 
   // Map label (lowercase) → node id for click handler
   var labelToId = {};
@@ -423,21 +504,39 @@ function _renderSummarizeReply(text, container) {
         parentEl.appendChild(document.createTextNode(rawText.slice(lastIndex, m.index)));
       }
       var matched = m[0];
-      var pmidMatch = /^PMIDs?\b/i.test(matched);
-      var doiMatch = !pmidMatch && /^DOIs?\b/i.test(matched);
+      var pmidMatch    = /^PMIDs?\b/i.test(matched);
+      var doiRefsMatch = !pmidMatch && matched.indexOf('[DOI refs](__DOISDAT__') === 0;
+      var doiMatch     = !pmidMatch && !doiRefsMatch && /^DOIs?\b/i.test(matched);
       if (pmidMatch) {
-        var pmids = matched.match(/\d{4,9}/g) || [];
+        var pmids = matched.match(/\d{1,9}/g) || [];
+        var pmidsCapped = pmids.slice(0, 25);  // PubMed URL cap
         var a = document.createElement('a');
-        // Single PMID → direct article page; multiple PMIDs → one link that opens
-        // all matching abstracts at once via PubMed's multi-UID search syntax.
-        a.href = pmids.length > 1
-          ? 'https://pubmed.ncbi.nlm.nih.gov/?term=' + pmids.join('%2C+') + '%5Buid%5D'
-          : 'https://pubmed.ncbi.nlm.nih.gov/' + pmids[0] + '/';
+        // Single PMID → direct article page; multiple PMIDs → one "Pubmed references"
+        // link that opens all matching abstracts via PubMed's multi-UID search.
+        a.href = pmidsCapped.length > 1
+          ? 'https://pubmed.ncbi.nlm.nih.gov/?term=' + pmidsCapped.join('%2C+') + '%5Buid%5D'
+          : 'https://pubmed.ncbi.nlm.nih.gov/' + pmidsCapped[0] + '/';
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
-        a.textContent = matched;
+        a.textContent = pmidsCapped.length > 1 ? 'references' : 'PMID ' + pmidsCapped[0];
+        a.title = pmidsCapped.join(', ');  // show actual PMIDs on hover
         a.style.cssText = 'color:#6ab4ff;text-decoration:underline;cursor:pointer';
         parentEl.appendChild(a);
+      } else if (doiRefsMatch) {
+        // Multiple DOIs consolidated by Pass 2.5 → one "DOI refs" hyperlink.
+        // Format inside: __DOISDAT__id1++id2__SEP__url1++url2
+        var _inner = matched.slice(22, -1);  // strip '[DOI refs](__DOISDAT__' (22 chars) and trailing ')'
+        var _sepIdx = _inner.indexOf('__SEP__');
+        var _doiIds  = (_sepIdx >= 0 ? _inner.slice(0, _sepIdx) : _inner).split('++');
+        var _doiUrls = (_sepIdx >= 0 ? _inner.slice(_sepIdx + 7).split('++') : []);
+        var doiRefsLink = document.createElement('a');
+        doiRefsLink.href = _doiUrls[0] || ('https://doi.org/' + _doiIds[0]);
+        doiRefsLink.target = '_blank';
+        doiRefsLink.rel = 'noopener noreferrer';
+        doiRefsLink.textContent = 'DOI refs';
+        doiRefsLink.title = _doiIds.join(', ');  // all DOI ids on hover
+        doiRefsLink.style.cssText = 'color:#6ab4ff;text-decoration:underline;cursor:pointer';
+        parentEl.appendChild(doiRefsLink);
       } else if (doiMatch) {
         var doiId = (matched.match(/10\.\d{4,9}\/[^\s,\]\)"']+/i) || [matched])[0];
         var doiLink = document.createElement('a');
@@ -494,24 +593,45 @@ function _renderSummarizeReply(text, container) {
 
   var lines = text.split('\n');
   var i = 0;
+  var prevWasBlank = true; // treat start-of-text as "after a blank line"
+
+  // Returns true when a plain-text line should be auto-promoted to a section
+  // title.  Triggered only on the first non-empty line after a blank line (or
+  // the very start of the reply).  Heuristics that disqualify a line:
+  //   • ends with sentence-ending punctuation (it's a sentence, not a heading)
+  //   • contains "PMID" or "[" (citation or markdown link — already content)
+  //   • longer than 100 chars (too long to be a title)
+  //   • starts with an explicit markdown prefix (handled separately above)
+  function _isAutoTitle(line) {
+    var t = line.trim();
+    if (!t || t.length > 100) return false;
+    if (/[.?!,;:]$/.test(t)) return false;
+    if (/PMID|\[/.test(t)) return false;
+    return true;
+  }
+
   while (i < lines.length) {
     var line = lines[i];
+    var trimmed = line.trim();
 
     if (/^###\s+/.test(line)) {
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:13px;color:#8ab4e8;margin-top:12px;margin-bottom:4px;border-bottom:1px solid #2a3a5a;padding-bottom:3px';
       renderInlineMarkdown(line.replace(/^###\s+/, ''), h);
       container.appendChild(h);
+      prevWasBlank = false;
     } else if (/^##\s+/.test(line)) {
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:14px;color:#a0c4ff;margin-top:14px;margin-bottom:5px';
       renderInlineMarkdown(line.replace(/^##\s+/, ''), h);
       container.appendChild(h);
+      prevWasBlank = false;
     } else if (/^#\s+/.test(line)) {
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:15px;color:#b8d4ff;margin-top:16px;margin-bottom:6px';
       renderInlineMarkdown(line.replace(/^#\s+/, ''), h);
       container.appendChild(h);
+      prevWasBlank = false;
     } else if (/^[-*]\s+/.test(line)) {
       var li = document.createElement('div');
       li.style.cssText = 'padding-left:16px;margin:2px 0';
@@ -519,16 +639,28 @@ function _renderSummarizeReply(text, container) {
       li.appendChild(bullet);
       renderInlineMarkdown(line.replace(/^[-*]\s+/, ''), li);
       container.appendChild(li);
-    } else if (line.trim() === '') {
-      // Blank line → small spacer (but not between bullets)
+      prevWasBlank = false;
+    } else if (trimmed === '') {
+      // Blank line → small spacer
       var spacer = document.createElement('div');
       spacer.style.height = '6px';
       container.appendChild(spacer);
+      prevWasBlank = true;
+    } else if (prevWasBlank && _isAutoTitle(trimmed)) {
+      // Plain-text title: first non-empty line after a blank (or start),
+      // styled the same as ### but with a slightly different accent colour
+      // to distinguish LLM-generated section titles from markdown headings.
+      var h = document.createElement('div');
+      h.style.cssText = 'font-weight:700;font-size:13px;color:#c8a4f0;margin-top:14px;margin-bottom:4px;border-bottom:1px solid #3a2a5a;padding-bottom:3px';
+      renderInlineMarkdown(trimmed, h);
+      container.appendChild(h);
+      prevWasBlank = false;
     } else {
       var p = document.createElement('div');
       p.style.marginBottom = '2px';
       renderInlineMarkdown(line, p);
       container.appendChild(p);
+      prevWasBlank = false;
     }
     i++;
   }
@@ -559,8 +691,14 @@ function switchAgentMode(mode) {
   }
   
   console.log('[switchAgentMode] Switching to mode:', mode);
+  var _prevMode = _agentCurrentMode;
   _agentCurrentMode = mode;
-  agentClearChat();
+  // Only clear chat when the mode actually changes — not when the panel is merely
+  // closed and reopened in the same mode.  The user must press "Clear chat" to
+  // wipe the history explicitly.
+  if (_prevMode !== mode) {
+    agentClearChat();
+  }
   
   // Update tab highlighting
   var tabs = document.querySelectorAll('.agent-mode-tab');
@@ -574,23 +712,19 @@ function switchAgentMode(mode) {
     title.textContent = mode === 'summarize' ? '🤖 Summarize' : '🤖 Text2Cypher';
   }
 
-  // Update message placeholder and action buttons based on mode
+  // Update message placeholder based on mode
   var input = document.getElementById('agent-input');
-  var actionBtns = document.getElementById('agent-action-buttons');
   if (input) {
-    if (mode === 'summarize') {
-      input.placeholder = 'Ask a question about the current graph and its references…';
-      if (actionBtns) actionBtns.style.display = 'flex';
-    } else {
-      input.placeholder = 'Ask anything about your graph…';
-      if (actionBtns) actionBtns.style.display = 'none';
-    }
+    input.placeholder = mode === 'summarize'
+      ? 'Ask a question about the current graph and its references…'
+      : 'Ask anything about your graph…';
   }
 }
 
 // ── Summarize mode actions ───────────────────────────────────────────────────
 
 function agentSummarizeAll() {
+  _ensureSummarizeMode();
   var input = document.getElementById('agent-input');
   input.value = 'Summarize all relations in the current graph using the supporting sentences and provide a comprehensive overview of the biological pathway.';
   agentSend();
@@ -602,19 +736,47 @@ function agentSummarizeSelected() {
     console.log('[agentSummarizeSelected] No Cytoscape instance');
     return;
   }
-  
+
   var selectedElements = cy.$(":selected");
   if (!selectedElements || selectedElements.length === 0) {
     alert('Please select nodes or edges to summarize');
     return;
   }
-  
+
   var selectedEdges = selectedElements.edges().length;
   var selectedNodes = selectedElements.nodes().length;
-  
+
+  _ensureSummarizeMode();
   var input = document.getElementById('agent-input');
   input.value = 'Summarize the ' + selectedEdges + ' selected relation(s) and ' + selectedNodes + ' selected node(s) using their supporting sentences and references.';
   agentSend();
+}
+
+// Enable/disable the "Summarize selected" button based on current Cytoscape selection.
+function _updateSummarizeSelectedBtn() {
+  var btn = document.getElementById('agent-summarize-selected-btn');
+  if (!btn) return;
+  var hasSelection = cy && typeof cy.$ === 'function' && cy.$(":selected").length > 0;
+  btn.disabled = !hasSelection;
+  if (hasSelection) {
+    btn.style.borderColor = '#4f8ef7';
+    btn.style.color = '#4f8ef7';
+    btn.style.cursor = 'pointer';
+  } else {
+    btn.style.borderColor = '#3a3f55';
+    btn.style.color = '#3a3f55';
+    btn.style.cursor = 'not-allowed';
+  }
+}
+
+// Switch to summarize mode and open the panel if it isn't already open.
+function _ensureSummarizeMode() {
+  if (_agentCurrentMode !== 'summarize') {
+    switchAgentMode('summarize');
+  }
+  if (!_agentPanelOpen) {
+    toggleAgenticPanel();
+  }
 }
 
 // ── Graph building for agent ─────────────────────────────────────────────────
