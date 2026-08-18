@@ -51,7 +51,7 @@ class Cypher:
     return cypher, parameter
 
 
-  def match_node_by_names(names:list[str],objtype='',letter='a'):
+  def match_node_by_names(names:list[str],objtype='',letter='a',with_connectivity=False):
     '''
      searches both Name and Alias properties for the names in the list
     '''
@@ -62,6 +62,9 @@ class Cypher:
               WHERE toLower({letter}.Name) = toLower(row) OR toLower(row) IN [x IN {letter}.Alias | toLower(x)]
               RETURN {letter}
               """
+    if with_connectivity:
+          cypher += f', COUNT{{({letter})-[]-()}} AS {CONNECTIVITY}'
+    
     parameter = {'batch':names}
     return cypher, parameter
 
@@ -466,24 +469,17 @@ class Cypher:
     parameters = dict()
     a = f'a:{'|'.join({obj.objtype() for obj in regulators})}'
     b = f'b:{'|'.join({obj.objtype() for obj in targets})}'
- 
-    reg_urns = [obj.urn() for obj in regulators]
-    parameters['rURNs'] = reg_urns
-    tar_urns = [obj.urn() for obj in targets]
-    parameters['tURNs'] = tar_urns
 
-    cypher = 'UNWIND $rURNs AS rURN\n'
-    cypher += f'MATCH ({a} {{URN:rURN}})\n'
-
-    cypher += f'UNWIND $tURNs AS tURN\n'
-    cypher += f'MATCH ({b} {{URN:tURN}})\n'
+    parameters['rURNs'] = [obj.urn() for obj in regulators]
+    parameters['tURNs'] = [obj.urn() for obj in targets]
 
     if dir:
-      cypher += f'MATCH (a)-[r]->(b)\n'
+      cypher = f'MATCH ({a})-[r]->({b})\n'
     else:
-      cypher += f'MATCH (a)-[r]-(b)\n'
-    
-    cypher = Cypher.add_relProps(cypher, by_relProps)
+      cypher = f'MATCH ({a})-[r]-({b})\n'
+
+    cypher += """WHERE a.URN IN $rURNs AND b.URN IN $tURNs"""    
+    cypher = Cypher.add_relProps(cypher, by_relProps,add_where=False)
     cypher += '\nRETURN startNode(r) AS Regulator, r AS Relation, endNode(r) AS Target'
     return cypher, parameters
   
