@@ -346,9 +346,10 @@
     <div class="menu-entry" id="me-ai">
       <div class="menu-label" onclick="toggleMenu('me-ai')" onmouseenter="hoverMenu('me-ai')">AI</div>
       <div class="menu-dropdown">
-        <div class="menu-item" onclick="openAgenticPanel('text2cypher');closeMenus()">Text2Cypher</div>
         <div class="menu-item" onclick="openAgenticPanel('summarize');closeMenus()">Summarize</div>
+        <div class="menu-item" onclick="openAgenticPanel('llm');closeMenus()">LLM</div>
         <div class="menu-item disabled" title="Coming soon">Curate</div>
+        <div class="menu-item" onclick="openAgenticPanel('text2cypher');closeMenus()">Text2Cypher</div>
         <div class="menu-item disabled" title="Coming soon">AI help</div>
       </div>
     </div>
@@ -610,10 +611,10 @@
     <p style="margin:0 0 10px;font-size:12px;color:#a0aec0">Every pathway you've opened, most recent first. Click a name or "Reopen" to view it again.</p>
 
     <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
-      <input type="text" id="ph-search-input" placeholder="🔍 Search history…" oninput="_phRender()"
+      <input type="text" id="ph-search-input" placeholder="🔍 Search history…" oninput="_phRender(true)"
         style="flex:1;min-width:200px;background:#1a1f35;border:1px solid #3a4060;border-radius:6px;color:#e2e8f0;font-size:13px;padding:6px 10px;outline:none">
       <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#a0aec0;cursor:pointer;white-space:nowrap">
-        <input type="checkbox" id="ph-dedupe" onchange="_phRender()"> Latest of each pathway only
+        <input type="checkbox" id="ph-dedupe" onchange="_phRender(true)"> Latest of each pathway only
       </label>
     </div>
 
@@ -631,7 +632,16 @@
         <tbody id="pathway-history-tbody"></tbody>
       </table>
     </div>
-    <div class="modal-actions" style="margin-top:12px">
+    <div id="ph-pagination" style="display:none;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button id="ph-prev" class="btn-ghost" style="font-size:12px;padding:4px 12px" onclick="_phPrevPage()">&#8592; Previous</button>
+      <span id="ph-page-info" style="font-size:12px;color:#a0aec0"></span>
+      <button id="ph-next" class="btn-ghost" style="font-size:12px;padding:4px 12px" onclick="_phNextPage()">Next &#8594;</button>
+      <span style="font-size:12px;color:#a0aec0;margin-left:8px">Go to:</span>
+      <input id="ph-goto-input" type="number" min="1" style="width:56px;background:#1a1f35;border:1px solid #3a4060;border-radius:5px;color:#e2e8f0;font-size:12px;padding:3px 6px;outline:none"
+        onkeydown="if(event.key==='Enter')_phGoTo()">
+      <button class="btn-ghost" style="font-size:12px;padding:4px 10px" onclick="_phGoTo()">Go</button>
+    </div>
+    <div class="modal-actions" style="margin-top:8px">
       <button class="btn-ghost" onclick="_phCloseModal()">Close</button>
     </div>
   </div>
@@ -666,6 +676,7 @@
   <div class="ctx-item" id="ctx-clone" onclick="cloneNodeFromContext()" style="display:none">🔗 Clone node</div>
   <div class="ctx-separator" id="ctx-sep-clone" style="display:none"></div>
   <div class="ctx-item" id="ctx-unclone" onclick="removeCloneFromContext()" style="display:none">🗑️ Remove clone</div>
+  <div class="ctx-item" id="ctx-select-all-clones" onclick="selectAllClonesFromContext()" style="display:none">🔍 Select all clones</div>
   <div class="ctx-separator" id="ctx-sep-merge" style="display:none"></div>
   <div class="ctx-item" id="ctx-merge-clones" onclick="mergeSelectedClonesFromContext()" style="display:none">🔀 Merge selected clones</div>
 </div>
@@ -1180,14 +1191,12 @@
     </div>
   </div>
 
-  <!-- Mode switcher — each AI submenu drives the same panel, swapping which
-       agent (system prompt + tool set) the input below talks to. Only
-       Text2Cypher (today's existing agent) is wired up so far; Summarize/
-       Curate/AI help are disabled placeholders until their own FDRs land. -->
+  <!-- Mode switcher tabs. Order: Summarize | LLM | Curate | Text2Cypher | AI help -->
   <div id="agent-mode-tabs" style="display:flex;gap:4px;padding:8px 16px 0;background:#161929;border-bottom:1px solid #2a3050;flex-shrink:0">
-    <div class="agent-mode-tab active" data-mode="text2cypher" onclick="switchAgentMode('text2cypher')">Text2Cypher</div>
     <div class="agent-mode-tab" data-mode="summarize" onclick="switchAgentMode('summarize')">Summarize</div>
+    <div class="agent-mode-tab" data-mode="llm" onclick="switchAgentMode('llm')">LLM</div>
     <div class="agent-mode-tab disabled" data-mode="curate" title="Coming soon">Curate</div>
+    <div class="agent-mode-tab active" data-mode="text2cypher" onclick="switchAgentMode('text2cypher')">Text2Cypher</div>
     <div class="agent-mode-tab disabled" data-mode="help" title="Coming soon">AI help</div>
   </div>
 
@@ -1209,8 +1218,10 @@
         style="padding:8px 16px;background:#4f8ef7;border:none;border-radius:6px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;align-self:stretch">Send</button>
     </div>
     <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">
-      <button onclick="agentSummarizeAll()" title="Summarize all relations in the graph" style="padding:3px 10px;background:transparent;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;font-size:11px;cursor:pointer">📋 Summarize all</button>
-      <button id="agent-summarize-selected-btn" onclick="agentSummarizeSelected()" title="Summarize only selected nodes/relations" disabled style="padding:3px 10px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#3a3f55;font-size:11px;cursor:not-allowed">✓ Summarize selected</button>
+      <span id="agent-summarize-actions" style="display:flex;gap:8px;align-items:center">
+        <button onclick="agentSummarizeAll()" title="Summarize all relations in the graph" style="padding:3px 10px;background:transparent;border:1px solid #4f8ef7;border-radius:4px;color:#4f8ef7;font-size:11px;cursor:pointer">📋 Summarize all</button>
+        <button id="agent-summarize-selected-btn" onclick="agentSummarizeSelected()" title="Summarize only selected nodes/relations" disabled style="padding:3px 10px;background:transparent;border:1px solid #3a3f55;border-radius:4px;color:#3a3f55;font-size:11px;cursor:not-allowed">✓ Summarize selected</button>
+      </span>
       <button onclick="agentClearChat()" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">Clear chat</button>
       <button onclick="agentSaveConversation()" title="Save this conversation to a local JSON file" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">💾 Save chat</button>
       <button onclick="agentTriggerLoadConversation()" title="Load a previously saved conversation from a local JSON file" style="padding:3px 10px;background:transparent;border:1px solid #2a3050;border-radius:4px;color:#5a6080;font-size:11px;cursor:pointer">📂 Load chat</button>
