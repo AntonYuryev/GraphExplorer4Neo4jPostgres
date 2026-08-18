@@ -122,11 +122,10 @@ class SummarizeRequest(BaseModel):
         if not node_urns:
             return []
         urns = set(node_urns)
-        cg = self.NodeJSGraph if isinstance(self.NodeJSGraph, dict) else {}
-        all_edges = cg.get("edges") or []
+        all_edges = self.NodeJSGraph.get("edges")
         return [
             e for e in all_edges
-            if isinstance(e, dict) and (e.get("sourceURN") in urns or e.get("targetURN") in urns)
+            if e.get("sourceURN") in urns or e.get("targetURN") in urns
         ]
 
 
@@ -242,22 +241,22 @@ class SummarizeRequest(BaseModel):
       Converts NodeJSGraph to PSPathway object for summarization.
       If self.scope is "selected", only selected edges and nodes are included.
       '''
-      cg = self.NodeJSGraph or {}
+      #cg = self.NodeJSGraph or {}
 
       my_edges = []
       if self.scope == "selected":
-          edges = (cg.get("selectedEdges") or [])
-          selected_nodes_urns = [n.get("urn") for n in (cg.get("selectedNodes") or []) if isinstance(n, dict) and n.get("urn")]
-          my_edges = edges + (self.edges4(selected_nodes_urns) if selected_nodes_urns else [])
+          edges = (self.NodeJSGraph.get("selectedEdges") or [])
+          selected_nodes_urns = [n.get("urn") for n in self.NodeJSGraph.get("selectedNodes")]
+          my_edges = edges + self.edges4(selected_nodes_urns) # will take all edges of selected nodes. not only those selected 
       else:
-          my_edges = cg.get("edges") or []
+          my_edges = self.NodeJSGraph.get("edges") or []
       
       my_rels = SummarizeRequest.edges2psrels(my_edges)
       graph2analyze = ResnetGraph.from_rels(my_rels)
       pathway_names = self.get_graph_names()
       pathway_name = ','.join(pathway_names)
       pathway_props = {'Name': [pathway_name]}
-      for prop, val in cg.items():
+      for prop, val in self.NodeJSGraph.items():
           if prop not in {'nodes', 'edges', 'selectedNodes', 'selectedEdges', 'graphName', 'pathwayName','tabName','subgraphName', 'currentSubgraphName','name','title'}:
               pathway_props[prop_to_title(prop)] = [val]
       my_pathway = PSPathway(pathway_props, graph2analyze)
