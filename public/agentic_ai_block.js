@@ -23,7 +23,7 @@ function openAgenticPanel(mode) {
   // Called from menu (e.g., onclick="openAgenticPanel('summarize')")
   // Switch mode and open the panel
   console.log('[openAgenticPanel] Called with mode:', mode);
-  if (mode === 'summarize' || mode === 'text2cypher') {
+  if (mode === 'summarize' || mode === 'text2cypher' || mode === 'llm') {
     switchAgentMode(mode);
   }
   toggleAgenticPanel();
@@ -209,6 +209,16 @@ async function agentSend() {
       
       result = await api('/api/agent/summarize-chat', payload);
       console.log('[agentSend] Response received from /api/agent/summarize-chat:', result);
+    } else if (_agentCurrentMode === 'llm') {
+      // LLM mode — general knowledge, no graph context
+      console.log('[agentSend] LLM mode');
+      var payload = {
+        message: msg,
+        history: _agentChatHistory.slice(0, -1),
+        llm:     _agentConfig,
+      };
+      result = await api('/api/agent/llm-chat', payload);
+      console.log('[agentSend] Response received from /api/agent/llm-chat:', result);
     } else {
       // Text2Cypher mode (default)
       console.log('[agentSend] TEXT2CYPHER mode');
@@ -221,11 +231,19 @@ async function agentSend() {
       result = await api('/api/agent/chat', payload);
       console.log('[agentSend] Response received from /api/agent/chat:', result);
     }
-    
+
     var reply = result.reply || '(no reply)';
     console.log('[agentSend] Appending assistant reply:', reply.slice(0, 100) + '...');
     _agentChatHistory.push({ role: 'assistant', content: reply });
     _agentAppendMessage('assistant', reply, result.generated_cypher, result.cypher_results);
+
+    // After a Summarize reply that lacks supporting info, nudge user toward the LLM tab
+    if (_agentCurrentMode === 'summarize' && _replyLacksInfo(reply)) {
+      _agentAppendMessage('assistant',
+        '💡 **Tip:** The Summarize agent is limited to knowledge from the pathway\'s supporting sentences. ' +
+        'For general biology questions, switch to the **LLM** tab — it has access to broad scientific knowledge without this restriction.'
+      );
+    }
 
     if (result.generated_cypher) {
       _agentLastCypher = result.generated_cypher;
@@ -486,16 +504,32 @@ function _renderSummarizeReply(text, container) {
   var entityParts = nodeNames.map(function(n) {
     // Escape regex special chars, then wrap with word boundaries so "ATR" does
     // not match inside "treatments" or "latrunculin" (whole-token match only).
+    // Allow common English plural suffixes (s / es) so "anthocyanins" matches
+    // the "anthocyanin" node, and "processes" matches "process", etc.
+    // Names ending in "y" also get an "ies" alternative (activity → activities).
     var escaped = n.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return '\\b' + escaped + '\\b';
+    var suffix = /y$/i.test(escaped)
+      ? '(?:ies|e?s)?'   // activity→activities, also activitys/es as fallback
+      : '(?:e?s)?';      // anthocyanin→anthocyanins, process→processes
+    return '\\b' + escaped + suffix + '\\b';
   });
   var combinedRE = entityParts.length
     ? new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')|(' + DOIREFS_RE.source + ')|(' + entityParts.join('|') + ')', 'gi')
     : new RegExp('(' + PMID_RE.source + ')|(' + DOI_RE.source + ')|(' + DOIREFS_RE.source + ')', 'gi');
 
-  // Map label (lowercase) → node id for click handler
+  // Map label (lowercase) → node id for click handler.
+  // Also register common plural forms so clicking a highlighted plural still
+  // selects the correct node on the graph.
   var labelToId = {};
-  nodeNames.forEach(function(n) { labelToId[n.label.toLowerCase()] = n.id; });
+  nodeNames.forEach(function(n) {
+    var lbl = n.label.toLowerCase();
+    labelToId[lbl] = n.id;
+    labelToId[lbl + 's']  = n.id;   // simple plural: anthocyanin→anthocyanins
+    labelToId[lbl + 'es'] = n.id;   // sibilant plural: process→processes
+    if (/y$/.test(lbl)) {
+      labelToId[lbl.slice(0, -1) + 'ies'] = n.id;  // activity→activities
+    }
+  });
 
   function annotateText(rawText, parentEl) {
     if (!rawText) return;
@@ -522,7 +556,7 @@ function _renderSummarizeReply(text, container) {
           : 'https://pubmed.ncbi.nlm.nih.gov/' + pmidsCapped[0] + '/';
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
-        a.textContent = pmidsCapped.length > 1 ? 'references' : 'PMID ' + pmidsCapped[0];
+        a.textContent = pmids.length > 1 ? pmids.length + ' references' : 'PMID ' + pmidsCapped[0];
         a.title = pmidsCapped.join(', ');  // show actual PMIDs on hover
         a.style.cssText = 'color:#6ab4ff;text-decoration:underline;cursor:pointer';
         parentEl.appendChild(a);
@@ -553,23 +587,46 @@ function _renderSummarizeReply(text, container) {
       } else {
         // Entity name
         var nodeId = labelToId[matched.toLowerCase()];
+        // Find the canonical (singular) label stored in nodeNames for this node id.
+        // We store the canonical label (not the matched plural) so the fallback
+        // label-search in the click handler compares against the actual node label.
+        var canonLabel = matched;
+        if (nodeId) {
+          for (var _cni = 0; _cni < nodeNames.length; _cni++) {
+            if (nodeNames[_cni].id === nodeId) { canonLabel = nodeNames[_cni].label; break; }
+          }
+        }
         var span = document.createElement('span');
         span.textContent = matched;
         span.title = 'Click to select "' + matched + '" on graph';
         span.style.cssText = 'color:#a8e6a8;border-bottom:1px dotted #6ab88a;cursor:pointer;font-weight:500';
         span.dataset.nodeId = nodeId || '';
-        span.dataset.nodeLabel = matched;
+        span.dataset.nodeLabel = canonLabel;
         span.onclick = function(e) {
           e.stopPropagation();
-          var nid = this.dataset.nodeId;
-          var nlbl = this.dataset.nodeLabel;
+          var nid  = this.dataset.nodeId;
+          var nlbl = (this.dataset.nodeLabel || '').toLowerCase();
           if (!cy || typeof cy.nodes !== 'function') return;
-          cy.nodes().unselect();
-          var targets = nid ? cy.$id(nid) : cy.nodes().filter(function(n) {
-            return (n.data('label') || n.data('Name') || n.data('name') || '').toLowerCase() === nlbl.toLowerCase();
-          });
-          if (targets.length) {
+          cy.elements().unselect();
+          var targets;
+          // Strategy 1: direct id lookup (fastest)
+          if (nid) targets = cy.$id(nid);
+          // Strategy 2: label match (handles clones whose original is not in nodeNames)
+          if (!targets || !targets.length) {
+            targets = cy.nodes().filter(function(n) {
+              return (n.data('label') || n.data('Name') || n.data('name') || '').toLowerCase() === nlbl;
+            });
+          }
+          // Strategy 3: if strategy 1 found a node, also select all clones sharing its URN
+          if (targets && targets.length) {
+            var urn = targets.first().data('URN');
+            if (urn) {
+              targets = cy.nodes().filter(function(n) {
+                return String(n.data('URN') || '') === String(urn);
+              });
+            }
             targets.select();
+            if (typeof updateSelectionInfo === 'function') updateSelectionInfo();
           }
         };
         parentEl.appendChild(span);
@@ -689,11 +746,12 @@ function agentClearChat() {
 
 // ── Agent mode switching ─────────────────────────────────────────────────────
 function switchAgentMode(mode) {
-  if (!mode || (mode !== 'text2cypher' && mode !== 'summarize')) {
+  var validModes = { 'text2cypher': 1, 'summarize': 1, 'llm': 1 };
+  if (!mode || !validModes[mode]) {
     console.log('[switchAgentMode] Invalid mode:', mode);
     return;
   }
-  
+
   console.log('[switchAgentMode] Switching to mode:', mode);
   var _prevMode = _agentCurrentMode;
   _agentCurrentMode = mode;
@@ -703,26 +761,55 @@ function switchAgentMode(mode) {
   if (_prevMode !== mode) {
     agentClearChat();
   }
-  
+
   // Update tab highlighting
   var tabs = document.querySelectorAll('.agent-mode-tab');
   tabs.forEach(function(tab) {
     tab.classList.toggle('active', tab.getAttribute('data-mode') === mode);
   });
 
-  // Update panel title so it doesn't keep showing "Text2Cypher" while in Summarize mode
+  // Update panel title
   var title = document.getElementById('agent-panel-title');
   if (title) {
-    title.textContent = mode === 'summarize' ? '🤖 Summarize' : '🤖 Text2Cypher';
+    title.textContent = mode === 'summarize' ? '🤖 Summarize'
+                      : mode === 'llm'       ? '🤖 LLM'
+                      :                        '🤖 Text2Cypher';
   }
 
-  // Update message placeholder based on mode
+  // Update message placeholder
   var input = document.getElementById('agent-input');
   if (input) {
     input.placeholder = mode === 'summarize'
       ? 'Ask a question about the current graph and its references…'
+      : mode === 'llm'
+      ? 'Ask anything — general biology, mechanisms, drugs, diseases…'
       : 'Ask anything about your graph…';
   }
+
+  // Show summarize-only action buttons only in summarize mode
+  var summarizeBar = document.getElementById('agent-summarize-actions');
+  if (summarizeBar) summarizeBar.style.display = mode === 'summarize' ? '' : 'none';
+}
+
+// Returns true when a Summarize reply appears to contain no useful pathway info,
+// which is the cue to suggest the LLM tab for general-knowledge follow-ups.
+function _replyLacksInfo(reply) {
+  if (!reply) return false;
+  var lower = reply.toLowerCase();
+  // Sentinel phrases the summarize agent uses when it has no supporting sentences
+  var sentinels = [
+    'no information available',
+    'no relevant information',
+    'no supporting sentences',
+    'no supporting evidence',
+    'not mentioned in',
+    'not found in the',
+    'no data available',
+    'cannot find information',
+    'unable to find',
+    'no pathway information',
+  ];
+  return sentinels.some(function(s) { return lower.indexOf(s) !== -1; });
 }
 
 // ── Summarize mode actions ───────────────────────────────────────────────────
