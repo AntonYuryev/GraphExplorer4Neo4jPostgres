@@ -375,6 +375,10 @@ class SummarizeRequest(BaseModel):
 
       # adding all edges for focus nodes in in_graph
       selected_rels = in_graph.graph.get_neighbors_rels(focus_nodes_in_graph)
+      if not selected_rels and self.scope == "selected":
+          # if no edges were found for focus nodes in the selected graph, 
+          # fall back to all edges in the selected graph
+          selected_rels = in_graph.rels()
       
       # now adding refs for focus nodes that are not in in_graph
       search_node_terms = set()
