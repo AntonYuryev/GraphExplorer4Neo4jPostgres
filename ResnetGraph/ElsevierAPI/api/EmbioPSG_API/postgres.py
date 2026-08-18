@@ -154,8 +154,8 @@ class PostgreSQL:
 
 
   def get_refs(self,relations_id:set[str]):
-    new_relids = relations_id.difference(self.rel2refDict)
-    #newrelid_str = ','.join(map(str, new_relids))
+    new_relids = list(map(str, relations_id))
+    new_relids = new_relids.difference(self.rel2refDict)
     sql = f"SELECT * FROM {self.schema}.reference WHERE {self.schema}.reference.id IN (%s)"
 
     with self.db.cursor() as cur:
