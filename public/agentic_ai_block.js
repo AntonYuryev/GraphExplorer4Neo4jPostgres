@@ -5,6 +5,7 @@
 
 // ── State ────────────────────────────────────────────────────────────────────
 var _agentPanelOpen    = false;
+var _summarizeRenderCount = 0;  // incremented per _renderSummarizeReply call for unique TOC anchor ids
 var _agentChatHistory  = [];   // [{role,content}]
 var _agentLastCypher   = null;
 var _agentLibraryFiles = [];
@@ -652,6 +653,21 @@ function _renderSummarizeReply(text, container) {
     });
   }
 
+  // Unique prefix for all anchor IDs within this one summarization call,
+  // so identical section names in different summarizations don't collide.
+  var _callId = ++_summarizeRenderCount;
+  var _tocHeadings = [];   // [{label, id}] collected during render
+
+  // Helper: register a heading element for the TOC and return the id assigned.
+  function _registerHeading(rawLabel, el) {
+    var id = 'ai-sec-' + _callId + '-' + _tocHeadings.length;
+    el.id = id;
+    // Strip markdown bold (**) for the TOC label
+    var label = rawLabel.replace(/\*\*/g, '').trim();
+    _tocHeadings.push({ label: label, id: id });
+    return id;
+  }
+
   var lines = text.split('\n');
   var i = 0;
   var prevWasBlank = true; // treat start-of-text as "after a blank line"
@@ -678,19 +694,25 @@ function _renderSummarizeReply(text, container) {
     if (/^###\s+/.test(line)) {
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:13px;color:#8ab4e8;margin-top:12px;margin-bottom:4px;border-bottom:1px solid #2a3a5a;padding-bottom:3px';
-      renderInlineMarkdown(line.replace(/^###\s+/, ''), h);
+      var _raw = line.replace(/^###\s+/, '');
+      _registerHeading(_raw, h);
+      renderInlineMarkdown(_raw, h);
       container.appendChild(h);
       prevWasBlank = false;
     } else if (/^##\s+/.test(line)) {
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:14px;color:#a0c4ff;margin-top:14px;margin-bottom:5px';
-      renderInlineMarkdown(line.replace(/^##\s+/, ''), h);
+      var _raw = line.replace(/^##\s+/, '');
+      _registerHeading(_raw, h);
+      renderInlineMarkdown(_raw, h);
       container.appendChild(h);
       prevWasBlank = false;
     } else if (/^#\s+/.test(line)) {
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:15px;color:#b8d4ff;margin-top:16px;margin-bottom:6px';
-      renderInlineMarkdown(line.replace(/^#\s+/, ''), h);
+      var _raw = line.replace(/^#\s+/, '');
+      _registerHeading(_raw, h);
+      renderInlineMarkdown(_raw, h);
       container.appendChild(h);
       prevWasBlank = false;
     } else if (/^[-*]\s+/.test(line)) {
@@ -713,6 +735,7 @@ function _renderSummarizeReply(text, container) {
       // to distinguish LLM-generated section titles from markdown headings.
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:13px;color:#c8a4f0;margin-top:14px;margin-bottom:4px;border-bottom:1px solid #3a2a5a;padding-bottom:3px';
+      _registerHeading(trimmed, h);
       renderInlineMarkdown(trimmed, h);
       container.appendChild(h);
       prevWasBlank = false;
@@ -724,6 +747,40 @@ function _renderSummarizeReply(text, container) {
       prevWasBlank = false;
     }
     i++;
+  }
+
+  // ── Table of contents ────────────────────────────────────────────────────────
+  // Only shown when there are at least 2 sections — a single-section reply
+  // doesn't benefit from a TOC.
+  if (_tocHeadings.length >= 2) {
+    var toc = document.createElement('div');
+    toc.style.cssText = 'background:#141828;border:1px solid #2a3050;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px';
+
+    var tocTitle = document.createElement('div');
+    tocTitle.style.cssText = 'font-weight:600;color:#7a8099;margin-bottom:5px;font-size:11px;letter-spacing:0.05em;text-transform:uppercase';
+    tocTitle.textContent = 'Contents';
+    toc.appendChild(tocTitle);
+
+    _tocHeadings.forEach(function(entry, idx) {
+      var row = document.createElement('div');
+      row.style.cssText = 'padding:1px 0';
+      var a = document.createElement('a');
+      a.href = '#' + entry.id;
+      a.textContent = (idx + 1) + '.  ' + entry.label;
+      a.style.cssText = 'color:#6ab4ff;text-decoration:none;cursor:pointer';
+      a.onmouseover = function() { a.style.textDecoration = 'underline'; };
+      a.onmouseout  = function() { a.style.textDecoration = 'none'; };
+      a.onclick = function(e) {
+        e.preventDefault();
+        var target = document.getElementById(entry.id);
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+      row.appendChild(a);
+      toc.appendChild(row);
+    });
+
+    // Prepend TOC before all other content in this container
+    container.insertBefore(toc, container.firstChild);
   }
 }
 
