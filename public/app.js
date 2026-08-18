@@ -847,7 +847,7 @@ function showApp() {
   _loadSchema(); // Preload schema immediately so relation-type dropdowns are ready before any dialog opens
 
   // Initialize tab system with one empty tab
-  tabs = [{ id: Date.now(), name: 'Pathway 1', snapshot: emptyTabSnapshot() }];
+  tabs = [{ id: Date.now(), name: 'Pathway 1', snapshot: emptyTabSnapshot(), dirty: false }];
   activeTabIdx = 0;
   renderTabBar();
 }
@@ -3594,6 +3594,7 @@ function mergeGraphData(newData) {
     requestAnimationFrame(function() { cy.fit(cy.elements(), 40); });
   }
 
+  if (addedNodes > 0 || addedEdges > 0) markActiveTabDirty();
   return { addedNodes: addedNodes, addedEdges: addedEdges };
 }
 
@@ -5362,6 +5363,7 @@ async function runQuery(mergeIntoExisting) {
         updateCurrentTabName(shortQ);
         hideQueryResultTable();
         renderGraph(data);
+        markActiveTabDirty();   // Cypher result is unsaved by definition
         // Build the central Graph object from the Cypher result (REQ-2.1, REQ-3.2.x).
         // Name starts as the 40-char query truncation; _nameGraphFromCypher()
         // will overwrite it asynchronously with an AI-generated name (REQ-3.2.3/4).
@@ -8160,10 +8162,13 @@ async function loadRnefFile(file) {
       pathways.forEach(function(pw, i) {
         var label = document.createElement('label');
         label.className = 'rnef-pw-row';
-        label.innerHTML = '<input type="checkbox" class="rnef-pw-cb" value="' + i + '">'
+        label.innerHTML = '<input type="checkbox" class="rnef-pw-cb" value="' + i + '" checked>'
           + '<span>' + escHtml(pw.name) + '</span>';
         list.appendChild(label);
       });
+      // Sync master "Select all" checkbox to match (all checked)
+      var masterCb = document.getElementById('rnef-select-all');
+      if (masterCb) masterCb.checked = true;
       if (statsEl) statsEl.innerHTML = '';
       document.getElementById('rnef-modal').style.display = 'flex';
     }
@@ -8184,6 +8189,7 @@ function openRnefPathway(data, filePath, sourceFileAbs) {
   // filePath provides the file stem for REQ-3.1.3 (name fallback).
   SummarizeRequest.NodeJSGraph = Graph.fromRnef(data, filePath);
   renderGraph(data.graphData, data.positions || null);
+  markActiveTabClean();   // freshly loaded from file — nothing unsaved yet
   updateCurrentTabName(SummarizeRequest.NodeJSGraph.Name || 'Pathway');
   appendPathwayHistory(currentSubgraphName || 'Pathway', filePath, sourceFileAbs);
 
@@ -13805,7 +13811,7 @@ function openSelectedRnefPathways() {
       }
       // Create the new tab with an empty snapshot (tab bar updated)
       var newIdx = tabs.length;
-      tabs.push({ id: Date.now() + newIdx, name: pw.name || ('Pathway ' + (newIdx + 1)), snapshot: emptyTabSnapshot() });
+      tabs.push({ id: Date.now() + newIdx, name: pw.name || ('Pathway ' + (newIdx + 1)), snapshot: emptyTabSnapshot(), dirty: false });
       activeTabIdx = newIdx;
       renderTabBar();
       // Show graph-view; don't call applyTabState so cy is NOT cleared yet
@@ -15719,6 +15725,7 @@ async function savePathwayInPlace() {
       }
       currentPathwaySourceFile = result.sourceFile;
     }
+    markActiveTabClean();   // successfully saved — no unsaved changes
     var statusEl = document.getElementById('pw-save-status');
     if (statusEl) {
       statusEl.style.color = '#4caf50';
@@ -15857,6 +15864,7 @@ async function savePathwayAs() {
     // own, so this tab's pathway is no longer alias-able as a target until
     // it's re-indexed with one some other way.
     currentPathwayUrn = null;
+    markActiveTabClean();   // successfully saved — no unsaved changes
     updateCurrentTabName(currentSubgraphName);
     closePathwaySaveAsModal();
   } catch (err) {
@@ -17538,7 +17546,8 @@ function createNewTab(name) {
   tabs.push({
     id: Date.now() + idx,
     name: name || ('Pathway ' + (idx + 1)),
-    snapshot: emptyTabSnapshot()
+    snapshot: emptyTabSnapshot(),
+    dirty: false
   });
   activeTabIdx = idx;
   renderTabBar();
@@ -17562,9 +17571,32 @@ function switchTab(idx) {
   applyTabState(tabs[activeTabIdx].snapshot);
 }
 
+// ── Dirty-state helpers ───────────────────────────────────────────────────────
+// "dirty" means the tab has unsaved content (Cypher result, or a pathway that
+// was modified after loading). Set true on graph renders and structural edits;
+// set false after loading from file or after a successful save.
+function markActiveTabDirty() {
+  if (tabs[activeTabIdx]) tabs[activeTabIdx].dirty = true;
+}
+function markActiveTabClean() {
+  if (tabs[activeTabIdx]) tabs[activeTabIdx].dirty = false;
+}
+
 function closeTab(idx, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
   if (tabs.length <= 1) return;
+
+  // Guard: prompt the user if the tab has unsaved content
+  var tab = tabs[idx];
+  if (tab && tab.dirty) {
+    var tabName = tab.name || 'this tab';
+    var ok = confirm(
+      'The graph "' + tabName + '" has unsaved changes.\n\n' +
+      'Close without saving?'
+    );
+    if (!ok) return;
+  }
+
   hideResizeHandles();
   var wasActive = (idx === activeTabIdx);
   tabs.splice(idx, 1);
@@ -18019,6 +18051,7 @@ function deleteSelection() {
   graphData.nodes = graphData.nodes.filter(function(n) { return !selIds.has(n.id); });
   graphData.edges = graphData.edges.filter(function(e) { return !selIds.has(e.id); });
   updateStats();
+  markActiveTabDirty();
 }
 
 
