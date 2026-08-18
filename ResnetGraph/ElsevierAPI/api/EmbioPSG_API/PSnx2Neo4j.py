@@ -137,7 +137,7 @@ class neo4j_nx(GraphDatabase):
       objtype (label) can be empty, but the query will be slower
     '''
     objtype_str = '|'.join(objtypes) if objtypes else ''
-    cypher,params = Cypher.match_node_by_names(names,objtype_str,'a')
+    cypher,params = Cypher.match_node_by_names(names,objtype_str,'a',with_connectivity)
 
     nodes = []
     # _unwind_ yields (records_list, request_name) tuples
