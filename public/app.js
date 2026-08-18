@@ -5408,56 +5408,82 @@ async function runQuery(mergeIntoExisting) {
  * @param {number} tabIdx      index of that tab at query time
  */
 async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
-  // Only attempt when the agent is configured
-  if (!_agentConfig || !_agentConfig.model) return;
-  try {
-    var prompt =
-      'Based on the following Neo4j Cypher query, generate a concise graph name ' +
-      '(5 words max) and a one-sentence description of what the graph represents. ' +
-      'Respond with ONLY valid JSON — no markdown, no extra text — in this exact ' +
-      'shape: {"name":"...","description":"..."}.\n\nQuery:\n' + cypher;
-    var resp = await api('/api/agent/chat', {
-      message:       prompt,
-      history:       [],
-      llm:           _agentConfig,
-      current_graph: _currentGraphSummary()
-    });
+  if (!_agentConfig || !_agentConfig.model_name) return;
 
-    // Extract JSON from the reply (agent may wrap it in prose or code fences)
-    var parsed = null;
-    try {
-      var raw = (resp && resp.reply) ? String(resp.reply).trim() : '';
-      // Strip optional ```json … ``` wrapper
-      var m = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-      var jsonStr = m ? m[1] : raw;
-      // Find the first {...} object in the string
-      var objM = jsonStr.match(/\{[\s\S]*\}/);
-      if (objM) parsed = JSON.parse(objM[0]);
-    } catch (_) { /* parse failure → keep fallback */ }
+  var prompt =
+    'Give a succinct name (5 words max) for the graph produced by this Cypher query. ' +
+    'Reply with ONLY the name — no quotes, no punctuation, no extra text.\n\nQuery:\n' + cypher;
 
-    if (!parsed || typeof parsed.name !== 'string' || !parsed.name.trim()) return;
+  // Helper: set the tab label (works whether tab is active or backgrounded)
+  function _setTabName(name) {
+    var idx = tabs.findIndex(function(t) { return t.id === tabId; });
+    if (idx < 0) return false;
+    if (idx === activeTabIdx) { updateCurrentTabName(name); }
+    else { tabs[idx].name = name; renderTabBar(); }
+    return true;
+  }
 
-    // Guard: only update if we're still looking at the same graph
-    var currentTabIdx = tabs.findIndex(function(t) { return t.id === tabId; });
-    if (currentTabIdx < 0) return;
+  // Helper: guard — returns false if the user has already loaded a different graph
+  function _graphStillCurrent() {
     var g = SummarizeRequest.NodeJSGraph;
-    if (!g || g.cypher !== cypher) return;   // user loaded a different graph
+    return g && g.cypher === cypher;
+  }
 
-    var aiName = parsed.name.trim();
-    var aiDesc = (parsed.description || '').trim();
-    g.Name        = aiName;
-    g.Description = aiDesc;
+  var MAX_ATTEMPTS = 12;          // up to ~36 s of waiting
+  var RETRY_MS     = 3000;        // 3 s between retries
+  var shownSpinner = false;
 
-    // Update the tab label (REQ-4.1)
-    if (currentTabIdx === activeTabIdx) {
-      updateCurrentTabName(aiName);
-    } else {
-      tabs[currentTabIdx].name = aiName;
-      renderTabBar();
+  for (var attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      var resp = await api('/api/agent/llm-chat', {
+        message: prompt,
+        history: [],
+        llm:     _agentConfig
+      });
+
+      var raw    = (resp && resp.reply) ? String(resp.reply).trim() : '';
+      var aiName = raw.replace(/^\*\*|\*\*$/g, '').replace(/^["']|["']$/g, '').trim();
+      if (!aiName || aiName.length > 80) return;   // empty or nonsense — keep fallback
+
+      if (!_graphStillCurrent()) return;            // user navigated away
+      if (shownSpinner) {
+        // Remove spinner prefix before setting the real name
+      }
+      _setTabName(aiName);
+      var g = SummarizeRequest.NodeJSGraph;
+      if (g && g.cypher === cypher) g.Name = aiName;
+      return;  // done
+
+    } catch (err) {
+      var msg = (err && err.message) || '';
+      // "starting" / "wait" in the message means the agent service is not yet up
+      var isStarting = /starting|wait.*moment|not.*ready|503/i.test(msg);
+      if (!isStarting) {
+        // Non-transient error — give up immediately; restore fallback if spinner was shown
+        console.warn('[_nameGraphFromCypher] failed:', msg);
+        if (shownSpinner) {
+          var shortQ = cypher.length > 40 ? cypher.substring(0, 40) + '…' : cypher;
+          _setTabName(shortQ);
+        }
+        return;
+      }
+
+      // Service is still booting — show spinner in tab on first retry
+      if (!shownSpinner) {
+        shownSpinner = true;
+        if (!_setTabName('⏳ Naming…')) return;  // tab already gone
+      }
+
+      // Wait, then check that the user hasn't switched graphs before retrying
+      await new Promise(function(res) { setTimeout(res, RETRY_MS); });
+      if (!_graphStillCurrent()) return;
     }
-  } catch (err) {
-    // REQ-3.2.4: any error is silently swallowed; fallback name stays in place
-    console.warn('_nameGraphFromCypher: AI name generation failed:', err && err.message);
+  }
+
+  // All retries exhausted — restore the short query truncation fallback
+  if (shownSpinner) {
+    var shortQ = cypher.length > 40 ? cypher.substring(0, 40) + '…' : cypher;
+    _setTabName(shortQ);
   }
 }
 
@@ -7249,6 +7275,13 @@ function _syncGraphSelectionFromTable() {
     idSet.forEach(function(id) {
       var e = cy.getElementById(id);
       if (e && e.length) toSelect = toSelect.union(e);
+      // Also select every clone of this node — clones share the entity but have
+      // a different cy id, so getElementById alone misses them.
+      if (tableViewMode === 'node') {
+        cy.nodes('[?isClone]').forEach(function(clone) {
+          if (clone.data('cloneOf') === id) toSelect = toSelect.union(clone);
+        });
+      }
     });
     if (toSelect.length) toSelect.select();
     updateSelectionInfo();
@@ -14370,6 +14403,8 @@ function appendPathwayHistory(name, filePath, sourceFile) {
 }
 
 var _phAllRows = [];
+var _phCurrentPage = 1;
+var _phPageSize = 20;
 
 async function openPathwayHistory() {
   var modal  = document.getElementById('pathway-history-modal');
@@ -14389,6 +14424,7 @@ async function openPathwayHistory() {
       var t = new Date(r.date).getTime();
       return { date: r.date, name: r.name, filePath: r.filePath, sourceFile: r.sourceFile, _time: isNaN(t) ? 0 : t };
     });
+    _phCurrentPage = 1;
     _phRender();
   } catch(e) {
     status.textContent = 'Error loading history: ' + e.message;
@@ -14397,6 +14433,20 @@ async function openPathwayHistory() {
 
 function _phCloseModal() {
   document.getElementById('pathway-history-modal').style.display = 'none';
+}
+
+function _phPrevPage() {
+  if (_phCurrentPage > 1) { _phCurrentPage--; _phRender(); }
+}
+
+function _phNextPage() {
+  _phCurrentPage++;
+  _phRender();
+}
+
+function _phGoTo() {
+  var v = parseInt(document.getElementById('ph-goto-input').value, 10);
+  if (!isNaN(v) && v >= 1) { _phCurrentPage = v; _phRender(); }
 }
 
 function _phEscHtml(s) {
@@ -14414,7 +14464,7 @@ function _phHighlight(text, term) {
   return escaped.replace(re, '<mark class="ch-hit">$1</mark>');
 }
 
-function _phRender() {
+function _phRender(resetPage) {
   var status = document.getElementById('pathway-history-status');
   var tbody  = document.getElementById('pathway-history-tbody');
   var search = (document.getElementById('ph-search-input').value || '').trim().toLowerCase();
@@ -14446,19 +14496,47 @@ function _phRender() {
     rows = Object.keys(latestByKey).map(function(k) { return latestByKey[k]; });
   }
 
-  var shown = rows.length;
+  var filtered = rows.length;
 
   // Newest first, always — mirrors the default (and most useful) sort for
   // Cypher History without needing its own sortable-column UI.
   rows = rows.slice().sort(function(a, b) { return b._time - a._time; });
 
+  // Pagination
+  if (resetPage) _phCurrentPage = 1;
+  var totalPages = Math.max(1, Math.ceil(filtered / _phPageSize));
+  if (_phCurrentPage > totalPages) _phCurrentPage = totalPages;
+  var pageStart = (_phCurrentPage - 1) * _phPageSize;
+  var pageEnd   = Math.min(pageStart + _phPageSize, filtered);
+  var pageRows  = rows.slice(pageStart, pageEnd);
+
+  var paginationEl = document.getElementById('ph-pagination');
+  var prevBtn  = document.getElementById('ph-prev');
+  var nextBtn  = document.getElementById('ph-next');
+  var pageInfo = document.getElementById('ph-page-info');
+  var gotoInput = document.getElementById('ph-goto-input');
+
+  if (filtered > _phPageSize) {
+    paginationEl.style.display = 'flex';
+    prevBtn.disabled  = (_phCurrentPage <= 1);
+    nextBtn.disabled  = (_phCurrentPage >= totalPages);
+    pageInfo.textContent = 'Page ' + _phCurrentPage + ' of ' + totalPages;
+    gotoInput.max = totalPages;
+    gotoInput.value = _phCurrentPage;
+  } else {
+    paginationEl.style.display = 'none';
+  }
+
   status.textContent = total === 0
     ? 'No pathways opened yet.'
-    : 'Showing ' + shown.toLocaleString() + ' of ' + total.toLocaleString() + ' pathway' + (total === 1 ? '' : 's') +
-      (shown === 0 ? ' — no matches.' : '');
+    : filtered === 0
+      ? 'No matches in ' + total.toLocaleString() + ' pathway' + (total === 1 ? '' : 's') + '.'
+      : 'Showing ' + (pageStart + 1) + '–' + pageEnd + ' of ' + filtered.toLocaleString() +
+        (filtered < total ? ' (filtered from ' + total.toLocaleString() + ' total)' : '') +
+        ' pathway' + (filtered === 1 ? '' : 's');
 
   tbody.innerHTML = '';
-  rows.forEach(function(r) {
+  pageRows.forEach(function(r) {
     var tr = document.createElement('tr');
     var dt = '';
     try { dt = new Date(r.date).toLocaleString(); } catch(e) { dt = r.date; }
@@ -16066,6 +16144,10 @@ function showContextMenu(x, y, type, id, elementId, displayName, properties, rel
   if (sepEl)     sepEl.style.display     = isNode ? '' : 'none';
   if (uncloneEl) uncloneEl.style.display = isNode && alreadyClone ? '' : 'none';
 
+  // "Select all clones" — visible for any node
+  var selectAllClonesEl = document.getElementById('ctx-select-all-clones');
+  if (selectAllClonesEl) selectAllClonesEl.style.display = isNode ? '' : 'none';
+
   // "Merge selected clones" is only meaningful when 2+ selected nodes
   // represent the same underlying entity -- either two clones of each
   // other, or one clone plus its own original (a very common real case:
@@ -16095,6 +16177,34 @@ function showContextMenu(x, y, type, id, elementId, displayName, properties, rel
 
 function hideContextMenu() {
   document.getElementById('context-menu').style.display = 'none';
+}
+
+function selectAllClonesFromContext() {
+  hideContextMenu();
+  if (!cy || !contextTarget || contextTarget.type !== 'node') return;
+  var targetNode = cy.getElementById(contextTarget.id);
+  if (!targetNode || !targetNode.length) return;
+
+  // Determine the canonical entity key.
+  // Clones store the original's id in cloneOf (usually the entity URN).
+  // All instances of an entity — original and clones — share the same URN property.
+  var entityUrn = String(targetNode.data('URN') || '');
+  var cloneOf   = String(targetNode.data('cloneOf') || '');
+  // entityKey is the "anchor id" that clones point to
+  var entityKey = cloneOf || entityUrn || String(targetNode.id());
+
+  cy.elements().unselect();
+  cy.nodes().forEach(function(n) {
+    var nId      = String(n.id());
+    var nCloneOf = String(n.data('cloneOf') || '');
+    var nUrn     = String(n.data('URN') || '');
+    // Match if this node IS the original, OR is a clone pointing to the same anchor,
+    // OR shares the same URN (most reliable: covers all instances of the entity).
+    if (nId === entityKey || nCloneOf === entityKey || (entityUrn && nUrn === entityUrn)) {
+      n.select();
+    }
+  });
+  updateSelectionInfo();
 }
 
 function openCurationFromContext() {
