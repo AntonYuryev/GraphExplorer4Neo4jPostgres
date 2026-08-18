@@ -1576,6 +1576,44 @@ def ping_llm(req: PingRequest = None):
         log.exception("Ping failed")
         return {"ok": False, "error": "Ping failed due to an internal error.", "elapsed_s": round(time.time() - t0, 2), "model": model}
 
+class LLMChatRequest(BaseModel):
+    message: str
+    history: Optional[List[Dict[str, Any]]] = []
+    llm:     Optional[Dict[str, Any]] = None
+
+
+@app.post("/llm-chat")
+def llm_chat(req: LLMChatRequest, request: Request):
+    """General-purpose LLM chat with no graph/pathway restrictions.
+    Accepts a plain message + conversation history, forwards to the configured
+    LLM, and returns the raw reply.  No supporting sentences, no Neo4j schema,
+    no cypher — just open-ended LLM access."""
+    username = _current_username.get()
+    llm = _effective_llm(req.llm)
+
+    system_prompt = (
+        "You are a knowledgeable scientific assistant with broad expertise in "
+        "biology, chemistry, medicine, and related fields. "
+        "Answer the user's questions clearly and accurately using your general knowledge. "
+        "When relevant, you may reference biological pathways, molecular mechanisms, "
+        "drugs, diseases, or other scientific concepts. "
+        "If you are uncertain about something, say so."
+    )
+
+    # Build message list from history + new message
+    messages = []
+    for h in (req.history or []):
+        role = h.get("role", "user")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": req.message})
+
+    reply, _was_truncated = _call_llm_with_retries(messages, llm, system_prompt)
+    log.info("[llm-chat] user=%s truncated=%s", username, _was_truncated)
+    return {"reply": reply}
+
+
 @app.post("/schema")
 def update_schema(payload: SchemaPayload):
     _state["neo4j"]       = payload.neo4j
