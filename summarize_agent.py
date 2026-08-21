@@ -97,7 +97,7 @@ class SummarizeRequest(BaseModel):
     
     default_context: List[PSObject] = []
     default_anatomy: List[PSObject] = []
-    context_dict: Annotated[DefaultDict[str, List[PSObject]], Field(default_factory=lambda: defaultdict(list))]  # local vocab to lookup nodes by tokenized name/aliases from user messages
+    context_dict: Annotated[DefaultDict[str, set[PSObject]], Field(default_factory=lambda: defaultdict(set))]  # local vocab to lookup nodes by tokenized name/aliases from user messages
 
  
     @staticmethod
@@ -348,14 +348,14 @@ class SummarizeRequest(BaseModel):
                 tokenized_name = tokenize(node_name)
                 tokenized_name_str = " ".join(tokenized_name)
                 if tokenized_name_str and tokenized_name_str not in _STOP_WORDS:
-                    self.context_dict[tokenized_name_str].append(node)
+                    self.context_dict[tokenized_name_str].add(node)
             for alias in node['Alias']:
                 if alias:
                     tokenized_aliases = tokenize(alias)
                     if len(tokenized_aliases) >=2:
                         tokenized_alias_str = " ".join(tokenized_aliases)
                         if not tokenized_alias_str.isnumeric() and tokenized_alias_str not in _STOP_WORDS:
-                            self.context_dict[tokenized_alias_str].append(node)
+                            self.context_dict[tokenized_alias_str].add(node)
         
         return self.default_anatomy, self.default_context
 
@@ -463,29 +463,30 @@ class SummarizeRequest(BaseModel):
         recent year range: tuple of (min_year, max_year) if a year range is found in the message, else None
       '''
       tokenized_message = tokenize(str(self.message or ""))
-      context_nodes = []
+      tokenized_message = [w for w in tokenized_message if w not in _STOP_WORDS]
+      context_nodes = set()
       for i in range(len(tokenized_message)-3):
           onegram = tokenized_message[i:i+1][0]
-          context_nodes = self.context_dict.get(onegram, [])
-          if context_nodes: 
-              break
+          onegram_nodes = self.context_dict.get(onegram, set())
+          if onegram_nodes: 
+            context_nodes.update(onegram_nodes)
           else:
               twogram = " ".join(tokenized_message[i:i+2])
-              context_nodes = self.context_dict.get(twogram, [])
-          if context_nodes: 
-              break
+              twogram_nodes = self.context_dict.get(twogram, set())
+          if twogram_nodes: 
+            context_nodes.update(twogram_nodes)
           else:
               threegram = " ".join(tokenized_message[i:i+3])
-              context_nodes = self.context_dict.get(threegram, [])
-              if context_nodes: 
-                  break
+              threegram_nodes = self.context_dict.get(threegram, set())
+              if threegram_nodes: 
+                context_nodes.update(threegram_nodes)
 
       # last resort to get context nodes from the last two or one token(s) of the message 
       # if no context nodes were found in the previous loop
       if not context_nodes:
-          context_nodes = self.context_dict.get(" ".join(tokenized_message[-2:]), [])
+          context_nodes = self.context_dict.get(" ".join(tokenized_message[-2:]), set())
           if not context_nodes:
-              context_nodes = self.context_dict.get(" ".join(tokenized_message[-1:]), [])
+              context_nodes = self.context_dict.get(" ".join(tokenized_message[-1:]), set())
 
   # finding and including ontology children for context nodes
       if context_nodes:
@@ -495,14 +496,13 @@ class SummarizeRequest(BaseModel):
                   nodes_need_children.append(node)
           self.neo4j._load_children_(nodes_need_children) if self.neo4j else None
 
-          context_nodes_set = set(context_nodes)
-          [context_nodes_set.update(node.childs()) for node in context_nodes.copy()]
+          [context_nodes.update(node.childs()) for node in context_nodes.copy()]
           use_default_context = False
       else:
-          context_nodes_set = set(self.default_context + self.default_anatomy)
+          context_nodes = set(self.default_context + self.default_anatomy)
           use_default_context = True
 
-      return use_default_context, list(context_nodes_set), _focusON_(self.message), _recent_year_range_(self.message), _uses_general_knowledge_(self.message)
+      return use_default_context, list(context_nodes), _focusON_(self.message), _recent_year_range_(self.message), _uses_general_knowledge_(self.message)
 
 
     @staticmethod
