@@ -1047,6 +1047,8 @@ function initCytoscape() {
     // Node was manually repositioned — reset the scale base so the slider
     // starts fresh from the current (post-drag) positions next time it's moved.
     _layoutBasePositions = null;
+    // Mark the tab dirty so closing without saving prompts the user.
+    markActiveTabDirty();
   });
 
   // Right-click on node
@@ -3551,7 +3553,19 @@ function mergeGraphData(newData) {
     if (!srcCyId || !tgtCyId) return;
     if (!cy.getElementById(srcCyId).length || !cy.getElementById(tgtCyId).length) return;
 
-    graphData.edges.push(e);
+    // Store the edge with the resolved cy IDs as startNodeId/endNodeId so that
+    // graphData stays consistent with graphData.nodes regardless of whether the
+    // server returned a different (e.g. Neo4j integer) ID for an anchor node
+    // that already lives on the canvas under a URN-based cy ID.  Without this,
+    // renderGraph rebuilds cyNodeIdSet from node.id values and then fails to
+    // find the server-integer startNodeId — silently dropping every edge whose
+    // anchor was remapped via URN.  enrichNodesFromNeo4j also propagates ID
+    // changes through edges keyed by the OLD node id, so normalising here
+    // keeps that propagation working correctly too.
+    var edgeForGraph = (srcCyId !== String(e.startNodeId) || tgtCyId !== String(e.endNodeId))
+      ? Object.assign({}, e, { startNodeId: srcCyId, endNodeId: tgtCyId })
+      : e;
+    graphData.edges.push(edgeForGraph);
     addedEdges++;
     var undirected = !(e.properties && e.properties.directed !== false &&
                        (e.properties.directed || DIRECT_TYPES.has(e.type || '')));
@@ -3825,6 +3839,9 @@ function renderGraph(data, savedPositions) {
     // Cytoscape "nonexistent source/target" crash on files saved with dangling edges.
     if (!cyNodeIdSet.has(String(e.startNodeId)) || !cyNodeIdSet.has(String(e.endNodeId))) {
       skippedEdges++;
+      console.warn('[renderGraph] skipped edge id=' + e.id +
+        ' startNodeId=' + e.startNodeId + ' (inSet=' + cyNodeIdSet.has(String(e.startNodeId)) + ')' +
+        ' endNodeId=' + e.endNodeId + ' (inSet=' + cyNodeIdSet.has(String(e.endNodeId)) + ')');
       return;
     }
     // When inline refs are present, derive both counts from them so they stay
@@ -5486,6 +5503,72 @@ async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
   if (shownSpinner) {
     var shortQ = cypher.length > 40 ? cypher.substring(0, 40) + '…' : cypher;
     _setTabName(shortQ);
+  }
+}
+
+// ─── AI tab naming helper for Explore operations ──────────────────────────────
+// Returns true if the tab at `tabIdx` still has an auto-generated placeholder
+// name that it's safe to overwrite (Pathway N, Expansion HH:MM, etc.).
+function _tabHasDefaultName(tabIdx) {
+  var tab = tabs[tabIdx];
+  if (!tab) return false;
+  var name = (tab.name || '').trim();
+  return /^Pathway\s+\d+$/i.test(name)
+      || /^Expansion\s+\d{1,2}:\d{2}/.test(name)
+      || /^Connect\s+Selected\s+\d{1,2}:\d{2}/.test(name)
+      || name === '⏳ Naming…';
+}
+
+// Asks the LLM for a short name describing an Explore-derived graph and writes
+// it to the tab.  Only renames tabs whose name is still a default placeholder.
+// `description` is a human-readable string summarising the Explore action.
+async function _nameTabFromExplore(description, tabId, tabIdx) {
+  if (!_agentConfig || !_agentConfig.model_name) return;
+  if (!description) return;
+
+  var prompt =
+    'Give a succinct name (5 words max) for a graph pathway produced by this Explore operation: ' +
+    description +
+    '\nReply with ONLY the name — no quotes, no punctuation, no extra text.';
+
+  function _setTabName(name) {
+    var idx = tabs.findIndex(function(t) { return t.id === tabId; });
+    if (idx < 0) return false;
+    if (!_tabHasDefaultName(idx)) return false;  // user or AI already set a real name
+    if (idx === activeTabIdx) { updateCurrentTabName(name); }
+    else { tabs[idx].name = name; renderTabBar(); }
+    return true;
+  }
+
+  var MAX_ATTEMPTS = 12;
+  var RETRY_MS     = 3000;
+  var shownSpinner = false;
+
+  for (var attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      var resp = await api('/api/agent/llm-chat', {
+        message: prompt,
+        history: [],
+        llm:     _agentConfig
+      });
+      var raw    = (resp && resp.reply) ? String(resp.reply).trim() : '';
+      var aiName = raw.replace(/^\*\*|\*\*$/g, '').replace(/^["']|["']$/g, '').trim();
+      if (!aiName || aiName.length > 80) return;
+      _setTabName(aiName);
+      return;
+    } catch (err) {
+      var msg = (err && err.message) || '';
+      var isStarting = /starting|wait.*moment|not.*ready|503/i.test(msg);
+      if (!isStarting) {
+        console.warn('[_nameTabFromExplore] failed:', msg);
+        return;
+      }
+      if (!shownSpinner) {
+        shownSpinner = true;
+        if (!_setTabName('⏳ Naming…')) return;
+      }
+      await new Promise(function(res) { setTimeout(res, RETRY_MS); });
+    }
   }
 }
 
@@ -9956,7 +10039,8 @@ async function mergeSimilarRelations() {
 
 // ─── Expand Selected Nodes ────────────────────────────────────────────────────
 // Pending expansion data — set before showing confirm modal, consumed on commit.
-var _expandPending = null;   // { nodes, edges }
+var _expandPending     = null;   // { nodes, edges }
+var _expandDescription = null;   // human-readable description of the Explore action, used for AI tab naming
 
 async function expandSelectedNodes(mode) {
   if (!cy || !graphData) { alert('No pathway loaded.'); return; }
@@ -10028,7 +10112,8 @@ async function findOntologyChildren() {
     var summary  = 'Will add ' + newNodes.length + ' ' + nodeWord +
                    ' and ' + newEdges.length + ' ' + edgeWord + '.';
 
-    _expandPending = { nodes: newNodes, edges: newEdges };
+    _expandPending     = { nodes: newNodes, edges: newEdges };
+    _expandDescription = 'Find ontology children for ' + nodeParams.map(function(p) { return p.name || p.urn; }).join(', ');
     document.getElementById('expand-confirm-msg').textContent = summary;
     document.getElementById('expand-confirm-modal').style.display = 'flex';
 
@@ -10108,7 +10193,8 @@ async function findDrugs(relTypes, effect) {
                    'Will add ' + newNodes.length + ' ' + nodeWord +
                    ' and ' + newEdges.length + ' ' + edgeWord + '.';
 
-    _expandPending = { nodes: newNodes, edges: newEdges };
+    _expandPending     = { nodes: newNodes, edges: newEdges };
+    _expandDescription = 'Find drugs upstream of ' + nodeParams.map(function(p) { return p.name || p.urn; }).join(', ') + ' (filter: ' + filterLabel + ')';
     document.getElementById('expand-confirm-msg').textContent = summary;
     document.getElementById('expand-confirm-modal').style.display = 'flex';
 
@@ -10762,7 +10848,8 @@ async function runExploreConfigQuery() {
       var spSummary = 'Found ' + (spResult.pathsFound || 0) + ' path(s). Will add ' +
                       newNodes.length + ' ' + nodeWord + ' and ' + newEdges.length + ' ' + edgeWord + '.';
 
-      _expandPending = { nodes: newNodes, edges: newEdges };
+      _expandPending     = { nodes: newNodes, edges: newEdges };
+      _expandDescription = 'Shortest path between ' + ctx.summaryText + ' within ' + maxLength + ' hop(s), filter: ' + filterLabel;
       document.getElementById('expand-confirm-msg').textContent = spSummary;
       document.getElementById('expand-confirm-modal').style.display = 'flex';
     } catch (err) {
@@ -10815,6 +10902,10 @@ async function runExploreConfigQuery() {
       var fbPending = { nodes: Array.from(fbNodesById.values()), edges: Array.from(fbEdgesById.values()) };
       var fbResult = mergeGraphData(fbPending);
       updateStats();
+      if (fbResult.addedEdges + fbResult.addedNodes > 0 && _tabHasDefaultName(activeTabIdx)) {
+        var fbDesc = dialogTitle + ': find relations between ' + (ctx.summaryText || '') + ', filter: ' + filterLabel;
+        _nameTabFromExplore(fbDesc, tabs[activeTabIdx].id, activeTabIdx);
+      }
       if (document.getElementById('table-view').style.display !== 'none') _reloadCurrentTableMode();
       console.log('[findBetween] added ' + fbResult.addedNodes + ' node(s), ' + fbResult.addedEdges + ' edge(s)');
       if (fbResult.addedEdges === 0 && fbResult.addedNodes === 0) {
@@ -10887,7 +10978,8 @@ async function findOntologyParents(maxDepth) {
     var summary  = 'Will add ' + newNodes.length + ' ' + nodeWord +
                    ' and ' + newEdges.length + ' ' + edgeWord + depthLabel + '.';
 
-    _expandPending = { nodes: newNodes, edges: newEdges };
+    _expandPending     = { nodes: newNodes, edges: newEdges };
+    _expandDescription = 'Find ontology parents' + depthLabel + ' of ' + nodeParams.map(function(p) { return p.name || p.urn; }).join(', ');
     document.getElementById('expand-confirm-msg').textContent = summary;
     document.getElementById('expand-confirm-modal').style.display = 'flex';
 
@@ -11917,6 +12009,9 @@ async function openRelationCurationDialog() {
 
 function closeRelationCurationDialog() {
   document.getElementById('rel-curation-modal').style.display = 'none';
+  // Always restore the nondirectional button (may have been hidden for hyperedge)
+  var ndBtn = document.getElementById('rc-nondirectional-btn');
+  if (ndBtn) ndBtn.style.display = '';
 }
 
 function rcToggleNondirectional() {
@@ -13405,7 +13500,8 @@ async function _doExpand(mode, targetLabels, urns) {
 }
 
 function _expandCancel() {
-  _expandPending = null;
+  _expandPending     = null;
+  _expandDescription = null;
   document.getElementById('expand-confirm-modal').style.display = 'none';
 }
 
@@ -13413,20 +13509,27 @@ function _expandCommit() {
   document.getElementById('expand-confirm-modal').style.display = 'none';
   if (!_expandPending) return;
   var pending = _expandPending;
-  _expandPending = null;
+  var desc    = _expandDescription;
+  _expandPending     = null;
+  _expandDescription = null;
 
   pushUndo();  // snapshot BEFORE merge so Undo restores pre-expand state
   var result = mergeGraphData(pending);
   console.log('[expand] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
 
   updateStats();
+  if (desc && result.addedEdges + result.addedNodes > 0 && _tabHasDefaultName(activeTabIdx)) {
+    _nameTabFromExplore(desc, tabs[activeTabIdx].id, activeTabIdx);
+  }
 }
 
 function _expandCommitNewTab() {
   document.getElementById('expand-confirm-modal').style.display = 'none';
   if (!_expandPending) return;
   var pending = _expandPending;
-  _expandPending = null;
+  var desc    = _expandDescription;
+  _expandPending     = null;
+  _expandDescription = null;
 
   // Save active tab state, create a fresh tab, then load the expansion into it
   createNewTab('Expansion ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
@@ -13434,6 +13537,9 @@ function _expandCommitNewTab() {
   console.log('[expand→new tab] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
 
   updateStats();
+  if (desc && result.addedEdges + result.addedNodes > 0) {
+    _nameTabFromExplore(desc, tabs[activeTabIdx].id, activeTabIdx);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -13484,8 +13590,12 @@ function openConnectSelectedResultDialog(options) {
   // brand-new, otherwise-empty tab; merging into the CURRENT graph just
   // dedupes them straight back out via mergeGraphData's URN matching.
   _csrPending = { nodes: Array.from(nodesById.values()), edges: edges };
+  // Store description for AI tab naming when the user commits.
+  _csrDescription = 'Connect Selected Nodes: ' + (options.summary || '');
   document.getElementById('connect-selected-result-modal').style.display = 'flex';
 }
+
+var _csrDescription = '';  // description for AI tab naming
 
 function closeConnectSelectedResultModal() {
   document.getElementById('connect-selected-result-modal').style.display = 'none';
@@ -13495,23 +13605,33 @@ function _csrCommit() {
   document.getElementById('connect-selected-result-modal').style.display = 'none';
   if (!_csrPending) return;
   var pending = _csrPending;
-  _csrPending = null;
+  var desc    = _csrDescription;
+  _csrPending     = null;
+  _csrDescription = '';
 
   var result = mergeGraphData(pending);
   console.log('[connectSelected] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
   updateStats();
+  if (desc && result.addedEdges + result.addedNodes > 0 && _tabHasDefaultName(activeTabIdx)) {
+    _nameTabFromExplore(desc, tabs[activeTabIdx].id, activeTabIdx);
+  }
 }
 
 function _csrCommitNewTab() {
   document.getElementById('connect-selected-result-modal').style.display = 'none';
   if (!_csrPending) return;
   var pending = _csrPending;
-  _csrPending = null;
+  var desc    = _csrDescription;
+  _csrPending     = null;
+  _csrDescription = '';
 
   createNewTab('Connect Selected ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
   var result = mergeGraphData(pending);
   console.log('[connectSelected→new tab] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
   updateStats();
+  if (desc && result.addedEdges + result.addedNodes > 0) {
+    _nameTabFromExplore(desc, tabs[activeTabIdx].id, activeTabIdx);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -13573,11 +13693,17 @@ function _crFormatBreakdown(groups) {
 // options: { title, columnLabel, summary, groups }
 // `groups` is exactly what /api/graph/find-drugs-report (or a future sibling
 // endpoint) returns — see that endpoint's comment for the shared shape.
+// Stored when openConnectivityReport() opens; consumed by _crCommit/_crCommitNewTab
+// to pass a description to the AI tab-naming function.
+var _crLastDescription = '';
+
 function openConnectivityReport(options) {
   document.getElementById('cr-title').textContent = options.title || 'Connectivity Report';
   document.getElementById('cr-col-name').textContent = options.columnLabel || 'Name';
   document.getElementById('cr-summary').textContent = options.summary || '';
   document.getElementById('cr-error').style.display = 'none';
+  // Capture a human-readable description for AI tab naming when the user commits.
+  _crLastDescription = [options.title, options.summary].filter(Boolean).join(': ');
   var selectAll = document.getElementById('cr-select-all');
   if (selectAll) selectAll.checked = false;
   // Stamp each group with its own primary node type up front (rather than
@@ -13600,6 +13726,9 @@ function openConnectivityReport(options) {
   _crExpandedIdx = new Set();
   _crLastClickedIdx = null;
   _renderConnectivityReport();
+  // Reset master checkbox to checked (all rows default to selected)
+  var crMaster = document.getElementById('cr-select-all');
+  if (crMaster) crMaster.checked = true;
   document.getElementById('connectivity-report-modal').style.display = 'flex';
 }
 // No longer takes/checks an event — this modal deliberately has no
@@ -13673,7 +13802,7 @@ function _renderConnectivityReport() {
     tr.style.cursor = 'pointer';
     tr.title = 'Click to select; Shift+click to select this whole range at once';
     tr.innerHTML =
-      '<td style="padding:5px 8px;border-top:1px solid #2a2f4a"><input type="checkbox" class="cr-row-cb" data-idx="' + idx + '"></td>' +
+      '<td style="padding:5px 8px;border-top:1px solid #2a2f4a"><input type="checkbox" class="cr-row-cb" data-idx="' + idx + '" checked></td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;cursor:pointer;color:#7a8099" title="Show all matched targets">' + (isOpen ? '▼' : '▶') + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a">' + escHtml(_crNodeName(g.node)) + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a">' + escHtml(g.nodeType || '') + '</td>' +
@@ -13752,6 +13881,7 @@ function _crCommit() {
   if (!pending) return;
   closeConnectivityReportModal();
   _expandPending = pending;
+  _expandDescription = _crLastDescription;
   _expandCommit();
 }
 
@@ -13760,6 +13890,7 @@ function _crCommitNewTab() {
   if (!pending) return;
   closeConnectivityReportModal();
   _expandPending = pending;
+  _expandDescription = _crLastDescription;
   _expandCommitNewTab();
   // A brand-new tab has no pre-existing layout to disturb (unlike "Add to
   // current graph", which merges into whatever the user already arranged),
@@ -16136,25 +16267,37 @@ function showContextMenu(x, y, type, id, elementId, displayName, properties, rel
   // Show/hide clone items depending on whether target is a node and whether it's already a clone
   var isNode = (type === 'node');
   var cyNode = isNode && cy ? cy.getElementById(id) : null;
+  var isHyperEdgeNode = cyNode && (cyNode.data('NodeType') === 'HyperEdge' || cyNode.data('nodeType') === 'HyperEdge');
   var alreadyClone = cyNode && cyNode.data('isClone');
+
+  // "Edit hyperedge relation" — only for HyperEdge hub nodes
+  var editHEEl = document.getElementById('ctx-edit-hyperedge');
+  if (editHEEl) editHEEl.style.display = isHyperEdgeNode ? '' : 'none';
+
+  // "Edit Properties" — shown for non-HyperEdge targets
+  var editPropsEl = document.getElementById('ctx-edit-props');
+  if (editPropsEl) editPropsEl.style.display = isHyperEdgeNode ? 'none' : '';
+
   var cloneEl   = document.getElementById('ctx-clone');
   var sepEl     = document.getElementById('ctx-sep-clone');
   var uncloneEl = document.getElementById('ctx-unclone');
   if (cloneEl) {
-    cloneEl.style.display = isNode ? '' : 'none';
+    // Clone is not meaningful for HyperEdge hub nodes (they're synthetic)
+    var showClone = isNode && !isHyperEdgeNode;
+    cloneEl.style.display = showClone ? '' : 'none';
     // Cloning only makes sense when the node has 2+ edges to split across
     // separate visual instances -- with 0 or 1 edges there's nothing to
     // divide up, so disable (but still show, for discoverability) rather
     // than hide outright.
     var edgeCount = cyNode ? cyNode.connectedEdges().length : 0;
-    cloneEl.classList.toggle('disabled', isNode && edgeCount <= 1);
+    cloneEl.classList.toggle('disabled', showClone && edgeCount <= 1);
   }
-  if (sepEl)     sepEl.style.display     = isNode ? '' : 'none';
-  if (uncloneEl) uncloneEl.style.display = isNode && alreadyClone ? '' : 'none';
+  if (sepEl)     sepEl.style.display     = isNode && !isHyperEdgeNode ? '' : 'none';
+  if (uncloneEl) uncloneEl.style.display = isNode && !isHyperEdgeNode && alreadyClone ? '' : 'none';
 
-  // "Select all clones" — visible for any node
+  // "Select all clones" — visible for any non-hyperedge node
   var selectAllClonesEl = document.getElementById('ctx-select-all-clones');
-  if (selectAllClonesEl) selectAllClonesEl.style.display = isNode ? '' : 'none';
+  if (selectAllClonesEl) selectAllClonesEl.style.display = isNode && !isHyperEdgeNode ? '' : 'none';
 
   // "Merge selected clones" is only meaningful when 2+ selected nodes
   // represent the same underlying entity -- either two clones of each
@@ -16242,6 +16385,155 @@ function openCurationFromContext() {
   // Nodes (or edges where cy element not found) → simple property editor
   openCurationModal(contextTarget.type, contextTarget.id, contextTarget.elementId,
     contextTarget.displayName, contextTarget.properties, contextTarget.relId);
+}
+
+// ─── HyperEdge hub context-menu handler ──────────────────────────────────────
+// Opens the HyperEdge relation curation dialog pre-populated from the hub node
+// that was right-clicked.  The hub node is a synthetic (non-database) node that
+// stands in for a multi-participant relation; its connected cy edges link it to
+// every real participant node.  We reconstruct _rc state from those edges so the
+// existing relation-curation dialog can be used unchanged for editing.
+//
+// Reference propagation is free: rcSaveRelation() writes by currentRelId, which
+// Neo4j already associates with every binary edge belonging to that relation.
+async function openHyperEdgeFromContext() {
+  hideContextMenu();
+  if (!cy || !contextTarget || contextTarget.type !== 'node') return;
+  if (currentRole !== 'user') return;
+
+  var hubCy = cy.getElementById(contextTarget.id);
+  if (!hubCy || !hubCy.length) return;
+  if (hubCy.data('NodeType') !== 'HyperEdge' && hubCy.data('nodeType') !== 'HyperEdge') return;
+
+  // Collect all edges touching the hub and their non-hub endpoints
+  var participantEdges = hubCy.connectedEdges();
+  if (!participantEdges.length) {
+    showAlignHint('This HyperEdge hub has no connected edges in the current graph view.');
+    return;
+  }
+
+  // Gather participant nodes (neighbours of the hub, excluding the hub itself)
+  var participantNodes = hubCy.neighborhood('node').not(hubCy);
+
+  // Reset dialog state
+  Object.assign(_rc, {
+    mode: 'edit', nodes: [], props: [], existingEdge: null,
+    refs: [], refIdx: 0, refsVisible: false, refsLoaded: false,
+    currentRelId: null, nondirectional: false, _pid: 0
+  });
+  _rc.mode = 'edit';
+
+  // Use the first participant edge as the "existing edge" anchor so the dialog
+  // can load references via its RelationID.  All participant edges of a
+  // hyperedge share the same RelationID (annotated during matching).
+  var anchorEdge = participantEdges[0];
+  _rc.existingEdge = anchorEdge;
+
+  // Populate participant nodes in _rc (direction icons are advisory — shown
+  // as '→' for nodes on the source side of the hub, '←' for target side).
+  participantNodes.forEach(function(n) {
+    // Determine if this participant is a "source" (edge goes participant→hub)
+    // or a "target" (edge goes hub→participant) by checking each edge's direction.
+    var connEdge = n.connectedEdges().intersection(participantEdges)[0];
+    var dir = '−';
+    if (connEdge) {
+      dir = connEdge.data('source') === n.id() ? '→' : '←';
+    }
+    _rc.nodes.push({
+      cyId:     n.id(),
+      label:    n.data('label') || n.data('Name') || n.id(),
+      nodeType: n.data('nodeType') || n.data('NodeType') || '',
+      nodeId:   n.data('NodeID') || '',
+      direction: dir
+    });
+  });
+
+  if (_rc.nodes.length < 2) {
+    showAlignHint('Could not find enough participant nodes for this HyperEdge in the current graph view.');
+    return;
+  }
+
+  // Pre-populate properties from the hub node's own data (it carries the
+  // relation's ControlType, Effect, Mechanism, etc.) — skip structural fields.
+  var HUB_SKIP = { NodeID:1, NodeType:1, nodeType:1, URN:1, urn:1,
+                   RelationID:1, RelationIDs:1, RelationNumberOfReferences:1,
+                   RelationNumberOfSentences:1, id:1, label:1, color:1,
+                   Name:1, name:1,  // relation type shown in the dropdown, not as a prop
+                   nodeWidth:1, nodeHeight:1, nodeFontSize:1,
+                   customColor:1, customTextColor:1, highlightColor:1,
+                   rnefShape:1, rnefFillColor:1, rnefBorderColor:1, rnefFillMode:1 };
+  Object.keys(hubCy.data()).forEach(function(k) {
+    if (HUB_SKIP[k]) return;
+    var v = hubCy.data(k);
+    if (v == null || v === '') return;
+    _rc.props.push({ id: ++_rc._pid, key: k,
+      value: Array.isArray(v) ? v.join(';') : String(v) });
+  });
+
+  // Also carry over props from the anchor edge that the hub node doesn't have
+  var EDGE_SKIP = { RelationID:1, RelationIDs:1, RelationNumberOfReferences:1,
+                    RelationNumberOfSentences:1, createdAt:1, updatedAt:1,
+                    createdBy:1, updatedBy:1, id:1, source:1, target:1,
+                    elementId:1, relType:1, relId:1, relIds:1, color:1, label:1,
+                    directed:1, edgeURN:1, lineStyle:1, isHyperedge:1 };
+  Object.keys(anchorEdge.data()).forEach(function(k) {
+    if (EDGE_SKIP[k]) return;
+    if (_rc.props.some(function(p) { return p.key === k; })) return; // hub already set it
+    var v = anchorEdge.data(k);
+    if (v == null || v === '') return;
+    _rc.props.push({ id: ++_rc._pid, key: k,
+      value: Array.isArray(v) ? v.join(';') : String(v) });
+  });
+
+  _rc.nondirectional = anchorEdge.data('directed') === false || anchorEdge.hasClass('undirected');
+
+  // Pre-set relation type from the hub node's Name (= ControlType, e.g. "ChemicalReaction")
+  var hubRelType = hubCy.data('Name') || hubCy.data('name') || anchorEdge.data('relType') || '';
+
+  // Ensure schema is loaded BEFORE rendering the dropdown — _loadSchema() returns
+  // from cache instantly on repeat calls, so this is free after the first open.
+  try {
+    var schema = await _loadSchema();
+    if (schema) {
+      if (!_rc.relTypes.length && schema.relTypes) _rc.relTypes = schema.relTypes;
+      if (!_rc.propKeys.length && schema.propKeys) _rc.propKeys = schema.propKeys;
+    }
+  } catch(e) {}
+  try {
+    if (!_rc.refCols.length) {
+      var colSchema = await api('/api/schema/columns');
+      _rc.refCols = colSchema.referenceColumns || [];
+    }
+  } catch(e) {}
+
+  document.getElementById('rc-title').textContent = 'Edit HyperEdge Relation';
+
+  rcRenderNodes();
+  rcRenderRelTypeDropdown();
+
+  // Auto-select the hub's relation type in the dropdown
+  if (hubRelType) {
+    var rtSel = document.getElementById('rc-reltype');
+    if (rtSel) {
+      for (var oi = 0; oi < rtSel.options.length; oi++) {
+        if (rtSel.options[oi].value === hubRelType) { rtSel.selectedIndex = oi; break; }
+      }
+    }
+  }
+
+  rcRenderPropKeyDropdown();
+  rcRenderProps();
+  rcHideRefsPanel();
+  rcUpdateNondirectionalBtn();
+
+  // HyperEdge directionality is controlled via each node's direction dropdown —
+  // the single "Make nondirectional" toggle does not apply here.
+  var ndBtn = document.getElementById('rc-nondirectional-btn');
+  if (ndBtn) ndBtn.style.display = 'none';
+
+  document.getElementById('rel-curation-modal').style.display = 'flex';
+
+  rcScheduleRelIdCalc();
 }
 
 // ─── Node cloning ─────────────────────────────────────────────────────────────
@@ -17582,7 +17874,27 @@ function markActiveTabClean() {
   if (tabs[activeTabIdx]) tabs[activeTabIdx].dirty = false;
 }
 
-function closeTab(idx, event) {
+// Callback set by _showUnsavedDialog; resolved by _unsavedChoice()
+var _unsavedResolve = null;
+
+function _unsavedChoice(choice) {
+  var modal = document.getElementById('unsaved-modal');
+  if (modal) modal.style.display = 'none';
+  if (_unsavedResolve) { _unsavedResolve(choice); _unsavedResolve = null; }
+}
+
+// Returns a promise that resolves to 'save' | 'discard' | 'cancel'
+function _showUnsavedDialog(tabName) {
+  return new Promise(function(resolve) {
+    _unsavedResolve = resolve;
+    var msg = document.getElementById('unsaved-modal-msg');
+    if (msg) msg.textContent = 'The graph "' + tabName + '" has unsaved changes.';
+    var modal = document.getElementById('unsaved-modal');
+    if (modal) modal.style.display = 'flex';
+  });
+}
+
+async function closeTab(idx, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
   if (tabs.length <= 1) return;
 
@@ -17590,11 +17902,19 @@ function closeTab(idx, event) {
   var tab = tabs[idx];
   if (tab && tab.dirty) {
     var tabName = tab.name || 'this tab';
-    var ok = confirm(
-      'The graph "' + tabName + '" has unsaved changes.\n\n' +
-      'Close without saving?'
-    );
-    if (!ok) return;
+    var choice = await _showUnsavedDialog(tabName);
+    if (choice === 'cancel') return;
+    if (choice === 'save') {
+      // Switch to the tab being closed so savePathwayInPlace operates on it
+      var prevActive = activeTabIdx;
+      if (idx !== activeTabIdx) { activeTabIdx = idx; applyTabState(tab.snapshot); }
+      await savePathwayInPlace();
+      // If the tab is still dirty the save was cancelled (e.g. file picker dismissed)
+      if (tabs[activeTabIdx] && tabs[activeTabIdx].dirty) {
+        if (prevActive !== idx) { activeTabIdx = prevActive; applyTabState(tabs[activeTabIdx].snapshot); }
+        return;
+      }
+    }
   }
 
   hideResizeHandles();
