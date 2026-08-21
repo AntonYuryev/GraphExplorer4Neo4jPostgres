@@ -1267,9 +1267,19 @@ def _openai_client(llm: Dict):
     api_key  = llm.get("apikey") or os.environ.get(env_key, "")
     if not api_key:
         raise RuntimeError(f"API key not set — configure in Settings → Agentic AI (env: {env_key})")
+    # Normalize base URL: strip a trailing /chat/completions suffix that users may
+    # accidentally paste from example code — the OpenAI client appends this itself.
+    if base_url and base_url.rstrip("/").endswith("/chat/completions"):
+        base_url = base_url.rstrip("/")[: -len("/chat/completions")]
     kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
+    # Portkey / Cerebus gateway: auth travels in x-portkey-api-key, not Authorization.
+    # Detect by URL hostname so users don't need extra config.
+    url_lower = (base_url or url or "").lower()
+    if "portkey" in url_lower or "cerebus" in url_lower:
+        kwargs["api_key"]          = "sk-portkey"          # SDK requires non-empty; ignored by gateway
+        kwargs["default_headers"]  = {"x-portkey-api-key": api_key}
     return _openai_mod.OpenAI(**kwargs)
 
 # Text2Cypher action-parsing helpers (_strip_actions_from_reply, _extract_action,
@@ -1861,6 +1871,13 @@ def list_models(req: ListModelsRequest):
         except Exception as e:
             log.exception("Anthropic /list-models unexpected error: %s", _safe_exc_str(e))
             return {"models": [], "error": "Internal error while listing models"}
+
+    # ── Portkey / Cerebus gateway ─────────────────────────────────────────────
+    # These gateways have no /models endpoint and use x-portkey-api-key for auth.
+    # Return an empty list with a clear message so the UI prompts manual entry.
+    base_url_lower = base_url.lower()
+    if "portkey" in base_url_lower or "cerebus" in base_url_lower:
+        return {"models": [], "error": "Portkey/Cerebus gateway has no /models endpoint — type the model name directly in the Model field (e.g. @sandbox-shared-google/gemini-3.6-flash)"}
 
     # ── OpenAI-compatible /models ──────────────────────────────────────────────
     # base_url here is the ALLOWLISTED literal returned by
