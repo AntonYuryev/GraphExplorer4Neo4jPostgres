@@ -673,7 +673,8 @@
 
 <!-- Right-click context menu -->
 <div id="context-menu" style="display:none">
-  <div class="ctx-item" onclick="openCurationFromContext()">✏️ Edit Properties</div>
+  <div class="ctx-item" id="ctx-edit-hyperedge" onclick="openHyperEdgeFromContext()" style="display:none">✏️ Edit hyperedge relation</div>
+  <div class="ctx-item" id="ctx-edit-props" onclick="openCurationFromContext()">✏️ Edit Properties</div>
   <div class="ctx-item" id="ctx-clone" onclick="cloneNodeFromContext()" style="display:none">🔗 Clone node</div>
   <div class="ctx-separator" id="ctx-sep-clone" style="display:none"></div>
   <div class="ctx-item" id="ctx-unclone" onclick="removeCloneFromContext()" style="display:none">🗑️ Remove clone</div>
@@ -1115,10 +1116,10 @@
           <button type="button" onclick="llmsUserFetchModels()" title="Fetch model list from provider"
             style="margin-left:8px;padding:1px 8px;background:#252a40;border:1px solid #3a3f55;border-radius:4px;color:#a0b0d0;font-size:11px;cursor:pointer">↻ Fetch</button>
         </label>
-        <select id="llms-user-model"
-          style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none">
-          <option value="">— Select provider first —</option>
-        </select>
+        <input type="text" id="llms-user-model" list="llms-model-datalist"
+          placeholder="Type or paste model name, or click ↻ Fetch"
+          style="width:100%;background:#252a40;border:1px solid #3a3f55;border-radius:6px;color:#e0e0e0;font-size:13px;padding:7px 10px;outline:none;box-sizing:border-box">
+        <datalist id="llms-model-datalist"></datalist>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div>
@@ -1574,6 +1575,19 @@
   </div>
 </div>
 
+<!-- Unsaved-changes confirmation dialog -->
+<div id="unsaved-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-box" style="width:380px;max-width:92vw" onclick="event.stopPropagation()">
+    <h3 style="margin-bottom:8px">Unsaved changes</h3>
+    <p id="unsaved-modal-msg" style="color:#a0aac0;font-size:13px;margin-bottom:18px"></p>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn-ghost" onclick="_unsavedChoice('cancel')">Cancel</button>
+      <button class="btn-ghost" onclick="_unsavedChoice('discard')" style="color:#e06c75">Close without saving</button>
+      <button class="btn-primary" onclick="_unsavedChoice('save')">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- RNEF pathway selection modal (shown when .rnef has multiple sub-graphs) -->
 <div id="rnef-modal" class="modal-backdrop" style="display:none" onclick="closeRnefModal(event)">
   <div class="modal-box" style="width:520px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden" onclick="event.stopPropagation()">
@@ -1772,7 +1786,7 @@
         <table style="width:100%;border-collapse:collapse;font-size:12px">
           <thead>
             <tr style="position:sticky;top:0;background:#1e2235">
-              <th style="padding:6px 8px;width:26px"><input type="checkbox" id="cr-select-all" onclick="_crToggleAllCheckboxes(this)"></th>
+              <th style="padding:6px 8px;width:26px"><input type="checkbox" id="cr-select-all" checked onclick="_crToggleAllCheckboxes(this)"></th>
               <th style="padding:6px 8px;width:18px"></th>
               <th id="cr-col-name" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="_crSort('name')">Drug name</th>
               <th id="cr-col-nodetype" style="cursor:pointer;padding:6px 8px;text-align:left" onclick="_crSort('nodeType')">Node type</th>
