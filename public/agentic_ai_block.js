@@ -1311,32 +1311,40 @@ var _LLM_DEFAULT_MODELS = {
     'meta/llama-3.1-405b-instruct', 'meta/llama-3.1-70b-instruct',
     'meta/llama-3.1-8b-instruct'
   ],
+  // Elsevier Cerebus / Portkey gateway — no /models endpoint; models listed manually
+  'https://gw.nonprod.cerebus.tio.elsevier.systems/v1': [
+    '@sandbox-shared-google/gemini-3.6-flash',
+    '@sandbox-shared-google/gemini-2.5-pro',
+    '@sandbox-shared-google/gemini-2.0-flash',
+  ],
+  'https://gw.nonprod.cerebus.tio.elsevier.systems/v1/chat/completions': [
+    '@sandbox-shared-google/gemini-3.6-flash',
+    '@sandbox-shared-google/gemini-2.5-pro',
+    '@sandbox-shared-google/gemini-2.0-flash',
+  ],
 };
 
 function _populateModelSelect(providerUrl, savedModel) {
-  var modelSelect = document.getElementById('llms-user-model');
-  var defaults = _LLM_DEFAULT_MODELS[providerUrl] || [];
-  modelSelect.innerHTML = '';
-  if (!providerUrl) {
-    modelSelect.innerHTML = '<option value="">— Select provider first —</option>';
-    return;
-  }
+  var modelInput = document.getElementById('llms-user-model');
+  var datalist   = document.getElementById('llms-model-datalist');
+  var defaults   = _LLM_DEFAULT_MODELS[providerUrl] || [];
+  // Rebuild datalist suggestions
+  datalist.innerHTML = '';
   var allModels = defaults.slice();
-  // If saved model isn't in defaults, add it at the top
   if (savedModel && allModels.indexOf(savedModel) < 0) {
     allModels.unshift(savedModel);
-  }
-  if (!allModels.length) {
-    modelSelect.innerHTML = '<option value="">— Click ↻ Fetch to load models —</option>';
-    return;
   }
   allModels.forEach(function(m) {
     var opt = document.createElement('option');
     opt.value = m;
-    opt.textContent = m;
-    modelSelect.appendChild(opt);
+    datalist.appendChild(opt);
   });
-  modelSelect.value = savedModel || allModels[0];
+  // Set input value: keep existing if it's still in the list, else use savedModel / first
+  if (savedModel) {
+    modelInput.value = savedModel;
+  } else if (allModels.length && !modelInput.value) {
+    modelInput.value = allModels[0];
+  }
 }
 
 // ── LLM Settings modal ────────────────────────────────────────────────────────
@@ -1453,18 +1461,20 @@ async function llmsUserFetchModels() {
       return;
     }
     
-    // Replace model dropdown with live API results
-    var modelSelect = document.getElementById('llms-user-model');
-    var currentModel = modelSelect.value;
-    modelSelect.innerHTML = '';
+    // Populate datalist with live API results; preserve any typed model name
+    var modelInput = document.getElementById('llms-user-model');
+    var datalist   = document.getElementById('llms-model-datalist');
+    var currentModel = modelInput.value;
+    datalist.innerHTML = '';
     models.forEach(function(model) {
       var option = document.createElement('option');
       option.value = model;
-      option.textContent = model;
-      modelSelect.appendChild(option);
+      datalist.appendChild(option);
     });
-    // Restore previously selected model if still in list, else pick first
-    modelSelect.value = (models.indexOf(currentModel) >= 0) ? currentModel : models[0];
+    // Auto-select only if nothing typed yet or if typed value is no longer relevant
+    if (!currentModel || models.indexOf(currentModel) >= 0) {
+      modelInput.value = (models.indexOf(currentModel) >= 0) ? currentModel : models[0];
+    }
     
     statusEl.textContent = models.length + ' models loaded';
     statusEl.style.color = '#70d070';
