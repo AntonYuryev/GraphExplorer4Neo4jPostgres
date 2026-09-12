@@ -115,124 +115,9 @@ function _relIds(v) {
 //  end result the old "no Neo4j match" case produced anyway.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Minimal, self-contained MD5 (RFC 1321) — returns a 16-byte digest.
-// No Web Crypto equivalent exists (SubtleCrypto deliberately excludes MD5),
-// so this is a plain reimplementation. The K table is generated at runtime
-// from the standard sin()-based formula rather than hardcoded, both to
-// avoid transcription typos in 64 magic numbers and because that's how the
-// reference algorithm itself defines the constants.
-function _md5Bytes(str) {
-  function rotl(x, c) { return (x << c) | (x >>> (32 - c)); }
-  function toBytesUTF8(s) {
-    var utf8 = unescape(encodeURIComponent(s));
-    var bytes = new Uint8Array(utf8.length);
-    for (var i = 0; i < utf8.length; i++) bytes[i] = utf8.charCodeAt(i) & 0xff;
-    return bytes;
-  }
-  var K = new Array(64);
-  for (var ki = 0; ki < 64; ki++) K[ki] = Math.floor(Math.abs(Math.sin(ki + 1)) * Math.pow(2, 32)) >>> 0;
-  var S = [7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
-           5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
-           4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
-           6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21];
 
-  var msg = toBytesUTF8(str);
-  var origLenBits = msg.length * 8;
 
-  var withOne = new Uint8Array(msg.length + 1);
-  withOne.set(msg);
-  withOne[msg.length] = 0x80;
 
-  var paddedLen = withOne.length;
-  while (paddedLen % 64 !== 56) paddedLen++;
-
-  var buf = new Uint8Array(paddedLen + 8);
-  buf.set(withOne);
-
-  var lenLow  = origLenBits >>> 0;
-  var lenHigh = Math.floor(origLenBits / 0x100000000) >>> 0;
-  var dv = new DataView(buf.buffer);
-  dv.setUint32(paddedLen, lenLow, true);
-  dv.setUint32(paddedLen + 4, lenHigh, true);
-
-  var a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
-
-  for (var chunkStart = 0; chunkStart < buf.length; chunkStart += 64) {
-    var M = new Array(16);
-    for (var j = 0; j < 16; j++) M[j] = dv.getUint32(chunkStart + j * 4, true);
-
-    var A = a0, B = b0, C = c0, D = d0;
-    for (var round = 0; round < 64; round++) {
-      var F, g;
-      if (round < 16) { F = (B & C) | (~B & D); g = round; }
-      else if (round < 32) { F = (D & B) | (~D & C); g = (5 * round + 1) % 16; }
-      else if (round < 48) { F = B ^ C ^ D; g = (3 * round + 5) % 16; }
-      else { F = C ^ (B | ~D); g = (7 * round) % 16; }
-      F = (F + A + K[round] + M[g]) >>> 0;
-      A = D; D = C; C = B;
-      B = (B + rotl(F, S[round])) >>> 0;
-    }
-    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
-  }
-
-  var out = new Uint8Array(16);
-  var outDv = new DataView(out.buffer);
-  outDv.setUint32(0, a0, true); outDv.setUint32(4, b0, true);
-  outDv.setUint32(8, c0, true); outDv.setUint32(12, d0, true);
-  return out;
-}
-
-// Mirrors server.js's _myhash(): MD5 the string, then XOR-fold the 16-byte
-// digest into a signed 63-bit integer — same big-endian high/low split, same mask.
-// Returns the result as a decimal string to preserve full 64-bit precision
-// (Number() would corrupt values above 2^53-1 = 9,007,199,254,740,991).
-function _myhashClient(text) {
-  var bytes = _md5Bytes(String(text));
-  var view  = new DataView(bytes.buffer);
-  var high  = view.getBigUint64(0, false);
-  var low   = view.getBigUint64(8, false);
-  var MASK  = 0x7FFFFFFFFFFFFFFFn;
-  var r = high ^ low;
-  if (r > MASK) r = -(r & MASK);
-  // Return as string — Number() would corrupt values > 2^53-1
-  return r.toString();
-}
-
-// Mirrors server.js's _pyRepr(): reproduces Python's str() of a list/string
-// so the hashed text is byte-identical to what the original curation
-// pipeline (and the Create/Edit Relation dialog's server-side calculation)
-// would produce for the same inputs.
-function _pyReprClient(val) {
-  if (Array.isArray(val)) {
-    if (!val.length) return '[]';
-    return '[' + val.map(function(v) {
-      var s = String(v);
-      return /^-?\d+$/.test(s) ? s : ("'" + s.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'");
-    }).join(', ') + ']';
-  }
-  return "'" + String(val).replace(/\\/g, '\\\\').replace(/'/g, "\\'") + "'";
-}
-
-// Mirrors server.js's calcRelationId() exactly — same field order, same
-// descending BigInt sort of each NodeID list (64-bit safe, unlike Number).
-function calcRelationIdClient(o) {
-  o = o || {};
-  var inref = o.inref || [], inoutref = o.inoutref || [], outref = o.outref || [];
-  var control_type = o.control_type || '', ontology = o.ontology || '', relationship = o.relationship || '';
-  var effect = o.effect || '', mechanism = o.mechanism || '';
-  function bigSort(a, b) {
-    var x = BigInt(String(a)), y = BigInt(String(b));
-    return x < y ? 1 : x > y ? -1 : 0;
-  }
-  var s = '(' + [
-    _pyReprClient(inref.slice().sort(bigSort)),
-    _pyReprClient(inoutref.slice().sort(bigSort)),
-    _pyReprClient(outref.slice().sort(bigSort)),
-    _pyReprClient(control_type), _pyReprClient(ontology),
-    _pyReprClient(relationship), _pyReprClient(String(effect).toLowerCase()), _pyReprClient(mechanism)
-  ].join(', ') + ')';
-  return _myhashClient(s);
-}
 
 // State for the pair dialog (exactly 2 nodes selected → Create Relation for pair)
 var _rcPair = {
@@ -3633,7 +3518,46 @@ function _qnsCurrentSegment(input) {
   return val.substring(lastSemi + 1).trim();
 }
 
+
+// Normalize paste into the quick-node-search input.
+// Accepts any mix of newlines, commas, tabs, and semicolons as separators,
+// converts them all to "; " so the existing semicolon-split search works
+// regardless of whether the user copied from Excel, CSV, or a text list.
+// Also updates the input width to show the full list.
+function _qnsOnPaste(e, input) {
+  var pasted = (e.clipboardData || window.clipboardData).getData('text');
+  if (!pasted) return;  // let browser handle non-text paste
+  e.preventDefault();
+
+  // Normalize: CR+LF or LF or CR → ";", tab → ";", then split and rejoin
+  var parts = pasted
+    .replace(/\r\n|\r|\n/g, ';')
+    .replace(/\t/g, ';')
+    .replace(/,/g, ';')
+    .split(';')
+    .map(function(s) { return s.trim(); })
+    .filter(Boolean);
+
+  if (!parts.length) return;
+
+  // Merge with whatever is already in the input (respect partial typing)
+  var existing = input.value;
+  var lastSemi = existing.lastIndexOf(';');
+  var prefix   = lastSemi >= 0 ? existing.substring(0, lastSemi + 1).trimEnd() + ' ' : '';
+  input.value  = (prefix + parts.join('; ')).trimStart();
+
+  _qnsUpdateWidth(input);
+  _qnsOnInput(input);   // refresh autocomplete for the last segment
+}
+
+// Widen the input to fit its content when it holds a multi-term list.
+function _qnsUpdateWidth(input) {
+  var terms = input.value.split(';').map(function(s) { return s.trim(); }).filter(Boolean);
+  input.style.width = (terms.length > 1 ? '340px' : '190px');
+}
+
 function _qnsOnInput(input) {
+  _qnsUpdateWidth(input);
   if (_qnsSuggestDebounce) clearTimeout(_qnsSuggestDebounce);
   var term = _qnsCurrentSegment(input);
   if (term.length < 2) { _qnsHideSuggestions(); return; }
@@ -3724,39 +3648,44 @@ async function quickNodeSearch() {
 
   setProgressMsg('⏳ Searching…');
   try {
-    var result = await api('/api/nodes/search-by-name', { names: names });
+    // Fire one request per name in parallel — each name/alias can resolve
+    // independently, so parallel fetches cut wall-clock time proportionally.
+    var results = await Promise.all(names.map(function(name) {
+      return api('/api/nodes/search-by-name', { names: [name] })
+        .catch(function(err) { return { error: err.message || String(err), nodes: [] }; });
+    }));
     setProgressMsg(null);
-    if (result.error) { alert('Search error: ' + result.error); return; }
 
-    var nodes = result.nodes || [];
-    if (!nodes.length) {
+    // Merge: collect all nodes (dedup by id), track per-name outcomes.
+    var seenIds = new Set();
+    var allNodes = [];
+    var anyContains = false;
+    var notFound = [];
+
+    results.forEach(function(result, i) {
+      if (result.error) { notFound.push(names[i] + ' (error)'); return; }
+      var rNodes = result.nodes || [];
+      if (!rNodes.length) { notFound.push(names[i]); return; }
+      if (result.matchType === 'contains') anyContains = true;
+      rNodes.forEach(function(n) {
+        var uid = n.id || (n.properties && n.properties[window._NEO4J_URN_PROP || 'URN']) || JSON.stringify(n);
+        if (!seenIds.has(uid)) { seenIds.add(uid); allNodes.push(n); }
+      });
+    });
+
+    if (!allNodes.length) {
       alert('No nodes found matching (exact or substring): ' + names.join(', '));
       return;
     }
 
-    var mergeResult = mergeGraphData({ nodes: nodes, edges: [] });
+    var mergeResult = mergeGraphData({ nodes: allNodes, edges: [] });
     updateStats();
 
     var msg = 'Quick search: added ' + mergeResult.addedNodes + ' node' + (mergeResult.addedNodes === 1 ? '' : 's') + '.';
-    if (result.matchType === 'contains') {
-      // Fallback substring search — every returned node just CONTAINS one of
-      // the search terms somewhere in Name/Alias, so comparing back against
-      // the typed terms for an exact "not found" list wouldn't mean much;
-      // just make clear these are partial matches, not exact ones.
+    if (anyContains) {
       msg += ' (No exact match — showing nodes containing your search term(s).)';
-    } else {
-      // Exact match — report any requested names that matched nothing,
-      // without blocking the ones that DID match from being added.
-      var foundLower = new Set();
-      nodes.forEach(function(n) {
-        var p = n.properties || {};
-        if (p.Name) foundLower.add(String(p.Name).toLowerCase());
-        (Array.isArray(p.Alias) ? p.Alias : (p.Alias ? [p.Alias] : [])).forEach(function(a) {
-          foundLower.add(String(a).toLowerCase());
-        });
-      });
-      var notFound = names.filter(function(n) { return !foundLower.has(n.toLowerCase()); });
-      if (notFound.length) msg += ' Not found: ' + notFound.join(', ');
+    } else if (notFound.length) {
+      msg += ' Not found: ' + notFound.join(', ');
     }
     setProgressMsg(msg);
     setTimeout(function() { setProgressMsg(null); }, 5000);
@@ -5304,6 +5233,65 @@ function confirmLargeExportCSV() {
   if (_largeExportResolve) { _largeExportResolve('csv');   _largeExportResolve = null; }
 }
 
+
+// Returns true when every item in the RETURN clause is a scalar expression
+// (aggregate function, property access, or literal) — meaning the query
+// cannot produce graph nodes or edges and the count-query pre-check should
+// be skipped entirely.  A bare identifier like "n" or "r" (no "." and no
+// function call "()") is conservatively treated as a possible node/relation
+// variable, keeping the count check active.
+function _analyzeCypherReturn(query) {
+  /**
+   * Parses the RETURN clause of a Cypher query and classifies what it returns.
+   *
+   * primary_type values
+   *   "graph_data"          – whole nodes / relationships / paths; use graph viewer + count check
+   *   "statistics"          – aggregate functions (count, sum, avg, …); show as simple table
+   *   "tabular_properties"  – property accesses without aggregates; show as simple table
+   *   "unknown"             – no RETURN clause found; treat as graph_data (safe default)
+   */
+
+  // Use the last RETURN clause (handles UNION queries where each branch has one).
+  var lastReturnIdx = -1;
+  var re = /\bRETURN\b/gi, m;
+  while ((m = re.exec(query)) !== null) lastReturnIdx = m.index;
+  if (lastReturnIdx < 0) return { primary_type: 'unknown' };
+
+  // Extract everything after RETURN, stopping at ORDER BY / LIMIT / SKIP / UNION.
+  var afterReturn = query.slice(lastReturnIdx + 6);
+  afterReturn = afterReturn.replace(/\b(ORDER\s+BY|LIMIT|SKIP|UNION)\b[\s\S]*/i, '').trim();
+  afterReturn = afterReturn.replace(/^\s*DISTINCT\s+/i, '');
+
+  // Aggregate functions: count, sum, avg, min, max, stdev, stdevp, percentileCont
+  var AGG_RE   = /\b(count|sum|avg|min|max|stdev|stdevp|percentileCont)\s*\(/i;
+  // Graph-traversal functions that return paths / node lists / rel lists
+  var GRAPH_RE = /\b(nodes|relationships|path)\s*\(/i;
+  // Property access: identifier.property
+  var PROP_RE  = /\b[A-Za-z0-9_]+\.[A-Za-z0-9_]+\b/;
+
+  var has_stats      = AGG_RE.test(afterReturn);
+  var has_graph_funcs = GRAPH_RE.test(afterReturn);
+  var has_properties = PROP_RE.test(afterReturn);
+
+  var types_found = [];
+  if (has_stats)                         types_found.push('statistics');
+  if (has_graph_funcs)                   types_found.push('graph_data');
+  if (!has_stats && !has_properties)     types_found.push('graph_data');   // bare variables → nodes/rels
+  if (has_properties && !has_stats)      types_found.push('tabular_properties');
+
+  var primary_type;
+  if (types_found.indexOf('statistics')         >= 0) primary_type = 'statistics';
+  else if (types_found.indexOf('graph_data')    >= 0) primary_type = 'graph_data';
+  else                                                 primary_type = 'tabular_properties';
+
+  return {
+    primary_type:         primary_type,
+    types_found:          types_found,
+    return_clause_parsed: afterReturn,
+  };
+}
+
+
 async function runQuery(mergeIntoExisting) {
   var query = getCypherQuery().trim();
   if (!query) return;
@@ -5311,42 +5299,47 @@ async function runQuery(mergeIntoExisting) {
   hideCypherErrorMarker(); // clear any marker from a previous failed run
 
   // ── Pre-execution count check ──────────────────────────────
-  var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
-  var _limitVal   = _limitMatch ? parseInt(_limitMatch[1], 10) : Infinity;
-  var _edgeCount  = NaN;
-  var _tooLarge   = false;
+  // Skip the edge-count pre-check for queries that return only scalars
+  // (aggregates, property accesses, literals).  Such queries can never
+  // overflow the graph viewer — they produce a simple table result.
+  var _tooLarge = false;
+  if (_analyzeCypherReturn(query).primary_type === 'graph_data') {
+    var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
+    var _limitVal   = _limitMatch ? parseInt(_limitMatch[1], 10) : Infinity;
+    var _edgeCount  = NaN;
 
-  setProgressMsg('\u23f3 Counting matching relations\u2026');
+    setProgressMsg('\u23f3 Counting matching relations\u2026');
 
-  // Run the COUNT(*) version of the query with no client-side timeout so we
-  // always get the real number (the server enforces its own Neo4j timeout).
-  try {
-    var _countOpts = {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json',
-                 'Authorization': authToken ? 'Bearer ' + authToken : '' },
-      body: JSON.stringify({ query: query }),
-    };
-    var _cRes    = await fetch('/api/graph/count-query', _countOpts);
-    var countRes = await _cRes.json().catch(function() { return {}; });
-    if (countRes && typeof countRes.edgeCount === 'number') {
-      _edgeCount = countRes.edgeCount;
-      appendCypherHistory(query, _edgeCount);
+    // Run the COUNT(*) version of the query with no client-side timeout so we
+    // always get the real number (the server enforces its own Neo4j timeout).
+    try {
+      var _countOpts = {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json',
+                   'Authorization': authToken ? 'Bearer ' + authToken : '' },
+        body: JSON.stringify({ query: query }),
+      };
+      var _cRes    = await fetch('/api/graph/count-query', _countOpts);
+      var countRes = await _cRes.json().catch(function() { return {}; });
+      if (countRes && typeof countRes.edgeCount === 'number') {
+        _edgeCount = countRes.edgeCount;
+        appendCypherHistory(query, _edgeCount);
+      }
+    } catch (countErr) {
+      console.warn('count-query failed:', countErr.message);
     }
-  } catch (countErr) {
-    console.warn('count-query failed:', countErr.message);
-  }
-  setProgressMsg(null);
+    setProgressMsg(null);
 
-  // Intercept when we have a real count >= 1000, or when count failed but the
-  // query has an explicit LIMIT >= 1000 (safe conservative assumption).
-  _tooLarge = (_edgeCount >= 1000) ||
-              (isNaN(_edgeCount) && _limitVal >= 1000);
+    // Intercept when we have a real count >= 1000, or when count failed but the
+    // query has an explicit LIMIT >= 1000 (safe conservative assumption).
+    _tooLarge = (_edgeCount >= 1000) ||
+                (isNaN(_edgeCount) && _limitVal >= 1000);
 
-  if (_tooLarge) {
-    var _countStr = isFinite(_edgeCount) ? _edgeCount.toLocaleString() : 'over 1,000';
-    _showLargeResultModal({ type: 'query', query: query }, 'The query returns ' + _countStr + ' edges.');
-    return;
+    if (_tooLarge) {
+      var _countStr = isFinite(_edgeCount) ? _edgeCount.toLocaleString() : 'over 1,000';
+      _showLargeResultModal({ type: 'query', query: query }, 'The query returns ' + _countStr + ' edges.');
+      return;
+    }
   }
 
   var startTabId = tabs[activeTabIdx].id;
@@ -8461,7 +8454,7 @@ async function matchRnefRelationsToNeo4j() {
     candidateCount++;
 
     var isNonDir = RELID_NONDIRECTIONAL_TYPES.has(relType);
-    var relId = calcRelationIdClient({
+    var relId = calcRelationId({
       inref:        isNonDir ? [] : [rNodeId],
       inoutref:     isNonDir ? [rNodeId, tNodeId] : [],
       outref:       isNonDir ? [] : [tNodeId],
@@ -8487,7 +8480,7 @@ async function matchRnefRelationsToNeo4j() {
     candidateCount++;
 
     var isNonDir = RELID_NONDIRECTIONAL_TYPES.has(relType);
-    var relId = calcRelationIdClient({
+    var relId = calcRelationId({
       inref:        isNonDir ? [] : rd.rNodeIds,
       inoutref:     isNonDir ? rd.rNodeIds.concat(rd.tNodeIds) : [],
       outref:       isNonDir ? [] : rd.tNodeIds,
@@ -9755,6 +9748,18 @@ async function mergeSimilarRelations() {
   // Snapshot before modifications so the operation is undoable
   pushUndo();
 
+  // Show progress message while merge runs (may take several seconds for large graphs)
+  var _mergeStatusEl = document.getElementById('merge-progress-status');
+  if (!_mergeStatusEl) {
+    _mergeStatusEl = document.createElement('span');
+    _mergeStatusEl.id = 'merge-progress-status';
+    _mergeStatusEl.style.cssText = 'color:#4caf50;font-size:12px;margin-left:10px';
+    var _statsEl = document.getElementById('graph-stats');
+    if (_statsEl) _statsEl.appendChild(_mergeStatusEl);
+  }
+  var _totalEdgesToMerge = multiGroups.reduce(function(s, g) { return s + g.length - 1; }, 0);
+  _mergeStatusEl.textContent = '⟳ Merging ' + _totalEdgesToMerge + ' duplicate relation(s) in ' + multiGroups.length + ' group(s)…';
+
   var mergedGroupCount = 0, removedEdgeCount = 0;
 
   function findGEdge(info) {
@@ -10019,6 +10024,7 @@ async function mergeSimilarRelations() {
     mergedGroupCount++;
   }
 
+  if (_mergeStatusEl) _mergeStatusEl.remove();
   alert('Merge complete:\n  ' + mergedGroupCount + ' group(s) merged\n  ' + removedEdgeCount + ' duplicate relation(s) removed');
   updateStats();
   if (document.getElementById('table-view').style.display !== 'none') {
@@ -10609,6 +10615,10 @@ async function _cncOpenDialog(action, context, title) {
   // rather than a misleading "everything selected" master checkbox.
   var maxLenRow = document.getElementById('cnc-sp-maxlen-row');
   if (maxLenRow) maxLenRow.style.display = (action === 'shortestPath') ? 'flex' : 'none';
+  var dirRow = document.getElementById('cnc-expand-direction-row');
+  if (dirRow) dirRow.style.display = (action === 'expand') ? 'flex' : 'none';
+  // Reset direction to Both each time the dialog opens
+  if (action === 'expand') { var defDir = document.querySelector('input[name="cnc-expand-dir"][value="both"]'); if (defDir) defDir.checked = true; }
 
   // Connect Selected Nodes and Find Between Selected/Unselected both search
   // for RELATIONS only — neither introduces new nodes the user hasn't already
@@ -10812,6 +10822,10 @@ async function runExploreConfigQuery() {
     nodeTypes: nodeTypesFilter, relTypes: relTypesFilter,
     propFilters: propFilters, nodePropFilters: nodePropFilters
   };
+  if (action === 'expand') {
+    var dirEl = document.querySelector('input[name="cnc-expand-dir"]:checked');
+    body.direction = dirEl ? dirEl.value : 'both';
+  }
 
   var dialogTitle = document.getElementById('cnc-title').textContent;
 
@@ -19000,7 +19014,7 @@ async function _summarizeSendRequest(message) {
     var reqBody = JSON.stringify({
       message:               message,
       history:                _agentChatHistory.slice(0, -1),
-      llm:                    _agentConfig,
+      llm:                    {},  // LLM config is resolved server-side from per-user settings; sending it here risks overriding the stored model/url with stale localStorage values
       NodeJSGraph:     _cgForSummarize,
       scope:                  _summarizeScope,
       fetched_rows:           _summarizeFetchedRows,
@@ -21155,7 +21169,7 @@ async function saveLLMSettings() {
   var prov = _llmProviders.find(function(p) { return p.name === provName; }) || {};
   _agentConfig.provider_name = provName;
   _agentConfig.url           = prov.url || _agentConfig.url || '';
-  _agentConfig.apikey        = document.getElementById('llms-user-apikey').value.trim();
+  _agentConfig.apikey        = (function(v) { return (v === '••••••••') ? '' : v; })(document.getElementById('llms-user-apikey').value.trim());
   _agentConfig.model_name    = document.getElementById('llms-user-model').value.trim();
   _agentConfig.temperature   = parseFloat(document.getElementById('llms-user-temperature').value) || 0.2;
   _agentConfig.top_p         = parseFloat(document.getElementById('llms-user-top-p').value) || 0.9;
