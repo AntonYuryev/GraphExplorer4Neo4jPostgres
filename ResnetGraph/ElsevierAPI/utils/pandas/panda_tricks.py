@@ -1,0 +1,1522 @@
+from pandas import ExcelWriter
+from scipy import stats
+from statistics import mean, median
+import rdfpandas,xlsxwriter,string, os
+import matplotlib.pyplot as plt, matplotlib.colors as mcolors
+from ..utils import unpack
+from ...api.ResnetAPI.NetworkxObjects import PSObject
+from openpyxl import load_workbook
+from pandas.api.types import is_string_dtype,is_numeric_dtype
+import datashader as ds, pandas as pd, colorcet as cc, numpy as np, plotly.express as px
+
+
+MIN_COLUMN_WIDTH = 0.65 # in inches
+NUMBER_OF_REFERENCE = 'Number of references'
+MAX_TAB_LENGTH = 31
+
+class df(pd.DataFrame):
+  # re-writing parent pd.DataFrame function is a BAD idea. Use other names
+  _metadata = [
+        '_name_', 
+        'column2format', 
+        'conditional_frmt', 
+        'tab_format', 
+        'col2rank', 
+        'Entities4df', 
+        'explodedEntities4df',
+        'header_format'
+    ]
+  
+  
+  def __init__(self, *args, **kwargs):
+      '''
+      kwargs:
+          name:str
+      '''
+      dfname = kwargs.pop('name','')  
+      pd.DataFrame.__init__(self,*args, **kwargs)
+      self._name_ = dfname
+      self.column2format = dict() # {column_index:{'font_color':'blue'}}
+      self.conditional_frmt = dict() # {area:{conditional_format}}
+      self.tab_format = dict() # font and color of the Excel tab with worksheet
+      self.col2rank = dict() # {colname:rank(int)}, used for column ranking and sorting by SemanticSearch
+      self.Entities4df = dict() # holds {mapping_attribute_coulm_name:{PSObject} with CHILDS property for SemanticSearch.
+      # Usually Entities4df can be linked to ['Name'] column by value
+      self.explodedEntities4df = dict() # holds {mapping_attribute_coulm_name:{PSObject} with CHILDS property for SemanticSearch and their ontology children.
+      self.header_format = {
+                  'bold': True,
+                  'text_wrap': True,
+                  'valign': 'vjustify',#'bottom',#'top', #vcenter',
+                  'align': 'center', # 'left'
+                  'height':15
+      }
+
+         
+  @property
+  def _constructor(self):
+    return df
+
+
+  @classmethod 
+  def from_pd(cls,d:pd.DataFrame,dfname=''):
+      new_df = cls(d)
+      new_df._name_ = dfname
+      return new_df
+
+
+  def __formats__(self)->dict[str,dict]:
+    formats = self.__ws_formats__()
+    formats.update(self.__col_formats__())
+    return formats
+  
+  def __ws_formats__(self):
+    return {
+      'header_format': self.header_format,
+      'conditional_frmt': self.conditional_frmt,
+      'tab_format': self.tab_format
+      }
+  
+  def __col_formats__(self):
+    return {
+      'column2format': self.column2format,
+      'col2rank': self.col2rank
+      }
+
+
+  def copy_format(self, from_df:'df'):
+    [setattr(self, n, a.copy()) for n,a in from_df.__formats__().items()]
+
+
+  def __copy_attrs__(self,from_df:'df'):
+    '''
+    copies format and _name_ except data
+    '''
+    [setattr(self, n, a.copy()) for n,a in from_df.__formats__().items()]
+    self._name_ = from_df._name_
+    for column, entities in from_df.Entities4df.items():
+      self.add_entities(entities,column)
+    return
+
+
+  def max_colrank(self)->int:
+    return max(self.col2rank.values()) if self.col2rank else 0
+  
+  
+  def set_rank(self, to_column:str, rank:int=None):
+    '''
+      assigns self._max_rank()+1 to new concept if my_rank is None
+    '''
+    if not rank:
+      rank = self.max_colrank()+1
+
+    self.col2rank[to_column] = rank
+    return
+
+
+  def __update_entities(self):
+    for colname, entities in self.Entities4df.items():
+      column_values = set(filter(None, self[colname].to_list()))
+      updated_entities = {x for x in entities if not column_values.isdisjoint(x[colname]) if colname in x}
+      self.Entities4df[colname] = updated_entities
+      children = set(unpack(e.childs() for e in updated_entities))
+      self.explodedEntities4df[colname] = updated_entities|children
+    return
+
+
+  def add_entities(self, entities:list[PSObject], with_values_in_column='Name'):
+    '''
+    only entities with values in self[with_values_in_column] will be added to self.Entities4df[with_values_in_column] 
+    and their children will be added to self.explodedEntities4df[with_values_in_column]
+    '''
+    self.Entities4df.update({with_values_in_column:set(entities)})
+    self.__update_entities()
+    return
+
+
+  def entities(self, include_children=True, for_column='')->set[PSObject]:
+    if for_column:
+      return self.explodedEntities4df[for_column] if include_children else self.Entities4df[for_column]
+    else:
+      all_entities = set()
+      for colname in self.Entities4df.keys():
+        all_entities.update(self.explodedEntities4df[colname] if include_children else self.Entities4df[colname])
+      return all_entities
+  
+
+  def uids(self,for_column='Name'):
+    return [o.uid() for o in self.Entities4df[for_column]]
+
+
+  def dfcopy(self, only_columns:list = None, rename2:dict = None, deep:bool = True):
+    """
+    Creates a filtered and/or renamed copy of the DataFrame and its formats.
+    Args:
+        only_columns: Optional list of columns to include in the copy.
+        rename2: Optional dictionary to map {old_name: new_name} for columns.
+        deep: If True, creates a deep copy of the underlying data.
+    """
+    if only_columns is None:
+      only_columns = self.columns.to_list()
+    if rename2 is None:
+      rename2 = dict()
+
+    self_cols = set(self.columns)
+    missing_cols = set(only_columns) - self_cols
+    if missing_cols:
+      print(f'Worksheet {self._name_} is missing columns: {list(missing_cols)}')
+
+    newpd = super().copy(deep)[[c for c in only_columns if c in self_cols]]
+    newpd.rename(columns=rename2, inplace=True)
+    newdf = df.from_pd(newpd, self._name_)
+    for attr_name, attr in self.__ws_formats__().items():
+      setattr(newdf, attr_name, attr)
+  
+    inverted_rename = {v:k for k,v in rename2.items()}
+    for attr_name,self_attr in self.__col_formats__().items():
+      new_attr = dict()
+      for col in newdf.columns:
+        original_col = inverted_rename.get(col, col)
+        if original_col in self_attr:
+          new_attr[col] = self_attr[original_col]
+      setattr(newdf, attr_name, new_attr)
+      
+    newdf.Entities4df = self.Entities4df.copy()
+    newdf.explodedEntities4df = self.explodedEntities4df.copy()
+    return newdf
+
+
+  @staticmethod
+  def _hyperlink(identifier:str,url:str,display_str=''):
+      # hyperlink in Excel does not work with long URLs, 
+      display_str = display_str if display_str else identifier
+      return '=HYPERLINK("'+url+identifier+'",\"{}\")'.format(display_str)
+  
+
+  def add_format(self, from_df:'df'):
+    '''
+    updates formats with from_df format
+    '''
+    self.header_format.update(from_df.header_format)
+    self.column2format.update(from_df.column2format)
+    self.conditional_frmt.update(from_df.conditional_frmt)
+    self.tab_format.update(from_df.tab_format)
+    self.col2rank.update({col:max(rank,self.col2rank.get(col,rank)) for col,rank in from_df.col2rank.items()})
+
+
+  def set_col_format(self,fmt:dict):
+      self.column2format = fmt
+
+
+  def add_column_format(self,column_name:str,fmt_property:str,fmt_value):
+      try:
+          self.column2format[column_name].update({fmt_property:fmt_value})
+      except KeyError:
+          self.column2format[column_name] = {fmt_property:fmt_value}
+
+
+  def set_hyperlink_color(self, column_names:list):
+      [self.add_column_format(column_name,'font_color','blue') for column_name in column_names]
+
+
+  def inch_width(self,col:str|int):
+      my_column = col if isinstance(col,str) else str(self.columns[col])
+      try:
+          return self.column2format[my_column]['inch_width']
+      except KeyError:
+          return 0
+
+
+  def set_inch_width(self,layout:dict):
+      """
+      layout = {column_index:inch_width}
+      """
+      for col_idx, width in layout.items():
+          col_name = str(self.columns[col_idx])
+          self.column2format[col_name] = {'inch_width':width}
+
+
+  def inch_width_layout(self):
+      layout = {i:self.inch_width(i) for i in range(0,len(self.columns))}
+      return layout
+
+
+  @classmethod
+  def read(cls, *args, **kwargs):
+      '''
+      Input
+        args[0] - input filname for reading Excel file\n
+        kwargs = {sheet_name:str, read_formula:bool, name:str}
+      '''
+      df_name = kwargs.pop('name','')
+      fname = str(args[0])
+      extension = os.path.splitext(fname)[1][1:] # remove period
+      if extension == 'xlsx':
+          read_formula = kwargs.pop('read_formula',False)
+          if read_formula:
+            wb = load_workbook(filename=fname)
+            try:
+              sheet = wb[kwargs['sheet_name']]  
+            except KeyError:
+              #sheet_names = wb.get_sheet_names()
+              sheet = wb[str(wb.sheetnames[0])]
+
+            header_pos = kwargs.pop('header',0)
+            skiprows = kwargs.pop('skiprows',0)
+            _dfname_ = df_name if df_name else sheet
+            _pd = pd.DataFrame(list(sheet.values))
+            _pd.columns = _pd.iloc[header_pos].to_list()
+            _df = df.from_pd(_pd[header_pos+1+skiprows:],str(_dfname_))
+            return _df
+          try:
+              _pd = pd.read_excel(*args, **kwargs)
+              _df = df.from_pd(_pd,df_name)
+              # _df._name_ = df_name
+              return _df
+          except FileNotFoundError: 
+              raise(FileNotFoundError)
+              #return df()
+      elif extension in ('tsv','txt','tab'):
+          kwargs.pop('sheet_name','')
+          kwargs.pop('read_formula',False)
+          my_kwargs = dict(kwargs)
+          my_kwargs['sep'] = '\t'
+          try:
+              return df.from_pd(pd.DataFrame(pd.read_csv(*args,**my_kwargs)),df_name)
+          except FileNotFoundError:
+              raise(FileNotFoundError)
+              #return df()
+      elif extension == ('csv'):
+          kwargs.pop('sheet_name','')
+          kwargs.pop('read_formula',False)
+          try:
+              my_kwargs = dict(kwargs)
+              my_kwargs['sep'] = ','
+              _df =  df.from_pd(pd.DataFrame(pd.read_csv(*args,**my_kwargs)),df_name)
+              return _df
+          except FileNotFoundError:
+              raise(FileNotFoundError)
+              #return df()
+      return df()
+
+
+  def pandas2rdf(self, remap:dict):
+    rdf_pandas = pd.DataFrame(self)
+    for c in rdf_pandas.columns:
+      rdf_pandas.rename(columns=remap[c])
+      return rdfpandas.to_graph(rdf_pandas)
+
+
+  def apply_and_concat(self, field, func, column_names):
+    merged_pd = pd.concat((self,self[field].apply(lambda cell: pd.Series(func(field,cell),index=column_names))),axis=1)
+    to_return = df.from_pd(merged_pd)
+    to_return.__copy_attrs__(self)
+    return to_return
+
+
+  #not yet tested
+  def apply_and_concat2(self, concept_name, func, column_names):
+    merged_pd = pd.concat((self,self['Name'].apply(lambda cell: pd.Series(func(cell,concept_name),index=column_names))),axis=1)
+    to_return = df.from_pd(merged_pd)
+    to_return.__copy_attrs__(self)
+    return to_return 
+
+
+  @classmethod 
+  def from_dict(cls, dic:dict, **kwargs):
+    '''
+    Input
+    -----
+    dic - {col_name:[values]}
+    orient: Literal['columns', 'index', 'tight'] = ...,
+    dtype: _str = ...,
+    columns: list[_str] = ...\n
+    The "orientation" of the data. If the keys of the passed dict should be the columns of the resulting DataFrame, pass 'columns' (default). Otherwise if the keys should be rows, pass 'index'. If 'tight', assume a dict with keys ['index', 'columns', 'data', 'index_names', 'column_names']
+    '''
+    df_name = kwargs.pop('name','')
+    new_pd = cls.from_pd(pd.DataFrame.from_dict(dic,**kwargs))
+    new_pd._name_ = df_name
+    return new_pd
+
+
+  @classmethod 
+  def from_rows(cls,rows:list[list],columns:list[str],index=-1,dfname='')->'df':
+    '''
+    rows - list/set of lists/tuples
+    '''
+    _2return = pd.DataFrame(rows,columns=columns)
+
+    if index >= 0:
+      _2return.set_index(columns[index], inplace=True)
+        
+    return df.from_pd(_2return,dfname)
+  
+
+  @classmethod
+  def from_dict2(cls,dic:dict, key_colname:str, value_colname:str)->'df':
+      #new_df = cls(pd.DataFrame(columns=[key_colname,value_colname]))
+      new_df = df.from_pd(pd.DataFrame.from_dict({key_colname:list(dic.keys()), value_colname:list(dic.values())}))
+      return new_df
+  
+
+  def merge_dict(self, dict2add:dict[str,str|int|float|tuple], new_col:str, map2column:str, 
+                 add_all=False,case_sensitive_match=True,default_val = ''):
+      '''
+      input:
+        "dict2add" must have keys equal to values in "map2column"
+      output:
+        new df with values from dict2add.values() in "new_col" 
+      '''
+      in2df = self.dfcopy()
+      mapping_column = map2column
+      if case_sensitive_match:
+        my_dict = dict2add
+      else:
+        my_dict = {k.lower():v for k,v in dict2add.items()}
+        mapping_column = map2column+'lowercase'
+        in2df[mapping_column] = in2df[map2column].str.lower()
+    
+      pd2merge = df.from_dict2(my_dict,mapping_column,new_col)
+      how = 'outer' if add_all else 'left'
+      merged_df = in2df.merge_df(pd2merge,how=how, on=mapping_column)
+      merged_df[new_col] = merged_df[new_col].fillna(default_val)
+
+      if not case_sensitive_match: #removing lowercased mapping_column
+        merged_df = merged_df.dfcopy(self.columns.to_list() + [new_col])
+
+      return merged_df
+
+
+  def append_df(self, other:'df'):
+    '''
+    output:
+      reindexed concatinated df
+    '''
+    merged_pd = pd.concat([self,other],ignore_index=True)
+    merged_pd = merged_pd.reindex()
+    merged_df = df.from_pd(merged_pd,dfname=self._name_)
+    merged_df.copy_format(other)
+    merged_df.add_format(from_df=self)
+    merged_df.Entities4df = other.Entities4df | self.Entities4df
+    merged_df.explodedEntities4df = other.explodedEntities4df | self.explodedEntities4df
+    return merged_df
+  
+
+  def add_dict(self, dic:dict):
+    new_df = df([dic])
+    return self.append_df(new_df)
+  
+
+  @staticmethod
+  def concat_df(dfs:list, dfname=''):
+      merged_pd = pd.concat(dfs,ignore_index=True)
+      merged_pd = merged_pd.reindex()
+      merged_df = df.from_pd(merged_pd,dfname=dfname)
+      return merged_df
+  
+  
+  def reindex_df(self):
+      reindexed_pd = self.reindex()
+      reindexed_df = df.from_pd(reindexed_pd,dfname=self._name_)
+      reindexed_df.copy_format(self)
+      return reindexed_df
+
+
+  def merge_df(self, df2merge:'df', **kwargs)->'df':
+      '''
+      Input
+      -----
+      right df = args[0]\n
+      non pd.DataFrame kwargs: 'name','columns'\n
+      "on" kwarg has to specify column in both self and right df
+      "how" - {"left", "right", "outer", "inner", "cross"}, default "inner"
+      inner: use intersection of keys from both frames,preserve the order of the left keys.
+
+      Return
+      ------
+      df merged using "on" kwarg with columns added from right df specified by 'columns'\n
+      if 'columns' were not specified will merge all columns from right df\n
+      Format of "self" takes precedent
+      '''
+      df_name = kwargs.pop('name',self._name_)
+      columns2copy = list(kwargs.pop('columns',[]))
+      merge_on_column = kwargs.get('on')
+      if columns2copy:
+          columns2copy.append(merge_on_column)
+          my_df2merge = df2merge.dfcopy(columns2copy)
+      else:
+          my_df2merge = df2merge
+
+      merged_df = df.from_pd(self.merge(pd.DataFrame(my_df2merge), **kwargs),dfname=df_name)
+      merged_df.add_format(from_df=df2merge)
+      merged_df.add_format(from_df=self)
+      merged_df.Entities4df = df2merge.Entities4df | self.Entities4df
+      merged_df.explodedEntities4df = df2merge.explodedEntities4df | self.explodedEntities4df
+      return merged_df
+
+
+  @classmethod
+  def psobj2df(cls,obj:PSObject,key_colname:str,value_colname:str,dfname=str()):
+      key_col = list()
+      value_col = list()
+      for k,v_list in obj.items():
+          key_col += [k]*len(v_list)
+          value_col += v_list
+      
+      new_df = cls.from_dict({key_colname:key_col,value_colname:value_col})
+      new_df._name_= dfname
+      return new_df
+
+
+  def merge_psobject(self, obj:PSObject, new_col:str, map2column:str, 
+          add_all=False, values21cell=False, sep=';', case_sensitive_match = False):
+
+      in2pd = self.dfcopy()
+      if not case_sensitive_match:
+          in2pd[map2column] = self[map2column].apply(lambda x: str(x).lower())
+
+      if values21cell:
+          if case_sensitive_match:
+              merge_dict = {k:sep.join(v) for k,v in obj.items()}
+          else:
+              merge_dict = {str(k).lower():sep.join(v) for k,v in obj.items()}
+              
+          in2pd =  in2pd.merge_dict(merge_dict,new_col,map2column,add_all)
+          in2pd[map2column] = self[map2column]
+      else:          
+          obj_df = df.psobj2df(obj,map2column,new_col)
+          how = 'outer' if add_all else 'left'
+          in2pd = in2pd.merge_df(obj_df,how=how,on=map2column)
+      
+      in2pd.__copy_attrs__(self)
+      return in2pd
+
+
+  def get_rows(self, by_value1, in_column1, and_by_value2, in_column2):
+      return self.loc[(self[in_column1] == by_value1) & (self[in_column2] == and_by_value2)]
+
+
+  def get_cells(self,by_value1, in_column1, and_by_value2, in_column2, from_column3):
+      return (self.loc[(self[in_column1] == by_value1) & (self[in_column2] == and_by_value2),from_column3]).iloc[0]
+
+
+  def df2json(self, to_file:str, dir=''):
+      dump_fname = to_file
+      if  to_file[-5:] != '.json': dump_fname += '.json'
+      dump_fname = dir+dump_fname
+      with open(dump_fname, 'w') as jsonout:
+          self.reset_index(inplace=True)
+          jsonout.write(self.to_json(None,indent=2, orient='index'))
+  
+
+  def __worksheet_area4(self, first_col:str,last_col:str,first_row=2,last_row=0):
+      # only area in the dformat A1:Z100 works as argument in conditional format()
+      first_col_idx = self.columns.to_list().index(first_col)
+      last_col_idx = self.columns.to_list().index(last_col)
+
+      first_col_letter_idx = string.ascii_uppercase[first_col_idx]
+      last_col_letter_idx = string.ascii_uppercase[last_col_idx]
+
+      area = first_col_letter_idx+str(first_row)+':'+last_col_letter_idx
+      if last_row:
+          area += str(last_row)
+      else:
+          area += str(first_row+len(self)-1)
+      
+      return area
+
+  
+  def set_conditional_frmt(self,conditional_format:dict, for_first_col:str,and_last_col:str,for_first_row=1,and_last_row=0):
+      lr = and_last_row if and_last_row else len(self)+1
+      area = self.__worksheet_area4(for_first_col,and_last_col,for_first_row,lr)
+      self.conditional_frmt[area] = conditional_format
+
+
+  def make_header_vertical(self,height=120):
+      self.header_format['rotation'] = '90'
+      self.header_format['height'] = height
+      self.header_format['valign'] = 'vcenter'
+
+
+  def make_header_horizontal(self):
+      self.header_format.pop('rotation','not_found')
+      self.header_format.pop('height','not_found')
+      self.header_format.pop('valign','not_found')
+
+
+  def __df2excel(self,writer:ExcelWriter,sheet_name:str,**kwargs):
+    '''
+    Column format specifications must be in self.column2format\n
+    Header format specification must be in self.header_format\n
+    Tab format specification must be in tab_format
+
+    Parameters
+    ----------
+    height,width,wrap_text,inch_width\n
+    other format parameters are at https://xlsxwriter.readthedocs.io/format.html
+    '''
+    my_kwargs = {'startrow':1,'header':False,'index':False,'float_format':'%g'}
+    my_kwargs.update(kwargs)
+
+    self.to_excel(writer, sheet_name=sheet_name, **my_kwargs)
+    assert isinstance(writer.book,xlsxwriter.workbook.Workbook)
+
+    my_worksheet = writer.sheets[sheet_name]
+    assert isinstance(my_worksheet,xlsxwriter.workbook.Worksheet)
+    # writing header
+    header_height = self.header_format.pop('height',15)
+    
+    format = writer.book.add_format(self.header_format)
+    my_worksheet.set_row(0,header_height,format)
+    for col_num, value in enumerate(self.columns.values):
+      writer.sheets[sheet_name].write(0, col_num, value,format)
+
+    # formating columns
+    for idx, column_name in enumerate(self.columns.to_list()):
+      try:
+        col_fmt_dic = dict(self.column2format[column_name])
+        # have to pop format settings unfamiliar to column_format
+        width = col_fmt_dic.pop('width', 20)
+        wrap = col_fmt_dic.pop('wrap_text', False)
+        col_fmt_dic.pop('inch_width', 1)
+        column_format = writer.book.add_format(col_fmt_dic)
+        if wrap: column_format.set_text_wrap()
+        my_worksheet.set_column(idx,idx,width,column_format)
+      except KeyError:
+        continue
+
+    for area, fmt in self.conditional_frmt.items():
+      #_1row,_1col,last_row,last_col = list(area)
+      #my_worksheet.conditional_format(_1row,_1col,last_row,last_col,fmt)
+      my_worksheet.conditional_format(area, fmt) # only area in format A1:Z100 works here
+
+    try:
+      tab_color = self.tab_format['tab_color']
+      my_worksheet.set_tab_color(tab_color)
+    except KeyError:
+      pass
+
+
+  def df2excel(self,writer:ExcelWriter,sheet_name:str,**kwargs):
+    if len(self) > 1000000:
+      chunks = [df.from_pd(self[i:i+1000000]) for i in range(0, len(self), 1000000)]
+      [d.__df2excel(writer,sheet_name+str(i+1),**kwargs) for i,d in enumerate(chunks)]
+    else:
+      self.__df2excel(writer,sheet_name,**kwargs)
+
+
+  def _2excel(self, fpath:str,ws_name='',mode='w'):
+    if not ws_name:
+      ws_name = self._name_ if self._name_ else 'Sheet1'
+
+    f = ExcelWriter(fpath, engine='xlsxwriter',mode=mode)
+    self.df2excel(f,ws_name)
+    f.close()
+
+
+  @staticmethod
+  def dfs2excel(dfs:list["df"], fpath:str, mode='w'):
+    f = ExcelWriter(fpath, engine='xlsxwriter',mode=mode)
+    for i,d in enumerate(dfs):
+      ws_name = d._name_ if d._name_ else f'Sheet{i+1}'
+      d.df2excel(f,ws_name)
+    f.close()
+
+
+  def clean(self):
+      clean_pd = self.dropna(how='all',subset=None)
+      clean_pd = clean_pd.drop_duplicates()
+      clean_pd = clean_pd.fillna('')
+      clean_df = df.from_pd(clean_pd, dfname=self._name_)
+      clean_df.copy_format(self)
+      return clean_df
+
+
+  def filter_by(self,values:list, in_column:str):
+      copedf = df.from_pd(self[self[in_column].isin(values)],self._name_)
+      copedf.copy_format(self)
+      return copedf
+
+
+  def greater_than(self, value:float, in_column:str,verbose = True):
+    '''removes rows with in_column value <= value'''
+    old_len = len(self)
+    new_pd = self[self[in_column] > value]
+    removed_rows = old_len - len(new_pd)
+    if verbose:
+        print(f'Removed {removed_rows} out of {old_len} rows from {self._name_} because their "{in_column}" values were smaller than {value}')
+    new_df = df.from_pd(new_pd)
+    new_df.__copy_attrs__(self) 
+    return new_df
+  
+  
+  def smaller_than(self, value:float, in_column:str, verbose = True):
+    '''
+      removes rows with in_column value >= value
+    '''
+    old_len = len(self)
+    new_pd = self[self[in_column] < value]
+    removed_rows = old_len - len(new_pd)
+    if verbose:
+      print(f'{removed_rows} rows were removed from {self._name_} because "{in_column}" value was greater than {value}')
+    new_df = df.from_pd(new_pd)
+    new_df.__copy_attrs__(self)
+    return new_df
+
+
+  def drop_empty_columns(self, max_abs=0.00000000000000001, subset=list()):
+      my_columns = subset if subset else self.columns
+      my_numeric_columns = subset if subset else [x for x in my_columns if is_numeric_dtype(self[x])]
+      no_value_cols = list()
+      [no_value_cols.append(col) for col in my_numeric_columns if abs(self[col].max()) < max_abs]
+      no_empty_cols = df.from_pd(self.drop(columns = no_value_cols),dfname=self._name_)
+      no_empty_cols.copy_format(self)
+      print(f'{len(no_value_cols)} columns were dropped because they have all values = 0')
+      if len(no_value_cols) < 20:
+          print('Dropped columns:')
+          [print(c) for c in no_value_cols]
+      return no_empty_cols
+      
+
+  def table_layout(self, table_witdh=7.5):
+      """
+      Returns {col_idx:width} for default table_witdh
+      """
+      length_averages = dict()
+      columns = list(self.columns)
+      rownum = float(len(self.index))
+      col_idx = 0
+      for col in columns:
+          col_values = list(self[col])+[col]
+          col_values = list(map(str,col_values))
+          split_col_values = list()
+          for v in col_values:
+              sentences = v.split('\n')
+              split_col_values += sentences
+          col_lengths = list(map(len, split_col_values))
+          length_averages[col_idx] = float(sum(col_lengths))/rownum
+          col_idx +=1
+      
+      scale_factor = table_witdh/sum(length_averages.values())
+      normalized_layout = {k:v*scale_factor for k,v in length_averages.items()}
+
+      # columns cannot be too narrow
+      #min_width = 0.65
+      [normalized_layout.update({i:MIN_COLUMN_WIDTH}) for i,w in normalized_layout.items() if w < MIN_COLUMN_WIDTH]
+
+      # trying to fit the table into the page by narrowing very wide columns
+      new_table_width = sum(list(normalized_layout.values()))
+      width_excess = new_table_width-table_witdh
+      for col_idx,col_width in normalized_layout.items():
+          if col_width > 3:
+              new_width = col_width - width_excess
+              if new_width > 2:
+                  normalized_layout[col_idx]= new_width
+              break
+
+      new_table_width = sum(list(normalized_layout.values()))
+      width_excess = new_table_width-table_witdh
+      if width_excess > 0:
+          #distributing width excess across all columns wider than min_col_width
+          wide_col_idxes = list()
+          sum_width2trim = 0.0
+          for idx,width in normalized_layout.items():
+              if width > MIN_COLUMN_WIDTH:
+                  wide_col_idxes.append(idx)
+                  sum_width2trim =  sum_width2trim + width
+
+          scale_factor = sum_width2trim/(sum_width2trim+width_excess)
+      
+          for col_idx,col_width in normalized_layout.items():
+              if col_idx in wide_col_idxes:
+                  normalized_layout[col_idx] = col_width*scale_factor
+      
+      #table_width = sum(list(normalized_layout.values()))
+      # assert table_width <= 6.8
+      return normalized_layout
+
+
+  def sort_columns_by_list(self,only_columns:list):
+      my_columns = [c for c in only_columns if c in self.columns]
+      new_df = df.from_pd(self[my_columns])
+      new_df.copy_format(self)
+      return new_df
+
+
+  def clean4doc(self,max_row=int(),only_columns=[],ref_limit=dict(), as_str=True):    
+      clean_df = self.sort_columns_by_list(only_columns) if only_columns else self.dfcopy()
+      clean_df.dropna(how='all',subset=None,inplace=True)
+      clean_df.drop_duplicates(inplace=True)
+      clean_df.fillna('', inplace=True)
+
+      if max_row: clean_df = df.from_pd(clean_df.head(max_row))
+
+      if ref_limit:
+          for col_name, cutoff in ref_limit.items():
+              clean_df = df(clean_df.loc[clean_df[col_name] >= cutoff])
+
+      if as_str:
+          for col in clean_df.columns:
+              if clean_df[col].dtype in ['float','float64']:
+                  clean_df[col] = clean_df[col].map(lambda x: '%2.2f' % x)
+              clean_df[col] = clean_df[col].astype(str)
+      return clean_df
+
+
+  @staticmethod
+  def read_clean(*args,**kwargs):
+      """
+      Input
+      -----
+      file name must be in args[0]
+      'only_columns' = [col_names]
+      'ref_limit' = [col_name:reflimit]
+      'as_str' = True - formats floats to string as %2.2f'
+      max_row = 0 - read only first max_row rows
+      other *args,**kwargs as in pandas.read_excel, pandas.read_excel
+      """
+      only_columns = kwargs.pop('only_columns',[])
+      ref_limit = kwargs.pop('ref_limit',dict())
+      as_str = kwargs.pop('as_str',True)
+      max_row = kwargs.pop('max_row',0)
+      try:
+          table_df = df.read(*args,**kwargs)
+          if table_df.empty:
+              print('worksheet %s in %s is empty' % (table_df._name_,args[0]))
+              return df()
+          
+          if only_columns:
+              if isinstance(only_columns[0],int):
+                  select_columns = [v for i,v in enumerate(table_df.columns.to_list()) if i in only_columns]
+              else:
+                  select_columns = only_columns
+          else:
+              select_columns = []
+
+          return table_df.clean4doc(max_row,select_columns,ref_limit,as_str) 
+      except FileNotFoundError: 
+          raise FileNotFoundError
+
+
+  @staticmethod
+  def formula2hyperlink(formula:str):
+      '''
+      extracts hyperlink from HYPERLINK formula in Excel
+      '''
+      values = formula[formula.find('(')+1:-2]
+      url, txt = values.split(',')
+      return url.strip(' "'), txt.strip(' "')
+
+
+  def remove_rows_by(self, values:list, in_column:str):
+      clean_df = df.from_pd(self[~self[in_column].isin(values)])
+      clean_df.__copy_attrs__(self)
+      return clean_df
+
+
+  def is_numeric(self,column:str):
+      return is_numeric_dtype(self[column])
+
+
+  def to_dict(self,key_col:str,values_col:str):
+      return dict(list(zip(getattr(self,key_col),getattr(self,values_col))))
+
+
+  def not_nulls(self,columns4count:list,write2column='Row count'):
+      '''
+      Adds
+      ----
+      Column named "write2column" with count of empty "columns4count" for every row
+      '''
+      self[write2column] = self[columns4count].isna().sum(axis=1)
+      self[write2column] = self[write2column].apply(lambda x: len(columns4count) - x)
+
+
+  def add_values(self,from_column:str,in_df:'df',map_by_my_col:str,to_my_col='',map2col='',how2replace='false'):
+      '''
+      Input
+      -----
+      replace = 'false' - no replacement\n
+      replace = 'true' - replace existing values\n
+      replace = 'merge' - adds values to existing values after ";"
+
+      Returns
+      -------
+      df with new "to_my_col"\n
+      if "to_my_col" is not specified the column named "from_column" will be created in retruned df\n
+      if "map2col" is not specified mapping of "in_df" values uses column with name "map_by_my_col" that must be present "in_df" 
+  
+      '''
+      in_df_map_column = map2col if map2col else map_by_my_col
+      map_dict = in_df.to_dict(in_df_map_column,from_column)
+      copy2column =  to_my_col if to_my_col else from_column
+      def __my_value(x):
+          try:
+              new_value = map_dict[x[map_by_my_col]]
+          except KeyError:
+              new_value = ''
+
+          exist_value = '' if pd.isna(x[copy2column]) else str(x[copy2column])
+
+          if how2replace == 'true':
+              return new_value
+          elif how2replace == 'merge':
+              if exist_value:
+                  return ';'.join({exist_value,new_value}) if new_value else exist_value
+              else:
+                  return new_value if new_value else np.nan
+          else:
+              # if how2replace='false' - do not replace
+              if exist_value:
+                  return exist_value
+              else:
+                  return new_value if new_value else np.nan
+
+      copy_df = self.dfcopy()
+      if copy2column not in copy_df.columns: copy_df[copy2column] = np.nan
+      copy_df[copy2column] = copy_df.apply(__my_value, axis=1)
+      return copy_df
+
+
+  def move_cols(self,col2pos:dict[str,int]):
+      '''
+      input:
+          col2pos = {colulmn_name : position}
+      '''
+      my_columns = [c for c in self.columns.to_list() if c not in col2pos]
+      sorted_col2pos = dict(sorted(col2pos.items(), key=lambda item: item[1]))
+      [my_columns.insert(pos,c) for c,pos in sorted_col2pos.items() if c in self.columns]
+      return self.dfcopy(my_columns)
+          
+
+  def l2norm(self,columns:list|dict=None):
+    '''
+    input:
+      columns = {column2normalize:column_with_normalization}
+      if columns is a list - normalized columns will be named the same as original columns
+      if columns is None all columns in dataframe will be normalized and named the same as original columns
+    '''
+    my_cols = columns if columns else self.columns
+    new_col_names = columns if isinstance(columns,dict) else dict()
+    col2newcol = [(col,new_col_names.get(col,col)) for col in my_cols]
+    copy_df = self.dfcopy()
+    for col,newcol in col2newcol:
+      if is_numeric_dtype(copy_df[col]):
+        vec = copy_df[[col]].to_numpy(float)
+        veclen =  np.sqrt(np.sum(vec**2))
+        copy_df[newcol] = vec / veclen if veclen > 0.0 else 0.0
+    return copy_df
+  
+
+  def minmax_norm(self,columns:list|dict=None):
+      '''
+      Input
+      -----
+      columns = {column2normalize:column_with_normalization}
+      if columns is a list - normalized columns will be named the same as original columns
+      if columns is None all columns in dataframe will be normalized and named the same as original columns
+      ''' 
+      my_cols = columns if columns else self.columns
+      new_col_names = columns if isinstance(columns,dict) else dict()
+      col2newcol = [(col,new_col_names.get(col,col)) for col in my_cols]
+      copy_df = self.dfcopy()
+      for col, newcol in col2newcol:
+        if is_numeric_dtype(copy_df[col]):
+          vec = copy_df[[col]].to_numpy(float)
+          vec_clean = vec[~np.isnan(vec)]
+          vec_min = vec_clean.min()
+          vec_max = vec_clean.max()
+          copy_df[newcol] = (vec - vec_min) / (vec_max - vec_min)
+      return copy_df
+  
+
+  def hadaramad(self,columns:list) -> pd.Series:
+    '''
+    input:
+    columns - list of columns to apply hadaramad product to. Columns must be numeric and have the same length.
+    output:
+    pd.Series with hadaramad product of specified columns
+    '''
+    copy_df = self.dfcopy()
+    vecs = [copy_df[col].to_numpy(dtype=float).reshape(-1) for col in columns if is_numeric_dtype(copy_df[col])]
+    if not vecs:
+        print("No numeric columns provided for Hadamard product.")
+        return pd.Series([], index=self.index)
+    hadamard_product = np.prod(np.vstack(vecs), axis=0).reshape(-1)
+    return pd.Series(hadamard_product, index=self.index)
+     
+
+  def split(self,num_parts:int):
+    split_dataframes = np.array_split(self, num_parts)
+    splits = list()
+    for d in split_dataframes:
+      part = df.from_pd(pd.DataFrame(d,columns=self.columns.to_list()))
+      part.__copy_attrs__(self)
+      splits.append(part)
+    return splits
+
+
+  def sort_columns(self,column_aggregate_func,ascending=False):
+      col_aggregate_values = self.apply(column_aggregate_func) # Calculate the sum of each column
+      assert(isinstance(col_aggregate_values,pd.Series))
+      new_order = col_aggregate_values.sort_values(ascending=ascending).index # Sort the column sums
+      sorted_self = df.from_pd(self[new_order],dfname=self._name_)
+      sorted_self.copy_format(self)
+      return sorted_self # Rearrange the columns based on the sorted sums
+  
+  
+  def deduplicate_rows(self,**kwargs):
+    '''
+    kwargs:
+      subset - column label or sequence of labels, optional
+      keep : {'first', 'last', False}, default 'first'
+    '''
+    my_kwargs = dict(kwargs)
+    my_kwargs['ignore_index'] = True
+    my_kwargs['inplace'] = False
+    before_count  = len(self)
+    dedupl_pd = self.drop_duplicates(**my_kwargs)
+    dedupl_df = df.from_pd(dedupl_pd)
+    dedupl_df.__copy_attrs__(self)
+    after_count = len(dedupl_df)
+    print(f"Deduplicated rows: {before_count - after_count} rows removed from self.{self._name_} worksheet.") 
+    return dedupl_df
+
+
+  @staticmethod
+  def calculate_pvalues(scores:pd.Series,skip1strow=False)->pd.Series:
+    def _empirical_pvalues_(series:pd.Series) -> pd.Series:
+      """
+      Fast exact empirical p-values: p_i = mean(series >= series[i]).
+      Uses sorting + search to avoid O(n^2) comparisons.
+      """
+      values = pd.to_numeric(series, errors='coerce').to_numpy(dtype=float)
+      n_total = values.size
+      if n_total == 0: return pd.Series([], index=series.index)
+
+      valid_mask = ~np.isnan(values)
+      valid_values = values[valid_mask]
+      n_valid = valid_values.size
+      if n_valid == 0: return pd.Series(np.zeros(n_total, dtype=float), index=series.index)
+
+      # Unique values are sorted ascending; ge_counts[idx] gives #valid values >= uniq[idx].
+      uniq, counts = np.unique(valid_values, return_counts=True)
+      ge_counts = np.cumsum(counts[::-1])[::-1] # cumulative counts of values >= each unique value
+
+      p_values = np.zeros(n_total, dtype=float)
+      valid_positions = np.searchsorted(uniq, values[valid_mask], side='left')
+      p_values[valid_mask] = ge_counts[valid_positions] / n_total
+      return pd.Series(p_values, index=series.index)
+
+    if skip1strow:
+      """Calculates exponential p-values, skipping the first row."""
+      if scores.empty or len(scores) <= 1: #handle empty, or single row series.
+          return pd.Series([], index=scores.index)
+      scores_to_fit = scores.iloc[1:]
+      p_values = _empirical_pvalues_(scores_to_fit)
+      full_p_values = pd.Series(index = scores.index)
+      full_p_values.iloc[1:] = p_values
+      return full_p_values
+    else:
+      """Calculates empirical p-values for a list of scores."""
+      return _empirical_pvalues_(scores)
+  
+
+  @staticmethod
+  def calculate_expo_pvalues(scores:pd.Series,skip1strow=False)->pd.Series:
+    if skip1strow:
+      """Calculates exponential p-values, skipping the first row."""
+      if scores.empty or len(scores) <= 1: #handle empty, or single row series.
+          return pd.Series([], index=scores.index)
+
+      scores_to_fit = scores.iloc[1:]  # Skip the first row
+      scores_filled = scores_to_fit.fillna(0)
+      lambda_hat = stats.expon.fit(scores_filled, floc=0)[1]
+      if lambda_hat <= 0:
+        print(f"Warning: lambda_hat is {lambda_hat}. Returning array of ones.")
+        p_values = pd.Series(np.ones_like(scores_filled), index=scores_filled.index)
+      else:
+        p_values = stats.expon.sf(scores_filled, scale=lambda_hat)
+        p_values = pd.Series(p_values, index=scores_filled.index)
+
+      full_p_values = pd.Series(index = scores.index)
+      full_p_values.iloc[1:] = p_values
+      return full_p_values
+    else:
+      scores_filled = scores.fillna(0)
+      lambda_hat = stats.expon.fit(scores_filled, floc=0)[1] # Fit an exponential distribution
+      p_values = stats.expon.sf(scores_filled, scale=lambda_hat) # Calculate p-values
+      return pd.Series(p_values, index=scores_filled.index)
+  
+
+  def sortrows(self,**kwargs)->"df":
+    # re-writing parent pd.DataFrame function is a BAD idea. Use other names
+    '''
+    by: str|list[str] - column name(s) to sort by\n
+    ascending: bool|list[bool] - sort order for each column, default is False (descending)\n
+    skip_rows: int - number of rows to skip before sorting, default is 0 (no rows skipped)\n
+    key - function to be called on each column before sorting, default is None (no key function)\n
+    '''
+    skip_rows = kwargs.pop('skip_rows',0)
+    my_kwargs = {'ascending':False, 'inplace':False}
+    my_kwargs.update(kwargs) # overwrites defaults with user-specified kwargs
+    if skip_rows:
+      if len(self) > skip_rows:
+        top_rows = self.iloc[:skip_rows]
+        remaining_rows = self.iloc[skip_rows:].sort_values(**my_kwargs)
+        sorted_df = df.from_pd(pd.concat([top_rows, remaining_rows], ignore_index=True),dfname=self._name_)
+        sorted_df.copy_format(self)
+        return sorted_df
+      else:
+        return self
+    else:
+      sorted_pd = self.sort_values(**my_kwargs)
+      sorted_df = df.from_pd(sorted_pd,self._name_)
+      sorted_df.copy_format(self)
+      return sorted_df
+  
+
+  def column_stats(self,column:str,sep=''):
+    column2stat = self[column].dropna().loc[lambda s: s != '']
+    if column in self.columns:
+      if sep:
+        all_values = column2stat.str.split(',')
+        exploded_values = all_values.explode()
+        cleaned_values = exploded_values.str.strip()
+        stat_pd = cleaned_values.value_counts().reset_index()
+      else:
+        if isinstance(column2stat.iloc[0], list):
+          stat_pd = df.from_pd(column2stat.explode().value_counts().reset_index())
+        else:
+          stat_pd = df.from_pd(column2stat.value_counts().reset_index())
+          
+      stat_pd.columns = [f'values in {column}', 'Count']
+      stat_df = df.from_pd(stat_pd,f'{column}_stats')
+      stat_df.make_header_horizontal()
+      return stat_df
+    else:
+      print(f'Column {column} is not in dataframe {self._name_}')
+      return df()
+
+
+  @staticmethod
+  def info_df()->"df":
+    rows = [['Number of worksheets in this file:','=INFO("numfile")']]
+    return df.from_rows(rows,['Info','Counts'],dfname='info')
+  
+
+  def calculate_confidence(self,distr_col:str)->pd.Series:
+    '''
+      Adds columns with p-values and confidence for values in "distr_col" column
+    '''
+    pValues = df.calculate_pvalues(self[distr_col])
+    return ((1.0 - pValues) * 100).round(3)
+  
+
+  def winsorize(self, columns:list[str], quantiles:tuple[float,float]=(0.05,0.95)):
+    lower_quantile, upper_quantile = quantiles
+    copy_df = self.dfcopy()
+    for column in columns:
+      if column in self.columns:
+        lower_bound = copy_df[column].quantile(lower_quantile)
+        upper_bound = copy_df[column].quantile(upper_quantile)
+        copy_df[column] = copy_df[column].clip(lower_bound, upper_bound)
+    return copy_df
+  
+
+  def clip(self, columns:list[str], limits:tuple[float,float]):
+    lower_limit, upper_limit = limits
+    copy_df = self.dfcopy()
+    for column in columns:
+      if column in self.columns:
+        copy_df[column] = copy_df[column].clip(lower_limit, upper_limit)
+    return copy_df
+  
+
+  def plot_correlation(self, Xcol:str, Ycol:str,**kwargs):
+    '''
+    kwargs:
+      plot_width:int - width of the plot in pixels, default is 100
+      plot_height:int - height of the plot in pixels, default is 100
+      outdir:str - directory to save the plot, default is current directory
+      how2shade - str - method to shade the plot, default is 'eq_hist', other option is 'log','linear'
+      out_file str - name of the output file, default is 'Correlation YcolVsXcol.png'
+    '''
+    print(f'Plotting correlation between {Xcol} and {Ycol} for {len(self)} data points in {self._name_}')
+    corr = self[Xcol].corr(self[Ycol])
+    print(f'Correlation coefficient between {Xcol} and {Ycol}: {corr:.3f}')
+    p_width, p_height = kwargs.pop('plot_width', 100), kwargs.pop('plot_height', 100)
+    cvs = ds.Canvas(plot_width=p_width, plot_height=p_height)
+    agg = cvs.points(pd.DataFrame(self), Xcol, Ycol)
+    how2shade = kwargs.pop('how2shade','eq_hist') # 'linear', 'log'
+    img = ds.tf.shade(agg, cmap=cc.fire, how=how2shade)
+    #img = ds.tf.set_background(img, "black")
+    #img = ds.tf.dynspread(img, threshold=0.5, max_px=2)
+    
+    figsize = 12
+    fig, ax = plt.subplots(figsize=(figsize+2, figsize), dpi=300) # leave 2 inches for color bar
+    # Display the image
+    x_min, x_max = self[Xcol].min(), self[Xcol].max()
+    y_min, y_max = self[Ycol].min(), self[Ycol].max()
+    ax.imshow(img.to_pil(), 
+              extent=[x_min, x_max, y_min, y_max],
+              #interpolation='nearest', 
+              #aspect='auto'
+              )
+
+    # Determine colorbar orientation based on figure aspect ratio
+    if (x_max - x_min) / (y_max - y_min) > 1.2:
+      cbar_orientation = 'horizontal'
+    else:
+      cbar_orientation = 'vertical'
+
+    # Add a manual colorbar to match 'cc.fire'
+    if how2shade == 'log':
+      sm = plt.cm.ScalarMappable(cmap=plt.get_cmap('hot'), norm=plt.Normalize(vmin=0, vmax=1))
+      plt.colorbar(sm, ax=ax, label='Relative Density (Log Scale)', orientation=cbar_orientation)
+    elif how2shade == 'eq_hist':
+      fire_cmap = mcolors.ListedColormap(cc.fire)
+      sm = plt.cm.ScalarMappable(cmap=fire_cmap, norm=plt.Normalize(vmin=0, vmax=1))
+      cbar = plt.colorbar(sm, ax=ax, orientation=cbar_orientation)
+      cbar.set_label('Relative Density (Histogram Equalized)', 
+            rotation=(0 if cbar_orientation == 'horizontal' else 270), 
+            labelpad=(10 if cbar_orientation == 'horizontal' else 15))
+      cbar.set_ticks([0, 0.5, 1])
+      cbar.set_ticklabels(['Low', 'Medium', 'High'])
+
+    plt.title(f"{len(self):,} data points | Correlation: {corr:.3f}")
+    plt.xlabel(Xcol)
+    plt.ylabel(Ycol)
+
+    fout = kwargs.pop('out_file', f'Correlation {Ycol.title()}Vs{Xcol.title()}')
+    fout += '.heatmap.png'
+    _2dir = kwargs.pop('outdir', '')
+    if _2dir:
+      fout = os.path.join(_2dir, fout)
+    plt.savefig(fout, dpi=300)
+    print(f'Correlation plot saved to {fout}')
+    plt.clf()
+
+
+  @staticmethod
+  def _plot_distribution_(distribution_dict:dict[str, list],**kwargs):
+    '''
+      kwargs: 
+        number_of_bins:int
+        edgecolor:'black'
+        xlabel:values; ylabel:'counts'
+        title
+        outdir
+        percentiles - list of percentiles to calculate and add to legend
+        percentile4score - list of scores to calculate percentiles for and add to legend
+        legend_loc - location of legend, default is 'best'
+        clear_plot - whether to clear the plot after saving, default is True, if False the plot will be kept in memory and can be displayed with plt.show() or used for further plotting
+      output:
+        histogram plot of the distribution with percentiles in legend.
+        histogram is saved to "outdir/title+'.histogram.png'".
+    '''
+    assert(isinstance(distribution_dict, dict)), "distribution_dict must be a dictionary with column names as keys and lists of values as values"
+    kwargs['alpha'] = kwargs.pop('alpha',0.5) # transperancy value
+    kwargs['bins'] = kwargs.pop('number_of_bins',50)
+    kwargs['edgecolor'] = kwargs.pop('edgecolor',"black")
+    data_dir = kwargs.pop('outdir','')
+    xlabel = kwargs.pop('xlabel',"values")
+    ylabel = kwargs.pop('ylabel',"counts")
+    percentiles = kwargs.pop('percentiles', [])
+    percentile4score = kwargs.pop('percentile4score', [])
+    legend_loc = kwargs.pop('legend_loc', 'best')
+    clear_plot = kwargs.pop('clear_plot', True)
+    title = kwargs.pop('title', 'Distribution of ' + ', '.join(distribution_dict.keys()))
+
+    legend_labels = []
+    patches_list = []
+    print(f'Plotting distribution for {title}')
+    for name, distribution in distribution_dict.items():
+      counts, bins, patches = plt.hist(distribution, label=name, **kwargs)
+      patches_list.append(patches)
+      legend_label = f'\n{name}:{len(distribution)}'
+      if percentiles:
+        legend_label += '\n'
+        for percentile in percentiles:
+          percentile_value = round(np.percentile(distribution, percentile),3)
+          legend_label += f'{percentile}%ile is at {percentile_value}\n'
+        
+      if percentile4score:
+        for score in percentile4score:
+          score_percentile = round(float(stats.percentileofscore(distribution, score, kind='strict')),2)
+          legend_label += f"{score_percentile}%ile at {score}\n"
+
+      if not legend_label:
+        max_idx = np.argmax(counts)
+        visual_mode = (bins[max_idx] + bins[max_idx + 1]) / 2
+        visual_mode = round(visual_mode,3)
+        average = round(mean(distribution),3)
+        _median = round(median(distribution),3)
+        percent_below_avg = round(float(stats.percentileofscore(distribution, average, kind='weak')),2)
+        percent_below_mode = round(stats.percentileofscore(distribution, visual_mode, kind='weak'),2)
+        skewness = stats.skew(distribution).item()
+        legend_label = f'Mean: {average}, %ile: {percent_below_avg}\nMedian: {_median}\nMode: {visual_mode}, %ile: {percent_below_mode}\nSkewness: {skewness:.2f}'
+
+      legend_labels.append(legend_label.strip())
+
+    plt.legend(handles=patches_list, labels=legend_labels, loc=legend_loc)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    fout = os.path.join(data_dir,title+'.histogram.png')
+    plt.savefig(fout)
+    y_min, y_max = plt.gca().get_ylim()
+    print(f'y-axis scale for "{title}":', y_min, "to", y_max)
+
+    if clear_plot:
+      plt.clf() # Clear the figure to free memory for the next plot
+    print(f'Finished building plots for {len(distribution_dict)} distributions')
+    return
+
+
+  def plot_distribution(self, distribution_cols:str, **kwargs):
+    '''
+      kwargs: 
+        number_of_bins:int
+        edgecolor:'black'
+        xlabel:values; ylabel:'counts'
+        title
+        outdir
+        percentiles - list of percentiles to calculate and add to legend
+        percentile4score - list of scores to calculate percentiles for and add to legend
+        legend_loc - location of legend, default is 'best'
+        clear_plot - whether to clear the plot after saving, default is True, if False the plot will be kept in memory and can be displayed with plt.show() or used for further plotting
+      output:
+        histogram plot of the distribution with percentiles in legend.
+        histogram is saved to "outdir/title+'.histogram.png'".
+    '''
+    distribution_dict = dict()
+    for name in distribution_cols:
+      distribution_dict[name] = self[name].dropna().tolist()
+    return self._plot_distribution_(distribution_dict, **kwargs)
+  
+    
+  def __plot_dependecies(self,Xcol:str,Ycols:list[str], **kwargs):
+    '''
+    kwargs:
+      outdir: directory to save the plot
+    '''
+    ycolnames = ', '.join(Ycols)
+    title = kwargs.get('title',f"{ycolnames} vs {Xcol}")
+    Yvalues = {col:self[col].tolist() for col in Ycols}
+    Xvalues = self[Xcol].tolist()
+    
+    legend_labels = []
+    patches_list = []
+    plt.figure(figsize=(10, 6)) # Optional: Makes the graph larger
+    for label, y_values in Yvalues.items():
+      line, = plt.plot(Xvalues, y_values, label=label)
+      patches_list.append(line)
+      legend_label = f'\n{label}:{len(y_values)}'
+      legend_labels.append(legend_label.strip())
+    
+    plt.grid(True) # Optional: Add a grid for better readability
+    plt.xlabel(kwargs.get('xlabel',''))
+    plt.ylabel(kwargs.get('ylabel',''))
+    plt.title(title)
+    plt.legend(handles=patches_list, labels=legend_labels, loc='best')
+    plt.gca().ticklabel_format(useOffset=False, style='plain')
+    #plt.show()# Display the plot
+    data_dir = kwargs.pop('outdir','')
+    fout = os.path.join(data_dir,title+'.dependency.png')
+    plt.savefig(fout)
+    print(f'Dependency plot saved to {fout}')
+    print(f'Finished building {len(Yvalues)} dependency plots')
+    plt.clf()
+
+
+  def plot_dependencies(self,Xcol:str,Ycols:list[str], **kwargs):
+    '''
+    kwargs:
+      outdir: directory to save the plot
+      number_of_bins: int - number of bins to group Xcol values into (for continuous float values), default is None (no binning, group by unique values)
+      float_round_digits: int - number of decimal places to round Xcol values to before grouping (for continuous float values), default is 0
+    '''
+    my_columns = [Xcol]+Ycols
+    my_stat_df = self.dfcopy(only_columns=my_columns)
+    my_stat_pd = my_stat_df.dropna(subset=my_columns).copy()
+    averaged_pd = my_stat_pd
+  
+    if my_stat_pd[Xcol].dtype.kind == 'f':
+      number_of_bins = kwargs.pop('number_of_bins', None)
+      float_round_digits = kwargs.pop('float_round_digits', 0)
+    
+      if number_of_bins: # Bin continuous float values to avoid one-row-per-unique-value grouping.
+        bin_size = (my_stat_pd[Xcol].max() - my_stat_pd[Xcol].min()) / number_of_bins
+        my_stat_pd['_group_bin'] = (my_stat_pd[Xcol] / bin_size).round() * bin_size
+      else: # Default behavior for floats: round to a stable precision before grouping.
+        my_stat_pd['_group_bin'] = my_stat_pd[Xcol].round(float_round_digits)
+
+      averaged_pd = my_stat_pd[['_group_bin']+Ycols]
+      averaged_pd = averaged_pd.rename(columns={'_group_bin': Xcol})
+      
+    averaged_pd = averaged_pd.groupby(Xcol).mean().reset_index()
+    averaged_df = df.from_pd(averaged_pd.sort_values(Xcol), dfname=f'{Xcol}VsAverages')
+    title = kwargs.pop('title',f'Averages per {Xcol}')
+    averaged_df.__plot_dependecies(Xcol,Ycols,xlabel=Xcol,ylabel='Averages',title=title, **kwargs)
+    return
+  
+
+  def scatter_plot(self, Xcol:str, Ycols:list[str], **kwargs):
+    '''
+    Yvalues = {label:[values]}
+    kwargs:
+      trend_line: default False
+    '''
+    ycolnames = ', '.join(Ycols)
+    title = kwargs.get('title',f"{ycolnames} vs {Xcol}")
+    Yvalues = {col:self[col].tolist() for col in Ycols}
+    Xvalues = self[Xcol].tolist()
+    
+    for label, y_values in Yvalues.items():
+      plt.plot(Xvalues, y_values,'o', label=label) # 'o' = marker='o', linestyle='none'
+      if kwargs.get('trend_line',False):
+        z = np.polyfit(Xvalues, y_values, 1)
+        p = np.poly1d(z)
+        plt.plot(Xvalues, p(Xvalues), "r--", label='Trend Line')
+
+    plt.title(title)
+    plt.xlabel(kwargs.get('xlabel',Xcol))
+    plt.ylabel(kwargs.get('ylabel',ycolnames))
+    plt.grid(True) # Optional: Add a grid for better readability
+    plt.legend(loc='best')
+    plt.gca().ticklabel_format(useOffset=False, style='plain')
+    data_dir = kwargs.pop('outdir','')
+    fout = os.path.join(data_dir,title+'.scatter.png')
+    plt.savefig(fout)
+    print(f'Scatter plot saved to {fout}')
+    print(f'Finished building {len(Yvalues)} scatter plots')
+    plt.clf()
+    
+
+  def rasterize(self, Xcol:str, Ycol:str, fout='', _2dir='', interactive=False):
+    '''
+    Create a rasterized 2D density plot.
+    
+    Parameters
+    ----------
+    Xcol : str
+        Column name for X-axis
+    Ycol : str
+        Column name for Y-axis
+    fout : str
+        Output filename (default: auto-generated)
+    _2dir : str
+        Output directory
+    interactive : bool
+        If True, creates interactive HTML with hover tooltips (Plotly).
+        If False, creates static PNG image (matplotlib). Default is False.
+    
+    Returns
+    -------
+    str
+        Path to the saved file (HTML or PNG depending on interactive flag)
+    '''
+    print(f'Plotting correlation between {Xcol} and {Ycol} for {len(self):,} data points')
+    corr = self[Xcol].corr(self[Ycol])
+    
+    if interactive:
+      # Create interactive Plotly 2D histogram with hover
+      fig = px.density_heatmap(
+          pd.DataFrame(self),
+          x=Xcol,
+          y=Ycol,
+          nbinsx=100,
+          nbinsy=100,
+          color_continuous_scale='Turbo',  # Similar to fire colormap
+          title=f"{len(self):,} data points | Correlation: {corr:.3f}",
+          hover_data={Xcol: ':.2f', Ycol: ':.2f'},
+          labels={Xcol: Xcol, Ycol: Ycol}
+      )
+      
+      # Customize layout for better interactivity
+      fig.update_layout(
+          width=1200,
+          height=1000,
+          hovermode='closest',
+          coloraxis_colorbar=dict(
+              title="Count",
+              thicknessmode="pixels",
+              thickness=20,
+              lenmode="pixels",
+              len=300,
+              yanchor="top",
+              y=1,
+              ticks="outside"
+          )
+      )
+      
+      # Handle file path
+      if not fout:
+          fout = f'Correlation_{Ycol.title()}Vs{Xcol.title()}_interactive.html'
+      if _2dir:
+          fout = os.path.join(_2dir, fout)
+      
+      fig.write_html(fout)
+      print(f"Saved interactive plot: {fout}")
+      return fout
+      
+    else:
+      # Create static matplotlib plot with datashader
+      p_width, p_height = 1000, 1000
+      cvs = ds.Canvas(plot_width=p_width, plot_height=p_height)
+      agg = cvs.points(pd.DataFrame(self), Xcol, Ycol)
+      
+      img = ds.tf.shade(agg, cmap=cc.fire, how='eq_hist')
+      img = ds.tf.dynspread(img, threshold=0.5, max_px=2)
+      
+      # Create matplotlib figure for output
+      figsize = 10
+      fig, ax = plt.subplots(figsize=(figsize+2, figsize))
+      
+      x_min, x_max = self[Xcol].min(), self[Xcol].max()
+      y_min, y_max = self[Ycol].min(), self[Ycol].max()
+      
+      ax.imshow(img.to_pil(),
+                extent=[x_min, x_max, y_min, y_max],
+                origin='lower',
+                aspect='auto')
+      
+      # Determine colorbar orientation based on figure aspect ratio
+      fig_width, fig_height = fig.get_size_inches()
+      cbar_orientation = 'horizontal' if fig_width / fig_height > 1.2 else 'vertical'
+      
+      # Add colorbar
+      fire_cmap = mcolors.ListedColormap(cc.fire)
+      sm = plt.cm.ScalarMappable(cmap=fire_cmap, norm=plt.Normalize(vmin=0, vmax=1))
+      cbar = plt.colorbar(sm, ax=ax, orientation=cbar_orientation)
+      cbar.set_label('Relative Density (Histogram Equalized)', rotation=(0 if cbar_orientation == 'horizontal' else 270), labelpad=(10 if cbar_orientation == 'horizontal' else 15))
+      cbar.set_ticks([0, 0.5, 1])
+      cbar.set_ticklabels(['Low', 'Medium', 'High'])
+      
+      plt.title(f"{len(self):,} data points | Correlation: {corr:.3f}")
+      plt.xlabel(Xcol)
+      plt.ylabel(Ycol)
+      
+      # Handle File Path
+      if not fout:
+          fout = f'Correlation_{Ycol.title()}Vs{Xcol.title()}.png'
+      if _2dir:
+          fout = os.path.join(_2dir, fout)
+      
+      plt.savefig(fout, dpi=300, bbox_inches='tight')
+      plt.close(fig)
+      print(f"Saved static plot: {fout}")
+      return fout
+    
+
+  def fit2normal(self,Xcol:str,Ycol:str, Yscale_factor = 1):
+    '''
+     Fits a normal distribution to the data in Ycol, weighted by the values in Xcol.
+     normal distribution formula: f(x) = (1 / (std * sqrt(2 * pi))) * exp(-0.5 * ((x - mean) / std) ** 2))
+    '''
+    print(f"Fitting normal distribution of size {len(self)} for {Ycol} vs {Xcol} with scale factor {Yscale_factor}")
+    frequencies = np.round(self[Ycol]*Yscale_factor).astype(int)
+    raw_data = np.repeat(self[Xcol].values, frequencies) # Create raw data by repeating Xcol values according to their frequencies in Ycol
+    mean, std = stats.norm.fit(raw_data) # Fit a normal distribution to the raw data
+    print(f"Fitted normal distribution parameters for {Ycol} vs {Xcol}: mean={mean:.2f}, std={std:.2f}")
+    return mean, std
