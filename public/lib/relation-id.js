@@ -1,5 +1,5 @@
 /**
- * relation-id.js — canonical RelationID calculation for GraphExplorer
+ * relation-id.js — canonical RelationID handling for GraphExplorer
  *
  * Single source of truth used by:
  *   - server.js          (Node.js, via require)
@@ -10,10 +10,35 @@
  *
  * UMD wrapper: works as CommonJS module (Node) or plain <script> (browser).
  *
- * Node.js exports:  { calcRelationId, myhash }
+ * Node.js exports:  { calcRelationId, myhash, normalizeRelationIds, fetchAndMergeDbReferences }
  * Browser globals:  calcRelationId
- *   (myhash is not exposed as a browser global — server.js uses it for
- *    _computeRefUniqueId, which is a server-only concern)
+ *   (myhash, normalizeRelationIds, fetchAndMergeDbReferences are server-only concerns
+ *    and are not exposed as browser globals)
+ *
+ * ── IMPORTANT: RelationID integer range ──────────────────────────────────────
+ *
+ * RelationIDs are 64-bit signed integers in both Neo4j and PostgreSQL.
+ * Their range is −(2^63) … +(2^63−1).
+ *
+ * JavaScript's Number type is IEEE-754 double-precision float, which can only
+ * represent integers exactly up to ±2^53 (Number.MAX_SAFE_INTEGER ≈ 9 × 10^15).
+ * Many RelationIDs exceed this limit, so converting them with Number() silently
+ * corrupts the value — e.g. Number('3362584539792416638') ≠ 3362584539792416638.
+ *
+ * Rule: RelationIDs MUST be kept as strings in Node.js at all times.
+ *   ✓  String(id)              — safe
+ *   ✓  BigInt(id)              — safe (for arithmetic / comparison only)
+ *   ✗  Number(id) / +id        — silently loses precision above 2^53
+ *   ✗  parseInt(id)            — same problem
+ *
+ * RelationIDs CAN BE NEGATIVE.  myhash() returns a signed 64-bit value, so
+ * roughly half of all RelationIDs are negative.  Any regex or filter that
+ * validates a RelationID string MUST include the optional leading minus sign:
+ *   ✓  /^-?\d+$/               — correct
+ *   ✗  /^\d+$/                 — rejects all negative IDs, breaking ~50 % of relations
+ *
+ * PostgreSQL handles the raw string just fine when the column is cast in SQL:
+ *   WHERE id = ANY($1::bigint[])    ← pass idList as an array of strings
  */
 (function (root, factory) {
   'use strict';
@@ -171,5 +196,193 @@
     return myhash(s);
   }
 
-  return { calcRelationId: calcRelationId, myhash: myhash };
+  // ── RelationID string normalisation ─────────────────────────────────────────
+  /**
+   * normalizeRelationIds(input) → string[]
+   *
+   * Accepts a single ID or any nested array of IDs (numbers, strings, or
+   * Neo4j Integer-like objects with a .toString() method).  Returns a
+   * deduplicated array of canonical RelationID strings.
+   *
+   * Key rules (see file header for the full explanation):
+   *  • IDs are returned as STRINGS — never as Number / BigInt.
+   *  • Negative IDs are valid; the leading "-" is preserved.
+   *  • Anything that is not a plain integer string (after toString) is dropped.
+   */
+  function normalizeRelationIds(input) {
+    if (input == null) return [];
+    // Flatten any nesting (e.g. [[id1, id2], id3])
+    var arr = Array.isArray(input) ? _flatten(input) : [input];
+    var seen = {};
+    var out  = [];
+    for (var i = 0; i < arr.length; i++) {
+      var item = arr[i];
+      if (item == null) continue;
+      // Support Neo4j Integer objects (have a .toString() that yields the value)
+      var s = (typeof item === 'object' && typeof item.toString === 'function')
+        ? item.toString()
+        : String(item);
+      // Must be an integer string, possibly negative — see header comment
+      if (/^-?\d+$/.test(s) && !seen[s]) {
+        seen[s] = true;
+        out.push(s);
+      }
+    }
+    return out;
+  }
+
+  function _flatten(arr) {
+    var result = [];
+    for (var i = 0; i < arr.length; i++) {
+      if (Array.isArray(arr[i])) {
+        var inner = _flatten(arr[i]);
+        for (var j = 0; j < inner.length; j++) result.push(inner[j]);
+      } else {
+        result.push(arr[i]);
+      }
+    }
+    return result;
+  }
+
+  // ── Server-side DB reference fetch (Node.js only) ────────────────────────────
+  /**
+   * fetchAndMergeDbReferences(body, pg) → Promise<body>
+   *
+   * Fetches PostgreSQL references for every relation ID in body's current graph
+   * and merges them into each edge as edge.references = [{...}, ...].
+   *
+   * Only available in Node.js (requires a pg connection pool object).
+   * Not exported as a browser global.
+   *
+   * @param {object} body  - The parsed request body sent to /api/agent/summarize-chat.
+   *                         Must contain NodeJSGraph (or CurrentNodeJSGraph / current_graph)
+   *                         with an edges array.  body.scope = 'selected' limits the fetch
+   *                         to selectedEdges only (avoids fetching thousands of unused refs).
+   * @param {object} pg    - { pool: pg.Pool, schema: string } from server.js middleware.
+   * @returns {Promise<object>} The same body object, edges mutated in place with .references.
+   *
+   * Implementation notes:
+   *  • IDs are normalised with normalizeRelationIds() — strings, negative allowed.
+   *  • The id[] array is split into CHUNK-sized slices run in parallel to avoid
+   *    a single huge query blocking the connection pool.
+   *  • SQL uses  WHERE id = ANY($1::bigint[])  with string values — PostgreSQL
+   *    casts them correctly; using Number() here would corrupt 64-bit IDs.
+   */
+  function fetchAndMergeDbReferences(body, pg) {
+    // Guard: only works in Node.js where pg is available
+    if (typeof pg === 'undefined' || !pg || !pg.pool || !pg.schema) return Promise.resolve(body);
+
+    var cg = body.NodeJSGraph || body.CurrentNodeJSGraph || body.current_graph;
+    if (!cg || !Array.isArray(cg.edges)) return Promise.resolve(body);
+
+    // For "selected" scope only fetch references for selected edges —
+    // avoids querying thousands of unused references for a full graph.
+    var scope        = body.scope || 'all';
+    var edgesToFetch = (scope === 'selected' && Array.isArray(cg.selectedEdges) && cg.selectedEdges.length > 0)
+      ? cg.selectedEdges
+      : cg.edges;
+
+    // Collect and normalise relation IDs — must remain strings (see header comment)
+    var rawIds = [];
+    for (var i = 0; i < edgesToFetch.length; i++) {
+      var e = edgesToFetch[i];
+      if (e.relationId  != null) rawIds.push(e.relationId);
+      if (Array.isArray(e.relationIds)) for (var j = 0; j < e.relationIds.length; j++) rawIds.push(e.relationIds[j]);
+    }
+    var idList = normalizeRelationIds(rawIds);
+    if (!idList.length) return Promise.resolve(body);
+
+    var schema = pg.schema;
+    var pool   = pg.pool;
+
+    // Split into parallel chunks so large graphs don't stall on one huge query
+    var CHUNK  = 500;
+    var chunks = [];
+    for (var c = 0; c < idList.length; c += CHUNK) chunks.push(idList.slice(c, c + CHUNK));
+
+    var sql = 'SELECT * FROM ' + schema + '.reference WHERE id = ANY($1::bigint[]) ORDER BY pubyear DESC NULLS LAST, id';
+
+    var t0 = Date.now();
+    return Promise.all(chunks.map(function(chunk) { return pool.query(sql, [chunk]); }))
+      .then(function(chunkResults) {
+        var allRows = [];
+        for (var i = 0; i < chunkResults.length; i++) {
+          var rows = chunkResults[i].rows;
+          for (var j = 0; j < rows.length; j++) allRows.push(rows[j]);
+        }
+        console.log('[fetchAndMergeDbReferences] fetched ' + allRows.length + ' references for ' +
+          idList.length + ' relation IDs in ' + chunks.length + ' parallel chunk(s) in ' + (Date.now() - t0) + 'ms');
+
+        // Build lookup: String(relationId) → [row, ...]
+        var byId = {};
+        for (var i = 0; i < allRows.length; i++) {
+          var row = allRows[i];
+          var rid = String(row.id);
+          if (!byId[rid]) byId[rid] = [];
+          byId[rid].push(row);
+        }
+
+        // Dedup key: doi + pmid + sentence
+        function refKey(r) {
+          return JSON.stringify([
+            (r.doi      || '').toLowerCase().trim(),
+            (r.pmid     || '').toLowerCase().trim(),
+            (r.msrc     || r.sentence || '').toLowerCase().trim()
+          ]);
+        }
+
+        // Merge DB refs into each edge
+        for (var i = 0; i < edgesToFetch.length; i++) {
+          var edge   = edgesToFetch[i];
+          var dbRefs = [];
+          if (edge.relationId != null) {
+            var r = byId[String(edge.relationId)];
+            if (r) for (var k = 0; k < r.length; k++) dbRefs.push(r[k]);
+          }
+          if (Array.isArray(edge.relationIds)) {
+            for (var ri = 0; ri < edge.relationIds.length; ri++) {
+              var r2 = byId[String(edge.relationIds[ri])];
+              if (r2) for (var k = 0; k < r2.length; k++) dbRefs.push(r2[k]);
+            }
+          }
+          if (!dbRefs.length) continue;
+
+          var existing = Array.isArray(edge.references) ? edge.references : [];
+          var seen     = {};
+          var merged   = [];
+          for (var m = 0; m < existing.length; m++) { var kk = refKey(existing[m]); seen[kk] = true; merged.push(existing[m]); }
+          for (var m = 0; m < dbRefs.length; m++) {
+            var kk = refKey(dbRefs[m]);
+            if (!seen[kk]) {
+              seen[kk] = true;
+              // Strip null / empty fields to keep payload lean
+              var clean = {};
+              var ref   = dbRefs[m];
+              var keys  = Object.keys(ref);
+              for (var f = 0; f < keys.length; f++) {
+                var v = ref[keys[f]];
+                if (v === null || v === undefined || v === '') continue;
+                if (Array.isArray(v) && v.length === 0) continue;
+                clean[keys[f]] = v;
+              }
+              merged.push(clean);
+            }
+          }
+          edge.references = merged;
+        }
+
+        return body;
+      })
+      .catch(function(err) {
+        console.warn('[fetchAndMergeDbReferences] DB fetch failed (continuing without):', err.message);
+        return body;
+      });
+  }
+
+  return {
+    calcRelationId:           calcRelationId,
+    myhash:                   myhash,
+    normalizeRelationIds:     normalizeRelationIds,
+    fetchAndMergeDbReferences: fetchAndMergeDbReferences
+  };
 }));
