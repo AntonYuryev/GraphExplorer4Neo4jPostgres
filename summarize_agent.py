@@ -886,7 +886,7 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
         # Stagger submissions to avoid hitting Cerebus/Portkey rate limits.
         # Each section is submitted with a short delay so concurrent bursts
         # don't trigger 429 errors. Adjust SECTION_STAGGER_SECS as needed.
-        SECTION_STAGGER_SECS = 3.0
+        SECTION_STAGGER_SECS = 0.0
         n_workers = max(1, len(system_prompts))
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             for i, prompt in enumerate(system_prompts):
