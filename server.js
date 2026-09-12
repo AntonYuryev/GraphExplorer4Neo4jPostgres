@@ -11,7 +11,7 @@ const http = require('http');
 const rateLimit = require('express-rate-limit');
 const _crypto   = require('crypto');
 const FlexSearch = require('flexsearch');
-const { calcRelationId, myhash: _myhash } = require('./public/lib/relation-id');
+const { calcRelationId, myhash: _myhash, normalizeRelationIds: _normalizeRelationIdInputs, fetchAndMergeDbReferences: _fetchAndMergeDbReferences } = require('./public/lib/relation-id');
 
 // ── Log injection hardening (CodeQL: js/log-injection, CWE-117) ───────────────
 // Many log calls throughout this file interpolate request-derived or
@@ -602,18 +602,9 @@ function _relationIdsOf(relOrValue) {
 
 // Normalizes caller-provided RelationID input into a deduplicated string array.
 // Accepts arrays or single values (numbers, BigInts, or numeric strings).
-function _normalizeRelationIdInputs(input) {
-  if (input == null) return [];
-  const arr = Array.isArray(input) ? input.flat(Infinity) : [input];
-  const seen = new Set();
-  const out = [];
-  for (const item of arr) {
-    if (item == null) continue;
-    const s = String(toPlain(item));
-    if (/^-?\d+$/.test(s) && !seen.has(s)) { seen.add(s); out.push(s); }
-  }
-  return out;
-}
+// _normalizeRelationIdInputs is imported from public/lib/relation-id.js as normalizeRelationIds.
+// It is aliased here so existing call sites throughout server.js need no changes.
+// See that file for the canonical implementation and the 64-bit / negative-ID rules.
 
 function processValue(val, nodesMap, edgesMap) {
   if (!val || typeof val !== 'object') return;
@@ -2662,7 +2653,7 @@ app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
       SELECT *
       FROM ${req.pg.schema}.reference
       WHERE id = ANY($1::bigint[])
-      ORDER BY COALESCE(pubyear::text, '9999'), id
+      ORDER BY pubyear DESC NULLS LAST, id
     `;
     const result = await req.pg.pool.query(sql, [validIds]);
     res.json(result.rows);
@@ -2727,14 +2718,14 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
         FROM ${req.pg.schema}.reference r
         LEFT JOIN ${req.pg.schema}.scopus_data sd ON r.unique_id = sd.reference_id
         WHERE r.id = ANY($1::bigint[])
-        ORDER BY r.id, COALESCE(r.pubyear::text, '9999')
+        ORDER BY r.pubyear DESC NULLS LAST, r.id
       `;
     } else {
       sql = `
         SELECT *
         FROM ${req.pg.schema}.reference
         WHERE id = ANY($1::bigint[])
-        ORDER BY id, COALESCE(pubyear::text, '9999')
+        ORDER BY pubyear DESC NULLS LAST, id
       `;
     }
     const result = await req.pg.pool.query(sql, [validIds]);
@@ -3117,14 +3108,21 @@ app.get('/api/schema/columns', dbLimiter, authMiddleware, async (req, res) => {
 // ─── Raw SQL query (admin only) ───────────────────────────────────────────────
 app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { sql } = req.body;
+  let { sql } = req.body;
   if (!sql || typeof sql !== 'string') return res.status(400).json({ error: 'sql required' });
 
-  // ── Input validation (defence-in-depth for a read-only admin endpoint) ──────
+  // Replace {schema} placeholder with the user's actual PostgreSQL schema name
+  // so users can paste queries like: SELECT * FROM {schema}.reference LIMIT 10
+  if (req.pg && req.pg.schema) {
+    sql = sql.replace(/\{schema\}/g, req.pg.schema);
+  }
+
+  // ── Input validation (defence-in-depth for an admin endpoint) ────────────────
   // 1. Must start with SELECT or WITH (read-only statements only)
   const trimmed = sql.trim().toUpperCase();
-  if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('WITH')) {
-    return res.status(400).json({ error: 'Only SELECT / WITH queries are permitted' });
+  const isCreateIndex = trimmed.startsWith('CREATE INDEX');
+  if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('WITH') && !isCreateIndex) {
+    return res.status(400).json({ error: 'Only SELECT / WITH / CREATE INDEX queries are permitted' });
   }
   // 2. Reject stacked queries (semicolons allow injecting additional statements)
   if (sql.includes(';')) {
@@ -3135,7 +3133,11 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'SQL comments are not permitted' });
   }
   // 4. Reject write keywords even if hidden after a WITH clause
-  if (/(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXECUTE|COPY)/i.test(sql)) {
+  // CREATE INDEX is already gated above; other CREATE variants remain blocked
+  const writePattern = isCreateIndex
+    ? /(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|GRANT|REVOKE|EXECUTE|COPY)/i
+    : /(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXECUTE|COPY)/i;
+  if (writePattern.test(sql)) {
     return res.status(400).json({ error: 'Write operations are not permitted' });
   }
 
@@ -4188,80 +4190,9 @@ function _enrichCurrentGraphWithReferences(body) {
   return body;
 }
 
-// Fetch DB references for all relation IDs in a graph and merge into edges.
-// Runs server-side so the browser doesn't need to make a separate /api/references
-// round-trip before sending the summarize payload (was causing 1-2 min startup delay).
-async function _fetchAndMergeDbReferences(body, pg) {
-  const cg = body.NodeJSGraph || body.CurrentNodeJSGraph || body.current_graph;
-  if (!cg || !Array.isArray(cg.edges) || !pg) return body;
-
-  // For "selected" scope, only fetch references for selected edges (not all edges).
-  // This avoids fetching thousands of references for edges that won't be summarized.
-  const scope = body.scope || 'all';
-  const edgesToFetch = (scope === 'selected' && Array.isArray(cg.selectedEdges) && cg.selectedEdges.length > 0)
-    ? cg.selectedEdges
-    : cg.edges;
-
-  // Collect unique relation IDs from the relevant edges only.
-  // Use _normalizeRelationIdInputs — same logic as the /api/references tooltip endpoint,
-  // which handles negative IDs, 64-bit bigints (no Number() corruption), and toPlain() objects.
-  const rawIds = [];
-  edgesToFetch.forEach(e => {
-    if (e.relationId != null) rawIds.push(e.relationId);
-    if (Array.isArray(e.relationIds)) rawIds.push(...e.relationIds);
-  });
-  const idList = _normalizeRelationIdInputs(rawIds);
-  if (!idList.length) return body;
-
-  try {
-    const t0 = Date.now();
-    // Split into parallel chunks so large graphs don't block on a single huge query.
-    const CHUNK = 50;
-    const chunks = [];
-    for (let i = 0; i < idList.length; i += CHUNK) chunks.push(idList.slice(i, i + CHUNK));
-    const sql = `SELECT * FROM ${pg.schema}.reference WHERE id = ANY($1::bigint[]) ORDER BY COALESCE(pubyear::text,'9999'), id`;
-    const chunkResults = await Promise.all(chunks.map(chunk => pg.pool.query(sql, [chunk])));
-    const allRows = chunkResults.flatMap(r => r.rows);
-    const result = { rows: allRows };
-    console.log(`[agent proxy] fetched ${result.rows.length} references for ${idList.length} relation IDs in ${chunks.length} parallel chunk(s) in ${Date.now()-t0}ms`);
-
-    // Build lookup: relationId → [ref, ...]
-    const byId = {};
-    result.rows.forEach(row => {
-      const rid = String(row.id);
-      if (!byId[rid]) byId[rid] = [];
-      byId[rid].push(row);
-    });
-
-    // Dedup key
-    const refKey = r => JSON.stringify([(r.doi||'').toLowerCase().trim(), (r.pmid||'').toLowerCase().trim(), (r.msrc||r.sentence||'').toLowerCase().trim()]);
-
-    // Merge into only the edges we fetched for (selected edges or all edges)
-    edgesToFetch.forEach(edge => {
-      const dbRefs = [];
-      if (edge.relationId) { const r = byId[String(edge.relationId)]; if (r) dbRefs.push(...r); }
-      if (Array.isArray(edge.relationIds)) edge.relationIds.forEach(rid => { const r = byId[String(rid)]; if (r) dbRefs.push(...r); });
-      if (!dbRefs.length) return;
-
-      const seen = new Set((edge.references || []).map(refKey));
-      const merged = [...(edge.references || [])];
-      dbRefs.forEach(r => { const k = refKey(r); if (!seen.has(k)) { seen.add(k); merged.push(r); } });
-      // Clean empty values
-      edge.references = merged.map(ref => {
-        const out = {};
-        for (const [k, v] of Object.entries(ref)) {
-          if (v === null || v === undefined || v === '') continue;
-          if (Array.isArray(v) && v.length === 0) continue;
-          out[k] = v;
-        }
-        return out;
-      });
-    });
-  } catch (err) {
-    console.warn('[agent proxy] DB reference fetch failed (continuing without):', err.message);
-  }
-  return body;
-}
+// _fetchAndMergeDbReferences and normalizeRelationIds are imported from
+// public/lib/relation-id.js (see require() at the top of this file).
+// Edit that file — not here — to change reference-fetching behaviour.
 
 // Proxy all /api/agent/* requests to the Python service
 app.all('/api/agent/*', dbLimiter, authMiddleware, async (req, res) => {
@@ -5340,7 +5271,7 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
   // drug (not one query per drug), then re-grouped back out per drug below —
   // avoids N round trips for a result set that can easily have dozens of drugs.
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(s => /^\d+$/.test(String(s)));
+    .filter(s => _normalizeRelationIdInputs([s]).length > 0);
   const rowsByRelId = new Map();
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
@@ -5553,7 +5484,7 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   // Same batched Postgres lookup as find-drugs-report: one query for every
   // RelationID across every group, re-aggregated per group below.
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(s => /^\d+$/.test(String(s)));
+    .filter(s => _normalizeRelationIdInputs([s]).length > 0);
   const rowsByRelId = new Map();
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
@@ -5853,7 +5784,7 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
 
   // Same batched Postgres reference/snippet lookup as common-neighbors-report.
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(s => /^\d+$/.test(String(s)));
+    .filter(s => _normalizeRelationIdInputs([s]).length > 0);
   const rowsByRelId = new Map();
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
