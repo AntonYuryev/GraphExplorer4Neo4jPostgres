@@ -1218,6 +1218,10 @@ def calc_relation_id(inref=None, inoutref=None, outref=None,
 #  LLM helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Placeholder the frontend uses to indicate "key is saved server-side, don't echo it".
+# _effective_llm must never let this propagate as a real API key value.
+_MASKED_KEY_PLACEHOLDER = "•" * 8   # '••••••••'
+
 def _effective_llm(override: Optional[Dict]) -> Dict:
     """Layers three sources, lowest to highest priority:
       1. _state['llm']       — shared/admin-configured defaults
@@ -1229,13 +1233,18 @@ def _effective_llm(override: Optional[Dict]) -> Dict:
          out a new key the user hasn't clicked Save on yet
     Empty-string / None values never clobber an already-set value from a
     lower-priority source, so a request that omits apikey still resolves to
-    the per-user stored key rather than wiping it out."""
+    the per-user stored key rather than wiping it out.
+    The masked placeholder '••••••••' is also skipped — the frontend sends it
+    when the saved key is already on the server and should not be echoed back."""
+    def _keep(v: Any) -> bool:
+        return v is not None and v != "" and v != _MASKED_KEY_PLACEHOLDER
+
     base = dict(_state["llm"])
     base.update({k: v for k, v in _resolve_llm_cfg(_current_username.get()).items()
-                 if v is not None and v != ""})
+                 if _keep(v)})
     if override:
         base.update({k: v for k, v in override.items()
-                     if v is not None and v != ""})
+                     if _keep(v)})
     return base
 
 def _is_gemini_model(model: str) -> bool:
@@ -1274,12 +1283,49 @@ def _openai_client(llm: Dict):
     kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
-    # Portkey / Cerebus gateway: auth travels in x-portkey-api-key, not Authorization.
-    # Detect by URL hostname so users don't need extra config.
+    # Portkey cloud (api.portkey.ai) uses x-portkey-api-key for auth.
+    # Cerebus (Elsevier's internal gateway) exposes an OpenAI-compatible endpoint
+    # and uses standard Authorization: Bearer <key> — the key goes in api_key, not
+    # a custom header. Keep x-portkey-api-key only for portkey.ai itself.
     url_lower = (base_url or url or "").lower()
-    if "portkey" in url_lower or "cerebus" in url_lower:
+    if "portkey.ai" in url_lower:
         kwargs["api_key"]          = "sk-portkey"          # SDK requires non-empty; ignored by gateway
         kwargs["default_headers"]  = {"x-portkey-api-key": api_key}
+        log.info("[openai_client] Portkey.ai gateway: base_url=%s key_len=%d key_prefix=%s",
+                 base_url, len(api_key), api_key[:4] if api_key else "(empty)")
+    elif "cerebus" in url_lower:
+        # Cerebus is a Portkey-based gateway. Requires x-portkey-api-key + x-portkey-provider.
+        # Provider is extracted from model name: @sandbox-shared-<provider>/<model>
+        # Falls back to a lookup table for known providers if pattern doesn't match.
+        _CEREBUS_PROVIDER_HINTS = {
+            "gpt": "openai", "o1": "openai", "o3": "openai", "o4": "openai",
+            "gemini": "google", "palm": "google",
+            "claude": "anthropic",
+            "llama": "meta", "mistral": "mistral", "mixtral": "mistral",
+            "command": "cohere", "embed": "cohere",
+        }
+        portkey_provider = ""
+        if "@sandbox-shared-" in model:
+            try:
+                portkey_provider = model.split("@sandbox-shared-")[1].split("/")[0]
+            except Exception:
+                pass
+        if not portkey_provider:
+            # Fallback: infer from model name keywords
+            model_lower = model.lower()
+            for hint, provider in _CEREBUS_PROVIDER_HINTS.items():
+                if hint in model_lower:
+                    portkey_provider = provider
+                    break
+        cerebus_headers: Dict[str, str] = {"x-portkey-api-key": api_key}
+        if portkey_provider:
+            cerebus_headers["x-portkey-provider"] = portkey_provider
+        else:
+            log.warning("[openai_client] Cerebus: could not infer x-portkey-provider from model=%r — call may fail", model)
+        kwargs["api_key"]         = "sk-portkey"   # non-empty placeholder; actual auth via headers
+        kwargs["default_headers"] = cerebus_headers
+        log.info("[openai_client] Cerebus/Portkey gateway: base_url=%s provider=%s key_len=%d key_prefix=%s",
+                 base_url, portkey_provider, len(api_key), api_key[:4] if api_key else "(empty)")
     return _openai_mod.OpenAI(**kwargs)
 
 # Text2Cypher action-parsing helpers (_strip_actions_from_reply, _extract_action,
@@ -1374,15 +1420,25 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
         # uvicorn's async event loop — mirrors the entity-lookup timeout pattern.
         client = _openai_client(llm)
         oai_messages = [{"role": "system", "content": sp}] + messages
+        # Newer OpenAI models (o1, o3, gpt-5.x, etc.) require max_completion_tokens
+        # instead of max_tokens. Detect by trying to infer from the model name.
+        _use_completion_tokens = any(
+            pat in model.lower() for pat in ("o1", "o3", "gpt-5", "gpt5")
+        ) or any(
+            pat in model for pat in ("/o1", "/o3", "/gpt-5", "/gpt5")
+        )
+        _max_tokens_key = "max_completion_tokens" if _use_completion_tokens else "max_tokens"
         kwargs_oai: Dict[str, Any] = dict(
             model=model,
             messages=oai_messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
+            **{_max_tokens_key: max_tokens},
             timeout=call_timeout,
         )
-        if top_p < 1.0:
-            kwargs_oai["top_p"] = top_p
+        # Newer reasoning models don't support temperature/top_p
+        if not _use_completion_tokens:
+            kwargs_oai["temperature"] = temperature
+            if top_p < 1.0:
+                kwargs_oai["top_p"] = top_p
         if model.startswith("gemini-2.5"):
             # Trim how much of the token budget goes to invisible reasoning so
             # more is left for the visible answer (see max_tokens note above).
@@ -1561,8 +1617,11 @@ def ping_llm(req: PingRequest = None):
             if not HAS_OPENAI:
                 return {"ok": False, "error": "openai package not installed — run: pip install openai"}
             client   = _openai_client(llm)
+            _ping_max_key = "max_completion_tokens" if any(
+                p in model.lower() for p in ("o1", "o3", "gpt-5", "gpt5")
+            ) or any(p in model for p in ("/o1", "/o3", "/gpt-5", "/gpt5")) else "max_tokens"
             response = client.chat.completions.create(
-                model=model, max_tokens=16,
+                model=model, **{_ping_max_key: 16},
                 messages=[
                     {"role": "system", "content": "Reply with only the word PONG."},
                     {"role": "user",   "content": "ping"},
