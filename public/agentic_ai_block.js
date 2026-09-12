@@ -3,6 +3,48 @@
 // AGENTIC AI — frontend module
 // ================================================================================
 
+// ── Panel resize (drag left border) ─────────────────────────────────────────
+(function () {
+  var MIN_W = 320;
+  var MAX_W = Math.round(window.innerWidth * 0.92);
+  var _dragging = false;
+  var _startX, _startW;
+
+  document.addEventListener('DOMContentLoaded', function () {
+    var resizer = document.getElementById('agentic-panel-resizer');
+    var panel   = document.getElementById('agentic-panel');
+    if (!resizer || !panel) return;
+
+    // Restore saved width
+    var saved = localStorage.getItem('agentPanelWidth');
+    if (saved && Number(saved) >= MIN_W) panel.style.width = saved + 'px';
+
+    resizer.addEventListener('mousedown', function (e) {
+      e.preventDefault();
+      _dragging = true;
+      _startX   = e.clientX;
+      _startW   = panel.offsetWidth;
+      document.body.style.cursor    = 'ew-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', function (e) {
+      if (!_dragging) return;
+      var delta = _startX - e.clientX;          // dragging left → delta > 0 → wider
+      var newW  = Math.min(Math.max(_startW + delta, MIN_W), Math.round(window.innerWidth * 0.92));
+      panel.style.width = newW + 'px';
+    });
+
+    document.addEventListener('mouseup', function () {
+      if (!_dragging) return;
+      _dragging = false;
+      document.body.style.cursor    = '';
+      document.body.style.userSelect = '';
+      localStorage.setItem('agentPanelWidth', panel.offsetWidth);
+    });
+  });
+}());
+
 // ── State ────────────────────────────────────────────────────────────────────
 var _agentPanelOpen    = false;
 var _summarizeRenderCount = 0;  // incremented per _renderSummarizeReply call for unique TOC anchor ids
