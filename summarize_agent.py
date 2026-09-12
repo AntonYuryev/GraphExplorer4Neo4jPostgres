@@ -1,4 +1,5 @@
 import re
+import time
 import contextvars
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Annotated, DefaultDict
@@ -247,7 +248,11 @@ class SummarizeRequest(BaseModel):
       if self.scope == "selected":
           edges = (self.NodeJSGraph.get("selectedEdges") or [])
           selected_nodes_urns = [n.get("urn") for n in self.NodeJSGraph.get("selectedNodes")]
-          my_edges = edges + self.edges4(selected_nodes_urns) # will take all edges of selected nodes. not only those selected 
+          # Merge selectedEdges + edges of selected nodes, deduplicating by id
+          # (an edge selected explicitly AND connected to a selected node would appear twice otherwise)
+          seen_ids: set = {e.get("id") for e in edges if e.get("id") is not None}
+          extra = [e for e in self.edges4(selected_nodes_urns) if e.get("id") not in seen_ids]
+          my_edges = edges + extra  # will take all edges of selected nodes, not only those selected
       else:
           my_edges = self.NodeJSGraph.get("edges") or []
       
@@ -374,12 +379,9 @@ class SummarizeRequest(BaseModel):
       [(focus_nodes_notin_graph,focus_nodes_in_graph)[node in graph_nodes].append(node) for node in _4focus_nodes]
 
       # adding all edges for focus nodes in in_graph
-      selected_rels = in_graph.graph.get_neighbors_rels(focus_nodes_in_graph)
-      if not selected_rels and self.scope == "selected":
-          # if no edges were found for focus nodes in the selected graph, 
-          # fall back to all edges in the selected graph
-          selected_rels = in_graph.rels()
-      
+      selected_rels = in_graph.rels() # in_graph here is either selected graph or entire graph
+      selected_rels.update(in_graph.graph.get_neighbors_rels(focus_nodes_in_graph))
+
       # now adding refs for focus nodes that are not in in_graph
       search_node_terms = set()
       for node in focus_nodes_notin_graph:
@@ -465,7 +467,7 @@ class SummarizeRequest(BaseModel):
       tokenized_message = tokenize(str(self.message or ""))
       tokenized_message = [w for w in tokenized_message if w not in _STOP_WORDS]
       context_nodes = set()
-      for i in range(len(tokenized_message)-3):
+      for i in range(len(tokenized_message)-2):
           onegram = tokenized_message[i:i+1][0]
           onegram_nodes = self.context_dict.get(onegram, set())
           if onegram_nodes: 
@@ -483,10 +485,13 @@ class SummarizeRequest(BaseModel):
 
       # last resort to get context nodes from the last two or one token(s) of the message 
       # if no context nodes were found in the previous loop
-      if not context_nodes:
-          context_nodes = self.context_dict.get(" ".join(tokenized_message[-2:]), set())
-          if not context_nodes:
-              context_nodes = self.context_dict.get(" ".join(tokenized_message[-1:]), set())
+      last_gram_nodes = self.context_dict.get(" ".join(tokenized_message[-2:-1]), set())
+      if last_gram_nodes:
+        context_nodes.update(last_gram_nodes)
+      else:
+         last2gram_nodes = self.context_dict.get(" ".join(tokenized_message[-2:]), set())
+         if last2gram_nodes:
+          context_nodes.update(last2gram_nodes)
 
   # finding and including ontology children for context nodes
       if context_nodes:
@@ -693,7 +698,8 @@ Make sure to mention {graph2analyze.name()} and {context_names}."""
         if is_followup:
           prompts.append(self.focus_section("follow-up", graph2analyze, context_nodes))
         else:
-          for mode in ["introduction", "molecular_cell", "physiology", "organ_system"]:
+          sections = ["introduction", "molecular_cell", "physiology", "organ_system"]
+          for mode in sections:
             prompts.append(prompt+self.focus_section(mode, graph2analyze, context_nodes))
 
       # Strings are immutable — `p += ...` in a for-loop rebinds the local var
@@ -840,71 +846,80 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
 
     @app.post("/summarize-chat")
     def summarize_chat(req: SummarizeRequest):
-        log = _runtime_("log")
+      log = _runtime_("log")
+      try:
+        llm = _runtime_("effective_llm")(req.llm)
+        # Neo4j schema (node labels / relationship types) is loaded into memory
+        # once at app startup (server.js pushes it to agent_service.py's /schema
+        # endpoint) — populate it here from that shared runtime state rather
+        # than requiring the frontend to resend it on every chat turn.
+        req.neo4j_node_types = _runtime_("neo4j_node_types")()
+        req.neo4j_relation_types = _runtime_("neo4j_relation_types")()
+        is_followup = False
+        if req.history:
+          is_followup = True
+        elif req.scope != "selected" and req.message:
+          # if req.scope == "selected" agent gets default message but it's not considered a follow-up
+          is_followup = True
+
+        req.init_resnet_graph()
         try:
-            llm = _runtime_("effective_llm")(req.llm)
-            is1st_turn = not req.history
+          req._default_context_()
+        except Exception as _ctx_err:
+          print(f'[summarize_agent] _default_context_ failed — continuing without Neo4j context: {_ctx_err}')
+        messages: List[Dict] = [{"role": m.role, "content": m.content} for m in req.history]
+        messages.append({"role": "user", "content": req.message})
 
-            # Neo4j schema (node labels / relationship types) is loaded into memory
-            # once at app startup (server.js pushes it to agent_service.py's /schema
-            # endpoint) — populate it here from that shared runtime state rather
-            # than requiring the frontend to resend it on every chat turn.
-            req.neo4j_node_types = _runtime_("neo4j_node_types")()
-            req.neo4j_relation_types = _runtime_("neo4j_relation_types")()
+        intro_line, system_prompts, num_refs = req._system_prompts_(is_followup = is_followup)
 
-            req.init_resnet_graph()
-            try:
-                req._default_context_()
-            except Exception as _ctx_err:
-                print(f'[summarize_agent] _default_context_ failed — continuing without Neo4j context: {_ctx_err}')
-            messages: List[Dict] = [{"role": m.role, "content": m.content} for m in req.history]
-            messages.append({"role": "user", "content": req.message})
+        # Guard: _system_prompts_ may return an error string instead of a list
+        if not isinstance(system_prompts, list) or not system_prompts:
+            return {"reply": intro_line, "llm_reference_count": 0, "was_truncated": False}
 
-            intro_line, system_prompts, num_refs = req._system_prompts_(is_followup=not is1st_turn)
+        futures = []
+        reply_text = intro_line
+        was_truncated = False
+        # Each worker thread needs its OWN copy of the current context so that
+        # _current_username (a ContextVar) is visible inside _call_llm's fallback
+        # path.  A single copy cannot be entered by more than one thread at once,
+        # so we call copy_context() once per prompt to get distinct objects.
+        # Stagger submissions to avoid hitting Cerebus/Portkey rate limits.
+        # Each section is submitted with a short delay so concurrent bursts
+        # don't trigger 429 errors. Adjust SECTION_STAGGER_SECS as needed.
+        SECTION_STAGGER_SECS = 3.0
+        n_workers = max(1, len(system_prompts))
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            for i, prompt in enumerate(system_prompts):
+                if i > 0:
+                    time.sleep(SECTION_STAGGER_SECS)
+                thread_ctx = contextvars.copy_context()
+                futures.append(executor.submit(thread_ctx.run, _call_summarize_llm, messages, llm, prompt))
 
-            # Guard: _system_prompts_ may return an error string instead of a list
-            if not isinstance(system_prompts, list) or not system_prompts:
-                return {"reply": intro_line, "llm_reference_count": 0, "was_truncated": False}
+            for future in futures:
+                try:
+                    prompt_reply, prompt_reply_was_truncated = future.result()
+                    if prompt_reply_was_truncated:
+                        was_truncated = True
+                    # Strip leading markdown section headers (## Organ System\n etc.)
+                    # before checking for the "No information available" sentinel,
+                    # because the LLM wraps the sentinel in a header line.
+                    _reply_body = re.sub(r'^#+[^\n]*\n?', '', prompt_reply.strip(),
+                                          flags=re.MULTILINE).strip()
+                    if prompt_reply and not _reply_body.lower().startswith("no information available"):
+                        reply_text += "\n\n" + prompt_reply
+                except Exception as section_exc:
+                    log.error("Section LLM call failed: %s", section_exc, exc_info=True)
+                    reply_text += "\n\n(Section could not be generated: " + str(section_exc) + ")"
 
-            futures = []
-            reply_text = intro_line
-            was_truncated = False
-            # Each worker thread needs its OWN copy of the current context so that
-            # _current_username (a ContextVar) is visible inside _call_llm's fallback
-            # path.  A single copy cannot be entered by more than one thread at once,
-            # so we call copy_context() once per prompt to get distinct objects.
-            n_workers = max(1, len(system_prompts))
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                for prompt in system_prompts:
-                    thread_ctx = contextvars.copy_context()
-                    futures.append(executor.submit(thread_ctx.run, _call_summarize_llm, messages, llm, prompt))
-
-                for future in futures:
-                    try:
-                        prompt_reply, prompt_reply_was_truncated = future.result()
-                        if prompt_reply_was_truncated:
-                            was_truncated = True
-                        # Strip leading markdown section headers (## Organ System\n etc.)
-                        # before checking for the "No information available" sentinel,
-                        # because the LLM wraps the sentinel in a header line.
-                        _reply_body = re.sub(r'^#+[^\n]*\n?', '', prompt_reply.strip(),
-                                             flags=re.MULTILINE).strip()
-                        if prompt_reply and not _reply_body.lower().startswith("no information available"):
-                            reply_text += "\n\n" + prompt_reply
-                    except Exception as section_exc:
-                        log.error("Section LLM call failed: %s", section_exc, exc_info=True)
-                        reply_text += "\n\n(Section could not be generated: " + str(section_exc) + ")"
-
-            return {
-                "reply": reply_text,
-                "llm_reference_count": num_refs,
-                "was_truncated": was_truncated
-            }
-
-        except Exception as exc:
-            log.error("Unhandled error in /summarize-chat: %s", exc, exc_info=True)
-            from fastapi import HTTPException
-            raise HTTPException(status_code=500, detail=str(exc))
+        return {
+            "reply": reply_text,
+            "llm_reference_count": num_refs,
+            "was_truncated": was_truncated
+        }
+      except Exception as exc:
+        log.error("Unhandled error in /summarize-chat: %s", exc, exc_info=True)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 def to_root_noun(word:str):
