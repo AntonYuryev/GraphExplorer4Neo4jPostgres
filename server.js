@@ -4215,9 +4215,15 @@ async function _fetchAndMergeDbReferences(body, pg) {
 
   try {
     const t0 = Date.now();
+    // Split into parallel chunks so large graphs don't block on a single huge query.
+    const CHUNK = 50;
+    const chunks = [];
+    for (let i = 0; i < idList.length; i += CHUNK) chunks.push(idList.slice(i, i + CHUNK));
     const sql = `SELECT * FROM ${pg.schema}.reference WHERE id = ANY($1::bigint[]) ORDER BY COALESCE(pubyear::text,'9999'), id`;
-    const result = await pg.pool.query(sql, [idList]);
-    console.log(`[agent proxy] fetched ${result.rows.length} references for ${idList.length} relation IDs in ${Date.now()-t0}ms`);
+    const chunkResults = await Promise.all(chunks.map(chunk => pg.pool.query(sql, [chunk])));
+    const allRows = chunkResults.flatMap(r => r.rows);
+    const result = { rows: allRows };
+    console.log(`[agent proxy] fetched ${result.rows.length} references for ${idList.length} relation IDs in ${chunks.length} parallel chunk(s) in ${Date.now()-t0}ms`);
 
     // Build lookup: relationId → [ref, ...]
     const byId = {};
