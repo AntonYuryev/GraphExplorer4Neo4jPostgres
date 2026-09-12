@@ -362,10 +362,10 @@
            pathway. Semicolon-separate multiple names to search for several
            at once. Matches are added directly to the current graph. -->
       <div id="quick-node-search" style="position:relative;display:flex;align-items:center;gap:4px;margin-left:16px">
-        <input type="text" id="qns-input" placeholder="Quick node search…" spellcheck="true" autocomplete="off"
-          oninput="_qnsOnInput(this)" onkeydown="_qnsHandleKeydown(event)" onblur="setTimeout(_qnsHideSuggestions,150)"
-          style="width:190px;background:#12162a;border:1px solid #2d3452;border-radius:4px;color:#c8ccdc;font-size:11px;padding:4px 8px">
-        <button onclick="quickNodeSearch()" title="Search for these node name(s)/alias(es)"
+        <input type="text" id="qns-input" placeholder="Node name, or paste list…" spellcheck="false" autocomplete="off"
+          oninput="_qnsOnInput(this)" onkeydown="_qnsHandleKeydown(event)" onpaste="_qnsOnPaste(event,this)" onblur="setTimeout(_qnsHideSuggestions,150)"
+          style="width:190px;transition:width .15s ease;background:#12162a;border:1px solid #2d3452;border-radius:4px;color:#c8ccdc;font-size:11px;padding:4px 8px">
+        <button onclick="quickNodeSearch()" title="Search for node name(s). Paste a semicolon-, comma-, or newline-separated list to find multiple nodes at once."
           style="background:none;border:none;color:#7a8099;cursor:pointer;font-size:14px;padding:2px 4px;line-height:1">🔍</button>
         <!-- Fixed width (not min-width) is deliberate: some matched node
              Names are very long (e.g. peptide sequences), and with only a
@@ -1628,10 +1628,13 @@
   <div id="ontology-analysis-modal" style="display:none;position:fixed;inset:0;background:transparent;z-index:4000;pointer-events:none">
     <div id="ontology-analysis-box" style="position:fixed;left:24px;top:70px;background:#1a2035;border:1px solid #2a3555;border-radius:10px;width:640px;max-width:95vw;max-height:82vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px #000c;pointer-events:auto">
       <!-- Header — also the drag handle (see _makeDialogDraggable in app.js) -->
-      <div id="ontology-analysis-draghandle" style="display:flex;align-items:center;justify-content:space-between;padding:13px 18px;border-bottom:1px solid #2a3555;flex-shrink:0;cursor:move" title="Drag to move this dialog">
-        <span style="font-size:14px;font-weight:600;color:#e8ecf3">Ontology Analysis</span>
-        <span id="ontology-scope-badge" style="font-size:11px;color:#7a8099;margin-left:10px"></span>
-        <div style="display:flex;align-items:center;gap:18px">
+      <div id="ontology-analysis-draghandle" style="display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid #2a3555;flex-shrink:0;cursor:move;user-select:none" title="Drag to move this dialog">
+        <!-- flex:1 wrapper = the entire left region is a drag target -->
+        <div style="display:flex;align-items:center;flex:1;min-width:0;gap:8px;overflow:hidden">
+          <span style="font-size:14px;font-weight:600;color:#e8ecf3;white-space:nowrap">Ontology Analysis</span>
+          <span id="ontology-scope-badge" style="font-size:11px;color:#7a8099;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:18px;flex-shrink:0">
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#7a8099;cursor:pointer">
             <input type="radio" name="ontology-layout" value="hierarchical" checked onchange="setOntologyLayout('hierarchical')" style="accent-color:#4f8ef7">
             Hierarchical
@@ -1704,6 +1707,21 @@
         <label style="font-size:12px;color:#a0a8c4;white-space:nowrap">Maximum path length</label>
         <input type="number" id="cnc-sp-maxlen" min="1" max="15" value="2"
           style="width:70px;background:#1a1e33;border:1px solid #2a2f4a;color:#c8ccdc;padding:5px 7px;border-radius:4px;font-size:12px">
+      </div>
+
+      <!-- Shown only for Expand Selected Nodes — lets user choose which
+           direction of edges to follow when expanding the graph. -->
+      <div id="cnc-expand-direction-row" style="display:none;align-items:center;gap:16px;margin-bottom:12px">
+        <span style="font-size:12px;color:#a0a8c4;white-space:nowrap">Direction</span>
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#c8ccdc;cursor:pointer">
+          <input type="radio" name="cnc-expand-dir" value="both" checked> Both
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#c8ccdc;cursor:pointer">
+          <input type="radio" name="cnc-expand-dir" value="downstream"> Downstream &#x2192;
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#c8ccdc;cursor:pointer">
+          <input type="radio" name="cnc-expand-dir" value="upstream"> &#x2190; Upstream
+        </label>
       </div>
 
       <!-- Node types / Relation types as tabs, not one long scrolling page —
@@ -2020,6 +2038,7 @@
 <script src="/vendor/jszip.min.js"></script>
 <script src="/vendor/d3.min.js"></script>
 <script src="/vendor/d3-sankey.min.js"></script>
+<script src="/lib/relation-id.js"></script>
 <script src="app.js"></script>
 <script src="../agentic_ai_block.js"></script>
 
