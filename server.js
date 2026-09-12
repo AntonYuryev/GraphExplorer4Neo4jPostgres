@@ -11,6 +11,7 @@ const http = require('http');
 const rateLimit = require('express-rate-limit');
 const _crypto   = require('crypto');
 const FlexSearch = require('flexsearch');
+const { calcRelationId, myhash: _myhash } = require('./public/lib/relation-id');
 
 // ── Log injection hardening (CodeQL: js/log-injection, CWE-117) ───────────────
 // Many log calls throughout this file interpolate request-derived or
@@ -4187,8 +4188,75 @@ function _enrichCurrentGraphWithReferences(body) {
   return body;
 }
 
+// Fetch DB references for all relation IDs in a graph and merge into edges.
+// Runs server-side so the browser doesn't need to make a separate /api/references
+// round-trip before sending the summarize payload (was causing 1-2 min startup delay).
+async function _fetchAndMergeDbReferences(body, pg) {
+  const cg = body.NodeJSGraph || body.CurrentNodeJSGraph || body.current_graph;
+  if (!cg || !Array.isArray(cg.edges) || !pg) return body;
+
+  // For "selected" scope, only fetch references for selected edges (not all edges).
+  // This avoids fetching thousands of references for edges that won't be summarized.
+  const scope = body.scope || 'all';
+  const edgesToFetch = (scope === 'selected' && Array.isArray(cg.selectedEdges) && cg.selectedEdges.length > 0)
+    ? cg.selectedEdges
+    : cg.edges;
+
+  // Collect unique relation IDs from the relevant edges only
+  const allIds = new Set();
+  edgesToFetch.forEach(e => {
+    if (e.relationId) allIds.add(e.relationId);
+    if (Array.isArray(e.relationIds)) e.relationIds.forEach(id => allIds.add(id));
+  });
+  const idList = Array.from(allIds).map(Number).filter(n => Number.isFinite(n) && n > 0);
+  if (!idList.length) return body;
+
+  try {
+    const t0 = Date.now();
+    const sql = `SELECT * FROM ${pg.schema}.reference WHERE id = ANY($1::bigint[]) ORDER BY COALESCE(pubyear::text,'9999'), id`;
+    const result = await pg.pool.query(sql, [idList]);
+    console.log(`[agent proxy] fetched ${result.rows.length} references for ${idList.length} relation IDs in ${Date.now()-t0}ms`);
+
+    // Build lookup: relationId → [ref, ...]
+    const byId = {};
+    result.rows.forEach(row => {
+      const rid = String(row.id);
+      if (!byId[rid]) byId[rid] = [];
+      byId[rid].push(row);
+    });
+
+    // Dedup key
+    const refKey = r => JSON.stringify([(r.doi||'').toLowerCase().trim(), (r.pmid||'').toLowerCase().trim(), (r.msrc||r.sentence||'').toLowerCase().trim()]);
+
+    // Merge into only the edges we fetched for (selected edges or all edges)
+    edgesToFetch.forEach(edge => {
+      const dbRefs = [];
+      if (edge.relationId) { const r = byId[String(edge.relationId)]; if (r) dbRefs.push(...r); }
+      if (Array.isArray(edge.relationIds)) edge.relationIds.forEach(rid => { const r = byId[String(rid)]; if (r) dbRefs.push(...r); });
+      if (!dbRefs.length) return;
+
+      const seen = new Set((edge.references || []).map(refKey));
+      const merged = [...(edge.references || [])];
+      dbRefs.forEach(r => { const k = refKey(r); if (!seen.has(k)) { seen.add(k); merged.push(r); } });
+      // Clean empty values
+      edge.references = merged.map(ref => {
+        const out = {};
+        for (const [k, v] of Object.entries(ref)) {
+          if (v === null || v === undefined || v === '') continue;
+          if (Array.isArray(v) && v.length === 0) continue;
+          out[k] = v;
+        }
+        return out;
+      });
+    });
+  } catch (err) {
+    console.warn('[agent proxy] DB reference fetch failed (continuing without):', err.message);
+  }
+  return body;
+}
+
 // Proxy all /api/agent/* requests to the Python service
-app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
+app.all('/api/agent/*', dbLimiter, authMiddleware, async (req, res) => {
   if (!_agentReady) {
     if (AGENT_AUTOSTART && !_agentRestarting) {
       _startAgentService();
@@ -4196,17 +4264,26 @@ app.all('/api/agent/*', dbLimiter, authMiddleware, (req, res) => {
     return res.status(503).json({ error: 'Agentic AI service is starting — please wait a moment and retry' });
   }
   const agentPath = req.url.replace(/^\/api\/agent/, '');
-  
-  // Enrich current_graph with references from inline edge data before proxying
+
+  // Enrich current_graph: inline refs (sync) then DB refs (async, server-side)
   if (req.body && agentPath.includes('/summarize-chat')) {
+    const _tEnrich = Date.now();
     req.body = _enrichCurrentGraphWithReferences(req.body);
+    console.log(`[agent proxy] inline-ref enrich: ${Date.now()-_tEnrich}ms`);
+    const _tDb = Date.now();
+    req.body = await _fetchAndMergeDbReferences(req.body, req.pg);
+    console.log(`[agent proxy] DB-ref fetch+merge: ${Date.now()-_tDb}ms`);
   }
-  
+
   // Express body-parser has already consumed req's stream, so we must re-serialise
   // req.body and set an accurate Content-Length instead of piping the raw stream.
+  const _tSerial = Date.now();
   const bodyStr = (req.method !== 'GET' && req.method !== 'HEAD' && req.body !== undefined)
     ? JSON.stringify(req.body)
     : null;
+  if (agentPath.includes('/summarize-chat')) {
+    console.log(`[agent proxy] JSON serialise: ${Date.now()-_tSerial}ms | body: ${bodyStr ? (bodyStr.length/1024).toFixed(1)+'KB' : 'none'}`);
+  }
 
   // x-ge-username is set here (never trusted from the client) so agent_service.py
   // can resolve THIS user's own Neo4j/Postgres credentials for its cypher/postgres
@@ -4705,30 +4782,8 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
 //  RELATION CURATION  ──  Create / Edit relations from the UI
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── RelationID hashing (mirrors Python myhash) ─────────────────────────────────
-function _myhash(text) {
-  const buf = Buffer.from(String(text), 'utf8');
-  const d   = _crypto.createHash('md5').update(buf).digest();
-  const high = d.readBigUInt64BE(0);
-  const low  = d.readBigUInt64BE(8);
-  const MASK = BigInt('0x7FFFFFFFFFFFFFFF');
-  let r = high ^ low;
-  if (r > MASK) r = -(r & MASK);
-  return r.toString();
-}
-
-// Reproduce Python's str() representation of a list/string so the hash matches.
-function _pyRepr(val) {
-  if (Array.isArray(val)) {
-    if (!val.length) return '[]';
-    // NodeIDs are integers — output as int literals (no quotes), matching Python str(list[int])
-    return '[' + val.map(v => {
-      const s = String(v);
-      return /^-?\d+$/.test(s) ? s : ("'" + s.replace(/\\/g,'\\\\').replace(/'/g,"\\'") + "'");
-    }).join(', ') + ']';
-  }
-  return "'" + String(val).replace(/\\/g,'\\\\').replace(/'/g,"\\'") + "'";
-}
+// ── calcRelationId and myhash are imported from public/lib/relation-id.js ──────
+// (required at the top of this file alongside other CommonJS imports)
 
 // ── Reference unique_id computation (mirrors Python readresnet.py) ─────────────
 // Column order matches Python's REF_COLUMNS (positions 1..43; 0=unique_id, 44=id)
@@ -4779,20 +4834,6 @@ function _computeUniqueRef(ref, uniqueIdBigInt) {
   const hashIdx = textref.indexOf('#');
   const base = hashIdx >= 0 ? textref.slice(0, hashIdx) : textref;
   return /\d/.test(base) ? base : uniqueIdBigInt.toString();
-}
-
-function calcRelationId({ inref=[], inoutref=[], outref=[], control_type='',
-                          ontology='', relationship='', effect='', mechanism='' }) {
-  // Lists sorted descending (matches Python .sort(reverse=True)) using BigInt for 64-bit NodeIDs
-  const bigSort = (a, b) => { const x = BigInt(String(a)), y = BigInt(String(b)); return x < y ? 1 : x > y ? -1 : 0; };
-  const s = '(' + [
-    _pyRepr([...inref  ].sort(bigSort)),
-    _pyRepr([...inoutref].sort(bigSort)),
-    _pyRepr([...outref ].sort(bigSort)),
-    _pyRepr(control_type), _pyRepr(ontology),
-    _pyRepr(relationship), _pyRepr(effect.toLowerCase()), _pyRepr(mechanism)
-  ].join(', ') + ')';
-  return _myhash(s);
 }
 
 // GET /api/schema/relation-types  — distinct Neo4j relationship types
@@ -5715,9 +5756,15 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
       `;
       cypherParams = { anchors: safeAnchors, ...propParams };
     } else { // 'expand'
+      // direction: 'downstream' → (a)-[r]->(d), 'upstream' → (a)<-[r]-(d), default both
+      const expandPattern = direction === 'downstream'
+        ? `(a {\`${NEO4J_URN_PROP}\`: aURN})-[r${relTypeClause}]->(d)`
+        : direction === 'upstream'
+        ? `(a {\`${NEO4J_URN_PROP}\`: aURN})<-[r${relTypeClause}]-(d)`
+        : `(a {\`${NEO4J_URN_PROP}\`: aURN})-[r${relTypeClause}]-(d)`;
       cypher = `
         UNWIND $anchors AS aURN
-        MATCH (a {\`${NEO4J_URN_PROP}\`: aURN})-[r${relTypeClause}]-(d)
+        MATCH ${expandPattern}
         WHERE NOT d.\`${NEO4J_URN_PROP}\` IN $anchors${nodeTypeClause}${propFilterClause}
         WITH DISTINCT d, a, r
         RETURN d, collect({target: a, rel: r}) AS links
