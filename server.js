@@ -4208,7 +4208,10 @@ async function _fetchAndMergeDbReferences(body, pg) {
     if (e.relationId) allIds.add(e.relationId);
     if (Array.isArray(e.relationIds)) e.relationIds.forEach(id => allIds.add(id));
   });
-  const idList = Array.from(allIds).map(Number).filter(n => Number.isFinite(n) && n > 0);
+  // Keep IDs as strings — relation IDs are 64-bit integers that exceed Number.MAX_SAFE_INTEGER,
+  // so converting via Number() silently corrupts them. PostgreSQL accepts string values fine
+  // when the column is cast to bigint[] in the query.
+  const idList = Array.from(allIds).map(String).filter(s => /^\d+$/.test(s) && s !== '0');
   if (!idList.length) return body;
 
   try {
