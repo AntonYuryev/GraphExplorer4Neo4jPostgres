@@ -83,55 +83,19 @@ async function agentSend() {
   try {
     var result;
     if (_agentCurrentMode === 'summarize') {
+      var _t0 = performance.now();
       console.log('[agentSend] SUMMARIZE mode - building graph from Cytoscape');
       // Summarize mode: include current graph
       var currentGraph = _buildCurrentGraphFromCy();
-      console.log('[agentSend] Built graph:', { nodes: currentGraph.nodes.length, edges: currentGraph.edges.length });
+      console.log('[agentSend] ✓ Built graph in ' + (performance.now()-_t0).toFixed(0) + 'ms:', { nodes: currentGraph.nodes.length, edges: currentGraph.edges.length });
 
-      // ── Merge database + inline references for all edges ────────────────
-      console.log('[agentSend] Merging database references into graph edges...');
-      currentGraph = await _mergeDbReferencesIntoGraph(currentGraph);
-      
-      // ── Clean empty values from reference objects only ──────────────────
-      console.log('[agentSend] Cleaning empty values from references...');
-      if (Array.isArray(currentGraph.edges)) {
-        currentGraph.edges.forEach(function(edge) {
-          if (Array.isArray(edge.references)) {
-            edge.references = edge.references.map(function(ref) {
-              var cleaned = {};
-              for (var key in ref) {
-                if (ref.hasOwnProperty(key)) {
-                  var val = ref[key];
-                  // Skip null, undefined, empty string, empty array
-                  if (val === null || val === undefined || val === '') continue;
-                  if (Array.isArray(val) && val.length === 0) continue;
-                  cleaned[key] = val;
-                }
-              }
-              return cleaned;
-            });
-          }
-        });
-      }
-      
-      // ── Debug: collect first 5 combined refs across all edges ────────────
-      var allInlineRefs = [];
-      var totalDatabaseRefs = 0;
-      currentGraph.edges.forEach(function(e) {
-        if (Array.isArray(e.references)) {
-          e.references.forEach(function(r) {
-            // Inject the edge's relationId into each ref so Python can echo it back
-            var enriched = Object.assign({}, r, { relationId: e.relationId, relationIds: e.relationIds });
-            allInlineRefs.push(enriched);
-          });
-        }
-      });
-      
-      var edgesWithRefs = currentGraph.edges.filter(function(e) { return Array.isArray(e.references) && e.references.length > 0; }).length;
-      var debugSampleRefs = allInlineRefs.slice(0, 5);
-      var totalRefs = allInlineRefs.length;
-      console.log('[agentSend] Combined references:', { totalRefs: totalRefs, edgesWithRefs: edgesWithRefs, sampleCount: debugSampleRefs.length });
-      console.log('[agentSend] Sample refs (first 5):', debugSampleRefs);
+      // ── References are fetched server-side (Node.js → Postgres) before  ──
+      // ── forwarding to Python, so we skip the expensive browser DB fetch. ──
+      // Use RelationNumberOfReferences for the status message counts.
+      var edgesWithRefs = currentGraph.edges.filter(function(e) { return (e.numberOfReferences || 0) > 0; }).length;
+      var totalRefs = currentGraph.edges.reduce(function(sum, e) { return sum + (e.numberOfReferences || 0); }, 0);
+      var debugSampleRefs = [];
+      console.log('[agentSend] References (from RelationNumberOfReferences):', { totalRefs: totalRefs, edgesWithRefs: edgesWithRefs });
 
       // Dump first raw graphData edge to diagnose field names
       var rawEdgeDump = '';
@@ -148,10 +112,18 @@ async function agentSend() {
                       ' references.length=' + (currentGraph.edges[0] && Array.isArray(currentGraph.edges[0].references) ? currentGraph.edges[0].references.length : 0);
       }
 
-      // Graph-size status message — only useful once, at the start of a new
-      // Summarize conversation; repeating it on every turn just adds noise
-      // once the user is already mid-conversation about the same graph.
-      if (_agentChatHistory.length === 1) {
+      var relationIds = _extractRelationIds(currentGraph.edges);
+      console.log('[agentSend] Extracted relation_ids:', relationIds);
+
+      // Scope the summary to the user's canvas selection, if any nodes/edges
+      // are currently selected — otherwise fall back to the whole graph.
+      var hasSelection = (currentGraph.selectedNodes && currentGraph.selectedNodes.length > 0) ||
+                          (currentGraph.selectedEdges && currentGraph.selectedEdges.length > 0);
+      var summaryScope = hasSelection ? 'selected' : 'all';
+
+      // “Analyzing graph...” status — only shown for full-graph summarize (not selection),
+      // and only once at the start of a conversation.
+      if (!hasSelection && _agentChatHistory.length === 1) {
         var _graphLabel = currentGraph.tabName || currentGraph.graphName || '';
         var _graphPrefix = _graphLabel
           ? 'Analyzing graph “' + _graphLabel + '” with '
@@ -163,26 +135,18 @@ async function agentSend() {
         );
       }
       // ─────────────────────────────────────────────────────────────────────
-
-      var relationIds = _extractRelationIds(currentGraph.edges);
-      console.log('[agentSend] Extracted relation_ids:', relationIds);
-
-      // Scope the summary to the user's canvas selection, if any nodes/edges
-      // are currently selected — otherwise fall back to the whole graph.
-      var hasSelection = (currentGraph.selectedNodes && currentGraph.selectedNodes.length > 0) ||
-                          (currentGraph.selectedEdges && currentGraph.selectedEdges.length > 0);
-      var summaryScope = hasSelection ? 'selected' : 'all';
       console.log('[agentSend] Summary scope:', summaryScope,
         '(selectedNodes=' + (currentGraph.selectedNodes ? currentGraph.selectedNodes.length : 0) +
         ', selectedEdges=' + (currentGraph.selectedEdges ? currentGraph.selectedEdges.length : 0) + ')');
 
       // ── Fetch database credentials from server ──────────────────────────
+      var _tCreds = performance.now();
       var dbCredentials = null;
       try {
         var credsResp = await api('/api/db-credentials', null, 'GET');
         if (credsResp) {
           dbCredentials = credsResp;
-          console.log('[agentSend] Fetched db_credentials');
+          console.log('[agentSend] ✓ Fetched db_credentials in ' + (performance.now()-_tCreds).toFixed(0) + 'ms');
         }
       } catch (e) {
         console.warn('[agentSend] Failed to fetch db_credentials:', e);
@@ -191,32 +155,31 @@ async function agentSend() {
       var payload = {
         message: msg,
         history: _agentChatHistory.slice(0, -1),
-        llm:     _agentConfig,
+        llm:     {},
         NodeJSGraph: currentGraph,
         scope: summaryScope,
         relation_ids: relationIds,
         db_credentials: dbCredentials,
         debug_inline_refs: debugSampleRefs,
       };
-      console.log('[agentSend] Full payload being sent to /api/agent/summarize-chat:');
-      console.log('  - message:', payload.message);
-      console.log('  - history length:', payload.history.length);
-      console.log('  - llm config:', payload.llm);
-      console.log('  - current_graph nodes:', payload.NodeJSGraph.nodes.length);
-      console.log('  - current_graph edges:', payload.NodeJSGraph.edges.length);
-      console.log('  - relation_ids:', payload.relation_ids);
-      console.log('  - db_credentials present:', !!payload.db_credentials);
-      console.log('  - debug_inline_refs:', payload.debug_inline_refs);
-      
+
+      // Estimate payload size before sending
+      var _tSerial = performance.now();
+      var _payloadBytes = 0;
+      try { _payloadBytes = new Blob([JSON.stringify(payload)]).size; } catch(e) {}
+      console.log('[agentSend] ✓ Payload ready in ' + (performance.now()-_tSerial).toFixed(0) + 'ms | size: ' + (_payloadBytes/1024).toFixed(1) + ' KB | nodes: ' + payload.NodeJSGraph.nodes.length + ' edges: ' + payload.NodeJSGraph.edges.length + ' history: ' + payload.history.length);
+
+      var _tSend = performance.now();
+      console.log('[agentSend] → Sending to /api/agent/summarize-chat …');
       result = await api('/api/agent/summarize-chat', payload);
-      console.log('[agentSend] Response received from /api/agent/summarize-chat:', result);
+      console.log('[agentSend] ✓ Response received in ' + (performance.now()-_tSend).toFixed(0) + 'ms (total from Send: ' + (performance.now()-_t0).toFixed(0) + 'ms)');
     } else if (_agentCurrentMode === 'llm') {
       // LLM mode — general knowledge, no graph context
       console.log('[agentSend] LLM mode');
       var payload = {
         message: msg,
         history: _agentChatHistory.slice(0, -1),
-        llm:     _agentConfig,
+        llm:     {},
       };
       result = await api('/api/agent/llm-chat', payload);
       console.log('[agentSend] Response received from /api/agent/llm-chat:', result);
@@ -226,7 +189,7 @@ async function agentSend() {
       var payload = {
         message: msg,
         history: _agentChatHistory.slice(0, -1),
-        llm:     _agentConfig,
+        llm:     {},
       };
       console.log('[agentSend] Payload sent to /api/agent/chat:', payload);
       result = await api('/api/agent/chat', payload);
@@ -891,12 +854,23 @@ function agentSummarizeSelected() {
     return;
   }
 
-  var selectedEdges = selectedElements.edges().length;
+  var selectedEdgeEls = selectedElements.edges();
+  var selectedEdges = selectedEdgeEls.length;
   var selectedNodes = selectedElements.nodes().length;
+
+  // Count supporting references from RelationNumberOfReferences on each selected edge
+  var selectedTotalRefs = 0;
+  selectedEdgeEls.forEach(function(cyEdge) {
+    var edgeId = String(cyEdge.data('id'));
+    var gde = (graphData && graphData.edges || []).find(function(e) { return String(e.id) === edgeId; }) || {};
+    var n = (gde.properties || {}).RelationNumberOfReferences;
+    if (n) selectedTotalRefs += Number(n);
+  });
 
   _ensureSummarizeMode();
   var input = document.getElementById('agent-input');
-  input.value = 'Summarize the ' + selectedEdges + ' selected relation(s) and ' + selectedNodes + ' selected node(s) using their supporting sentences and references.';
+  var refPart = selectedTotalRefs > 0 ? ' supported by ' + selectedTotalRefs + ' references' : '';
+  input.value = 'Summarize the ' + selectedEdges + ' selected relation(s)' + refPart + ' and ' + selectedNodes + ' selected node(s) using their supporting sentences and references.';
   agentSend();
 }
 
@@ -1043,9 +1017,10 @@ function _buildCurrentGraphFromCy() {
       type:         d.relType || gde.type || '',
       effect:       d.effect  || gdeProps.Effect || gdeProps.effect || '',
       mechanism:    d.mechanism || gdeProps.Mechanism || gdeProps.mechanism || '',
-      relationId:   relId,
-      relationIds:  relIds,
-      references:   refs
+      relationId:          relId,
+      relationIds:         relIds,
+      references:          refs,
+      numberOfReferences:  gdeProps.RelationNumberOfReferences != null ? Number(gdeProps.RelationNumberOfReferences) : 0
     };
     edges.push(edgeObj);
     // Same object reference (not a clone) so the reference-merge step below
@@ -1266,7 +1241,7 @@ async function agentRunWorkflow() {
     var result = await api('/api/agent/workflow/execute', {
       workflow: _agentWorkflow,
       input:    userInput,
-      llm:      _agentConfig,
+      llm:      {},
     });
     var lines = ['Workflow completed:'];
     (result.results || []).forEach(function(r) {
