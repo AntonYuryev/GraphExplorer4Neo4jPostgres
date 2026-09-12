@@ -4202,16 +4202,15 @@ async function _fetchAndMergeDbReferences(body, pg) {
     ? cg.selectedEdges
     : cg.edges;
 
-  // Collect unique relation IDs from the relevant edges only
-  const allIds = new Set();
+  // Collect unique relation IDs from the relevant edges only.
+  // Use _normalizeRelationIdInputs — same logic as the /api/references tooltip endpoint,
+  // which handles negative IDs, 64-bit bigints (no Number() corruption), and toPlain() objects.
+  const rawIds = [];
   edgesToFetch.forEach(e => {
-    if (e.relationId) allIds.add(e.relationId);
-    if (Array.isArray(e.relationIds)) e.relationIds.forEach(id => allIds.add(id));
+    if (e.relationId != null) rawIds.push(e.relationId);
+    if (Array.isArray(e.relationIds)) rawIds.push(...e.relationIds);
   });
-  // Keep IDs as strings — relation IDs are 64-bit integers that exceed Number.MAX_SAFE_INTEGER,
-  // so converting via Number() silently corrupts them. PostgreSQL accepts string values fine
-  // when the column is cast to bigint[] in the query.
-  const idList = Array.from(allIds).map(String).filter(s => /^\d+$/.test(s) && s !== '0');
+  const idList = _normalizeRelationIdInputs(rawIds);
   if (!idList.length) return body;
 
   try {
