@@ -3,6 +3,46 @@
 // AGENTIC AI — frontend module
 // ================================================================================
 
+/**
+ * _safeDoiUrl(rawUrl, doiId) → string
+ *
+ * Returns a safe https:// URL for use in anchor href attributes.
+ * Never assigns untrusted strings directly to DOM href — addresses CodeQL
+ * CWE-79 / "DOM text reinterpreted as HTML" (agentic_ai_block.js #183).
+ *
+ * Resolution order:
+ *  1. If rawUrl is a valid https:// URL → use it as-is.
+ *  2. If rawUrl starts with //doi.org or doi.org → rewrite to https://doi.org/…
+ *  3. If doiId looks like a real DOI (starts with 10.) → build https://doi.org/{doiId}
+ *  4. Fall back to https://doi.org/
+ */
+function _safeDoiUrl(rawUrl, doiId) {
+  if (rawUrl) {
+    try {
+      var parsed = new URL(String(rawUrl));
+      if (parsed.protocol === 'https:') {
+        return parsed.href;
+      }
+      // http:// doi.org → upgrade to https://
+      if (parsed.protocol === 'http:' && parsed.hostname.toLowerCase().includes('doi.org')) {
+        parsed.protocol = 'https:';
+        return parsed.href;
+      }
+    } catch (e) {
+      // rawUrl is not a full URL — try treating it as a bare doi.org path
+      var s = String(rawUrl).trim();
+      if (/^\/\/doi\.org\//i.test(s)) return 'https:' + s;
+      if (/^doi\.org\//i.test(s))    return 'https://' + s;
+    }
+  }
+  // Fall back to building from doiId
+  var id = String(doiId || '').trim();
+  if (/^10\.\d{4,9}\//.test(id)) {
+    return 'https://doi.org/' + id;
+  }
+  return 'https://doi.org/';
+}
+
 // ── Panel resize (drag left border) ─────────────────────────────────────────
 (function () {
   var MIN_W = 320;
@@ -574,7 +614,7 @@ function _renderSummarizeReply(text, container) {
         var _doiIds  = (_sepIdx >= 0 ? _inner.slice(0, _sepIdx) : _inner).split('++');
         var _doiUrls = (_sepIdx >= 0 ? _inner.slice(_sepIdx + 7).split('++') : []);
         var doiRefsLink = document.createElement('a');
-        doiRefsLink.href = _doiUrls[0] || ('https://doi.org/' + _doiIds[0]);
+        doiRefsLink.href = _safeDoiUrl(_doiUrls[0], _doiIds[0]);
         doiRefsLink.target = '_blank';
         doiRefsLink.rel = 'noopener noreferrer';
         doiRefsLink.textContent = 'DOI refs';
@@ -584,7 +624,7 @@ function _renderSummarizeReply(text, container) {
       } else if (doiMatch) {
         var doiId = (matched.match(/10\.\d{4,9}\/[^\s,\]\)"']+/i) || [matched])[0];
         var doiLink = document.createElement('a');
-        doiLink.href = 'https://doi.org/' + doiId;
+        doiLink.href = _safeDoiUrl(null, doiId);
         doiLink.target = '_blank';
         doiLink.rel = 'noopener noreferrer';
         doiLink.textContent = matched;
