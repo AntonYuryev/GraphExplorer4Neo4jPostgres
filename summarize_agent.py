@@ -16,7 +16,10 @@ RELATION_NAME = 'Relation symbolic name'
 
 _RUNTIME: Dict[str, Any] = {} # runtime dependencies are injected at startup
 _REL_TOKEN_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-_NLP_MARKUP_RE = re.compile(r'ID\{[^{}=]+=(.*?)\}')
+_NLP_MARKUP_RE = re.compile(r'ID\{[^{}=]+=([^}]*)\}')
+# Note: [^}]* replaces the original (.*?) to prevent polynomial backtracking (ReDoS).
+# A negated character class [^}]* scans linearly with no backtracking, unlike .*?
+# which can degrade to O(n²) or worse on crafted inputs (CodeQL py/polynomial-redos).
 # CONTEXT{8803117}-style markup carries no user-facing text (unlike ID{...=text}) —
 # strip it out entirely, including the number inside the braces, along with any
 # leading whitespace so it doesn't leave a dangling space behind.
