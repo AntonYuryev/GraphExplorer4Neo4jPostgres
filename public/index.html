@@ -365,7 +365,7 @@
         <input type="text" id="qns-input" placeholder="Node name, or paste list…" spellcheck="false" autocomplete="off"
           oninput="_qnsOnInput(this)" onkeydown="_qnsHandleKeydown(event)" onpaste="_qnsOnPaste(event,this)" onblur="setTimeout(_qnsHideSuggestions,150)"
           style="width:190px;transition:width .15s ease;background:#12162a;border:1px solid #2d3452;border-radius:4px;color:#c8ccdc;font-size:11px;padding:4px 8px">
-        <button onclick="quickNodeSearch()" title="Search for node name(s). Paste a semicolon-, comma-, or newline-separated list to find multiple nodes at once."
+        <button onclick="quickNodeSearch()" title="Quick node search. Allowed name separators: ';', '/', newline"
           style="background:none;border:none;color:#7a8099;cursor:pointer;font-size:14px;padding:2px 4px;line-height:1">🔍</button>
         <!-- Fixed width (not min-width) is deliberate: some matched node
              Names are very long (e.g. peptide sequences), and with only a
