@@ -10,6 +10,7 @@ Port: 3001 (override with AGENT_PORT env var)
 
 import os
 import re
+from urllib.parse import urlparse as _urlparse
 import json
 import uuid
 import struct
@@ -29,6 +30,23 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 # Note: register_summarize_routes is imported lazily in startup handler to improve initial startup speed
+
+def _is_anthropic_url(url: str) -> bool:
+    """Return True only when the URL hostname is exactly anthropic.com or a subdomain.
+
+    Replaces bare substring checks like ``"anthropic.com" in url`` which are
+    flagged by CodeQL py/incomplete-url-substring-sanitization (CWE-20): a URL
+    such as ``https://evil.com/path/anthropic.com`` would pass the substring
+    test but is NOT an Anthropic endpoint.  Parsing the hostname and checking
+    for an exact domain match eliminates that false-positive path.
+    """
+    if not url:
+        return False
+    try:
+        host = (_urlparse(url).hostname or "").lower()
+        return host == "anthropic.com" or host.endswith(".anthropic.com")
+    except Exception:
+        return False
 
 # ── Optional heavy deps — imported lazily so the service starts even if missing ──
 try:
@@ -1258,7 +1276,7 @@ def _anthropic_client(llm: Dict):
         raise RuntimeError("Anthropic API key not set — configure in Settings → Agentic AI")
     base_url = llm.get("url") or None
     kwargs = {"api_key": api_key}
-    if base_url and "anthropic.com" not in (base_url or ""):
+    if base_url and not _is_anthropic_url(base_url):
         kwargs["base_url"] = base_url
     return _anthropic_mod.Anthropic(**kwargs)
 
@@ -1291,8 +1309,8 @@ def _openai_client(llm: Dict):
     if "portkey.ai" in url_lower:
         kwargs["api_key"]          = "sk-portkey"          # SDK requires non-empty; ignored by gateway
         kwargs["default_headers"]  = {"x-portkey-api-key": api_key}
-        log.info("[openai_client] Portkey.ai gateway: base_url=%s key_len=%d key_prefix=%s",
-                 base_url, len(api_key), api_key[:4] if api_key else "(empty)")
+        log.info("[openai_client] Portkey.ai gateway: base_url=%s key_len=%d key_present=%s",
+                 base_url, len(api_key), bool(api_key))
     elif "cerebus" in url_lower:
         # Cerebus is a Portkey-based gateway. Requires x-portkey-api-key + x-portkey-provider.
         # Provider is extracted from model name: @sandbox-shared-<provider>/<model>
@@ -1324,8 +1342,8 @@ def _openai_client(llm: Dict):
             log.warning("[openai_client] Cerebus: could not infer x-portkey-provider from model=%r — call may fail", model)
         kwargs["api_key"]         = "sk-portkey"   # non-empty placeholder; actual auth via headers
         kwargs["default_headers"] = cerebus_headers
-        log.info("[openai_client] Cerebus/Portkey gateway: base_url=%s provider=%s key_len=%d key_prefix=%s",
-                 base_url, portkey_provider, len(api_key), api_key[:4] if api_key else "(empty)")
+        log.info("[openai_client] Cerebus/Portkey gateway: base_url=%s provider=%s key_len=%d key_present=%s",
+                 base_url, portkey_provider, len(api_key), bool(api_key))
     return _openai_mod.OpenAI(**kwargs)
 
 # Text2Cypher action-parsing helpers (_strip_actions_from_reply, _extract_action,
@@ -1372,7 +1390,7 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
     # This prevents routing to Anthropic when the URL is Gemini/OpenAI but the
     # model name hasn't been saved yet — will raise a clear error below.
     is_anthropic = (
-        "anthropic.com" in url
+        _is_anthropic_url(url)
         or (not url and model.startswith("claude"))
     )
 
@@ -1600,7 +1618,7 @@ def ping_llm(req: PingRequest = None):
                               .get("content", {})
                               .get("parts", [{}])[0]
                               .get("text", "PONG"))
-        elif "anthropic.com" in url or (not url and HAS_ANTHROPIC):
+        elif _is_anthropic_url(url) or (not url and HAS_ANTHROPIC):
             # Anthropic (native SDK)
             if not HAS_ANTHROPIC:
                 return {"ok": False, "error": "anthropic package not installed — run: pip install anthropic"}
@@ -1630,7 +1648,7 @@ def ping_llm(req: PingRequest = None):
             )
             reply = response.choices[0].message.content.strip()
         elapsed  = time.time() - t0
-        if "anthropic.com" in url:
+        if _is_anthropic_url(url):
             provider = "anthropic"
         elif _is_gemini_model(model):
             provider = "gemini"
