@@ -3520,20 +3520,19 @@ function _qnsCurrentSegment(input) {
 
 
 // Normalize paste into the quick-node-search input.
-// Accepts any mix of newlines, commas, tabs, and semicolons as separators,
-// converts them all to "; " so the existing semicolon-split search works
-// regardless of whether the user copied from Excel, CSV, or a text list.
-// Also updates the input width to show the full list.
+// Accepts newlines, tabs, semicolons, and forward-slashes as separators.
+// Commas are NOT treated as separators — many chemical names contain commas.
+// Converts all separators to "; " so the existing semicolon-split search works.
 function _qnsOnPaste(e, input) {
   var pasted = (e.clipboardData || window.clipboardData).getData('text');
   if (!pasted) return;  // let browser handle non-text paste
   e.preventDefault();
 
-  // Normalize: CR+LF or LF or CR → ";", tab → ";", then split and rejoin
+  // Normalize: newlines → ";", tab → ";", "/" → ";", but NOT commas
   var parts = pasted
     .replace(/\r\n|\r|\n/g, ';')
     .replace(/\t/g, ';')
-    .replace(/,/g, ';')
+    .replace(/\//g, ';')
     .split(';')
     .map(function(s) { return s.trim(); })
     .filter(Boolean);
@@ -3642,8 +3641,8 @@ function _qnsHandleKeydown(e) {
 async function quickNodeSearch() {
   var input = document.getElementById('qns-input');
   if (!input) return;
-  var names = input.value.split(';').map(function(s) { return s.trim(); }).filter(Boolean);
-  if (!names.length) { alert('Type a node name (or semicolon-separated list of names) first.'); return; }
+  var names = input.value.split(/[;\/]/).map(function(s) { return s.trim(); }).filter(Boolean);
+  if (!names.length) { alert("Type a node name, or a list separated by ';', '/', or newlines."); return; }
   _qnsHideSuggestions();
 
   setProgressMsg('⏳ Searching…');
@@ -5359,6 +5358,7 @@ async function runQuery(mergeIntoExisting) {
     if (startTabIdx === activeTabIdx) {
       // Still on the originating tab — render normally
       if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
+        appendCypherHistory(query, 0);   // record aggregate/table queries in history
         showQueryResultTable(data.table);
       } else if (mergeIntoExisting && cy && cy.elements().length) {
         // "Add to graph" — merge into whatever's already on the canvas instead of
@@ -5420,8 +5420,7 @@ async function runQuery(mergeIntoExisting) {
  * @param {number} tabIdx      index of that tab at query time
  */
 async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
-  if (!_agentConfig || !_agentConfig.model_name) return;
-
+  // LLM config lives server-side (users.json) — no client-side model_name check needed.
   var prompt =
     'Give a succinct name (5 words max) for the graph produced by this Cypher query. ' +
     'Reply with ONLY the name — no quotes, no punctuation, no extra text.\n\nQuery:\n' + cypher;
@@ -5450,7 +5449,7 @@ async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
       var resp = await api('/api/agent/llm-chat', {
         message: prompt,
         history: [],
-        llm:     _agentConfig
+        llm:     {}              // use server-side LLM config from users.json
       });
 
       var raw    = (resp && resp.reply) ? String(resp.reply).trim() : '';
@@ -5516,7 +5515,6 @@ function _tabHasDefaultName(tabIdx) {
 // it to the tab.  Only renames tabs whose name is still a default placeholder.
 // `description` is a human-readable string summarising the Explore action.
 async function _nameTabFromExplore(description, tabId, tabIdx) {
-  if (!_agentConfig || !_agentConfig.model_name) return;
   if (!description) return;
 
   var prompt =
@@ -5542,7 +5540,7 @@ async function _nameTabFromExplore(description, tabId, tabIdx) {
       var resp = await api('/api/agent/llm-chat', {
         message: prompt,
         history: [],
-        llm:     _agentConfig
+        llm:     {}              // use server-side LLM config from users.json
       });
       var raw    = (resp && resp.reply) ? String(resp.reply).trim() : '';
       var aiName = raw.replace(/^\*\*|\*\*$/g, '').replace(/^["']|["']$/g, '').trim();
