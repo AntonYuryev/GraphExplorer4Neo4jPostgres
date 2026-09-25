@@ -110,18 +110,6 @@ log = logging.getLogger("agent")
 # message and substitution arguments before they're ever formatted/written.
 _LOG_CONTROL_RE = re.compile(r'[\r\n\x00-\x08\x0b\x0c\x0e-\x1f]+')
 
-def _log_safe(value):
-    """Strip newline/control characters from a single value, for use INLINE
-    at a specific log call's argument list — e.g. log.info("...%s...",
-    _log_safe(user_message)). CodeQL's py/log-injection check requires the
-    sanitization to be visible at the call site, on each individual tainted
-    argument; it does NOT recognize _SanitizeLogFilter below (a
-    logging.Filter that cleans a record after it's already built) as a
-    sanitizer, even though the Filter is real, independently-working
-    protection — the two are complementary defense-in-depth, not
-    alternatives. Non-string values (ints, lists, bools) pass through
-    unchanged since they can't carry injected newlines."""
-    return _LOG_CONTROL_RE.sub(" ", value) if isinstance(value, str) else value
 
 class _SanitizeLogFilter(logging.Filter):
     def _clean(self, value):
