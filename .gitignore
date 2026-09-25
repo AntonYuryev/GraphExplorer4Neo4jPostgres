@@ -5,6 +5,9 @@ node_modules/
 INDEX~1.zip
 public/INDEX~1.zip
 github-upload.js
+github-download.js
+install-autostart.ps1
+autostart.log
 settings.json
 users.json
 GithubToken.txt
