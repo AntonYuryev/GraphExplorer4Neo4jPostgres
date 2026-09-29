@@ -3645,12 +3645,14 @@ async function quickNodeSearch() {
   if (!names.length) { alert("Type a node name, or a list separated by ';', '/', or newlines."); return; }
   _qnsHideSuggestions();
 
+  var exactOnly = !!(document.getElementById('qns-exact') || {}).checked;
+
   setProgressMsg('⏳ Searching…');
   try {
     // Fire one request per name in parallel — each name/alias can resolve
     // independently, so parallel fetches cut wall-clock time proportionally.
     var results = await Promise.all(names.map(function(name) {
-      return api('/api/nodes/search-by-name', { names: [name] })
+      return api('/api/nodes/search-by-name', { names: [name], exactOnly: exactOnly })
         .catch(function(err) { return { error: err.message || String(err), nodes: [] }; });
     }));
     setProgressMsg(null);
@@ -3673,7 +3675,7 @@ async function quickNodeSearch() {
     });
 
     if (!allNodes.length) {
-      alert('No nodes found matching (exact or substring): ' + names.join(', '));
+      alert('No nodes found matching ' + (exactOnly ? '(exact)' : '(exact or substring)') + ': ' + names.join(', '));
       return;
     }
 
