@@ -2935,7 +2935,7 @@ app.post('/api/nodes/connectivity', dbLimiter, authMiddleware, async (req, res) 
 // /api/graph/explore-relations-report uses, so the client can feed the
 // result straight into mergeGraphData().
 app.post('/api/nodes/search-by-name', dbLimiter, authMiddleware, async (req, res) => {
-  const { names } = req.body || {};
+  const { names, exactOnly } = req.body || {};
   const safeNames = (Array.isArray(names) ? names : [])
     .map(n => (typeof n === 'string' ? n.trim() : ''))
     .filter(n => n.length > 0 && n.length < 500)
@@ -2978,7 +2978,7 @@ app.post('/api/nodes/search-by-name', dbLimiter, authMiddleware, async (req, res
     let nodes = exactResult.records.map(rec => nodeToPlain(rec.get('n')));
     let matchType = 'exact';
 
-    if (!nodes.length) {
+    if (!nodes.length && !exactOnly) {
       const containsResult = await session.run(containsCypher, { batch: safeNames });
       nodes = containsResult.records.map(rec => nodeToPlain(rec.get('n')));
       matchType = 'contains';
