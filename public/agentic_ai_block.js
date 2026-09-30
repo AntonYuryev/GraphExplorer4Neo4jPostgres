@@ -240,6 +240,7 @@ async function agentSend() {
         llm:     {},
         NodeJSGraph: currentGraph,
         scope: summaryScope,
+        sourceFilter: window._activeSourceFilter || null,
         relation_ids: relationIds,
         db_credentials: dbCredentials,
         debug_inline_refs: debugSampleRefs,
