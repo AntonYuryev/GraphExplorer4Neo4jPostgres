@@ -268,7 +268,7 @@
    *  • SQL uses  WHERE id = ANY($1::bigint[])  with string values — PostgreSQL
    *    casts them correctly; using Number() here would corrupt 64-bit IDs.
    */
-  function fetchAndMergeDbReferences(body, pg) {
+  function fetchAndMergeDbReferences(body, pg, options) {
     // Guard: only works in Node.js where pg is available
     if (typeof pg === 'undefined' || !pg || !pg.pool || !pg.schema) return Promise.resolve(body);
 
@@ -300,10 +300,13 @@
     var chunks = [];
     for (var c = 0; c < idList.length; c += CHUNK) chunks.push(idList.slice(c, c + CHUNK));
 
-    var sql = 'SELECT * FROM ' + schema + '.reference WHERE id = ANY($1::bigint[]) ORDER BY pubyear DESC NULLS LAST, id';
+    var sources = (options && Array.isArray(options.sources) && options.sources.length) ? options.sources : null;
+    var sql = 'SELECT * FROM ' + schema + '.reference WHERE id = ANY($1::bigint[])' +
+      (sources ? ' AND source = ANY($2::text[])' : '') +
+      ' ORDER BY pubyear DESC NULLS LAST, id';
 
     var t0 = Date.now();
-    return Promise.all(chunks.map(function(chunk) { return pool.query(sql, [chunk]); }))
+    return Promise.all(chunks.map(function(chunk) { return pool.query(sql, sources ? [chunk, sources] : [chunk]); }))
       .then(function(chunkResults) {
         var allRows = [];
         for (var i = 0; i < chunkResults.length; i++) {
