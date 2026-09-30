@@ -298,9 +298,12 @@ def _system_prompt(user_message: str = "", current_graph: Optional[Dict[str, Any
     to include — see _examples_prompt_section. `current_graph` grounds the model in
     what's actually on screen right now — see _current_graph_prompt_section.
     Everything else in the prompt is unconditional and always included."""
+    # Resolved per-user (each user's own Neo4j schema, computed from THAT
+    # user's own Neo4j connection) — never a shared/global or admin schema.
+    _schema_cfg_for_prompt = _runtime_('resolve_schema_cfg')(_runtime_('current_username').get())
     schema_section = ""
-    if _runtime_('state')["schema_text"]:
-        schema_section = f"\n\n## Neo4j Database Schema\n{_runtime_('state')['schema_text']}"
+    if _schema_cfg_for_prompt["schema_text"]:
+        schema_section = f"\n\n## Neo4j Database Schema\n{_schema_cfg_for_prompt['schema_text']}"
 
     examples_section     = _runtime_('examples_prompt_section')(user_message)
     skills_section       = _runtime_('skills_prompt_section')("text2cypher", user_message)
