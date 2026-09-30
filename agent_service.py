@@ -649,24 +649,36 @@ def _vocabulary_prompt_section() -> str:
 
 # ── Runtime state (updated via /schema endpoint from Node.js) ─────────────────
 _state: Dict[str, Any] = {
-    "neo4j":       {},   # url, database, username, password — LEGACY/FALLBACK values
     "postgres":    {},   # host, port, database, schema, username, password — LEGACY/FALLBACK
     "llm":         {},   # apikey, url, model_name, temperature, top_p, json_mode
-    "schema_text": "",   # human-readable schema for LLM system prompt
-    "schema_labels":   [],  # Neo4j node labels (structured list, alongside schema_text above)
-    "schema_rel_types": [], # Neo4j relationship types (structured list, alongside schema_text above)
 }
 
+# ── Per-user Neo4j schema cache ─────────────────────────────────────────────
+# Keyed by Graph Explorer username (from the trusted x-ge-username header —
+# see _current_username below). Each entry is that user's OWN schema, computed
+# by server.js from THAT user's own Neo4j connection (never the admin's or
+# another user's) and pushed via POST /schema. Never fall back to another
+# user's entry: an unrecognized/missing username simply has no schema yet.
+_schema_by_user: Dict[str, Dict[str, Any]] = {}
+
+def _resolve_schema_cfg(username: str) -> Dict[str, Any]:
+    return _schema_by_user.get(username) or {
+        "neo4j": {}, "schema_text": "", "schema_labels": [], "schema_rel_types": [],
+    }
+
 # ── Per-user Neo4j/Postgres credentials ────────────────────────────────────────
-# Mirrors server.js: the connection ENDPOINT (Neo4j url / Postgres host+port) is
-# admin-managed and lives in _state["neo4j"/"postgres"] above (pushed via
-# /schema). WHICH database/schema and WHICH login a request uses is each Graph
-# Explorer user's OWN setting, stored on their account in users.json — read
-# directly here since agent_service.py runs alongside server.js on the same
-# filesystem. server.js's /api/agent/* proxy stamps a trusted `x-ge-username`
-# header (never taken from the client) on every forwarded request; a request
-# context var carries it from that header through to run_cypher()/run_postgres()
-# without threading a parameter through every helper function.
+# Mirrors server.js: the Postgres host/port is admin-managed and lives in
+# _state["postgres"] above (pushed via /schema, one shared value for all
+# users). The Neo4j connection/schema, by contrast, is entirely per-user —
+# see _schema_by_user above — since it's computed from each user's own Neo4j
+# credentials and must never leak between users. WHICH database/schema and
+# WHICH login a request uses is each Graph Explorer user's OWN setting, stored
+# on their account in users.json — read directly here since agent_service.py
+# runs alongside server.js on the same filesystem. server.js's /api/agent/*
+# proxy stamps a trusted `x-ge-username` header (never taken from the client)
+# on every forwarded request; a request context var carries it from that
+# header through to run_cypher()/run_postgres() without threading a parameter
+# through every helper function.
 import contextvars
 
 USERS_FILE = Path(__file__).parent / "users.json"
@@ -679,11 +691,14 @@ def _load_users() -> List[Dict]:
         return []
 
 def _resolve_neo4j_cfg(username: str) -> Dict[str, str]:
-    base     = _state.get("neo4j") or {}
+    # `base` is this user's OWN last-pushed Neo4j connection (via POST /schema,
+    # sourced from server.js's per-user req.neo4j) — never another user's or
+    # the admin's, since _schema_by_user is keyed by username.
+    base     = _resolve_schema_cfg(username).get("neo4j") or {}
     user     = next((u for u in _load_users() if u.get("username") == username), None)
     override = (user or {}).get("neo4j") or {}
     return {
-        "url":      base.get("url", ""),
+        "url":      override.get("url") or base.get("url", ""),
         "database": override.get("database") or base.get("database") or "neo4j",
         "username": override.get("username") or base.get("username") or "",
         "password": override.get("password") or base.get("password") or "",
@@ -1499,11 +1514,12 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
 
 @app.get("/health")
 def health():
+    _schema_cfg = _resolve_schema_cfg(_current_username.get())
     return {
         "status":        "ok",
-        "schema_loaded": bool(_state["schema_text"]),
-        "schema_chars":  len(_state["schema_text"]),
-        "neo4j_url":     _state["neo4j"].get("url", ""),
+        "schema_loaded": bool(_schema_cfg["schema_text"]),
+        "schema_chars":  len(_schema_cfg["schema_text"]),
+        "neo4j_url":     _schema_cfg["neo4j"].get("url", ""),
         "postgres_host": _state["postgres"].get("host", ""),
         "llm_model":     _state["llm"].get("model_name") or _resolve_llm_cfg(_current_username.get()).get("model_name") or "(not configured)",
         "has_anthropic": HAS_ANTHROPIC,
@@ -1691,10 +1707,18 @@ def llm_chat(req: LLMChatRequest, request: Request):
 
 @app.post("/schema")
 def update_schema(payload: SchemaPayload):
-    _state["neo4j"]       = payload.neo4j
-    _state["schema_text"] = payload.schema_text
-    _state["schema_labels"]    = payload.labels
-    _state["schema_rel_types"] = payload.rel_types
+    # Identity comes ONLY from the trusted x-ge-username header (set exclusively
+    # by server.js's proxy, never from the request body) — never trust a
+    # username the client might embed in the JSON payload. A push with no
+    # identified user (e.g. the pre-login system/admin seed push) is kept
+    # separate under "" and is never used as another user's fallback.
+    username = _current_username.get()
+    _schema_by_user[username] = {
+        "neo4j":            payload.neo4j,
+        "schema_text":      payload.schema_text,
+        "schema_labels":    payload.labels,
+        "schema_rel_types": payload.rel_types,
+    }
     if payload.llm:
         _state["llm"].update({k: v for k, v in payload.llm.items() if v is not None})
     if payload.postgres:
@@ -1785,6 +1809,7 @@ register_text2cypher_routes(
         "calc_relation_id": calc_relation_id,
         "state": _state,
         "resolve_llm_cfg": _resolve_llm_cfg,
+        "resolve_schema_cfg": _resolve_schema_cfg,
         "current_username": _current_username,
         "load_vocabulary": _load_vocabulary,
         "examples_prompt_section": _examples_prompt_section,
