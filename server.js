@@ -287,7 +287,13 @@ function getNeo4jConnForUser(loginUsername) {
   let entry = _userNeo4jConns.get(loginUsername);
   if (entry) return entry;
   const cfg = _resolveNeo4jCfgForUser(loginUsername);
-  entry = { driver: makeNeo4jDriver(cfg), database: cfg.database };
+  entry = {
+    driver:   makeNeo4jDriver(cfg),
+    database: cfg.database,
+    url:      cfg.url,
+    username: cfg.username,
+    password: cfg.password,
+  };
   _userNeo4jConns.set(loginUsername, entry);
   return entry;
 }
@@ -554,6 +560,31 @@ function authMiddleware(req, res, next) {
 }
 
 // ─── Neo4j helpers ────────────────────────────────────────────────────────────
+
+// A Neo4j label/relationship-type name as it can actually appear in this
+// app's schema — e.g. "biomed:Complex", "biomed:DirectRegulation" (namespaced
+// with a single colon), or a plain "Protein"/"Binding" for schemas with no
+// namespace. Used to validate label/relType values coming from client
+// Node-Types/Relation-Types checkboxes (Explore config dialog) before they're
+// interpolated into Cypher — either as a $-parameter value list (no further
+// escaping needed) or as bare pattern syntax (":Type1|Type2"), which
+// additionally requires each segment to be backtick-quoted — see
+// quoteCypherIdent below. The older `/^[A-Za-z_][A-Za-z0-9_]*$/` version of
+// this check (still used in a few older/unused endpoints) silently rejected
+// every namespaced label/relType, which made type filters evaporate with no
+// error rather than actually filtering.
+function isSafeSchemaIdent(s) {
+  return typeof s === 'string' && /^[A-Za-z_][A-Za-z0-9_]*(:[A-Za-z_][A-Za-z0-9_]*)?$/.test(s);
+}
+// Backtick-quote a single Cypher label/relationship-type name for use inside
+// bare pattern syntax (e.g. ":`biomed:Complex`|`biomed:Protein`") — required
+// whenever the name contains characters (like ':') invalid in unquoted
+// Cypher syntax. Not needed when the name is instead passed as a query
+// parameter or compared as a plain string value (e.g. `lbl IN [...]`).
+function quoteCypherIdent(s) {
+  return '`' + String(s).replace(/`/g, '``') + '`';
+}
+
 function toPlain(val) {
   if (val === null || val === undefined) return val;
   if (neo4j.isInt(val)) return val.inSafeRange() ? val.toNumber() : val.toString();
@@ -598,6 +629,29 @@ function _relationIdsOf(relOrValue) {
   return (Array.isArray(raw) ? raw : [raw])
     .map(x => { const v = toPlain(x); return v != null ? String(v) : null; })
     .filter(s => s != null && /^-?\d+$/.test(s));
+}
+
+// Sums each distinct relation's own Neo4j RelationNumberOfReferences property
+// across a group of (plain, already-toPlain'd) edge objects — used by the
+// Connectivity Report endpoints (find-drugs-report, common-neighbors-report,
+// explore-relations-report) for their "RelationNumberOfReferences" column.
+// Deliberately NEVER derived by counting Postgres reference rows: Neo4j
+// already stores this value per relation, so this just reads and sums it.
+// Dedupes by RelationID so a hyperedge represented as several physical Neo4j
+// relationships sharing one RelationID (see match-rnef's hyperedge comment
+// above) isn't counted once per physical row.
+function _sumNeo4jRefCounts(edges) {
+  const seen = new Set();
+  let total = 0;
+  (edges || []).forEach(e => {
+    const ids = _relationIdsOf(e);
+    const key = ids.length ? ids.join(',') : (e.elementId || e.id);
+    if (seen.has(key)) return;
+    seen.add(key);
+    const n = e.properties && e.properties.RelationNumberOfReferences;
+    if (n != null && !isNaN(Number(n))) total += Number(n);
+  });
+  return total;
 }
 
 // Normalizes caller-provided RelationID input into a deduplicated string array.
@@ -741,6 +795,7 @@ app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, asyn
   // Also wipe all per-database schema caches — they're invalid against a new host.
   invalidateAllNeo4jConns();
   _schemaCacheByDb.clear();
+  _sourcesCacheBySchema.clear();
   _schemaFetchByDb.clear();
 
   // Best-effort check using the saving admin's OWN personal Neo4j credentials
@@ -862,6 +917,9 @@ app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, a
   appSettings.postgres.port = parseInt(port) || 5432;
   saveAppSettings(appSettings);
   invalidateAllPgConns();
+  // Every cached Sources list was queried against the OLD host — drop them all,
+  // same as the Neo4j URL handler above does for _schemaCacheByDb.
+  _sourcesCacheBySchema.clear();
 
   let warning = null;
   try {
@@ -906,11 +964,19 @@ app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res
 
   const testPool = makePgPool(cfg);
   try {
-    await testPool.query('SELECT 1');
+    // A bare `SELECT 1` only proves the login/password are valid — it says
+    // nothing about whether this role can actually use the SCHEMA the user
+    // just typed in (Postgres schema permissions are independent of login
+    // authentication, unlike Neo4j's per-database access checked above via
+    // a database-scoped session). Query the one table every feature of this
+    // app actually depends on, so a schema the role has no USAGE/SELECT grant
+    // on — or that doesn't exist — is caught here instead of succeeding this
+    // test and then failing later, silently, on every real query.
+    await testPool.query(`SELECT 1 FROM ${safeSchema}.reference LIMIT 1`);
   } catch(e) {
     await testPool.end();
     console.error('[settings/my-postgres] Connection test failed for %s: %s', req.user.username, e.message);
-    return res.status(400).json({ error: 'Connection test failed. Check database, schema, and credentials.' });
+    return res.status(400).json({ error: 'Connection test failed: ' + e.message });
   }
   await testPool.end();
 
@@ -920,6 +986,13 @@ app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res
   u.postgres = { database: cfg.database, schema: safeSchema, username: cfg.username, password: cfg.password };
   saveUsers(users);
   invalidatePgConnForUser(req.user.username);
+  // Drop any cached Sources list for both the old and new schema name — it may
+  // have been populated (possibly empty, from a failed earlier attempt or a
+  // different account) before this connection/credential fix, and Sources is
+  // cached by schema name alone rather than by connection, so a stale entry
+  // would otherwise linger until server restart.
+  _sourcesCacheBySchema.delete(current.schema);
+  _sourcesCacheBySchema.delete(safeSchema);
   res.json({ success: true });
 });
 
@@ -2639,29 +2712,77 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
   }
 });
 
+// GET /api/references/sources — returns distinct Source values from the reference table.
+// Result is cached per PG schema for the session lifetime (invalidated on DB reconnect,
+// or on the next request after a settings save — see POST /api/settings/my-postgres).
+app.get('/api/references/sources', dbLimiter, authMiddleware, async (req, res) => {
+  if (!req.pg || !req.pg.pool) return res.json([]);
+  const cacheKey = req.pg.schema;
+  if (_sourcesCacheBySchema.has(cacheKey)) return res.json(_sourcesCacheBySchema.get(cacheKey));
+  try {
+    const result = await req.pg.pool.query(
+      `SELECT DISTINCT source FROM ${req.pg.schema}.reference WHERE source IS NOT NULL ORDER BY source ASC`
+    );
+    const sources = result.rows.map(r => r.source).filter(Boolean);
+    // Only cache a non-empty result. An empty list almost always means "this
+    // connection/schema can't see any reference rows yet" (e.g. a permission
+    // grant that hasn't landed) rather than a genuinely source-less database
+    // — caching it would make the dialog stay empty forever after the
+    // permission is fixed, until something happens to invalidate the cache
+    // (a settings save) or the server restarts. Leaving it uncached costs one
+    // extra (cheap) query per dialog-open in that situation, and self-heals
+    // the moment access actually works — no user action required.
+    if (sources.length > 0) {
+      _sourcesCacheBySchema.set(cacheKey, sources);
+      console.log(`Sources cached [${cacheKey}]: ${sources.length} sources`);
+    }
+    res.json(sources);
+  } catch (err) {
+    console.error('[sources] error:', err.message);
+    res.json([]);
+  }
+});
+
+// GET /api/references/count — total row count of the reference table for the
+// current user's schema. Cheap (plain COUNT(*), no DISTINCT/sort) even on a
+// large table — used only so the frontend can show "Loading Source values
+// from the table with N references…" instead of an empty-looking dialog
+// while the (much slower) DISTINCT source query above is still running.
+app.get('/api/references/count', dbLimiter, authMiddleware, async (req, res) => {
+  if (!req.pg || !req.pg.pool) return res.json({ count: null });
+  try {
+    const result = await req.pg.pool.query(`SELECT COUNT(*) AS count FROM ${req.pg.schema}.reference`);
+    res.json({ count: Number(result.rows[0].count) });
+  } catch (err) {
+    console.error('[references/count] error:', err.message);
+    res.json({ count: null });
+  }
+});
+
 // ─── PostgreSQL references (tooltip — single edge hover) ──────────────────────
 // RelationID is integer in both Neo4j and Postgres.
 app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
-  const { relationIds } = req.body || {};
+  const { relationIds, sources } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json([]);
 
   const validIds = _normalizeRelationIdInputs(relationIds);
   if (!validIds.length) return res.json([]);
 
+  const safeSources = Array.isArray(sources) && sources.length
+    ? sources.map(String).filter(s => s.length > 0 && s.length < 500)
+    : null;
   try {
-    const sql = `
-      SELECT *
-      FROM ${req.pg.schema}.reference
-      WHERE id = ANY($1::bigint[])
-      ORDER BY pubyear DESC NULLS LAST, id
-    `;
-    const result = await req.pg.pool.query(sql, [validIds]);
+    const sql = safeSources
+      ? `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) AND source = ANY($2::text[]) ORDER BY pubyear DESC NULLS LAST, id`
+      : `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) ORDER BY pubyear DESC NULLS LAST, id`;
+    const result = await req.pg.pool.query(sql, safeSources ? [validIds, safeSources] : [validIds]);
     res.json(result.rows);
   } catch (err) {
-    // Fallback without ORDER BY date in case column name differs
     try {
-      const sql2 = `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
-      const result2 = await req.pg.pool.query(sql2, [validIds]);
+      const sql2 = safeSources
+        ? `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) AND source = ANY($2::text[])`
+        : `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      const result2 = await req.pg.pool.query(sql2, safeSources ? [validIds, safeSources] : [validIds]);
       res.json(result2.rows);
     } catch (err2) {
       console.error('PostgreSQL error:', err2.message);
@@ -2697,7 +2818,7 @@ const SCOPUS_COL_SQL = {
 };
 
 app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res) => {
-  const { relationIds, scopusColumns } = req.body || {};
+  const { relationIds, scopusColumns, sources } = req.body || {};
   if (!Array.isArray(relationIds) || !relationIds.length) return res.json({});
 
   const validIds = _normalizeRelationIdInputs(relationIds);
@@ -2711,24 +2832,29 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
 
   try {
     let sql;
+    const safeSources = Array.isArray(sources) && sources.length
+      ? sources.map(String).filter(s => s.length > 0 && s.length < 500)
+      : null;
+    const srcClause = safeSources ? ` AND source = ANY($2::text[])` : '';
+    const queryParams = safeSources ? [validIds, safeSources] : [validIds];
     if (scopusFragments.length > 0) {
       const scopusSelect = scopusFragments.join(', ');
       sql = `
         SELECT r.*, ${scopusSelect}
         FROM ${req.pg.schema}.reference r
         LEFT JOIN ${req.pg.schema}.scopus_data sd ON r.unique_id = sd.reference_id
-        WHERE r.id = ANY($1::bigint[])
+        WHERE r.id = ANY($1::bigint[])${srcClause}
         ORDER BY r.pubyear DESC NULLS LAST, r.id
       `;
     } else {
       sql = `
         SELECT *
         FROM ${req.pg.schema}.reference
-        WHERE id = ANY($1::bigint[])
+        WHERE id = ANY($1::bigint[])${srcClause}
         ORDER BY pubyear DESC NULLS LAST, id
       `;
     }
-    const result = await req.pg.pool.query(sql, [validIds]);
+    const result = await req.pg.pool.query(sql, queryParams);
 
     // Group by relation id (string key to preserve full 64-bit precision)
     const grouped = {};
@@ -4027,18 +4153,14 @@ function _doSpawnAgent() {
         _agentReady = true;
         _agentRestarting = false;
         console.log(`[agent] ready on port ${AGENT_PORT}`);
-        // Push schema + LLM/Neo4j config to agent.
-        // Always push credentials immediately (empty schema) so /health shows the
-        // right model name right away, then push again with the full schema once
-        // the Neo4j introspection query completes.
-        setTimeout(async () => {
-          // Immediate push — credentials + LLM, empty schema (status will show model name)
+        // Push LLM config immediately (no Neo4j schema/credentials — nobody has
+        // logged in yet, so there is no "current user" to fetch a schema for)
+        // so /health shows the right model name right away. Each user's own
+        // Neo4j schema is fetched and pushed, under their own identity, the
+        // moment their browser calls GET /api/graph/schema on login/page load
+        // (see _loadSchema() in app.js) — never eagerly with the admin's.
+        setTimeout(() => {
           _pushSchemaToAgent({ labels: [], relTypes: [], propKeys: [] });
-          // Full push — only needed if schema not yet cached
-          if (!_schemaServerCache) {
-            // _fetchSchemaFromNeo4j calls _pushSchemaToAgent internally on success
-            await _fetchSchemaFromNeo4j().catch(() => null);
-          }
         }, 500);
       }
     }).on('error', () => {});
@@ -4057,44 +4179,57 @@ function _doSpawnAgent() {
   }, 500);
 }
 
-function _pushSchemaToAgent(schema) {
+function _pushSchemaToAgent(schema, neo4jConn, username, pgConn) {
   if (!_agentReady) return;
-  const cache = schema || _schemaServerCache;
-  if (!cache) return;
+  if (!schema) return;
   const llmCfg = appSettings.llm || {};
-  const neo4jCfg = {
-    url:      appSettings.neo4j.url,
-    database: appSettings.neo4j.database,
-    username: appSettings.neo4j.username,
-    password: appSettings.neo4j.password,
-  };
+  // neo4jConn/pgConn are the calling user's OWN connections (req.neo4j /
+  // _resolvePgCfgForUser(username)) — NEVER fall back to the shared/admin
+  // appSettings.neo4j / appSettings.postgres here. The agent stores this
+  // schema keyed by `username` below, so an omitted neo4jConn/pgConn (e.g.
+  // the pre-login LLM-config priming push, where there is no "current user")
+  // must send no DB connection at all rather than silently substituting the
+  // admin's credentials.
+  const neo4jCfg = neo4jConn ? {
+    url:      neo4jConn.url,
+    database: neo4jConn.database,
+    username: neo4jConn.username,
+    password: neo4jConn.password,
+  } : {};
   const schemaText = [
-    `Node labels: ${(cache.labels || []).join(', ')}`,
-    `Relationship types: ${(cache.relTypes || []).join(', ')}`,
-    `Relationship property keys: ${(cache.propKeys || []).join(', ')}`,
+    `Node labels: ${(schema.labels || []).join(', ')}`,
+    `Relationship types: ${(schema.relTypes || []).join(', ')}`,
+    `Relationship property keys: ${(schema.propKeys || []).join(', ')}`,
   ].join('\n');
 
-  const pgCfg = appSettings.postgres ? {
-    host:     appSettings.postgres.url,
-    port:     appSettings.postgres.port,
-    database: appSettings.postgres.database,
-    schema:   appSettings.postgres.schema,
-    username: appSettings.postgres.username,
-    password: appSettings.postgres.password,
+  const pgCfg = pgConn ? {
+    host:     pgConn.host,
+    port:     pgConn.port,
+    database: pgConn.database,
+    schema:   pgConn.schema,
+    username: pgConn.username,
+    password: pgConn.password,
   } : null;
 
   const body = JSON.stringify({
     neo4j: neo4jCfg,
     schema_text: schemaText,
-    labels: cache.labels || [],
-    rel_types: cache.relTypes || [],
+    labels: schema.labels || [],
+    rel_types: schema.relTypes || [],
     llm: llmCfg,
     postgres: pgCfg,
   });
   const opts = {
     hostname: '127.0.0.1', port: AGENT_PORT, path: '/schema',
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      // Trusted identity (never taken from the client) so agent_service.py
+      // stores this schema under THIS user's own key, never a shared global
+      // — mirrors the x-ge-username header used by the /api/agent/* proxy.
+      'x-ge-username': username || '',
+    }
   };
   const req = http.request(opts, r => {
     if (r.statusCode === 200) console.log('[agent] schema pushed (' + schemaText.length + ' chars, pg=' + !!pgCfg + ')');
@@ -4210,7 +4345,7 @@ app.all('/api/agent/*', dbLimiter, authMiddleware, async (req, res) => {
     req.body = _enrichCurrentGraphWithReferences(req.body);
     console.log(`[agent proxy] inline-ref enrich: ${Date.now()-_tEnrich}ms`);
     const _tDb = Date.now();
-    req.body = await _fetchAndMergeDbReferences(req.body, req.pg);
+    req.body = await _fetchAndMergeDbReferences(req.body, req.pg, { sources: Array.isArray(req.body.sourceFilter) ? req.body.sourceFilter : null });
     console.log(`[agent proxy] DB-ref fetch+merge: ${Date.now()-_tDb}ms`);
   }
 
@@ -4297,9 +4432,10 @@ _killPortProcess(PORT, () => {
               clearInterval(poll);
               _agentReady = true;
               console.log(`[agent] external agent detected on port ${AGENT_PORT}`);
-              setTimeout(async () => {
+              // LLM config only — see comment at the AGENT_AUTOSTART branch above;
+              // each user's own Neo4j schema arrives on their own login/page load.
+              setTimeout(() => {
                 _pushSchemaToAgent({ labels: [], relTypes: [], propKeys: [] });
-                if (!_schemaServerCache) await _fetchSchemaFromNeo4j().catch(() => null);
               }, 500);
             }
           }).on('error', () => {});
@@ -4319,10 +4455,8 @@ process.on('SIGTERM', () => { if (_agentProc) _agentProc.kill(); process.exit();
 // Neo4j databases each get accurate schema, and a misconfigured admin account
 // cannot poison the schema for a working user.
 const _schemaCacheByDb = new Map();  // dbName → { labels, relTypes, propKeys }
+const _sourcesCacheBySchema = new Map();   // pgSchema key → string[] of distinct Sources
 const _schemaFetchByDb = new Map();  // dbName → in-flight Promise guard
-
-// Legacy alias kept current for agent-startup guards below.
-let _schemaServerCache = null;
 
 async function _fetchSchemaForConn(driver, database) {
   if (_schemaCacheByDb.has(database)) return _schemaCacheByDb.get(database);
@@ -4362,9 +4496,9 @@ async function _doFetchSchemaForConn(driver, database) {
     }
     const schema = { labels, relTypes, propKeys };
     _schemaCacheByDb.set(database, schema);
-    _schemaServerCache = schema;   // keep legacy alias current for agent guards
     console.log(`Schema cache refreshed [${database}]: ${labels.length} labels, ${relTypes.length} relTypes, ${propKeys.length} propKeys`);
-    _pushSchemaToAgent(schema);
+    // No push here — the caller pushes explicitly, since only the caller knows
+    // WHICH user's own Neo4j connection/identity this schema belongs to.
     return schema;
   } catch (err) {
     console.error(`Schema cache fetch error [${database}]:`, err.message);
@@ -4372,24 +4506,6 @@ async function _doFetchSchemaForConn(driver, database) {
   } finally {
     await Promise.all([s1.close(), s2.close(), s3.close()]);
   }
-}
-
-// Legacy wrapper for agent-startup code; resolves admin user's connection.
-// Silently skips if no admin has configured a Neo4j database yet.
-let _schemaFetchPromise = null;
-function _getSystemNeo4jConn() {
-  const users = loadUsers();
-  const admin = users.find(u => u.role === 'admin') || users[0];
-  if (!admin) throw new Error('No users configured');
-  return getNeo4jConnForUser(admin.username);
-}
-async function _fetchSchemaFromNeo4j() {
-  if (_schemaFetchPromise) return _schemaFetchPromise;
-  let conn;
-  try { conn = _getSystemNeo4jConn(); } catch(e) { return null; }
-  _schemaFetchPromise = _fetchSchemaForConn(conn.driver, conn.database)
-    .finally(() => { _schemaFetchPromise = null; });
-  return _schemaFetchPromise;
 }
 
 // Invalidate the cached schema for a specific database (called when a user
@@ -4406,6 +4522,10 @@ app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
   try {
     const schema = await _fetchSchemaForConn(req.neo4j.driver, req.neo4j.database);
     if (!schema) return res.status(503).json({ error: 'Schema not available yet' });
+    // Push schema to Text2Cypher agent using THIS user's own Neo4j AND
+    // Postgres credentials — never the shared admin credentials in
+    // appSettings.neo4j / appSettings.postgres.
+    _pushSchemaToAgent(schema, req.neo4j, req.user.username, _resolvePgCfgForUser(req.user.username));
     res.json(schema);
   } catch (err) {
     console.error('schema error:', err.message);
@@ -4466,7 +4586,7 @@ app.post('/api/graph/expand', dbLimiter, authMiddleware, async (req, res) => {
   let targetClause = '';
   if (mode === 'to' && Array.isArray(targetLabels) && targetLabels.length) {
     // Sanitize: only allow label names that are safe identifiers
-    const safeLabels = targetLabels.filter(l => /^[A-Za-z_][A-Za-z0-9_]*$/.test(l));
+    const safeLabels = targetLabels.filter(isSafeSchemaIdent);
     if (safeLabels.length) {
       targetClause = ' AND any(lbl IN labels(b) WHERE lbl IN ' +
                      JSON.stringify(safeLabels) + ')';
@@ -4509,7 +4629,7 @@ app.post('/api/graph/ontology-parents', dbLimiter, authMiddleware, async (req, r
     return res.status(400).json({ error: 'nodeParams array is required' });
 
   const safe = nodeParams.filter(np =>
-    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
     typeof np.urn === 'string' && np.urn.trim().length > 0
   );
   if (!safe.length) return res.json({ nodes: [], edges: [] });
@@ -4576,7 +4696,7 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
   const { nodeParams = [], maxLength, relTypes, nodeTypes, propFilters, nodePropFilters } = req.body || {};
 
   const safeNodes = (Array.isArray(nodeParams) ? nodeParams : []).filter(np =>
-    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
     typeof np.urn === 'string' && np.urn.trim().length > 0
   );
   if (safeNodes.length < 2)
@@ -4586,18 +4706,16 @@ app.post('/api/graph/shortest-path', dbLimiter, authMiddleware, async (req, res)
 
   const len = Number.isInteger(maxLength) && maxLength >= 1 && maxLength <= 15 ? maxLength : 2;
 
-  const safeIdent = s => typeof s === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
-
   let relPattern = '';
   if (Array.isArray(relTypes) && relTypes.length) {
-    const safeTypes = relTypes.filter(safeIdent);
-    if (safeTypes.length) relPattern = ':' + safeTypes.map(t => '`' + t + '`').join('|');
+    const safeTypes = relTypes.filter(isSafeSchemaIdent);
+    if (safeTypes.length) relPattern = ':' + safeTypes.map(quoteCypherIdent).join('|');
   }
 
   let safeNodeTypes = [];
   let nodeTypeClause = '';
   if (Array.isArray(nodeTypes) && nodeTypes.length) {
-    safeNodeTypes = nodeTypes.filter(safeIdent);
+    safeNodeTypes = nodeTypes.filter(isSafeSchemaIdent);
     if (safeNodeTypes.length) nodeTypeClause = 'all(n IN nodes(p)[1..-1] WHERE any(lbl IN labels(n) WHERE lbl IN $nodeTypesParam))';
   }
 
@@ -4858,10 +4976,15 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
   const relIdChanged = effectiveRelId !== canonicalRelationId;
 
   // Validate identifiers used in Cypher interpolation
-  const safeId = s => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
-  if (!safeId(relationType))       return res.status(400).json({ error: `Unsafe relation type: "${relationType}"` });
-  if (!safeId(sourceNode.nodeLabel)) return res.status(400).json({ error: `Unsafe label: "${sourceNode.nodeLabel}"` });
-  if (!safeId(targetNode.nodeLabel)) return res.status(400).json({ error: `Unsafe label: "${targetNode.nodeLabel}"` });
+  if (!isSafeSchemaIdent(relationType))       return res.status(400).json({ error: `Unsafe relation type: "${relationType}"` });
+  if (!isSafeSchemaIdent(sourceNode.nodeLabel)) return res.status(400).json({ error: `Unsafe label: "${sourceNode.nodeLabel}"` });
+  if (!isSafeSchemaIdent(targetNode.nodeLabel)) return res.status(400).json({ error: `Unsafe label: "${targetNode.nodeLabel}"` });
+  // Backtick-quoted for Cypher pattern syntax — required for namespaced names
+  // (e.g. "biomed:Protein"): an unquoted "a:biomed:Protein" would parse as
+  // TWO labels ("biomed" AND "Protein"), not the single literal label.
+  const qSrcLabel = quoteCypherIdent(sourceNode.nodeLabel);
+  const qTgtLabel = quoteCypherIdent(targetNode.nodeLabel);
+  const qRelType  = quoteCypherIdent(relationType);
 
   const username = req.user.username;
 
@@ -4894,9 +5017,9 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
 
     if (relIdChanged) {
       cypher = `
-        MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
-              (b:${targetNode.nodeLabel} {NodeID: $tgtId})
-        MERGE (a)-[r:${relationType} {RelationID: $effectiveRelId}]->(b)
+        MATCH (a:${qSrcLabel} {NodeID: $srcId}),
+              (b:${qTgtLabel} {NodeID: $tgtId})
+        MERGE (a)-[r:${qRelType} {RelationID: $effectiveRelId}]->(b)
         ON CREATE SET r.createdAt = timestamp(), r.updatedAt = timestamp(),
                       r.createdBy = $username,   r.updatedBy = $username
         ON MATCH  SET r.updatedAt = timestamp(), r.updatedBy = $username
@@ -4910,9 +5033,9 @@ app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, 
                  effectiveRelId: effectiveRelIdInt, username, relProps };
     } else {
       cypher = `
-        MATCH (a:${sourceNode.nodeLabel} {NodeID: $srcId}),
-              (b:${targetNode.nodeLabel} {NodeID: $tgtId})
-        MERGE (a)-[r:${relationType} {RelationID: $relId}]->(b)
+        MATCH (a:${qSrcLabel} {NodeID: $srcId}),
+              (b:${qTgtLabel} {NodeID: $tgtId})
+        MERGE (a)-[r:${qRelType} {RelationID: $relId}]->(b)
         ON CREATE SET r.createdAt = timestamp(), r.updatedAt = timestamp(),
                       r.createdBy = $username,   r.updatedBy = $username
         ON MATCH  SET r.updatedAt = timestamp(), r.updatedBy = $username
@@ -5032,7 +5155,7 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
 
   // Validate inputs — label must be a safe Neo4j identifier, urn must be non-empty string
   const safe = nodeParams.filter(np =>
-    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
     typeof np.urn === 'string' && np.urn.trim().length > 0
   );
   if (!safe.length) return res.json({ nodes: [], edges: [] });
@@ -5106,12 +5229,12 @@ app.post('/api/graph/ontology-children', dbLimiter, authMiddleware, async (req, 
 // and /api/graph/expand, so the caller can merge it into the graph via the
 // same expand-confirm-modal flow findOntologyChildren() already uses.
 app.post('/api/graph/find-drugs', dbLimiter, authMiddleware, async (req, res) => {
-  const { nodeParams = [], relTypes, effect } = req.body || {};
+  const { nodeParams = [], relTypes, effect, sources } = req.body || {};
   if (!Array.isArray(nodeParams) || !nodeParams.length)
     return res.status(400).json({ error: 'nodeParams array is required' });
 
   const safe = nodeParams.filter(np =>
-    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
     typeof np.urn === 'string' && np.urn.trim().length > 0
   );
   if (!safe.length) return res.json({ nodes: [], edges: [] });
@@ -5121,8 +5244,8 @@ app.post('/api/graph/find-drugs', dbLimiter, authMiddleware, async (req, res) =>
   // being inlined, never taken from the client as a raw string.
   let relClause = '-[r]->';
   if (Array.isArray(relTypes) && relTypes.length) {
-    const safeTypes = relTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
-    if (safeTypes.length) relClause = '-[r:' + safeTypes.join('|') + ']->';
+    const safeTypes = relTypes.filter(isSafeSchemaIdent);
+    if (safeTypes.length) relClause = '-[r:' + safeTypes.map(quoteCypherIdent).join('|') + ']->';
   }
 
   const params = { nodeParams: safe };
@@ -5184,7 +5307,7 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
     return res.status(400).json({ error: 'nodeParams array is required' });
 
   const safe = nodeParams.filter(np =>
-    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
     typeof np.urn === 'string' && np.urn.trim().length > 0
   );
   if (!safe.length) return res.json({ groups: [] });
@@ -5192,8 +5315,8 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
   // Same relType/effect validation and clause-building as /api/graph/find-drugs.
   let relClause = '-[r]->';
   if (Array.isArray(relTypes) && relTypes.length) {
-    const safeTypes = relTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
-    if (safeTypes.length) relClause = '-[r:' + safeTypes.join('|') + ']->';
+    const safeTypes = relTypes.filter(isSafeSchemaIdent);
+    if (safeTypes.length) relClause = '-[r:' + safeTypes.map(quoteCypherIdent).join('|') + ']->';
   }
   const cypherParams = { nodeParams: safe };
   let effectClause = '';
@@ -5273,9 +5396,22 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
     .filter(s => _normalizeRelationIdInputs([s]).length > 0);
   const rowsByRelId = new Map();
+  // Bug fix: this handler never destructured `sources` from req.body (unlike
+  // its sibling report endpoints below) — every call that reached this block
+  // threw a ReferenceError on the old `sources` reference, silently caught
+  // below, leaving referenceCount/snippetCount at 0 for EVERY request
+  // regardless of any Source filter. Now destructured properly, and — see the
+  // comment on `_sf` below — used to compute a filtered count ALONGSIDE the
+  // unfiltered total rather than instead of it.
+  const { sources } = req.body || {};
+  const _sf = Array.isArray(sources) && sources.length ? new Set(sources.map(String)) : null;
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
-      const sql = `SELECT id, doi, pmid, unique_id FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      // Always fetch the FULL (unfiltered) row set, including `source` — needed
+      // to compute both the unfiltered total (referenceCount) and, when a
+      // Source filter is active, the filtered subset (filteredReferenceCount)
+      // from this SAME batch fetch, rather than round-tripping to Postgres twice.
+      const sql = `SELECT id, doi, pmid, unique_id, source FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
       const pgResult = await req.pg.pool.query(sql, [allRelIds]);
       pgResult.rows.forEach(row => {
         const key = String(row.id);
@@ -5290,22 +5426,29 @@ app.post('/api/graph/find-drugs-report', dbLimiter, authMiddleware, async (req, 
   }
 
   groups.forEach(g => {
-    // # references: SELECT COUNT(DISTINCT COALESCE(doi, pmid)) FROM reference
-    // WHERE id IN (this drug's RelationIDs) — computed here from the shared
-    // batch fetch above instead of issuing that query per drug.
-    const refKeys = new Set();
+    // referenceCount (unfiltered total, "RelationNumberOfReferences"): summed
+    // straight from each relation's OWN Neo4j property — never derived by
+    // counting Postgres rows (see _sumNeo4jRefCounts). filteredReferenceCount
+    // genuinely does need Postgres (Neo4j has no per-source-filtered count):
+    // it's the distinct-reference count restricted to rows whose source is
+    // one of the currently-selected Source filter values — only present when
+    // a filter is active, and always ≤ referenceCount.
+    const filteredRefKeys = _sf ? new Set() : null;
     // #snippets: SELECT COUNT(unique_id) FROM reference WHERE id IN (...) —
     // counts ROWS (supporting sentences), not distinct papers.
     let snippetCount = 0;
     g._relationIds.forEach(rid => {
       (rowsByRelId.get(rid) || []).forEach(row => {
-        const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
-        if (coalesced != null && coalesced !== '') refKeys.add(String(coalesced));
+        if (_sf && row.source != null && _sf.has(String(row.source))) {
+          const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+          if (coalesced != null && coalesced !== '') filteredRefKeys.add(String(coalesced));
+        }
         if (row.unique_id != null) snippetCount++;
       });
     });
-    g.referenceCount = refKeys.size;
+    g.referenceCount = _sumNeo4jRefCounts(g.edges);
     g.snippetCount = snippetCount;
+    if (_sf) g.filteredReferenceCount = filteredRefKeys.size;
     delete g._relationIds;
   });
 
@@ -5374,12 +5517,12 @@ function _buildRelPropFilterClauses(propFilters, relVar) {
 }
 
 app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async (req, res) => {
-  const { nodeParams = [], direction, nodeTypes, relTypes, propFilters } = req.body || {};
+  const { nodeParams = [], direction, nodeTypes, relTypes, propFilters, sources } = req.body || {};
   if (!Array.isArray(nodeParams) || !nodeParams.length)
     return res.status(400).json({ error: 'nodeParams array is required' });
 
   const safe = nodeParams.filter(np =>
-    np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+    np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
     typeof np.urn === 'string' && np.urn.trim().length > 0
   );
   if (!safe.length) return res.json({ groups: [] });
@@ -5389,8 +5532,8 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   // /api/graph/expand and /api/graph/find-drugs use.
   let relTypeClause = '';
   if (Array.isArray(relTypes) && relTypes.length) {
-    const safeTypes = relTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
-    if (safeTypes.length) relTypeClause = ':' + safeTypes.join('|');
+    const safeTypes = relTypes.filter(isSafeSchemaIdent);
+    if (safeTypes.length) relTypeClause = ':' + safeTypes.map(quoteCypherIdent).join('|');
   }
   // Direction determines which side of the pattern is the candidate neighbor
   // (d) vs. the input entity (p) — see the endpoint comment above.
@@ -5406,7 +5549,7 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   // Node labels also cannot be parameterized — same allowlist treatment.
   let nodeTypeClause = '';
   if (Array.isArray(nodeTypes) && nodeTypes.length) {
-    const safeNodeTypes = nodeTypes.filter(t => typeof t === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(t));
+    const safeNodeTypes = nodeTypes.filter(isSafeSchemaIdent);
     if (safeNodeTypes.length) nodeTypeClause = ` AND any(lbl IN labels(d) WHERE lbl IN ${JSON.stringify(safeNodeTypes)})`;
   }
 
@@ -5443,6 +5586,7 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   let groups;
   try {
     const result = await session.run(cypher, { nodeParams: safe, ...propParams });
+
     groups = result.records.map(rec => {
       const d = rec.get('d');
       const links = rec.get('links') || [];
@@ -5486,9 +5630,14 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
     .filter(s => _normalizeRelationIdInputs([s]).length > 0);
   const rowsByRelId = new Map();
+  const _sf = Array.isArray(sources) && sources.length ? new Set(sources.map(String)) : null;
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
-      const sql = `SELECT id, doi, pmid, unique_id FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      // Always fetch the FULL (unfiltered) row set, including `source` — needed
+      // to compute both the unfiltered total (referenceCount) and, when a
+      // Source filter is active, the filtered subset (filteredReferenceCount)
+      // from this SAME batch fetch, rather than round-tripping to Postgres twice.
+      const sql = `SELECT id, doi, pmid, unique_id, source FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
       const pgResult = await req.pg.pool.query(sql, [allRelIds]);
       pgResult.rows.forEach(row => {
         const key = String(row.id);
@@ -5501,17 +5650,24 @@ app.post('/api/graph/common-neighbors-report', dbLimiter, authMiddleware, async 
   }
 
   groups.forEach(g => {
-    const refKeys = new Set();
+    // referenceCount ("RelationNumberOfReferences"): summed from each
+    // relation's own Neo4j property — see _sumNeo4jRefCounts. Never derived
+    // by counting Postgres rows. filteredReferenceCount is the one count that
+    // genuinely does need Postgres (Neo4j has no per-source-filtered count).
+    const filteredRefKeys = _sf ? new Set() : null;
     let snippetCount = 0;
     g._relationIds.forEach(rid => {
       (rowsByRelId.get(rid) || []).forEach(row => {
-        const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
-        if (coalesced != null && coalesced !== '') refKeys.add(String(coalesced));
+        if (_sf && row.source != null && _sf.has(String(row.source))) {
+          const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+          if (coalesced != null && coalesced !== '') filteredRefKeys.add(String(coalesced));
+        }
         if (row.unique_id != null) snippetCount++;
       });
     });
-    g.referenceCount = refKeys.size;
+    g.referenceCount = _sumNeo4jRefCounts(g.edges);
     g.snippetCount = snippetCount;
+    if (_sf) g.filteredReferenceCount = filteredRefKeys.size;
     delete g._relationIds;
   });
 
@@ -5624,7 +5780,7 @@ async function _fetchNodePropsByNodeId(pg, nodeIds, propNames) {
 app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async (req, res) => {
   const {
     action, anchorURNs = [], scopeURNs = [], nodeParams = [], direction,
-    nodeTypes, relTypes, propFilters, nodePropFilters
+    nodeTypes, relTypes, propFilters, nodePropFilters, sources
   } = req.body || {};
 
   const VALID_ACTIONS = new Set(['findBetween', 'connectSelected', 'expand', 'commonNeighbors']);
@@ -5632,15 +5788,14 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
 
   // Relation types and node labels can't be parameterized in Cypher — same
   // safe-identifier allowlist common-neighbors-report/expand already use.
-  const safeIdent = s => typeof s === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s);
   let relTypeClause = '';
   if (Array.isArray(relTypes) && relTypes.length) {
-    const safeTypes = relTypes.filter(safeIdent);
-    if (safeTypes.length) relTypeClause = ':' + safeTypes.join('|');
+    const safeTypes = relTypes.filter(isSafeSchemaIdent);
+    if (safeTypes.length) relTypeClause = ':' + safeTypes.map(quoteCypherIdent).join('|');
   }
   let nodeTypeClause = '';
   if (Array.isArray(nodeTypes) && nodeTypes.length) {
-    const safeNodeTypes = nodeTypes.filter(safeIdent);
+    const safeNodeTypes = nodeTypes.filter(isSafeSchemaIdent);
     if (safeNodeTypes.length) nodeTypeClause = ` AND any(lbl IN labels(d) WHERE lbl IN ${JSON.stringify(safeNodeTypes)})`;
   }
   const { clauses: propClauses, params: propParams } = _buildRelPropFilterClauses(propFilters, 'r');
@@ -5650,7 +5805,7 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
 
   if (action === 'commonNeighbors') {
     const safeNodeParams = (Array.isArray(nodeParams) ? nodeParams : []).filter(np =>
-      np && typeof np.label === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(np.label) &&
+      np && typeof np.label === 'string' && isSafeSchemaIdent(np.label) &&
       typeof np.urn === 'string' && np.urn.trim().length > 0
     );
     if (!safeNodeParams.length) return res.json({ groups: [] });
@@ -5786,9 +5941,14 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
   const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
     .filter(s => _normalizeRelationIdInputs([s]).length > 0);
   const rowsByRelId = new Map();
+  const _sf = Array.isArray(sources) && sources.length ? new Set(sources.map(String)) : null;
   if (allRelIds.length && req.pg && req.pg.pool) {
     try {
-      const sql = `SELECT id, doi, pmid, unique_id FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+      // Always fetch the FULL (unfiltered) row set, including `source` — needed
+      // to compute both the unfiltered total (referenceCount) and, when a
+      // Source filter is active, the filtered subset (filteredReferenceCount)
+      // from this SAME batch fetch, rather than round-tripping to Postgres twice.
+      const sql = `SELECT id, doi, pmid, unique_id, source FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
       const pgResult = await req.pg.pool.query(sql, [allRelIds]);
       pgResult.rows.forEach(row => {
         const key = String(row.id);
@@ -5801,17 +5961,24 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
   }
 
   groups.forEach(g => {
-    const refKeys = new Set();
+    // referenceCount ("RelationNumberOfReferences"): summed from each
+    // relation's own Neo4j property — see _sumNeo4jRefCounts. Never derived
+    // by counting Postgres rows. filteredReferenceCount is the one count that
+    // genuinely does need Postgres (Neo4j has no per-source-filtered count).
+    const filteredRefKeys = _sf ? new Set() : null;
     let snippetCount = 0;
     g._relationIds.forEach(rid => {
       (rowsByRelId.get(rid) || []).forEach(row => {
-        const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
-        if (coalesced != null && coalesced !== '') refKeys.add(String(coalesced));
+        if (_sf && row.source != null && _sf.has(String(row.source))) {
+          const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+          if (coalesced != null && coalesced !== '') filteredRefKeys.add(String(coalesced));
+        }
         if (row.unique_id != null) snippetCount++;
       });
     });
-    g.referenceCount = refKeys.size;
+    g.referenceCount = _sumNeo4jRefCounts(g.edges);
     g.snippetCount = snippetCount;
+    if (_sf) g.filteredReferenceCount = filteredRefKeys.size;
     delete g._relationIds;
   });
 
