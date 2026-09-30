@@ -521,6 +521,10 @@ const DEFAULT_COLUMNS = [
   { key: 'relationType',  label: 'Relation Type',  visible: true,  source: 'graph' },
   { key: 'effect',        label: 'Effect',         visible: true,  source: 'graph' },
   { key: 'numRefs',       label: 'Reference count',  visible: true,  source: 'graph', numeric: true },
+  // Only meaningful while a Source filter is active (see _activeSourceFilter) — hidden
+  // otherwise by _visibleColsForMode(). Always ≤ numRefs (it's a subset of the same
+  // relation's references, restricted to the currently-selected source(s)).
+  { key: 'filteredNumRefs', label: 'Filtered Reference count', visible: true, source: 'graph', numeric: true },
   { key: 'numSentences',  label: 'Assertion count',  visible: true,  source: 'graph', numeric: true },
   { key: 'pmid',          label: 'PMID',           visible: true,  source: 'reference', dbField: 'pmid' },
   { key: 'doi',           label: 'DOI',            visible: true,  source: 'reference', dbField: 'doi' },
@@ -551,7 +555,6 @@ window.addEventListener('DOMContentLoaded', function() {
     currentUser = sessionStorage.getItem('currentUser');
     currentRole = sessionStorage.getItem('currentRole');
     showApp();
-    _loadSchema(); // Preload schema if already logged in
   }
   // Hide autocomplete dropdown when textarea loses focus
   document.addEventListener('focusout', function(e) {
@@ -678,8 +681,6 @@ async function handleLogin(e) {
     sessionStorage.setItem('currentUser', currentUser);
     sessionStorage.setItem('currentRole', currentRole);
     showApp();
-    // Preload schema for autocomplete in background
-    _loadSchema();
   } catch (err) {
     errEl.textContent = err.message;
     errEl.style.display = 'block';
@@ -729,7 +730,8 @@ function showApp() {
     if (!_rc.refCols.length) _rc.refCols = data.referenceColumns || [];
   }).catch(function() {});
   initCytoscape();
-  _loadSchema(); // Preload schema immediately so relation-type dropdowns are ready before any dialog opens
+  // Fire both in parallel — Neo4j schema and Postgres source list are independent
+  Promise.all([_loadSchema(), _loadSources()]);
 
   // Initialize tab system with one empty tab
   tabs = [{ id: Date.now(), name: 'Pathway 1', snapshot: emptyTabSnapshot(), dirty: false }];
@@ -837,7 +839,7 @@ function initCytoscape() {
       var cacheKey = relId || (relIds.length ? relIds[0] : null);
       if (cacheKey && refsCache[cacheKey] === undefined) {
         try {
-          var rows = await api('/api/references', { relationIds: relIds.length ? relIds : [cacheKey] });
+          var rows = await api('/api/references', { relationIds: relIds.length ? relIds : [cacheKey], sources: _activeSourceFilter || undefined });
           refsCache[cacheKey] = rows;
         } catch(e) { refsCache[cacheKey] = []; }
       }
@@ -1435,7 +1437,12 @@ function _invalidateSchemaCache() {
   _schemaCache = null;
   _rc.relTypes = [];
   _rc.propKeys = [];
-  _loadSchema(); // repopulate globals for new connection
+  _loadSchema();
+  _activeSourceFilter = null;
+  window._activeSourceFilter = null;
+  _allSources = [];
+  _renderSourceFilterBanner();
+  _loadSources(); // repopulate globals for new connection
 }
 
 function _acShow(items, ta) {
@@ -2012,6 +2019,24 @@ async function runSankeyQuery() {
   try {
     var data = await api('/api/graph/query', { query: query });
     _sankeyCache = data;
+    if (_activeSourceFilter) {
+      // Apply zero-reference exclusion for active source filter
+      await (async function() {
+        var relIds = [];
+        (_sankeyCache.edges || []).forEach(function(e) {
+          var rid = e.properties && (e.properties.RelationID || e.properties.relationId);
+          if (rid != null) relIds.push(String(rid));
+        });
+        if (!relIds.length) return;
+        var CHUNK = 500; var chunks = []; for (var i = 0; i < relIds.length; i += CHUNK) chunks.push(relIds.slice(i, i + CHUNK));
+        var hits = new Set();
+        try { await Promise.all(chunks.map(async function(c) { var g = await api('/api/references/batch', { relationIds: c, sources: _activeSourceFilter }); Object.keys(g).forEach(function(k) { if (g[k] && g[k].length) hits.add(k); }); })); } catch(e) { return; }
+        _sankeyCache.edges = (_sankeyCache.edges || []).filter(function(e) {
+          var rid = e.properties && (e.properties.RelationID || e.properties.relationId);
+          return rid != null && hits.has(String(rid));
+        });
+      })();
+    }
     renderSankeyFromCache();
     var edgeCount = data.edges ? data.edges.length : 0;
     status.textContent = data.nodes.length + ' nodes · ' + edgeCount + ' edges';
@@ -3506,6 +3531,14 @@ function mergeGraphData(newData) {
 //  current graph (there's nothing to pick between — it's "add these exact
 //  nodes", not a candidate list like the Connectivity Report).
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Relation Source Filter ─────────────────────────────────────────────────────
+// null = All sources (no filter); string[] = only these sources are included.
+// When active: SQL queries append AND "Source" = ANY(...); edges with 0 matching
+// references are removed from the graph after load.
+var _activeSourceFilter = null;
+var _allSources = [];            // populated from /api/references/sources on login
+window._activeSourceFilter = null;  // exposed for agentic_ai_block.js
+
 var _qnsSuggestions      = [];
 var _qnsSelectedIdx      = -1;
 var _qnsSuggestDebounce  = null;
@@ -3636,6 +3669,228 @@ function _qnsHandleKeydown(e) {
     _qnsHideSuggestions();
     quickNodeSearch();
   }
+}
+
+// ── Source Filter: load, UI, apply ──────────────────────────────────────────
+function _loadSources() {
+  api('/api/references/sources', null, 'GET')
+    .then(function(sources) {
+      _allSources = Array.isArray(sources) ? sources : [];
+    })
+    .catch(function() { _allSources = []; });
+}
+
+function _renderSourceFilterBanner() {
+  var banner = document.getElementById('source-filter-banner');
+  var btn    = document.getElementById('source-filter-btn');
+  if (!banner) return;
+  if (!_activeSourceFilter || !_activeSourceFilter.length) {
+    banner.style.display = 'none';
+    if (btn) { btn.style.color = '#7a8099'; btn.style.borderColor = '#3a3f55'; }
+    return;
+  }
+  banner.style.display = 'flex';
+  document.getElementById('source-filter-banner-text').textContent =
+    'Warning: Data is actively filtered by Source(s): ' + _activeSourceFilter.join(', ');
+  if (btn) { btn.style.color = '#ff8a80'; btn.style.borderColor = '#e05560'; }
+}
+
+function openSourceFilterDialog() {
+  if (!_allSources.length) {
+    // Not yet loaded — the DISTINCT source query can take minutes on a large
+    // reference table, so show a loading placeholder (with the table's row
+    // count, once known) instead of leaving the list looking empty/broken
+    // for however long that takes.
+    _sfmShowLoading();
+    api('/api/references/sources', null, 'GET')
+      .then(function(sources) {
+        _allSources = Array.isArray(sources) ? sources : [];
+        _sfmRender();
+      })
+      .catch(function() { _sfmRender(); });
+  } else {
+    _sfmRender();
+  }
+  document.getElementById('source-filter-modal').style.display = 'flex';
+}
+
+// Shown in the source list area while /api/references/sources is still in
+// flight. The row-count fetch is a separate, cheap request (plain COUNT(*),
+// no DISTINCT/sort) so it resolves quickly even while the slower query is
+// still running, upgrading the message from generic to specific.
+function _sfmShowLoading() {
+  var list = document.getElementById('sfm-source-list');
+  if (!list) return;
+  list.innerHTML = '<div id="sfm-loading-msg" style="color:#7a8099;font-size:12px;padding:10px 0">⏳ Loading Source values…</div>';
+  api('/api/references/count', null, 'GET')
+    .then(function(result) {
+      var count = result && result.count;
+      var msgEl = document.getElementById('sfm-loading-msg');
+      if (msgEl && count != null) {
+        msgEl.textContent = '⏳ Loading Source values from the table with ' + count.toLocaleString() + ' references…';
+      }
+    })
+    .catch(function() {});
+}
+
+function closeSourceFilterDialog() {
+  document.getElementById('source-filter-modal').style.display = 'none';
+}
+
+function _sfmRender() {
+  var list  = document.getElementById('sfm-source-list');
+  var allCb = document.getElementById('sfm-all');
+  if (!list || !allCb) return;
+  list.innerHTML = '';
+  var isAll = !_activeSourceFilter || !_activeSourceFilter.length;
+  allCb.checked = isAll;
+  _allSources.forEach(function(src) {
+    var checked = isAll || (_activeSourceFilter && _activeSourceFilter.indexOf(src) >= 0);
+    var lbl = document.createElement('label');
+    lbl.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;padding:4px 0;color:#c0c4d8;font-size:12px';
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = src;
+    cb.checked = checked;
+    cb.style.cssText = 'accent-color:#4a6cf7;width:12px;height:12px;cursor:pointer';
+    cb.onchange = function() {
+      // If any individual box is unchecked, also uncheck "All"
+      var allCb2 = document.getElementById('sfm-all');
+      if (!this.checked && allCb2) allCb2.checked = false;
+      // If all individual boxes are now checked, re-check "All"
+      var allBoxes = Array.from(document.querySelectorAll('#sfm-source-list input[type=checkbox]'));
+      if (allBoxes.every(function(b) { return b.checked; }) && allCb2) allCb2.checked = true;
+    };
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(src));
+    list.appendChild(lbl);
+  });
+}
+
+function _sfmToggleAll(allCb) {
+  document.querySelectorAll('#sfm-source-list input[type=checkbox]').forEach(function(cb) {
+    cb.checked = allCb.checked;
+  });
+}
+
+function applySourceFilter() {
+  var allCb = document.getElementById('sfm-all');
+  var checked = Array.from(document.querySelectorAll('#sfm-source-list input[type=checkbox]:checked')).map(function(cb) { return cb.value; });
+  var allBoxes = Array.from(document.querySelectorAll('#sfm-source-list input[type=checkbox]'));
+  // "All" checked, or every individual source is checked → no filter
+  var isAll = (allCb && allCb.checked) || (allBoxes.length > 0 && checked.length === allBoxes.length);
+  _activeSourceFilter = isAll ? null : (checked.length ? checked : null);
+  window._activeSourceFilter = _activeSourceFilter;
+  _renderSourceFilterBanner();
+  closeSourceFilterDialog();
+  if (_activeSourceFilter && cy && cy.elements().length) {
+    _applySourceFilterZeroRefExclusion();
+  }
+  _onSourceFilterChanged();
+}
+
+function resetSourceFilter() {
+  _activeSourceFilter = null;
+  window._activeSourceFilter = null;
+  _renderSourceFilterBanner();
+  _onSourceFilterChanged();
+}
+
+// Common refresh after the Source filter is turned on/off/changed — the
+// tooltip's own reference fetch is keyed only by relId (not by filter state),
+// so a cache entry fetched under a different (or no) filter would otherwise
+// silently keep showing stale FilteredNumberOfReferences data. Also forces
+// the Relations/References table views to recompute filteredNumRefs (and
+// show/hide that column) rather than reusing already-rendered rows.
+function _onSourceFilterChanged() {
+  refsCache = {};
+  relationRows = [];
+  tableRows = [];
+  if (document.getElementById('table-view').style.display !== 'none') {
+    if (tableViewMode === 'relation') loadRelationData();
+    else if (tableViewMode === 'reference') loadTableData();
+  }
+}
+
+// FilteredNumberOfReferences — per-relation reference count restricted to the
+// currently-selected source(s) (_activeSourceFilter). Only meaningful while a
+// Source filter is active; always ≤ that relation's own RelationNumberOfReferences,
+// since it's counting a subset (by source) of the very same Postgres rows.
+// Returns {} immediately when no filter is active — callers should treat a
+// missing key as "not computed" rather than "zero".
+async function _fetchFilteredRefCounts(relIds) {
+  var counts = {};
+  if (!_activeSourceFilter || !relIds || !relIds.length) return counts;
+  var uniqueIds = Array.from(new Set(relIds.map(String)));
+  var CHUNK = 500;
+  var chunks = [];
+  for (var i = 0; i < uniqueIds.length; i += CHUNK) chunks.push(uniqueIds.slice(i, i + CHUNK));
+  try {
+    await Promise.all(chunks.map(async function(chunk) {
+      var grouped = await api('/api/references/batch', { relationIds: chunk, sources: _activeSourceFilter });
+      Object.keys(grouped).forEach(function(k) { counts[k] = (grouped[k] || []).length; });
+    }));
+  } catch (e) { /* leave whatever was resolved before the failure — partial is fine */ }
+  return counts;
+}
+
+async function _applySourceFilterZeroRefExclusion() {
+  if (!_activeSourceFilter || !cy) return;
+  setProgressMsg('\u23f3 Applying source filter \u2014 checking references\u2026');
+
+  // Collect all edge relation IDs
+  var allRelIds = [];
+  var edgeIdsByRelId = {};   // relId string → cy edge element id[]
+  cy.edges().forEach(function(e) {
+    var relId  = e.data('relId');
+    var relIds = e.data('relIds') || (relId != null ? [relId] : []);
+    relIds.forEach(function(rid) {
+      if (rid == null) return;
+      var k = String(rid);
+      if (!edgeIdsByRelId[k]) { edgeIdsByRelId[k] = []; allRelIds.push(k); }
+      edgeIdsByRelId[k].push(e.id());
+    });
+  });
+  if (!allRelIds.length) { setProgressMsg(null); return; }
+
+  // Fetch which relIds have at least 1 reference under the active source filter
+  var CHUNK = 500;
+  var chunks = [];
+  for (var i = 0; i < allRelIds.length; i += CHUNK) chunks.push(allRelIds.slice(i, i + CHUNK));
+  var refHits = new Set();
+  try {
+    await Promise.all(chunks.map(async function(chunk) {
+      var grouped = await api('/api/references/batch', { relationIds: chunk, sources: _activeSourceFilter });
+      Object.keys(grouped).forEach(function(k) { if (grouped[k] && grouped[k].length) refHits.add(k); });
+    }));
+  } catch (e) { setProgressMsg(null); return; }
+
+  // Remove cy edges that have 0 matching references
+  var removedEdges = 0;
+  cy.edges().forEach(function(e) {
+    var relId  = e.data('relId');
+    var relIds = e.data('relIds') || (relId != null ? [relId] : []);
+    var hasRef = relIds.some(function(rid) { return refHits.has(String(rid)); });
+    if (!hasRef) { e.remove(); removedEdges++; }
+  });
+
+  // Remove isolated nodes (degree 0 after edge removal)
+  var removedNodes = 0;
+  cy.nodes().forEach(function(n) {
+    if (n.connectedEdges().length === 0) { n.remove(); removedNodes++; }
+  });
+
+  // Sync graphData with cy state
+  if (removedEdges > 0 || removedNodes > 0) {
+    var cyEdgeIds = new Set(cy.edges().map(function(e) { return e.id(); }));
+    var cyNodeIds = new Set(cy.nodes().map(function(n) { return n.id(); }));
+    graphData.edges = (graphData.edges || []).filter(function(e) { return cyEdgeIds.has(String(e.id)); });
+    graphData.nodes = (graphData.nodes || []).filter(function(n) { return cyNodeIds.has(String(n.id)); });
+    updateStats();
+  }
+
+  setProgressMsg('Source filter applied: ' + removedEdges + ' edge(s) removed (0 refs in selected source(s)).');
+  setTimeout(function() { setProgressMsg(null); }, 6000);
 }
 
 async function quickNodeSearch() {
@@ -4440,12 +4695,12 @@ async function exportQueryCSVReferences(query) {
         while (_qIdx < batchChunks.length) {
           var _i = _qIdx++;
           try {
-            var _part = await api('/api/references/batch', { relationIds: batchChunks[_i], scopusColumns: scopusCols });
+            var _part = await api('/api/references/batch', { relationIds: batchChunks[_i], scopusColumns: scopusCols, sources: _activeSourceFilter || undefined });
             Object.assign(refsGrouped, _part);
           } catch(e) {
             if (scopusCols.length > 0) {
               try {
-                var _p2 = await api('/api/references/batch', { relationIds: batchChunks[_i], scopusColumns: [] });
+                var _p2 = await api('/api/references/batch', { relationIds: batchChunks[_i], scopusColumns: [], sources: _activeSourceFilter || undefined });
                 Object.assign(refsGrouped, _p2);
               } catch(e2) {}
             }
@@ -4676,10 +4931,10 @@ async function exportQueryReferences(query) {
     // Fetch one chunk, with Scopus fallback on error
     async function _fetchChunk(chunk) {
       try {
-        return await api('/api/references/batch', { relationIds: chunk, scopusColumns: scopusCols });
+        return await api('/api/references/batch', { relationIds: chunk, scopusColumns: scopusCols, sources: _activeSourceFilter || undefined });
       } catch(e) {
         if (scopusCols.length > 0) {
-          try { return await api('/api/references/batch', { relationIds: chunk, scopusColumns: [] }); }
+          try { return await api('/api/references/batch', { relationIds: chunk, scopusColumns: [], sources: _activeSourceFilter || undefined }); }
           catch(e2) {}
         }
         return {};
@@ -6153,18 +6408,19 @@ function renderTooltip(edge, refs) {
   var relType = edge.data('relType');
   var effect = edge.data('effect');
   var mechanism = edge.data('mechanism');
+  // RelationNumberOfReferences — Neo4j's own precalculated property is the
+  // single source of truth for this TOTAL count; it is never recomputed by
+  // counting Postgres rows. `refs` (the actual reference rows/text, fetched
+  // from Postgres for display below) is used ONLY to backfill numRefs in the
+  // rare case Neo4j never supplied a value at all (e.g. a client-side pasted
+  // edge not yet written to Neo4j) — never to override a real Neo4j value,
+  // and never from a Source-filtered fetch (that's a subset, not the total —
+  // see the mouseover handler above, which fetches `refs` with
+  // `sources: _activeSourceFilter`).
   var numRefs = edge.data('numRefs');
-  // If actual refs were passed in (freshly loaded), derive the count from them
-  // so the header always matches the list — even when the cy edge data was
-  // computed before background reference fetching completed.  Also write the
-  // correct count back to the cy element so future tooltip opens don't need to
-  // re-derive it.
-  if (refs && refs.length > 0) {
-    var freshCount = calcRefCount(refs);
-    if (freshCount !== numRefs) {
-      numRefs = freshCount;
-      try { edge.data('numRefs', numRefs); edge.data('thickness', getEdgeThickness(numRefs)); } catch(e) {}
-    }
+  if (numRefs == null && !_activeSourceFilter && refs && refs.length > 0) {
+    numRefs = calcRefCount(refs);
+    try { edge.data('numRefs', numRefs); edge.data('thickness', getEdgeThickness(numRefs)); } catch(e) {}
   }
   var confidence = edge.data('confidence');
   var citationScore = edge.data('citationScore');
@@ -6209,8 +6465,12 @@ function renderTooltip(edge, refs) {
   // matched, so it counts as a file reference either way. Only computable
   // once refs has actually been fetched/merged -- before that, fall back to
   // the plain total (numRefs) the cy edge already carries from render time.
+  // SKIPPED while a Source filter is active — same reasoning as the numRefs
+  // guard above: `refs` is a filtered subset there, not the full set this
+  // breakdown assumes, so it falls back to the true unfiltered total instead
+  // (with the actual filtered count shown separately just below).
   var metaLine;
-  if (refs && refs.length > 0) {
+  if (!_activeSourceFilter && refs && refs.length > 0) {
     var _dbRefCount = 0, _fileRefCount = 0;
     refs.forEach(function(r) {
       if (r && r.unique_id != null && String(r.unique_id).trim() !== '') _dbRefCount++;
@@ -6223,6 +6483,15 @@ function renderTooltip(edge, refs) {
   }
   if (confidence !== '' && confidence != null) metaLine += ' · Confidence: ' + confidence + '%';
   if (citationScore !== '' && citationScore != null) metaLine += ' · Citation score: ' + citationScore;
+  // FilteredNumberOfReferences — only shown while a Source filter is active.
+  // `refs` here was fetched with `sources: _activeSourceFilter` (see the edge
+  // mouseover handler above), so it's already this relation's own Postgres
+  // reference rows restricted to the selected source(s) — refs.length IS the
+  // filtered count, always ≤ numRefs (the unfiltered RelationNumberOfReferences)
+  // shown just above.
+  if (_activeSourceFilter) {
+    metaLine += ' · Filtered: ' + (refs ? refs.length : 0) + ' reference(s)';
+  }
   html += '<div style="font-size:11px;color:#7a8099;margin-bottom:8px">' + metaLine + '</div>';
 
   tooltipCurrentRefs = refs;
@@ -6651,14 +6920,16 @@ async function loadTableData() {
   var refsGrouped = {};
   if (relIds.length > 0) {
     try {
-      refsGrouped = await api('/api/references/batch', { relationIds: relIds, scopusColumns: scopusCols });
+      // Honor the active Source filter — otherwise this table would list every
+      // reference regardless of the filter banner shown at the top of the app.
+      refsGrouped = await api('/api/references/batch', { relationIds: relIds, scopusColumns: scopusCols, sources: _activeSourceFilter || undefined });
     } catch(err) {
       console.error('Batch references failed (with scopus):', err.message);
       // Scopus JOIN may have failed (e.g. table missing or type mismatch).
       // Retry without scopus columns so reference data still loads.
       if (scopusCols.length > 0) {
         try {
-          refsGrouped = await api('/api/references/batch', { relationIds: relIds, scopusColumns: [] });
+          refsGrouped = await api('/api/references/batch', { relationIds: relIds, scopusColumns: [], sources: _activeSourceFilter || undefined });
           console.warn('Scopus JOIN failed — showing reference columns only. Check server log for details.');
         } catch(err2) {
           console.error('Batch references also failed without scopus:', err2.message);
@@ -6667,6 +6938,11 @@ async function loadTableData() {
     }
   }
   msg.style.display = 'none';
+
+  // FilteredNumberOfReferences — see _fetchFilteredRefCounts. {} (all misses)
+  // when no Source filter is active, so `filteredCounts[id] || 0` below is a
+  // real 0 (correct: filtering is currently off) rather than "not computed".
+  var filteredCounts = await _fetchFilteredRefCounts(relIds);
 
   // Fetch RelationNumberOfSentences from Neo4j for edges that have a RelationID
   // but no value yet (RNEF-matched edges, similar relations).
@@ -6830,7 +7106,11 @@ async function loadTableData() {
         : (edge.properties.RelationNumberOfReferences != null ? edge.properties.RelationNumberOfReferences : 0),
       numSentences: (Array.isArray(edge.properties.references) && edge.properties.references.length)
         ? edge.properties.references.length
-        : (edge.properties.RelationNumberOfSentences != null ? Number(edge.properties.RelationNumberOfSentences) : '')
+        : (edge.properties.RelationNumberOfSentences != null ? Number(edge.properties.RelationNumberOfSentences) : ''),
+      // Only meaningful under an active Source filter — always ≤ numRefs above.
+      filteredNumRefs: _activeSourceFilter
+        ? relIdsArr.reduce(function(sum, id) { return sum + (filteredCounts[id] || 0); }, 0)
+        : ''
     };
 
     var buildRow = function(ref) {
@@ -7147,6 +7427,25 @@ async function loadRelationData() {
     });
     return row;
   });
+
+  // FilteredNumberOfReferences — see _fetchFilteredRefCounts. Computed as a
+  // second pass (needs the async Postgres batch call) rather than inline
+  // above, keeping the fast synchronous row-build unaffected when no source
+  // filter is active (the common case).
+  if (_activeSourceFilter) {
+    var relIdSetsByRow = graphData.edges.map(function(edge) {
+      var multi = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : null;
+      return _relIds(multi && multi.length > 1 ? multi : edge.properties.RelationID);
+    });
+    var allRelIdsForFilter = relIdSetsByRow.reduce(function(acc, ids) { return acc.concat(ids); }, []);
+    var filteredCounts = await _fetchFilteredRefCounts(allRelIdsForFilter);
+    relationRows.forEach(function(row, i) {
+      row.filteredNumRefs = relIdSetsByRow[i].reduce(function(sum, id) { return sum + (filteredCounts[id] || 0); }, 0);
+    });
+  } else {
+    relationRows.forEach(function(row) { row.filteredNumRefs = ''; });
+  }
+
   renderTableHeader();
   renderTableRows(relationRows);
 }
@@ -7157,6 +7456,8 @@ async function loadRelationData() {
 function _visibleColsForMode() {
   return columnDefs.filter(function(c) {
     if (!c.visible) return false;
+    // Only meaningful while a Source filter is active — see _activeSourceFilter.
+    if (c.key === 'filteredNumRefs' && !_activeSourceFilter) return false;
     if (tableViewMode === 'relation') return c.source === 'graph' || c.source === 'neo4j' || c.source === 'node_prop';
     if (tableViewMode === 'node')     return c.source === 'node_graph' || c.source === 'node_col';
     return c.source === 'graph' || c.source === 'reference' || c.source === 'scopus_data' || c.source === 'node_prop';
@@ -9880,8 +10181,28 @@ async function mergeSimilarRelations() {
     });
     var uniqueGroupRelIds = Array.from(new Set(allGroupRelIds));
 
-    // Reference count = unique papers by DOI/EMBASE/PII/PUI/NCT_ID (shared helper).
-    var refCount = calcRefCount(dedupedRefs);
+    // Reference count ("RelationNumberOfReferences") for the merged anchor:
+    // SUM each ORIGINAL relation's own Neo4j property, never recomputed via
+    // calcRefCount(dedupedRefs). dedupedRefs/refsCache can be only a
+    // SOURCE-FILTERED subset (whatever was cached the last time a tooltip
+    // was opened under an active Source filter) — using that here produced
+    // an impossible "total" smaller than the tooltip's own
+    // FilteredNumberOfReferences. Dedup by RelationID so a relation already
+    // spanning several physical Neo4j rows, or already merged in an earlier
+    // pass, isn't summed twice.
+    var seenRelIdsForCount = new Set();
+    var refCount = 0;
+    group.forEach(function(ei) {
+      var ge = findGEdge(ei);
+      var rids = ge && ge.properties
+        ? (Array.isArray(ge.properties.RelationIDs) ? ge.properties.RelationIDs.map(String) : _relIds(ge.properties.RelationID))
+        : (ei.relId ? [ei.relId] : []);
+      var key = rids.length ? rids.slice().sort().join(',') : ei.id;
+      if (seenRelIdsForCount.has(key)) return;
+      seenRelIdsForCount.add(key);
+      var n = ge && ge.properties && ge.properties.RelationNumberOfReferences;
+      if (n != null && !isNaN(Number(n))) refCount += Number(n);
+    });
 
     // Update anchor cy edge
     if (resolvedEffect !== anchor.effect) {
@@ -9917,8 +10238,13 @@ async function mergeSimilarRelations() {
       }
     }
 
-    // Update refsCache under all RelationIDs so tooltip shows merged refs immediately
-    uniqueGroupRelIds.forEach(function(id) { refsCache[id] = dedupedRefs; });
+    // Invalidate (rather than pre-populate) refsCache under every merged
+    // RelationID, so the NEXT tooltip open re-fetches fresh from Postgres —
+    // correctly filtered by whatever Source filter is active at that time —
+    // instead of freezing in `dedupedRefs`, which may itself only be a
+    // filtered/partial snapshot assembled from whatever refs happened to
+    // already be cached across the merged edges at merge time.
+    uniqueGroupRelIds.forEach(function(id) { delete refsCache[id]; });
 
     // Remove non-anchor edges from cy and graphData.
     // Exception: when BOTH the anchor and the candidate are RNEF edges (have edgeURN)
@@ -10216,7 +10542,7 @@ async function findDrugs(relTypes, effect) {
 async function _runFindDrugsReport(nodeParams, relTypes, effect, filterLabel) {
   setProgressMsg('⏳ Finding drugs upstream…');
   try {
-    var result = await api('/api/graph/find-drugs-report', { nodeParams: nodeParams, relTypes: relTypes || null, effect: effect || null });
+    var result = await api('/api/graph/find-drugs-report', { nodeParams: nodeParams, relTypes: relTypes || null, effect: effect || null, sources: _activeSourceFilter || undefined });
     setProgressMsg(null);
 
     if (result.error) { alert('Find drugs upstream error: ' + result.error); return; }
@@ -10884,6 +11210,7 @@ async function runExploreConfigQuery() {
   closeCommonNeighborsConfigModal();
   setProgressMsg('⏳ Running query…');
   try {
+    if (_activeSourceFilter) body.sources = _activeSourceFilter;
     var result = await api('/api/graph/explore-relations-report', body);
     setProgressMsg(null);
 
@@ -13716,6 +14043,13 @@ function openConnectivityReport(options) {
   document.getElementById('cr-col-name').textContent = options.columnLabel || 'Name';
   document.getElementById('cr-summary').textContent = options.summary || '';
   document.getElementById('cr-error').style.display = 'none';
+  // FilteredNumberOfReferences column — only meaningful while a Source filter
+  // is active (see _activeSourceFilter); the server only populates
+  // g.filteredReferenceCount at all when a filter was in effect for this
+  // request, so gate the column on that same condition rather than on
+  // whether any individual row happens to have the field.
+  var filteredRefsCol = document.getElementById('cr-col-filteredrefs');
+  if (filteredRefsCol) filteredRefsCol.style.display = _activeSourceFilter ? '' : 'none';
   // Capture a human-readable description for AI tab naming when the user commits.
   _crLastDescription = [options.title, options.summary].filter(Boolean).join(': ');
   var selectAll = document.getElementById('cr-select-all');
@@ -13822,6 +14156,9 @@ function _renderConnectivityReport() {
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a">' + escHtml(g.nodeType || '') + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + g.targetCount + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + g.referenceCount + '</td>' +
+      (_activeSourceFilter
+        ? '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + (g.filteredReferenceCount != null ? g.filteredReferenceCount : '') + '</td>'
+        : '') +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + g.snippetCount + '</td>';
 
     var cb = tr.querySelector('.cr-row-cb');
