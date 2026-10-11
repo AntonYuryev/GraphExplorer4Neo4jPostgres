@@ -334,6 +334,14 @@
         <div class="menu-item" onclick="openLoadNodePropertiesDialog();closeMenus()">Load node properties</div>
         <div class="menu-item" onclick="loadSimilarRelations();closeMenus()">Load similar relations</div>
         <div class="menu-item" onclick="mergeSimilarRelations();closeMenus()">Merge similar relations</div>
+        <div class="menu-separator"></div>
+        <!-- Enabled only while a Source filter is active — see updateSourceMenuItems() -->
+        <div class="menu-item disabled" id="mi-unique-to-source" title="Turn on a Source filter (🔬 Sources) first" onclick="findRelationsUniqueToFilteredSource();closeMenus()">Relations unique to filtered source</div>
+        <div class="menu-separator"></div>
+        <!-- Admin only — bulk write to the shared Neo4j/Postgres databases. Shown via showApp() like the other admin-only menu items. -->
+        <div class="menu-item" id="mi-import-rnef" style="display:none" onclick="openImportRnefDialog();closeMenus()">Import RNEF</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item" onclick="openStatisticsDialog();closeMenus()">Statistics</div>
       </div>
     </div>
 
@@ -471,14 +479,67 @@
   </div><!-- /content-area -->
 
   <!-- SQL Query modal -->
-  <div id="sql-modal" class="modal-backdrop" style="display:none" onclick="closeSqlModal(event)">
-    <div class="modal-box" style="width:680px;max-width:95vw" onclick="event.stopPropagation()">
+  <div id="sql-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-box" style="width:1200px;max-width:95vw" onclick="event.stopPropagation()">
       <h3>Postgres SQL Query</h3>
-      <textarea id="sql-input" rows="4" placeholder="SELECT * FROM relations LIMIT 20" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#12151f;color:#e0e0e0;border:1px solid #2d3147;border-radius:6px;font-family:'Courier New',monospace;font-size:12px;resize:vertical;outline:none;margin-bottom:10px"></textarea>
-      <div id="sql-results" style="max-height:320px;overflow:auto;font-size:12px"></div>
+      <p style="font-size:11px;color:#7a8099;margin:-4px 0 8px">
+        Tip: use <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">{schema}</code> instead of your schema name
+        — e.g. <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">SELECT * FROM {schema}.reference LIMIT 20</code> —
+        and the app will substitute your current Postgres schema (from Settings → My Connection → Postgres) automatically.
+      </p>
+      <textarea id="sql-input" rows="4" placeholder="SELECT * FROM {schema}.reference LIMIT 20" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#12151f;color:#e0e0e0;border:1px solid #2d3147;border-radius:6px;font-family:'Courier New',monospace;font-size:12px;resize:vertical;outline:none;margin-bottom:10px"></textarea>
+      <div id="sql-results" style="max-height:70vh;overflow:auto;font-size:12px"></div>
       <div class="modal-actions" style="margin-top:12px">
         <button class="btn-ghost" onclick="document.getElementById('sql-modal').style.display='none'">Close</button>
         <button class="btn-primary" onclick="runSqlQuery()">▶ Run</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Statistics modal -->
+  <div id="statistics-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-box" style="width:900px;max-width:95vw" onclick="event.stopPropagation()">
+      <h3>Database Statistics</h3>
+      <div id="statistics-body" style="max-height:75vh;overflow:auto;font-size:12px"></div>
+      <div class="modal-actions" style="margin-top:12px">
+        <button class="btn-ghost" onclick="document.getElementById('statistics-modal').style.display='none'">Close</button>
+        <button class="btn-primary" onclick="refreshStatistics()">↻ Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import RNEF modal (admin only — bulk write to shared Neo4j/Postgres) -->
+  <div id="import-rnef-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-box" style="width:720px;max-width:95vw" onclick="event.stopPropagation()">
+      <h3>Database → Import RNEF</h3>
+      <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
+        Imports a single <code>.rnef</code> file, or every <code>.rnef</code>/<code>.xml</code> file found in a folder (including subfolders), into the shared Neo4j and Postgres databases.
+      </p>
+      <div id="irn-error" class="error-msg" style="display:none"></div>
+
+      <!-- Native pickers — the browser never exposes a real filesystem path,
+           so picking a file/folder here uploads its content to the server
+           (same mechanism File -> Load subgraph already uses for one file),
+           rather than sending a path. -->
+      <input type="file" id="irn-file-input" accept=".rnef,.xml" style="display:none" onchange="_irnFilesPicked(this.files)">
+      <input type="file" id="irn-dir-input" webkitdirectory directory multiple style="display:none" onchange="_irnFilesPicked(this.files)">
+      <div style="display:flex;gap:10px">
+        <button type="button" class="btn-ghost" onclick="document.getElementById('irn-file-input').click()">📄 Choose File…</button>
+        <button type="button" class="btn-ghost" onclick="document.getElementById('irn-dir-input').click()">📁 Choose Folder…</button>
+      </div>
+      <div id="irn-picked-summary" style="font-size:12px;color:#7a8099;margin-top:8px"></div>
+
+      <div style="display:flex;align-items:center;gap:10px;margin:14px 0;color:#5a6080;font-size:11px">
+        <div style="flex:1;height:1px;background:#2d3147"></div>— or, if the server can already see it —<div style="flex:1;height:1px;background:#2d3147"></div>
+      </div>
+      <label style="font-size:12px;color:#7a8099">File or directory path (as seen by the server)</label>
+      <input type="text" id="irn-path" placeholder="e.g. C:\GraphExplorer\TestData\RNEF\Abcuro (KLRG1+ T-cells)" autocomplete="off" oninput="_irnPathTyped()" onkeydown="if(event.key==='Enter')runRnefImport()">
+
+      <div id="irn-progress" style="display:none;margin-top:12px;font-size:12px;color:#c0c4d4;line-height:1.8"></div>
+      <div id="irn-summary" style="display:none;margin-top:10px;font-size:12px"></div>
+      <div class="modal-actions" style="margin-top:12px">
+        <button class="btn-ghost" onclick="document.getElementById('import-rnef-modal').style.display='none'">Close</button>
+        <button class="btn-primary" id="irn-run-btn" onclick="runRnefImport()" disabled>Import</button>
       </div>
     </div>
   </div>
@@ -512,6 +573,7 @@
         <select id="lq-format-sel" style="width:100%;padding:6px 8px;background:#1e2235;color:#c0c4d8;border:1px solid #3a3f55;border-radius:4px;font-size:13px">
           <option value="excel">Excel</option>
           <option value="csv">CSV</option>
+          <option value="rnef">RNEF</option>
         </select>
       </div>
     </div>
@@ -536,7 +598,7 @@
 </div>
 
 <!-- Save subgraph modal -->
-<div id="save-modal" class="modal-backdrop" style="display:none" onclick="closeSaveModal(event)">
+<div id="save-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box">
     <h3>Save Subgraph</h3>
     <input type="text" id="save-name-input" placeholder="Subgraph name..." onkeydown="if(event.key==='Enter')confirmSave()">
@@ -548,7 +610,7 @@
 </div>
 
 <!-- Change password modal -->
-<div id="change-pw-modal" class="modal-backdrop" style="display:none" onclick="closeChangePwModal(event)">
+<div id="change-pw-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box">
     <h3>Change Password</h3>
     <div id="change-pw-error" class="error-msg" style="display:none"></div>
@@ -573,7 +635,7 @@
   .ch-chip:hover:not(.active) { border-color: #4f8ef7; color: #c8d8ff; }
   mark.ch-hit { background: #4f8ef7; color: #fff; border-radius: 2px; padding: 0 1px; }
 </style>
-<div id="cypher-history-modal" class="modal-backdrop" style="display:none" onclick="if(event.target===this)_chCloseModal()">
+<div id="cypher-history-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:760px;max-width:92vw;max-height:85vh;display:flex;flex-direction:column">
     <h3 style="margin:0 0 12px">Cypher Query History</h3>
     <p style="margin:0 0 10px;font-size:12px;color:#a0aec0">Click a query row to load it, or choose a destination from the dropdown.</p>
@@ -617,7 +679,7 @@
 </div>
 
 <!-- Pathway browse history modal -->
-<div id="pathway-history-modal" class="modal-backdrop" style="display:none" onclick="if(event.target===this)_phCloseModal()">
+<div id="pathway-history-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:720px;max-width:92vw;max-height:85vh;display:flex;flex-direction:column">
     <h3 style="margin:0 0 12px">Pathway Browse History</h3>
     <p style="margin:0 0 10px;font-size:12px;color:#a0aec0">Every pathway you've opened, most recent first. Click a name or "Reopen" to view it again.</p>
@@ -660,7 +722,7 @@
 </div>
 
 <!-- User management modal (admin only) -->
-<div id="users-modal" class="modal-backdrop" style="display:none" onclick="closeUsersModal(event)">
+<div id="users-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:480px">
     <h3>User Management</h3>
     <div id="users-list-container"></div>
@@ -695,7 +757,7 @@
 </div>
 
 <!-- Columns dialog -->
-<div id="columns-modal" class="modal-backdrop" style="display:none" onclick="closeColumnsModal(event)">
+<div id="columns-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:500px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
     <h3>Configure Columns</h3>
     <p style="color:#7a8099;font-size:12px;margin-bottom:14px">Check columns to show. Drag table headers to reorder.</p>
@@ -734,7 +796,7 @@
 </div>
 
 <!-- Neo4j endpoint modal (admin only — URL/host is shared infrastructure) -->
-<div id="neo4j-settings-modal" class="modal-backdrop" style="display:none" onclick="closeNeo4jSettingsModal(event)">
+<div id="neo4j-settings-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
     <h3>Neo4j Database Endpoint</h3>
     <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
@@ -752,7 +814,7 @@
 </div>
 
 <!-- Postgres endpoint modal (admin only — url/port is shared infrastructure) -->
-<div id="postgres-settings-modal" class="modal-backdrop" style="display:none" onclick="closePostgresSettingsModal(event)">
+<div id="postgres-settings-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
     <h3>Postgres Database Endpoint</h3>
     <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
@@ -772,7 +834,7 @@
 </div>
 
 <!-- Pathway Collection settings modal (admin only) -->
-<div id="pathway-collection-modal" class="modal-backdrop" style="display:none" onclick="closeMyPathwayCollectionModal(event)">
+<div id="pathway-collection-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:460px" onclick="event.stopPropagation()">
     <h3>My Pathway Collection</h3>
     <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
@@ -792,7 +854,7 @@
 </div>
 
 <!-- Pathway Text Search dialog -->
-<div id="pathway-search-modal" class="modal-backdrop" style="display:none" onclick="closePathwaySearchModal(event)">
+<div id="pathway-search-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:1150px;max-width:95vw" onclick="event.stopPropagation()">
     <h3>Pathway Text Search</h3>
     <div id="pws-error" class="error-msg" style="display:none"></div>
@@ -830,7 +892,7 @@
 
 <!-- Pathway Entity Search dialog — REQ-3.21-3.24. Runs immediately on the
      current graph selection (no keyword input needed), results only. -->
-<div id="pathway-entity-search-modal" class="modal-backdrop" style="display:none" onclick="closePathwayEntitySearchModal(event)">
+<div id="pathway-entity-search-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:1200px;max-width:95vw" onclick="event.stopPropagation()">
     <h3>Pathway Entity Search</h3>
     <div id="pes-error" class="error-msg" style="display:none"></div>
@@ -867,7 +929,7 @@
 <!-- Pathway Combined Search dialog — REQ-3.31-3.34. Prompts for keywords,
      then filters by the current graph selection's Entity Overlap before
      ranking the filtered subset by Text Search relevance. -->
-<div id="pathway-combined-search-modal" class="modal-backdrop" style="display:none" onclick="closePathwayCombinedSearchModal(event)">
+<div id="pathway-combined-search-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:960px;max-width:95vw" onclick="event.stopPropagation()">
     <h3>Pathway Combined Search</h3>
     <div id="pcs-error" class="error-msg" style="display:none"></div>
@@ -902,7 +964,7 @@
 
 <!-- Pathway Statistics dialog — REQ-3.71-3.73, sourced from the last Index
      run (persisted server-side, no re-computation needed on open). -->
-<div id="pathway-statistics-modal" class="modal-backdrop" style="display:none" onclick="closePathwayStatisticsModal(event)">
+<div id="pathway-statistics-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:520px;max-width:90vw" onclick="event.stopPropagation()">
     <h3>Pathway Collection Statistics</h3>
     <div id="pst-error" class="error-msg" style="display:none"></div>
@@ -920,7 +982,7 @@
      .graph.json under a user-chosen name, defaulting to the currently open
      pathway's own name and folder; the folder field can be changed to save
      into a different subfolder of the same collection. -->
-<div id="pathway-saveas-modal" class="modal-backdrop" style="display:none" onclick="closePathwaySaveAsModal(event)">
+<div id="pathway-saveas-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:460px" onclick="event.stopPropagation()">
     <h3>Save Pathway As</h3>
     <div id="pwsa-error" class="error-msg" style="display:none"></div>
@@ -949,7 +1011,7 @@
   </div>
 </div>
 
-<div id="pathway-annotation-modal" class="modal-backdrop" style="display:none" onclick="closePathwayAnnotationModal(event)">
+<div id="pathway-annotation-modal" class="modal-backdrop" style="display:none">
   <!-- Wider default (720px vs. the shared .modal-box's normal min-width) and
        user-resizable (native browser resize handle, bottom-right corner) --
        Notes in particular can be long enough that the old fixed size made it
@@ -982,7 +1044,7 @@
 
 <!-- Pathway Alphabetical Index — REQ-3.51-3.53, sourced from this user's own
      already-indexed pathway list (same data as Browse). -->
-<div id="pathway-alpha-index-modal" class="modal-backdrop" style="display:none" onclick="closePathwayAlphaIndexModal(event)">
+<div id="pathway-alpha-index-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:480px;max-width:90vw" onclick="event.stopPropagation()">
     <h3>Alphabetical Pathway Index</h3>
     <div id="pai-error" class="error-msg" style="display:none"></div>
@@ -998,7 +1060,7 @@
 <!-- Pathway Anatomy Index (File → Pathway → Anatomy Index, Phase 3) — drills
      down Category (Organ/Organ System/Organelle/Tissue/CellType) -> Term ->
      Pathways, same up/breadcrumb pattern as Browse. -->
-<div id="pathway-anatomy-index-modal" class="modal-backdrop" style="display:none" onclick="closePathwayAnatomyIndexModal(event)">
+<div id="pathway-anatomy-index-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:520px;max-width:90vw" onclick="event.stopPropagation()">
     <h3>Anatomy Index</h3>
     <div id="pan-error" class="error-msg" style="display:none"></div>
@@ -1018,7 +1080,7 @@
 <!-- Pathway Browse dialog — REQ-3.41-3.42, sourced from this user's own
      indexed collection only (see openPathwayBrowse() in app.js for why: a
      native file picker can't be pointed at, or restricted to, a directory). -->
-<div id="pathway-browse-modal" class="modal-backdrop" style="display:none" onclick="closePathwayBrowseModal(event)">
+<div id="pathway-browse-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:520px;max-width:90vw" onclick="event.stopPropagation()">
     <h3 id="pwb-title">Browse Pathways</h3>
     <div id="pwb-error" class="error-msg" style="display:none"></div>
@@ -1037,7 +1099,7 @@
 </div>
 
 <!-- My Neo4j Connection modal (every role — personal database/username/password) -->
-<div id="my-neo4j-modal" class="modal-backdrop" style="display:none" onclick="closeMyNeo4jSettingsModal(event)">
+<div id="my-neo4j-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
     <h3>My Neo4j Connection</h3>
     <div id="my-neo4j-error" class="error-msg" style="display:none"></div>
@@ -1064,7 +1126,7 @@
 </div>
 
 <!-- My Postgres Connection modal (every role — personal database/schema/username/password) -->
-<div id="my-postgres-modal" class="modal-backdrop" style="display:none" onclick="closeMyPostgresSettingsModal(event)">
+<div id="my-postgres-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:420px" onclick="event.stopPropagation()">
     <h3>My Postgres Connection</h3>
     <div id="my-pg-error" class="error-msg" style="display:none"></div>
@@ -1100,7 +1162,7 @@
 </div>
 
 <!-- ══════════════ LLM / Agentic AI Settings modal ══════════════ -->
-<div id="llm-settings-modal" class="modal-backdrop" style="display:none" onclick="closeLLMSettings(event)">
+<div id="llm-settings-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:520px;max-width:640px" onclick="event.stopPropagation()">
     <h3>Agentic AI / LLM Settings</h3>
     <div id="llm-settings-error"   class="error-msg"   style="display:none"></div>
@@ -1546,7 +1608,7 @@
 </div>
 
 <!-- Load node properties modal -->
-<div id="load-props-modal" class="modal-backdrop" style="display:none" onclick="closeLoadPropsModal(event)">
+<div id="load-props-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:480px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
     <h3>Load Node Properties</h3>
     <p style="color:#7a8099;font-size:12px;margin-bottom:10px">Select properties to add to nodes in the current pathway.</p>
@@ -1579,7 +1641,7 @@
 </div>
 
 <!-- Curation modal -->
-<div id="curation-modal" class="modal-backdrop" style="display:none" onclick="closeCurationModal(event)">
+<div id="curation-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:580px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
     <h3 id="curation-title">Edit Properties</h3>
     <div id="curation-props-container" style="overflow-y:auto;flex:1;margin-bottom:12px"></div>
@@ -1606,7 +1668,7 @@
 </div>
 
 <!-- RNEF pathway selection modal (shown when .rnef has multiple sub-graphs) -->
-<div id="rnef-modal" class="modal-backdrop" style="display:none" onclick="closeRnefModal(event)">
+<div id="rnef-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="width:520px;max-width:90vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden" onclick="event.stopPropagation()">
     <h3>Select Pathways</h3>
     <p style="color:#7a8099;font-size:12px;margin-bottom:10px">Check the pathways to open — each opens in its own tab.</p>
@@ -1712,7 +1774,7 @@
        /api/nodes/property-names-all). A single master checkbox at the top
        can select/deselect every relation subsection at once. Results feed
        into the same Connectivity Report dialog "Find drugs upstream" uses. -->
-  <div id="common-neighbors-config-modal" class="modal-backdrop" style="display:none" onclick="closeCommonNeighborsConfigModal(event)">
+  <div id="common-neighbors-config-modal" class="modal-backdrop" style="display:none">
     <div class="modal-box" style="min-width:640px;max-width:92vw;max-height:88vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
       <h3 id="cnc-title">Find Common Neighbors</h3>
       <div id="cnc-error" class="error-msg" style="display:none"></div>
@@ -1836,10 +1898,16 @@
         </table>
         <div id="cr-empty-msg" style="display:none;padding:14px;text-align:center;color:#7a8099;font-size:12px">No results found.</div>
       </div>
-      <div class="modal-actions">
-        <button class="btn-ghost" onclick="closeConnectivityReportModal()">Cancel</button>
-        <button class="btn-ghost" onclick="_crCommitNewTab()">Open in another graph</button>
-        <button class="btn-primary" onclick="_crCommit()">Add to current graph</button>
+      <div class="modal-actions" style="justify-content:space-between">
+        <label style="display:flex;align-items:center;gap:6px;color:#c8ccdc;font-size:12px;cursor:pointer">
+          <input type="checkbox" id="cr-include-relations" checked>
+          Include relations
+        </label>
+        <div style="display:flex;gap:10px">
+          <button class="btn-ghost" onclick="closeConnectivityReportModal()">Cancel</button>
+          <button class="btn-ghost" onclick="_crCommitNewTab()">Open in another graph</button>
+          <button class="btn-primary" onclick="_crCommit()">Add to current graph</button>
+        </div>
       </div>
     </div>
   </div>
