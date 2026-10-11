@@ -102,6 +102,53 @@ function _relIds(v) {
     .filter(function(s) { return /^-?\d+$/.test(s); });
 }
 
+// A relation's own RelationID property can itself be EITHER a single integer
+// OR a list of integers — a MERGED/FUSED relation (two or more originally-
+// separate relations combined into one, e.g. by curation or an import-time
+// match) spanning several logical RelationIDs on one physical Neo4j
+// relationship, stored that way natively (not just via a client-side
+// mergeSimilarRelations() pass, which stamps a SEPARATE plural RelationIDs
+// property instead). Not to be confused with this app's OTHER, unrelated
+// "hyperedge" concept (isHyperedge / HyperEdge hub nodes) — genuine multi-
+// participant ChemicalReaction-type relations with several regulators/targets. Cy edge data's `relIds`
+// field — read by the tooltip, table views, and search-by-id — used to come
+// ONLY from that plural RelationIDs property, so a relation whose RelationID
+// was natively list-valued but never went through a client merge lost every
+// id but the first (_relId() only returns v[0] for a list). This combines
+// whichever of the two actually carry ids into one deduped array.
+//
+// ALWAYS returns an array — never null, even for a relation with exactly one
+// id (or none at all: []) — so relIds is the one canonical "list of
+// RelationIDs" every part of the app can rely on unconditionally, rather
+// than each caller needing its own `edge.data('relIds') || (relId ? [relId] : [])`
+// fallback to cover the "just one id" case. relId (the scalar, first-id
+// convenience field used e.g. as a cache key) is unaffected and still exists
+// alongside it.
+function _computeRelIds(props) {
+  var ids = _relIds(props.RelationID);
+  if (Array.isArray(props.RelationIDs)) {
+    props.RelationIDs.forEach(function(id) { if (id != null) ids.push(String(id)); });
+  }
+  return Array.from(new Set(ids));
+}
+
+// RelationNumberOfReferences/RelationNumberOfSentences, like RelationID
+// itself, can be EITHER a single integer OR a list of integers for a
+// merged/fused relation — one value per originally-separate relation that
+// got combined. Unlike RelationID (an identifier, kept as separate values),
+// these are COUNTS, so the correct aggregate is their SUM. Reading the raw
+// property directly when it's list-valued previously passed the array
+// through untouched, which rendered as e.g. "6,3" in an exported cell
+// (Array's default toString()) instead of the combined total 9.
+function _sumRelProp(val) {
+  if (val == null) return 0;
+  if (Array.isArray(val)) {
+    return val.reduce(function(sum, v) { var n = Number(v); return sum + (isNaN(n) ? 0 : n); }, 0);
+  }
+  var n = Number(val);
+  return isNaN(n) ? 0 : n;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Client-side RelationID calculation — mirrors server.js's calcRelationId /
 //  _myhash / _pyRepr EXACTLY (verified bit-for-bit against the Node/Python
@@ -516,8 +563,10 @@ function loadColumnConfig() {
 const DEFAULT_COLUMNS = [
   { key: 'regulator',     label: 'Regulator',      visible: true,  source: 'graph' },
   { key: 'regulatorType', label: 'Regulator Type', visible: true,  source: 'graph' },
+  { key: 'regulatorURN',  label: 'Regulator URN',  visible: true,  source: 'graph' },
   { key: 'target',        label: 'Target',         visible: true,  source: 'graph' },
   { key: 'targetType',    label: 'Target Type',    visible: true,  source: 'graph' },
+  { key: 'targetURN',     label: 'Target URN',     visible: true,  source: 'graph' },
   { key: 'relationType',  label: 'Relation Type',  visible: true,  source: 'graph' },
   { key: 'effect',        label: 'Effect',         visible: true,  source: 'graph' },
   { key: 'numRefs',       label: 'Reference count',  visible: true,  source: 'graph', numeric: true },
@@ -701,6 +750,7 @@ function showApp() {
     document.getElementById('settings-users-item').style.display = '';
     // Database endpoint (URL/host) configuration is admin-only
     document.getElementById('settings-db-admin-section').style.display = '';
+    document.getElementById('mi-import-rnef').style.display = '';
   }
   // Initialise Agentic AI (show button, load LLM config)
   window._currentUser = { name: currentUser, role: currentRole };
@@ -713,6 +763,19 @@ function showApp() {
     var newCol = { key: 'numSentences', label: 'Assertion count', visible: true, source: 'graph', numeric: true };
     if (numRefsIdx >= 0) columnDefs.splice(numRefsIdx + 1, 0, newCol);
     else columnDefs.push(newCol);
+  }
+  // Migration: inject Regulator/Target URN columns if absent (added after initial release)
+  if (!columnDefs.find(function(c) { return c.key === 'regulatorURN'; })) {
+    var regTypeIdx = columnDefs.findIndex(function(c) { return c.key === 'regulatorType'; });
+    var regURNCol = { key: 'regulatorURN', label: 'Regulator URN', visible: true, source: 'graph' };
+    if (regTypeIdx >= 0) columnDefs.splice(regTypeIdx + 1, 0, regURNCol);
+    else columnDefs.push(regURNCol);
+  }
+  if (!columnDefs.find(function(c) { return c.key === 'targetURN'; })) {
+    var tgtTypeIdx = columnDefs.findIndex(function(c) { return c.key === 'targetType'; });
+    var tgtURNCol = { key: 'targetURN', label: 'Target URN', visible: true, source: 'graph' };
+    if (tgtTypeIdx >= 0) columnDefs.splice(tgtTypeIdx + 1, 0, tgtURNCol);
+    else columnDefs.push(tgtURNCol);
   }
   // Migration: ensure numeric flag is set on numRefs (may be absent in older saved configs)
   var numRefsCol = columnDefs.find(function(c) { return c.key === 'numRefs'; });
@@ -2214,7 +2277,7 @@ function _renderSankey(gNodes, gEdges, valueProp, showLabels) {
     // Reference count is tracked independently of `value` above (which follows
     // whatever "Value prop" the user picked) so the tooltip can always show the
     // true literature reference sum regardless of that setting.
-    var refsN = parseFloat((e.properties || {}).RelationNumberOfReferences);
+    var refsN = _sumRelProp((e.properties || {}).RelationNumberOfReferences);
     if (!isFinite(refsN) || refsN < 0) refsN = 0;
     if (isUp) {
       var k = label+'|||'+effect+'|||'+relType;
@@ -2622,14 +2685,14 @@ async function runSqlQuery() {
       return;
     }
     var cols = data.fields;
-    var html = '<table style="border-collapse:collapse;width:100%;font-size:11px">'
+    var html = '<table style="border-collapse:collapse;width:max-content;max-width:none;font-size:11px">'
       + '<thead><tr>' + cols.map(function(c) {
-          return '<th style="padding:4px 8px;background:#1a1f33;border:1px solid #2d3147;color:#8899cc;text-align:left;white-space:nowrap">' + escHtml(c) + '</th>';
+          return '<th style="padding:4px 8px;background:#1a1f33;border:1px solid #2d3147;color:#8899cc;text-align:left;white-space:nowrap;position:sticky;top:0">' + escHtml(c) + '</th>';
         }).join('') + '</tr></thead><tbody>';
     data.rows.forEach(function(row) {
       html += '<tr>' + cols.map(function(c) {
         var v = row[c];
-        return '<td style="padding:4px 8px;border:1px solid #1e2340;color:#c8cde4;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+        return '<td style="padding:4px 8px;border:1px solid #1e2340;color:#c8cde4;max-width:600px;white-space:pre-wrap;word-break:break-word">'
           + escHtml(v == null ? '' : String(v)) + '</td>';
       }).join('') + '</tr>';
     });
@@ -2638,6 +2701,303 @@ async function runSqlQuery() {
     resultsEl.innerHTML = html;
   } catch(e) {
     resultsEl.innerHTML = '<span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+  }
+}
+
+function closeStatisticsModal(e) {
+  if (e.target === document.getElementById('statistics-modal'))
+    document.getElementById('statistics-modal').style.display = 'none';
+}
+
+// The four queries behind this dialog run as independent requests (fired in
+// parallel below) rather than one combined call, so each section of the
+// dialog renders the moment ITS OWN query finishes. Any section still waiting
+// stays marked "unfinished" — that makes the slow query visible directly,
+// instead of one opaque "Loading…" covering all four at once.
+//
+// Results are cached client-side (_statsCache) across dialog opens — these
+// are expensive full-table/full-graph queries, so re-running them just
+// because the user reopened the dialog would be wasteful. Re-opening shows
+// the last-fetched numbers instantly; the "Refresh" button is the only thing
+// that re-queries.
+var _STAT_UNFINISHED_HTML = '<span style="color:#c9a227">⏳ unfinished…</span>';
+var _statsCache = null;  // null until the first fetch cycle completes; then { elId: innerHTML, ... }
+
+function openStatisticsDialog() {
+  document.getElementById('statistics-modal').style.display = 'flex';
+  _renderStatisticsSkeleton();
+  if (_statsCache) {
+    Object.keys(_statsCache).forEach(function(elId) {
+      var el = document.getElementById(elId);
+      if (el) el.innerHTML = _statsCache[elId];
+    });
+  } else {
+    refreshStatistics();
+  }
+}
+
+function refreshStatistics() {
+  _statsCache = {};
+  _renderStatisticsSkeleton();
+  _statFetchSection('/api/database/statistics/counts', 'stat-sec-counts', _renderStatCounts);
+  _statFetchSection('/api/database/statistics/node-props', 'stat-sec-nodeprops', _renderStatNodeProps);
+  _statFetchSection('/api/database/statistics/rel-props', 'stat-sec-relprops', _renderStatRelProps);
+  // Each Postgres count is its own query/request — count(distinct unique_ref)
+  // and count(distinct journal) each do their own full-table scan + dedup, so
+  // bundling them with count(*) made the combined statement as slow as the
+  // slowest of the three. Running them as separate requests also means the
+  // frontend can show which one specifically is still running.
+  _statFetchSection('/api/database/statistics/postgres/snippets', 'stat-sec-pg-snippets', function(d) { return _statNumberOrNotConnected(d.snippets); });
+  _statFetchSection('/api/database/statistics/postgres/articles', 'stat-sec-pg-articles', function(d) { return _statNumberOrNotConnected(d.articles); });
+  _statFetchSection('/api/database/statistics/postgres/journals', 'stat-sec-pg-journals', function(d) { return _statNumberOrNotConnected(d.journals); });
+  _statFetchSection('/api/database/statistics/postgres/sources', 'stat-sec-pg-sources', _renderStatSources);
+}
+
+function _renderStatisticsSkeleton() {
+  document.getElementById('statistics-body').innerHTML = ''
+    + '<h4 style="margin:0 0 8px;color:#e0e0e0">Neo4j</h4>'
+    + '<div id="stat-sec-counts" style="margin-bottom:12px">' + _STAT_UNFINISHED_HTML + '</div>'
+    + '<div style="margin-bottom:6px"><span style="color:#7a8099">Node attributes:</span> <span id="stat-sec-nodeprops">' + _STAT_UNFINISHED_HTML + '</span></div>'
+    + '<div style="margin-bottom:16px"><span style="color:#7a8099">Relation attributes:</span> <span id="stat-sec-relprops">' + _STAT_UNFINISHED_HTML + '</span></div>'
+    + '<h4 style="margin:0 0 8px;color:#e0e0e0">Postgres</h4>'
+    + '<div style="display:flex;gap:28px">'
+    + '<div><span style="color:#7a8099">Snippets:</span> <span id="stat-sec-pg-snippets">' + _STAT_UNFINISHED_HTML + '</span></div>'
+    + '<div><span style="color:#7a8099">Articles:</span> <span id="stat-sec-pg-articles">' + _STAT_UNFINISHED_HTML + '</span></div>'
+    + '<div><span style="color:#7a8099">Journals:</span> <span id="stat-sec-pg-journals">' + _STAT_UNFINISHED_HTML + '</span></div>'
+    + '</div>'
+    + '<div style="margin-top:10px"><span style="color:#7a8099">Sources:</span> <span id="stat-sec-pg-sources">' + _STAT_UNFINISHED_HTML + '</span></div>';
+}
+
+function _renderStatSources(d) {
+  if (!d.sources) return '<span style="color:#7a8099">N/A</span>';
+  if (!d.sources.length) return '<span style="color:#7a8099">None</span>';
+  return escHtml(d.sources.join(', '));
+}
+
+function _statNumberOrNotConnected(v) {
+  return v == null ? '<span style="color:#7a8099">N/A</span>' : '<b style="color:#e0e0e0">' + v.toLocaleString() + '</b>';
+}
+
+async function _statFetchSection(url, elId, renderFn) {
+  var el = document.getElementById(elId);
+  try {
+    var data = await api(url, null, 'GET');
+    el.innerHTML = renderFn(data);
+  } catch (e) {
+    el.innerHTML = '<span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+  }
+  if (_statsCache) _statsCache[elId] = el.innerHTML;
+}
+
+function _renderStatCounts(n) {
+  var html = '<div style="display:flex;gap:28px;margin-bottom:10px">'
+    + '<div><span style="color:#7a8099">Total nodes:</span> <b style="color:#e0e0e0">' + n.totalNodes.toLocaleString() + '</b></div>'
+    + '<div><span style="color:#7a8099">Total relations:</span> <b style="color:#e0e0e0">' + n.totalRelations.toLocaleString() + '</b></div>'
+    + '</div>';
+  html += '<div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap">'
+    + '<div>' + _statCountTable(n.nodesByLabel.map(function(r) { return { key: r.label, count: r.count }; }), 'Node label') + '</div>'
+    + '<div>' + _statCountTable(n.relationsByType.map(function(r) { return { key: r.relType, count: r.count }; }), 'Relation type') + '</div>'
+    + '</div>';
+  return html;
+}
+
+function _renderStatNodeProps(d) {
+  return (d.nodePropertyKeys && d.nodePropertyKeys.length) ? escHtml(d.nodePropertyKeys.join(', ')) : '<span style="color:#7a8099">None</span>';
+}
+
+function _renderStatRelProps(d) {
+  return (d.relationPropertyKeys && d.relationPropertyKeys.length) ? escHtml(d.relationPropertyKeys.join(', ')) : '<span style="color:#7a8099">None</span>';
+}
+
+
+function _statCountTable(rows, labelHeader) {
+  if (!rows || !rows.length) return '<span style="color:#7a8099">None</span>';
+  var html = '<table style="border-collapse:collapse;font-size:11px">'
+    + '<thead><tr>'
+    + '<th style="padding:3px 10px;background:#1a1f33;border:1px solid #2d3147;color:#8899cc;text-align:left">' + escHtml(labelHeader) + '</th>'
+    + '<th style="padding:3px 10px;background:#1a1f33;border:1px solid #2d3147;color:#8899cc;text-align:right">Count</th>'
+    + '</tr></thead><tbody>';
+  rows.forEach(function(r) {
+    html += '<tr>'
+      + '<td style="padding:3px 10px;border:1px solid #1e2340;color:#c8cde4">' + escHtml(r.key) + '</td>'
+      + '<td style="padding:3px 10px;border:1px solid #1e2340;color:#c8cde4;text-align:right">' + r.count.toLocaleString() + '</td>'
+      + '</tr>';
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+// ── Database -> Import RNEF ────────────────────────────────────────────────
+var _irnPollHandle = null;
+var _irnPickedFiles = null;  // FileList from the native file/folder picker, or null if using the path input instead
+
+function openImportRnefDialog() {
+  document.getElementById('import-rnef-modal').style.display = 'flex';
+  document.getElementById('irn-error').style.display = 'none';
+  document.getElementById('irn-progress').style.display = 'none';
+  document.getElementById('irn-summary').style.display = 'none';
+  document.getElementById('irn-summary').innerHTML = '';
+  document.getElementById('irn-path').value = '';
+  document.getElementById('irn-picked-summary').textContent = '';
+  document.getElementById('irn-file-input').value = '';
+  document.getElementById('irn-dir-input').value = '';
+  _irnPickedFiles = null;
+  document.getElementById('irn-run-btn').disabled = true;
+}
+
+// Native picker chosen — a folder pick (webkitdirectory) returns EVERY file
+// under it, so filter down to the ones the importer actually cares about.
+function _irnFilesPicked(fileList) {
+  var files = Array.prototype.filter.call(fileList, function(f) {
+    return /\.(rnef|xml)$/i.test(f.name);
+  });
+  var summaryEl = document.getElementById('irn-picked-summary');
+  if (!files.length) {
+    _irnPickedFiles = null;
+    summaryEl.textContent = 'No .rnef/.xml files found in that selection.';
+    document.getElementById('irn-run-btn').disabled = true;
+    return;
+  }
+  _irnPickedFiles = files;
+  document.getElementById('irn-path').value = '';  // picked files take priority over a typed path
+  summaryEl.textContent = files.length + ' file' + (files.length !== 1 ? 's' : '') + ' selected: ' +
+    files.slice(0, 3).map(function(f) { return f.name; }).join(', ') + (files.length > 3 ? ', …' : '');
+  document.getElementById('irn-run-btn').disabled = false;
+}
+
+// Typing a path clears any previously-picked files, so Import always acts on
+// whichever source the user touched most recently.
+function _irnPathTyped() {
+  var val = document.getElementById('irn-path').value.trim();
+  if (val) {
+    _irnPickedFiles = null;
+    document.getElementById('irn-picked-summary').textContent = '';
+    document.getElementById('irn-file-input').value = '';
+    document.getElementById('irn-dir-input').value = '';
+  }
+  document.getElementById('irn-run-btn').disabled = !val && !_irnPickedFiles;
+}
+
+async function runRnefImport() {
+  var errEl = document.getElementById('irn-error');
+  var progressEl = document.getElementById('irn-progress');
+  var summaryEl = document.getElementById('irn-summary');
+  errEl.style.display = 'none';
+  summaryEl.style.display = 'none';
+  summaryEl.innerHTML = '';
+
+  document.getElementById('irn-run-btn').disabled = true;
+  progressEl.style.display = '';
+
+  try {
+    if (_irnPickedFiles && _irnPickedFiles.length) {
+      await _irnUploadAndStart(_irnPickedFiles, progressEl);
+    } else {
+      var targetPath = document.getElementById('irn-path').value.trim();
+      if (!targetPath) { errEl.textContent = 'Choose a file/folder, or enter a server path.'; errEl.style.display = ''; progressEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
+      progressEl.textContent = 'Starting…';
+      await api('/api/import/rnef/start', { path: targetPath });
+    }
+  } catch (e) {
+    errEl.textContent = e.message || String(e);
+    errEl.style.display = '';
+    progressEl.style.display = 'none';
+    document.getElementById('irn-run-btn').disabled = false;
+    return;
+  }
+
+  if (_irnPollHandle) clearTimeout(_irnPollHandle);
+  _pollRnefImportProgress();
+}
+
+// Uploads every picked file's own text content to a fresh upload session
+// (4 at a time — same worker-pool concurrency already used elsewhere in this
+// app, e.g. _fetchReferencesForChunk), then starts the import job against
+// that session's server-side temp directory.
+async function _irnUploadAndStart(files, progressEl) {
+  progressEl.textContent = 'Starting upload session…';
+  var session = await api('/api/import/rnef/upload-session/start', {});
+  var sessionId = session.sessionId;
+
+  var uploaded = 0;
+  var CONCURRENCY = 4;
+  var nextIdx = 0;
+  async function worker() {
+    while (nextIdx < files.length) {
+      var idx = nextIdx++;
+      var file = files[idx];
+      var content = await file.text();
+      await fetch('/api/import/rnef/upload-session/' + sessionId + '/file', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain',
+          'X-Filename': encodeURIComponent(file.name),
+          'Authorization': 'Bearer ' + authToken
+        },
+        body: content
+      }).then(function(res) {
+        if (!res.ok) throw new Error('Upload failed for ' + file.name + ' (HTTP ' + res.status + ')');
+      });
+      uploaded++;
+      progressEl.textContent = 'Uploading… ' + uploaded + ' / ' + files.length;
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, files.length) }, worker));
+
+  progressEl.textContent = 'Starting import…';
+  await api('/api/import/rnef/upload-session/' + sessionId + '/finish', {});
+}
+
+async function _pollRnefImportProgress() {
+  var progressEl = document.getElementById('irn-progress');
+  var summaryEl = document.getElementById('irn-summary');
+  try {
+    var job = await api('/api/import/rnef/progress', null, 'GET');
+    if (job.noJob) return;
+
+    var lines = [];
+    lines.push('Files: ' + job.filesDone + ' / ' + job.filesTotal + (job.currentFile ? ' (' + escHtml(job.currentFile) + ')' : ''));
+    if (job.phase) {
+      var elapsed = job.phaseStartedAt ? Math.max(0, Math.round((Date.now() - job.phaseStartedAt) / 1000)) : null;
+      lines.push('<span style="color:#8fb8ff">Phase: ' + escHtml(job.phase) + (elapsed != null ? ' (' + elapsed + 's)' : '') + '</span>');
+    }
+    lines.push('Relations parsed: ' + job.relationsParsed.toLocaleString());
+    if (job.batchTotal) lines.push('Batch: ' + job.batchIndex + ' / ' + job.batchTotal);
+    lines.push('References inserted: ' + job.referencesInserted.toLocaleString());
+    lines.push('References skipped (no identifier): ' + job.referencesSkippedMalformed.toLocaleString());
+    if (job.lastStderr) {
+      lines.push('<details style="margin-top:4px"><summary style="cursor:pointer;color:#7a8099">Parser output (last lines)</summary>'
+        + '<pre style="white-space:pre-wrap;font-size:10px;color:#9aa0c0;max-height:120px;overflow:auto;margin:4px 0 0">' + escHtml(job.lastStderr) + '</pre></details>');
+    }
+    progressEl.innerHTML = lines.join('<br>');
+
+    if (job.done) {
+      document.getElementById('irn-run-btn').disabled = false;
+      var errCount = (job.errors || []).length;
+      var html = '<b>Import finished.</b>';
+      if (errCount) {
+        html += '<div style="margin-top:6px;color:#e0a040">' + errCount + ' item(s) need review:</div>'
+          + '<div style="max-height:200px;overflow:auto;border:1px solid #2d3147;border-radius:5px;margin-top:4px">'
+          + '<table style="border-collapse:collapse;width:100%;font-size:11px">'
+          + '<thead><tr><th style="padding:3px 8px;background:#1a1f33;text-align:left">RelationID</th><th style="padding:3px 8px;background:#1a1f33;text-align:left">Issue</th><th style="padding:3px 8px;background:#1a1f33;text-align:left">Title/File</th></tr></thead><tbody>'
+          + job.errors.slice(0, 500).map(function(e) {
+              return '<tr>'
+                + '<td style="padding:3px 8px;border-top:1px solid #1e2340">' + escHtml(e.relationId != null ? String(e.relationId) : '') + '</td>'
+                + '<td style="padding:3px 8px;border-top:1px solid #1e2340">' + escHtml(e.error || '') + '</td>'
+                + '<td style="padding:3px 8px;border-top:1px solid #1e2340">' + escHtml(e.title || e.file || e.textref || '') + '</td>'
+                + '</tr>';
+            }).join('')
+          + '</tbody></table></div>';
+      }
+      summaryEl.innerHTML = html;
+      summaryEl.style.display = '';
+      return;
+    }
+
+    _irnPollHandle = setTimeout(_pollRnefImportProgress, 1500);
+  } catch (e) {
+    progressEl.innerHTML += '<br><span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+    document.getElementById('irn-run-btn').disabled = false;
   }
 }
 
@@ -3224,6 +3584,11 @@ function _cleanRefSentenceMarkup(sentence) {
   // cut point falls after any markup near the start rather than through it.
   return String(sentence || '').slice(0, 200).replace(/ID\{[^=}]*=([^}]*)\}/g, '$1');
 }
+// Purely a FUZZY key (DOI/PMID + sentence prefix) — used only to cross-match
+// an inline (file-embedded, no unique_id) reference against its Postgres
+// counterpart in _mergeInlineAndDbRefs(). NEVER used to decide whether two
+// DB-sourced rows (both carrying their own unique_id) are "the same
+// reference" — see that function's own handling of unique_id for why.
 function _refDedupeKey(ref) {
   var sentence = _cleanRefSentenceMarkup(ref.msrc).slice(0, 30);
   if (ref.doi)  return 'doi:'  + String(ref.doi).toLowerCase().trim()  + ' ' + sentence;
@@ -3244,18 +3609,43 @@ function _refDedupeKey(ref) {
 // duplicate would silently drop that unique_id even though a real Postgres
 // match exists.
 function _mergeInlineAndDbRefs(inlineRefs, dbRefs) {
-  var byKey = new Map();   // dedupe key -> surviving ref (Postgres wins on conflict)
-  var order = [];          // first-seen key order, for stable display order
+  var byKey = new Map();      // dedupe key -> surviving ref (Postgres wins on conflict)
+  var seenUniqueIds = new Set();  // guards against the exact same Postgres row appearing twice in dbRefs
+  var order = [];             // first-seen key order, for stable display order
 
   (inlineRefs || []).forEach(function(ref) {
+    // Inline/file refs never carry unique_id (not yet matched to Postgres),
+    // so this is always the fuzzy key.
     var k = _refDedupeKey(ref);
     if (!byKey.has(k)) order.push(k);
     byKey.set(k, ref);
   });
   (dbRefs || []).forEach(function(ref) {
-    var k = _refDedupeKey(ref);
-    if (!byKey.has(k)) order.push(k);
-    byKey.set(k, ref);   // overwrites any file-only entry with the Postgres one
+    var uid = (ref.unique_id != null && String(ref.unique_id).trim() !== '') ? String(ref.unique_id).trim() : null;
+    if (uid) {
+      if (seenUniqueIds.has(uid)) return;  // literally the same Postgres row seen twice — skip
+      seenUniqueIds.add(uid);
+    }
+    var fuzzyKey = _refDedupeKey(ref);
+    var existing = byKey.get(fuzzyKey);
+    // Only collapse into the fuzzy-key slot when nothing's there yet, or
+    // what's there is an INLINE entry this DB row corresponds to (no
+    // unique_id of its own) — the Postgres copy wins, exactly as before.
+    // If another DB row (with its OWN unique_id) already claimed this fuzzy
+    // key, that's two DISTINCT Postgres references that merely cite the same
+    // paper with a similar opening sentence (common for templated
+    // NLP-extracted text) — give this one its own slot instead of silently
+    // merging two different reference rows into one. This is the fix for
+    // "References table shows 1 row, tooltip shows 28" when 28 real Postgres
+    // rows for one relation share a DOI.
+    if (!existing || !(existing.unique_id != null && String(existing.unique_id).trim() !== '')) {
+      if (!byKey.has(fuzzyKey)) order.push(fuzzyKey);
+      byKey.set(fuzzyKey, ref);
+    } else {
+      var ownKey = uid ? ('uid:' + uid) : fuzzyKey;
+      if (!byKey.has(ownKey)) order.push(ownKey);
+      byKey.set(ownKey, ref);
+    }
   });
 
   return order.map(function(k) { return byKey.get(k); });
@@ -3311,7 +3701,7 @@ function _buildCyEdgeData(e, srcCyId, tgtCyId) {
   var _inlineRefs = Array.isArray(p.references) && p.references.length ? p.references : null;
   var numRefs = _inlineRefs
     ? calcRefCount(_inlineRefs)
-    : (p.RelationNumberOfReferences != null ? p.RelationNumberOfReferences : 0);
+    : _sumRelProp(p.RelationNumberOfReferences);
   var undirected = p.directed === false || !p.directed && !DIRECT_TYPES.has(e.type || '');
   return {
     id:           e.id,
@@ -3320,7 +3710,7 @@ function _buildCyEdgeData(e, srcCyId, tgtCyId) {
     target:       tgtCyId,
     relType:      e.type || '',
     relId:        _relId(p.RelationID),
-    relIds:       Array.isArray(p.RelationIDs) ? p.RelationIDs : null,
+    relIds:       _computeRelIds(p),
     edgeURN:      p.URN != null ? String(p.URN) : '',
     numRefs:      numRefs,
     effect:       normEffectDisplay(p.Effect || p.effect || ''),
@@ -3810,14 +4200,117 @@ function _onSourceFilterChanged() {
     if (tableViewMode === 'relation') loadRelationData();
     else if (tableViewMode === 'reference') loadTableData();
   }
+  updateSourceMenuItems();
+}
+
+// Enables/disables Database menu items that only make sense while a Source
+// filter is active. Purely visual (menu-item.disabled has no pointer-events
+// rule — see app.css), so findRelationsUniqueToFilteredSource() itself also
+// no-ops with no filter active, same pattern as updatePasteMenuItem().
+function updateSourceMenuItems() {
+  var el = document.getElementById('mi-unique-to-source');
+  if (el) el.classList.toggle('disabled', !_activeSourceFilter || !_activeSourceFilter.length);
+}
+
+// Builds the Cypher query for a batch/chunk of RelationIDs found by
+// /api/references/unique-source-relation-ids. A Neo4j relationship's own
+// RelationID property can be EITHER a single integer OR a list of integers
+// (a merged/fused relation spanning several logical RelationIDs that share
+// one physical Neo4j relationship) — such a relation only counts as "unique to the
+// filtered source" when EVERY one of its RelationIDs is in the list the SQL
+// query found, not just one of them (a plain `r.RelationID IN [...ids]`
+// would silently never match a list-valued RelationID at all, since IN
+// checks whether the property VALUE — here, a whole list — is itself one of
+// the elements of the ids array, which it never is).
+// `[] + coalesce(r.RelationID, [])` normalizes either shape into a flat
+// list — Cypher's list `+` operator appends a scalar or concatenates a list
+// depending on the runtime type of its right operand, with no error either
+// way — then ALL(...) requires every element to be in the filtered-source
+// id set; size(...) > 0 excludes relations with no RelationID at all (ALL()
+// on an empty list is vacuously true, which would otherwise wrongly count
+// them as "unique").
+function _buildUniqueSourceRelationsQuery(ids) {
+  return 'MATCH (a)-[r]-(b) WITH a, r, b, ([] + coalesce(r.RelationID, [])) AS _rids ' +
+         'WHERE size(_rids) > 0 AND ALL(x IN _rids WHERE x IN [' + ids.join(',') + ']) ' +
+         'RETURN a, r, b';
+}
+
+// Database → "Relations unique to filtered source" — finds every relation
+// whose Postgres reference rows come EXCLUSIVELY from the currently selected
+// Source(s): total reference count for that RelationID equals its filtered
+// count (FilteredNumberOfReferences === RelationNumberOfReferences), i.e. it
+// has zero references from any OTHER source. The comparison is done entirely
+// in one SQL statement server-side (see /api/references/unique-source-relation-ids)
+// rather than against Neo4j's own RelationNumberOfReferences property, which
+// can drift slightly from the real Postgres reference count.
+async function findRelationsUniqueToFilteredSource() {
+  if (!_activeSourceFilter || !_activeSourceFilter.length) return;  // menu item is disabled in this state
+  setProgressMsg('⏳ Finding relations unique to the filtered source(s)…');
+  var relationIds;
+  try {
+    var result = await api('/api/references/unique-source-relation-ids', { sources: _activeSourceFilter });
+    relationIds = result.relationIds || [];
+  } catch (e) {
+    setProgressMsg(null);
+    alert('Failed to find relations unique to the filtered source: ' + e.message);
+    return;
+  }
+  if (!relationIds.length) {
+    setProgressMsg(null);
+    alert('No relations found whose references come exclusively from the currently selected Source(s).');
+    return;
+  }
+  // Let the user gauge how long the retrieval will take before it starts —
+  // stays visible through the "Query Result Too Large" modal for the large
+  // case below, and through runQuery()'s own progress for the small case.
+  setProgressMsg('✓ Found ' + relationIds.length.toLocaleString() + ' relation(s) unique to the filtered source(s) — starting retrieval…');
+
+  // RelationIDs are kept as raw digit strings throughout (never parsed as JS
+  // Numbers) when building Cypher query text below, since the ID can exceed
+  // JavaScript's safe integer range.
+  var fullQuery = _buildUniqueSourceRelationsQuery(relationIds);
+
+  // Small enough to load straight into the graph viewer — same threshold and
+  // same code path (runQuery()) a manually-typed Cypher query goes through.
+  // One RelationID is (at minimum) one physical relationship, so this count
+  // is already a safe proxy for the eventual edge count — no separate
+  // pre-execution COUNT round trip needed here.
+  if (relationIds.length < 1000) {
+    setCypherQuery(fullQuery);
+    await runQuery();
+    return;
+  }
+
+  // Large result: batch Neo4j retrieval into chunks of 5,000 RelationIDs.
+  // exportQueryReferences()/exportQueryCSVReferences() (via largeQueryExport())
+  // fetch each chunk from Neo4j in turn and, for the References scope,
+  // immediately submit that chunk's RelationIDs to Postgres for reference
+  // retrieval in the background — overlapping Postgres work with the NEXT
+  // chunk's Neo4j round trip instead of waiting for every batch to land
+  // before any Postgres fetching starts. Reuses the exact same "Query Result
+  // Too Large" modal (Data Scope / Format / Export) a manually-typed Cypher
+  // query shows once it exceeds the same 1,000-edge threshold.
+  var CHUNK = 5000;
+  var relationIdChunks = [];
+  for (var i = 0; i < relationIds.length; i += CHUNK) relationIdChunks.push(relationIds.slice(i, i + CHUNK));
+  _showLargeResultModal(
+    { type: 'query', query: fullQuery, relationIdChunks: relationIdChunks },
+    'Found ' + relationIds.length.toLocaleString() + ' relation(s) unique to the filtered source(s).'
+  );
 }
 
 // FilteredNumberOfReferences — per-relation reference count restricted to the
 // currently-selected source(s) (_activeSourceFilter). Only meaningful while a
-// Source filter is active; always ≤ that relation's own RelationNumberOfReferences,
-// since it's counting a subset (by source) of the very same Postgres rows.
-// Returns {} immediately when no filter is active — callers should treat a
-// missing key as "not computed" rather than "zero".
+// Source filter is active; always ≤ that relation's own RelationNumberOfReferences.
+// MUST use the same "distinct paper" dedup as calcRefCount() (by DOI/EMBASE/
+// PII/PUI/NCT_ID) — NOT a raw Postgres row count — because Neo4j's own
+// RelationNumberOfReferences is itself a distinct-paper count (a single paper
+// can be cited by several sentences/rows). Comparing a raw row count against
+// a distinct-paper count is comparing two different metrics and can make the
+// "filtered" count come out LARGER than the true total even though it's a
+// subset of the exact same rows — not a real violation, just the wrong
+// measure. Returns {} immediately when no filter is active — callers should
+// treat a missing key as "not computed" rather than "zero".
 async function _fetchFilteredRefCounts(relIds) {
   var counts = {};
   if (!_activeSourceFilter || !relIds || !relIds.length) return counts;
@@ -3828,7 +4321,7 @@ async function _fetchFilteredRefCounts(relIds) {
   try {
     await Promise.all(chunks.map(async function(chunk) {
       var grouped = await api('/api/references/batch', { relationIds: chunk, sources: _activeSourceFilter });
-      Object.keys(grouped).forEach(function(k) { counts[k] = (grouped[k] || []).length; });
+      Object.keys(grouped).forEach(function(k) { counts[k] = calcRefCount(grouped[k] || []); });
     }));
   } catch (e) { /* leave whatever was resolved before the failure — partial is fine */ }
   return counts;
@@ -4029,36 +4522,20 @@ function renderGraph(data, savedPositions) {
         ' endNodeId=' + e.endNodeId + ' (inSet=' + cyNodeIdSet.has(String(e.endNodeId)) + ')');
       return;
     }
-    // When inline refs are present, derive both counts from them so they stay
-    // consistent with each other (Neo4j values may be from a different snapshot).
-    var _inlineRefs = Array.isArray(e.properties.references) && e.properties.references.length
-                      ? e.properties.references : null;
-    var numRefs = _inlineRefs
-      ? calcRefCount(_inlineRefs)
-      : (e.properties.RelationNumberOfReferences != null ? e.properties.RelationNumberOfReferences : 0);
-    var undirected = e.properties.directed === false;
+    // Single source of truth for Neo4j-relation → Cytoscape-edge-data
+    // translation — see _buildCyEdgeData()'s own comment. Every other
+    // "add edges to the graph" pathway (mergeGraphData, loadSimilarRelations,
+    // findRelationsBetweenGroups, connectSelectedNodes) already calls it;
+    // this used to be a separately hand-maintained duplicate here that had
+    // drifted (missing relIds' list-valued-RelationID handling, and a
+    // simpler "undirected" fallback that didn't consider relation type),
+    // same `undirected`/`classes` computation as those other callers use.
+    var undirected = !(e.properties && e.properties.directed !== false &&
+                       (e.properties.directed || DIRECT_TYPES.has(e.type || '')));
     cyEdges.push({
       group: 'edges',
       classes: undirected ? 'undirected' : '',
-      data: {
-        id: e.id,
-        elementId: e.elementId || e.id,
-        source: e.startNodeId,
-        target: e.endNodeId,
-        relType: e.type,
-        relId: _relId(e.properties.RelationID),
-        relIds: Array.isArray(e.properties.RelationIDs) ? e.properties.RelationIDs : null,
-        edgeURN: e.properties.URN != null ? String(e.properties.URN) : '',
-        numRefs: numRefs,
-        effect: normEffectDisplay(e.properties.Effect || e.properties.effect || ''),
-        mechanism: e.properties.Mechanism || e.properties.mechanism || '',
-        confidence: e.properties['Confidence (%)'] != null ? e.properties['Confidence (%)'] : '',
-        citationScore: e.properties['Citation score'] != null ? e.properties['Citation score'] : '',
-        color: getTypeColor(e.type),
-        isHyperedge: (e.type === 'Substrate' || e.type === 'Product' || e.type === 'Cofactor'),
-        thickness: getEdgeThickness(numRefs),
-        lineStyle: DIRECT_TYPES.has(e.type) ? 'solid' : 'dashed'
-      }
+      data: _buildCyEdgeData(e, e.startNodeId, e.endNodeId)
     });
   });
   if (skippedEdges > 0) console.warn('renderGraph: skipped ' + skippedEdges + ' edge(s) with missing endpoints.');
@@ -4578,20 +5055,38 @@ async function writeRowsToCSV(rows, isRelMode, baseName, maxRows) {
 // Processes edges in batches of EDGE_BATCH to keep browser memory bounded:
 // refs are fetched and converted to CSV lines per-batch, then discarded.
 // Splits output at MAX_CSV_ROWS rows per file; downloads a zip when > 1 file.
-async function exportQueryCSVReferences(query) {
+// `relationIdChunks` — see exportQueryReferences — batches the Neo4j fetch
+// itself in that many round trips (progress reported per batch) instead of
+// one single query carrying every RelationID. The Postgres reference fetch
+// below (EDGE_BATCH loop) already processes qEdges in its own 5,000-edge
+// batches regardless of how qEdges was populated, so it needs no changes.
+async function exportQueryCSVReferences(query, relationIdChunks) {
   setProgressMsg('⏳ Fetching relations from database…');
-  var qData;
-  try { qData = await api('/api/export/csv-query', { query }); }
-  catch (err) { setProgressMsg(null); alert('Query error: ' + err.message); return; }
-
-  var qNodes = qData.nodes || [];
-  var qEdges = qData.edges || [];
-
+  var qNodes = [], qEdges = [];
   var nodeById = {};
-  qNodes.forEach(function(n) {
-    nodeById[n.id] = n;
-    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
-  });
+  function _mergeCsvQData(data) {
+    (data.nodes || []).forEach(function(n) {
+      if (!nodeById[n.id]) {
+        nodeById[n.id] = n;
+        qNodes.push(n);
+        if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+      }
+    });
+    (data.edges || []).forEach(function(e) { qEdges.push(e); });
+  }
+  if (Array.isArray(relationIdChunks)) {
+    for (var ci = 0; ci < relationIdChunks.length; ci++) {
+      setProgressMsg(_batchProgressMsg(relationIdChunks, ci + 1));
+      var chunkQuery = _buildUniqueSourceRelationsQuery(relationIdChunks[ci]);
+      try { _mergeCsvQData(await api('/api/export/csv-query', { query: chunkQuery })); }
+      catch (err) { alert('Query error on batch ' + (ci + 1) + '/' + relationIdChunks.length + ': ' + err.message); }
+    }
+  } else {
+    var qData;
+    try { qData = await api('/api/export/csv-query', { query }); }
+    catch (err) { setProgressMsg(null); alert('Query error: ' + err.message); return; }
+    _mergeCsvQData(qData);
+  }
 
   // MedScan IDs
   var medScan = {};
@@ -4717,26 +5212,46 @@ async function exportQueryCSVReferences(query) {
       var srcNode   = nodeById[edge.startNodeId];
       var tgtNode   = nodeById[edge.endNodeId];
       var relId     = _relId(edge.properties.RelationID);
-      var relIdsArr = Array.isArray(edge.properties.RelationIDs)
-                    ? edge.properties.RelationIDs : (relId ? [relId] : []);
+      // _computeRelIds handles BOTH shapes a merged/fused relation can carry
+      // its ids in: a native Neo4j list-valued RelationID property, or a
+      // client-side merge's plural RelationIDs property — never just one or
+      // the other.
+      var relIdsArr = _computeRelIds(edge.properties);
 
+      // Concatenate EVERY id's reference bucket — not just the first
+      // non-empty one. A merged relation's references can be split across
+      // its several RelationIDs in Postgres; taking only the first id that
+      // happens to have any rows silently discarded every other id's rows
+      // (e.g. a relation with 2 RelationIDs where one has 1 reference and
+      // the other has 27 was showing only the 1).
       var refs = [];
-      for (var ri = 0; ri < relIdsArr.length; ri++) {
-        var _r = refsGrouped[String(relIdsArr[ri])];
-        if (_r && _r.length) { refs = _r; break; }
-      }
+      relIdsArr.forEach(function(rid) {
+        var _r = refsGrouped[String(rid)];
+        if (_r && _r.length) refs = refs.concat(_r);
+      });
 
       var base = {
         edgeId: edge.id, elementId: edge.elementId || edge.id,
         relId:         relIdsArr.join(', ') || relId,
         regulator:     nodeLabel(srcNode),    regulatorMedScan: nodeMedScan(srcNode),
         regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+        regulatorURN:  (srcNode && srcNode.properties && srcNode.properties.URN) || '',
         target:        nodeLabel(tgtNode),    targetMedScan:    nodeMedScan(tgtNode),
         targetType:    (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+        targetURN:     (tgtNode && tgtNode.properties && tgtNode.properties.URN) || '',
         relationType:  edge.type,
         effect:        normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
-        numRefs:       edge.properties.RelationNumberOfReferences  || 0,
-        numSentences:  edge.properties.RelationNumberOfSentences   || 0,
+        numRefs:       _sumRelProp(edge.properties.RelationNumberOfReferences),
+        numSentences:  _sumRelProp(edge.properties.RelationNumberOfSentences),
+        // refsGrouped for this batch was already fetched WITH
+        // sources:_activeSourceFilter above — calcRefCount() (distinct papers
+        // by DOI/EMBASE/PII/PUI/NCT_ID) here, NOT a raw row count, to match
+        // Neo4j's own RelationNumberOfReferences methodology (see
+        // _fetchFilteredRefCounts' comment) — otherwise "filtered" can come
+        // out larger than "total" despite being a subset of the same rows.
+        filteredNumRefs: _activeSourceFilter
+          ? relIdsArr.reduce(function(sum, id) { return sum + calcRefCount(refsGrouped[String(id)] || []); }, 0)
+          : '',
       };
 
       function writeEdge(ref) {
@@ -4787,20 +5302,36 @@ async function exportQueryCSVReferences(query) {
 // ─── CSV export — Relations mode ──────────────────────────────────────────────
 // Uses /api/export/csv-query (Neo4j fetchSize 50 000). No PG calls needed —
 // all relation data comes directly from Neo4j edge properties.
-async function exportQueryCSVRelations(query) {
+// `relationIdChunks` — see exportQueryCSVReferences — batches the Neo4j
+// fetch itself; this mode needs no Postgres reference lookup at all (numRefs
+// comes straight from Neo4j's own RelationNumberOfReferences property).
+async function exportQueryCSVRelations(query, relationIdChunks) {
   setProgressMsg('⏳ Fetching relations from database…');
-  var qData;
-  try { qData = await api('/api/export/csv-query', { query }); }
-  catch (err) { setProgressMsg(null); alert('Query error: ' + err.message); return; }
-
-  var qNodes = qData.nodes || [];
-  var qEdges = qData.edges || [];
-
+  var qNodes = [], qEdges = [];
   var nodeById = {};
-  qNodes.forEach(function(n) {
-    nodeById[n.id] = n;
-    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
-  });
+  function _mergeCsvQData(data) {
+    (data.nodes || []).forEach(function(n) {
+      if (!nodeById[n.id]) {
+        nodeById[n.id] = n;
+        qNodes.push(n);
+        if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+      }
+    });
+    (data.edges || []).forEach(function(e) { qEdges.push(e); });
+  }
+  if (Array.isArray(relationIdChunks)) {
+    for (var ci = 0; ci < relationIdChunks.length; ci++) {
+      setProgressMsg(_batchProgressMsg(relationIdChunks, ci + 1));
+      var chunkQuery = _buildUniqueSourceRelationsQuery(relationIdChunks[ci]);
+      try { _mergeCsvQData(await api('/api/export/csv-query', { query: chunkQuery })); }
+      catch (err) { alert('Query error on batch ' + (ci + 1) + '/' + relationIdChunks.length + ': ' + err.message); }
+    }
+  } else {
+    var qData;
+    try { qData = await api('/api/export/csv-query', { query }); }
+    catch (err) { setProgressMsg(null); alert('Query error: ' + err.message); return; }
+    _mergeCsvQData(qData);
+  }
 
   var medScan = {};
   var nodeIds = qNodes
@@ -4828,6 +5359,15 @@ async function exportQueryCSVRelations(query) {
     }
   });
 
+  // This mode has no per-reference Postgres fetch at all (numRefs comes
+  // straight from Neo4j), so filteredNumRefs needs its own dedicated count
+  // lookup — same helper loadRelationData() uses.
+  var allRelIdsForFilter = [];
+  qEdges.forEach(function(edge) {
+    allRelIdsForFilter = allRelIdsForFilter.concat(_computeRelIds(edge.properties));
+  });
+  var filteredCounts = await _fetchFilteredRefCounts(allRelIdsForFilter);
+
   setProgressMsg('⏳ Building rows…');
   await yieldToUI();
 
@@ -4835,19 +5375,26 @@ async function exportQueryCSVRelations(query) {
     var srcNode   = nodeById[edge.startNodeId];
     var tgtNode   = nodeById[edge.endNodeId];
     var relId     = _relId(edge.properties.RelationID);
-    var relIdsArr = Array.isArray(edge.properties.RelationIDs)
-                  ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    // _computeRelIds handles BOTH shapes a merged/fused relation can carry
+    // its ids in — a native Neo4j list-valued RelationID, or a client-merge's
+    // plural RelationIDs — never just one or the other (see its own comment).
+    var relIdsArr = _computeRelIds(edge.properties);
     var row = {
       edgeId: edge.id, elementId: edge.elementId || edge.id,
       relId:         relIdsArr.length > 1 ? relIdsArr.join(', ') : relId,
       regulator:     nodeLabel(srcNode),    regulatorMedScan: nodeMedScan(srcNode),
       regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      regulatorURN:  (srcNode && srcNode.properties && srcNode.properties.URN) || '',
       target:        nodeLabel(tgtNode),    targetMedScan:    nodeMedScan(tgtNode),
       targetType:    (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      targetURN:     (tgtNode && tgtNode.properties && tgtNode.properties.URN) || '',
       relationType:  edge.type,
       effect:        normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
-      numRefs:       edge.properties.RelationNumberOfReferences  || 0,
-      numSentences:  edge.properties.RelationNumberOfSentences   || '',
+      numRefs:       _sumRelProp(edge.properties.RelationNumberOfReferences),
+      numSentences:  _sumRelProp(edge.properties.RelationNumberOfSentences),
+      filteredNumRefs: _activeSourceFilter
+        ? relIdsArr.reduce(function(sum, id) { return sum + (filteredCounts[id] || 0); }, 0)
+        : '',
     };
     columnDefs.forEach(function(col) {
       if (col.source === 'neo4j') {
@@ -4864,22 +5411,64 @@ async function exportQueryCSVRelations(query) {
   await writeRowsToCSV(rows, true, 'query-relations');
 }
 
+// Progress text shared by every batched Neo4j fetch below — reports both
+// "batch X of Y" and the running RelationID count against the TOTAL the
+// initial SQL query found (see findRelationsUniqueToFilteredSource()), so
+// the user can gauge how much of the job is left, not just which batch.
+function _batchProgressMsg(relationIdChunks, batchIdx, suffix) {
+  var total = relationIdChunks.reduce(function(s, c) { return s + c.length; }, 0);
+  var done  = relationIdChunks.slice(0, batchIdx).reduce(function(s, c) { return s + c.length; }, 0);
+  return '⏳ Fetching relations from Neo4j… (batch ' + batchIdx + '/' + relationIdChunks.length +
+    '  ·  ' + done.toLocaleString() + ' / ' + total.toLocaleString() + ' relations)' + (suffix || '');
+}
+
 // Shared: run query in-memory and build node/edge lookup + MedScan map.
 // Returns { qNodes, qEdges, nodeById, medScan } or null on error.
-async function _fetchQueryData(query) {
-  var qData;
-  try { qData = await api('/api/graph/query', { query }); }
-  catch (err) { alert('Query error: ' + err.message); return null; }
-
-  var qNodes = qData.nodes || [];
-  var qEdges = qData.edges || [];
-
-  // nodeById index (by id and URN)
+// `relationIdChunks`, when given (an array of RelationID-string arrays),
+// fetches Neo4j data in that many separate batched queries — one
+// _buildUniqueSourceRelationsQuery(chunk) per chunk — instead of the single
+// `query` string. `onChunk(chunkRelationIds)`,
+// if given, fires right after each chunk's Neo4j data is merged in and
+// BEFORE the next chunk's fetch starts, so a caller can kick off Postgres
+// reference retrieval for that chunk immediately (see
+// findRelationsUniqueToFilteredSource()) and let it run concurrently with
+// the next Neo4j round trip, rather than waiting for every batch to land
+// before any Postgres work begins. Ignored (single-query path, unchanged
+// from before this was added) when relationIdChunks is omitted.
+async function _fetchQueryData(query, relationIdChunks, onChunk) {
+  var qNodes = [], qEdges = [];
   var nodeById = {};
-  qNodes.forEach(function(n) {
-    nodeById[n.id] = n;
-    if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
-  });
+
+  function _mergeQData(data) {
+    (data.nodes || []).forEach(function(n) {
+      if (!nodeById[n.id]) {
+        nodeById[n.id] = n;
+        qNodes.push(n);
+        if (n.properties && n.properties.URN) nodeById[n.properties.URN] = n;
+      }
+    });
+    (data.edges || []).forEach(function(e) { qEdges.push(e); });
+  }
+
+  if (Array.isArray(relationIdChunks)) {
+    for (var ci = 0; ci < relationIdChunks.length; ci++) {
+      var chunk = relationIdChunks[ci];
+      var chunkQuery = _buildUniqueSourceRelationsQuery(chunk);
+      var chunkData;
+      try { chunkData = await api('/api/graph/query', { query: chunkQuery }); }
+      catch (err) {
+        alert('Query error on batch ' + (ci + 1) + '/' + relationIdChunks.length + ': ' + err.message);
+        continue;  // keep going — a batch failure shouldn't lose the other batches already/still fetching
+      }
+      _mergeQData(chunkData);
+      if (onChunk) onChunk(chunk);  // NOT awaited here — runs concurrently with the next chunk's Neo4j fetch
+    }
+  } else {
+    var qData;
+    try { qData = await api('/api/graph/query', { query }); }
+    catch (err) { alert('Query error: ' + err.message); return null; }
+    _mergeQData(qData);
+  }
 
   // Fetch MedScan IDs for nodes that have a Neo4j NodeID
   var nodeIds = qNodes
@@ -4896,71 +5485,91 @@ async function _fetchQueryData(query) {
   return { qNodes, qEdges, nodeById, medScan };
 }
 
+// Sub-chunks a chunk's RelationIDs into ~200-id Postgres batch requests, run
+// with limited concurrency (same pattern exportQueryReferences already used
+// for its single, all-at-once batch) — but callable per Neo4j chunk, so
+// findRelationsUniqueToFilteredSource() can fire this off as soon as each
+// Neo4j batch lands instead of after every batch finishes. Merges results
+// directly into the shared `refsGroupedOut` object as they arrive.
+async function _fetchReferencesForChunk(relIds, scopusCols, refsGroupedOut, onProgress) {
+  var CHUNK = 200, CONCURRENCY = 4;
+  var subChunks = [];
+  for (var i = 0; i < relIds.length; i += CHUNK) subChunks.push(relIds.slice(i, i + CHUNK));
+
+  async function fetchSub(sub) {
+    try {
+      return await api('/api/references/batch', { relationIds: sub, scopusColumns: scopusCols, sources: _activeSourceFilter || undefined });
+    } catch (e) {
+      if (scopusCols.length > 0) {
+        try { return await api('/api/references/batch', { relationIds: sub, scopusColumns: [], sources: _activeSourceFilter || undefined }); }
+        catch (e2) { /* fall through to {} below */ }
+      }
+      return {};
+    }
+  }
+
+  var idx = 0, completed = 0;
+  async function worker() {
+    while (idx < subChunks.length) {
+      var part = await fetchSub(subChunks[idx++]);
+      Object.assign(refsGroupedOut, part);
+      completed++;
+      if (onProgress) onProgress(completed, subChunks.length);
+    }
+  }
+  var workers = [];
+  for (var w = 0; w < Math.min(CONCURRENCY, subChunks.length); w++) workers.push(worker());
+  await Promise.all(workers);
+}
+
 // Export References — mirrors loadTableData row-building, no UI side effects.
-async function exportQueryReferences(query) {
+// `relationIdChunks`, when given, fetches Neo4j data in that many batches
+// (see _fetchQueryData) and, for EACH batch, immediately kicks off its own
+// Postgres reference fetch in the background rather than waiting for every
+// Neo4j batch to land before any Postgres work starts — see
+// findRelationsUniqueToFilteredSource(). Omit it for the normal single-query
+// path (unchanged behavior from before this was added).
+async function exportQueryReferences(query, relationIdChunks) {
   setProgressMsg('⏳ Fetching relations from database…');
-  var ctx = await _fetchQueryData(query);
+  var scopusCols = columnDefs.filter(function(c) { return c.source === 'scopus_data' && c.visible; }).map(function(c) { return c.dbField; });
+  var refsGrouped = {};
+  var pgPromises = [];  // in-flight per-chunk Postgres fetches, only used on the batched path
+  var batchesSeen = 0;
+
+  var ctx = Array.isArray(relationIdChunks)
+    ? await _fetchQueryData(query, relationIdChunks, function(chunk) {
+        batchesSeen++;
+        setProgressMsg(_batchProgressMsg(relationIdChunks, batchesSeen, '  ·  references loading in background'));
+        pgPromises.push(_fetchReferencesForChunk(chunk, scopusCols, refsGrouped));
+      })
+    : await _fetchQueryData(query);
   if (!ctx) { setProgressMsg(null); return; }
   var { qEdges, nodeById, medScan } = ctx;
 
-  setProgressMsg('⏳ Fetching references… (' + qEdges.length + ' relations)');
-  // Collect relation IDs and fetch references
-  var relIds = [];
-  qEdges.forEach(function(e) {
-    if (Array.isArray(e.properties.RelationIDs))
-      e.properties.RelationIDs.forEach(function(id) { if (id != null) relIds.push(String(id)); });
-    else _relIds(e.properties.RelationID).forEach(function(id) { relIds.push(id); });
-  });
-
-  var refsGrouped = {};
-  if (relIds.length > 0) {
-    var scopusCols = columnDefs.filter(function(c) { return c.source === 'scopus_data' && c.visible; }).map(function(c) { return c.dbField; });
-    var CHUNK       = 200;
-    var CONCURRENCY = 4;   // parallel requests in flight at once
-
-    // Split into chunks
-    var _chunks = [];
-    for (var _ci = 0; _ci < relIds.length; _ci += CHUNK)
-      _chunks.push(relIds.slice(_ci, _ci + CHUNK));
-
-    var _completed  = 0;
-    var _total      = _chunks.length;
-    var _totalIds   = relIds.length;
-    var _startTime  = Date.now();
-
-    // Fetch one chunk, with Scopus fallback on error
-    async function _fetchChunk(chunk) {
-      try {
-        return await api('/api/references/batch', { relationIds: chunk, scopusColumns: scopusCols, sources: _activeSourceFilter || undefined });
-      } catch(e) {
-        if (scopusCols.length > 0) {
-          try { return await api('/api/references/batch', { relationIds: chunk, scopusColumns: [], sources: _activeSourceFilter || undefined }); }
-          catch(e2) {}
-        }
-        return {};
-      }
-    }
-
-    // Concurrency-limited pool — workers pull from _chunks as they finish (as_completed style)
-    var _qIdx = 0;
-    async function _worker() {
-      while (_qIdx < _chunks.length) {
-        var _i     = _qIdx++;
-        var _part  = await _fetchChunk(_chunks[_i]);
-        Object.assign(refsGrouped, _part);
-        _completed++;
-        var _doneIds = Math.min(_completed * CHUNK, _totalIds);
+  if (pgPromises.length) {
+    setProgressMsg('⏳ Finishing reference retrieval…');
+    await Promise.all(pgPromises);
+  } else {
+    // Single-query path: nothing was pipelined above, so fetch references
+    // the same way this function always has — one batch-of-batches after
+    // the (one) Neo4j query returns.
+    setProgressMsg('⏳ Fetching references… (' + qEdges.length + ' relations)');
+    var relIds = [];
+    qEdges.forEach(function(e) {
+      if (Array.isArray(e.properties.RelationIDs))
+        e.properties.RelationIDs.forEach(function(id) { if (id != null) relIds.push(String(id)); });
+      else _relIds(e.properties.RelationID).forEach(function(id) { relIds.push(id); });
+    });
+    if (relIds.length > 0) {
+      var _startTime = Date.now();
+      await _fetchReferencesForChunk(relIds, scopusCols, refsGrouped, function(completed, total) {
+        var _doneIds = Math.min(completed * 200, relIds.length);
         var _elapsed = (Date.now() - _startTime) / 1000;
-        var _eta     = (_completed > 1) ? formatEta(_elapsed / _completed * (_total - _completed)) : '';
-        setProgressMsg('⏳ Fetching references… (' + _doneIds + ' / ' + _totalIds +
+        var _eta     = (completed > 1) ? formatEta(_elapsed / completed * (total - completed)) : '';
+        setProgressMsg('⏳ Fetching references… (' + _doneIds + ' / ' + relIds.length +
                        (_eta ? '  ·  ~' + _eta + ' left' : '') + ')');
-      }
+      });
     }
-
-    // Launch CONCURRENCY workers in parallel; each drains the queue independently
-    var _workers = [];
-    for (var _w = 0; _w < Math.min(CONCURRENCY, _chunks.length); _w++) _workers.push(_worker());
-    await Promise.all(_workers);
   }
 
   function nodeLabel(node) { return node ? getNodeLabel(node) : '?'; }
@@ -4977,23 +5586,35 @@ async function exportQueryReferences(query) {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
     var relId = _relId(edge.properties.RelationID);
-    var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var relIdsArr = _computeRelIds(edge.properties);
+    // Concatenate EVERY id's reference bucket — see the identical comment in
+    // exportQueryCSVReferences for why "first non-empty id wins" silently
+    // discarded other RelationIDs' rows for a merged/fused relation.
     var refs = [];
-    for (var ri = 0; ri < relIdsArr.length; ri++) {
-      var _r = refsGrouped[relIdsArr[ri]];
-      if (_r && _r.length) { refs = _r; break; }
-    }
+    relIdsArr.forEach(function(rid) {
+      var _r = refsGrouped[rid];
+      if (_r && _r.length) refs = refs.concat(_r);
+    });
     var base = {
       edgeId: edge.id, elementId: edge.elementId || edge.id,
       relId: relIdsArr.join(', ') || relId,
       regulator: nodeLabel(srcNode), regulatorMedScan: nodeMedScanLocal(srcNode),
       regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      regulatorURN: (srcNode && srcNode.properties && srcNode.properties.URN) || '',
       target: nodeLabel(tgtNode), targetMedScan: nodeMedScanLocal(tgtNode),
       targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      targetURN: (tgtNode && tgtNode.properties && tgtNode.properties.URN) || '',
       relationType: edge.type,
       effect: normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
-      numRefs: edge.properties.RelationNumberOfReferences || 0,
-      numSentences: edge.properties.RelationNumberOfSentences || 0,
+      numRefs: _sumRelProp(edge.properties.RelationNumberOfReferences),
+      numSentences: _sumRelProp(edge.properties.RelationNumberOfSentences),
+      // refsGrouped was already fetched WITH sources:_activeSourceFilter (see
+      // _fetchReferencesForChunk above) — calcRefCount() (distinct papers),
+      // NOT a raw row count, to match Neo4j's own RelationNumberOfReferences
+      // methodology (see _fetchFilteredRefCounts' comment).
+      filteredNumRefs: _activeSourceFilter
+        ? relIdsArr.reduce(function(sum, id) { return sum + calcRefCount(refsGrouped[id] || []); }, 0)
+        : '',
     };
     var buildRow = function(ref) {
       var row = Object.assign({}, base);
@@ -5111,9 +5732,19 @@ async function exportQueryReferences(query) {
 }
 
 // Export Relations — mirrors loadRelationData row-building, no UI side effects.
-async function exportQueryRelations(query) {
+// `relationIdChunks` — see exportQueryReferences; here it just gets the
+// Neo4j fetch itself batched (with per-batch progress) since this mode needs
+// no Postgres reference lookup at all (numRefs comes straight from Neo4j's
+// own RelationNumberOfReferences property).
+async function exportQueryRelations(query, relationIdChunks) {
   setProgressMsg('⏳ Fetching relations from database…');
-  var ctx = await _fetchQueryData(query);
+  var batchesSeen = 0;
+  var ctx = Array.isArray(relationIdChunks)
+    ? await _fetchQueryData(query, relationIdChunks, function() {
+        batchesSeen++;
+        setProgressMsg(_batchProgressMsg(relationIdChunks, batchesSeen));
+      })
+    : await _fetchQueryData(query);
   if (!ctx) { setProgressMsg(null); return; }
   var { qEdges, nodeById, medScan } = ctx;
 
@@ -5134,22 +5765,36 @@ async function exportQueryRelations(query) {
     }
   });
 
+  // This mode has no per-reference Postgres fetch at all (numRefs comes
+  // straight from Neo4j), so filteredNumRefs needs its own dedicated count
+  // lookup — same helper loadRelationData() uses.
+  var allRelIdsForFilter = [];
+  qEdges.forEach(function(edge) {
+    allRelIdsForFilter = allRelIdsForFilter.concat(_computeRelIds(edge.properties));
+  });
+  var filteredCounts = await _fetchFilteredRefCounts(allRelIdsForFilter);
+
   var rows = qEdges.map(function(edge) {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
     var relId = _relId(edge.properties.RelationID);
-    var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var relIdsArr = _computeRelIds(edge.properties);
     var row = {
       edgeId: edge.id, elementId: edge.elementId || edge.id,
       relId: relIdsArr.length > 1 ? relIdsArr.join(', ') : relId,
       regulator: nodeLabel(srcNode), regulatorMedScan: nodeMedScanLocal(srcNode),
       regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      regulatorURN: (srcNode && srcNode.properties && srcNode.properties.URN) || '',
       target: nodeLabel(tgtNode), targetMedScan: nodeMedScanLocal(tgtNode),
       targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      targetURN: (tgtNode && tgtNode.properties && tgtNode.properties.URN) || '',
       relationType: edge.type,
       effect: normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
-      numRefs: edge.properties.RelationNumberOfReferences || 0,
-      numSentences: edge.properties.RelationNumberOfSentences || '',
+      numRefs: _sumRelProp(edge.properties.RelationNumberOfReferences),
+      numSentences: _sumRelProp(edge.properties.RelationNumberOfSentences),
+      filteredNumRefs: _activeSourceFilter
+        ? relIdsArr.reduce(function(sum, id) { return sum + (filteredCounts[id] || 0); }, 0)
+        : '',
     };
     columnDefs.forEach(function(col) {
       if (col.source === 'neo4j') {
@@ -5289,18 +5934,29 @@ async function largeQueryExport() {
   var scope  = (document.getElementById('lq-scope-sel')  || {}).value || 'references';
   var format = (document.getElementById('lq-format-sel') || {}).value || 'excel';
 
+  // RNEF export — handles both query and pathway types
+  if (format === 'rnef') {
+    if (pending.type === 'pathway') {
+      await exportPathwayRNEF(pending.data);
+    } else {
+      await exportQueryRNEF(pending.query, pending.relationIdChunks);
+    }
+    return;
+  }
+
   if (pending.type === 'pathway') {
     await exportPathwayToExcel(pending.data, scope, format);
     return;
   }
 
   var query = pending.query;
+  var relationIdChunks = pending.relationIdChunks;  // set only by findRelationsUniqueToFilteredSource()
   if (format === 'csv') {
-    if (scope === 'relations') await exportQueryCSVRelations(query);
-    else                       await exportQueryCSVReferences(query);
+    if (scope === 'relations') await exportQueryCSVRelations(query, relationIdChunks);
+    else                       await exportQueryCSVReferences(query, relationIdChunks);
   } else {
-    if (scope === 'relations') await exportQueryRelations(query);
-    else                       await exportQueryReferences(query);
+    if (scope === 'relations') await exportQueryRelations(query, relationIdChunks);
+    else                       await exportQueryReferences(query, relationIdChunks);
   }
 }
 
@@ -5347,6 +6003,225 @@ async function openLargeResultAsSankey() {
     var sankeyInput = document.getElementById('sankey-cypher');
     if (sankeyInput) sankeyInput.value = pending.query;
   }
+}
+
+// ─── RNEF export helpers ──────────────────────────────────────────────────────
+
+// XML attribute-value escaping (for use inside double-quoted attr values).
+function _xmlEsc(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Relation types where both endpoints are symmetric (no directionality).
+// These get link type="in-out"; all others get type="out"/"in".
+var _RNEF_UNDIRECTED = {
+  CellExpression: true, Binding: true, CoExpression: true,
+  GeneticChange: true,  Homolog: true, FunctionalAssociation: true,
+};
+
+// Postgres reference columns → RNEF indexed attr names.
+// Order matches real Pathway Studio exports (PMID first).
+var _RNEF_REF_FIELDS = [
+  ['pmid',      'PMID'],
+  ['textref',   'TextRef'],
+  ['pubyear',   'PubYear'],
+  ['pubmonth',  'PubMonth'],
+  ['pubday',    'PubDay'],
+  ['authors',   'Authors'],
+  ['title',     'Title'],
+  ['volume',    'Volume'],
+  ['issue',     'Issue'],
+  ['pages',     'Pages'],
+  ['issn',      'ISSN'],
+  ['medlineta', 'MedlineTA'],
+  ['mref',      'mref'],
+  ['msrc',      'msrc'],
+];
+
+// Neo4j edge property names → RNEF relation-level attr names (no index).
+var _RNEF_REL_PROPS = [
+  ['Effect',    'Effect'],
+  ['Mechanism', 'Mechanism'],
+  ['Organism',  'Organism'],
+  ['CellType',  'CellType'],
+  ['Tissue',    'Tissue'],
+  ['Disease',   'Disease'],
+  ['Comment',   'Comment'],
+];
+
+// Build the full RNEF XML string from arrays of edges+nodes+refs.
+// Splits into <resnet> sections of up to RNEF_BATCH relations each.
+function _buildRNEF(edges, nodeById, refsGrouped) {
+  var RNEF_BATCH = 5000;
+  var totalParts = Math.max(1, Math.ceil(edges.length / RNEF_BATCH));
+  var xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<batch>'];
+
+  for (var bStart = 0; bStart < edges.length; bStart += RNEF_BATCH) {
+    var bEdges = edges.slice(bStart, bStart + RNEF_BATCH);
+    var partNum = Math.floor(bStart / RNEF_BATCH) + 1;
+    var resnetName = totalParts > 1
+      ? 'GraphExplorer Export Part ' + partNum + ' of ' + totalParts
+      : 'GraphExplorer Export';
+
+    xml.push(' <resnet name="' + _xmlEsc(resnetName) + '">');
+
+    // Collect unique node IDs for this batch and assign local_ids
+    var batchNodeIds = [];
+    var seenNodeIds = {};
+    bEdges.forEach(function(e) {
+      [e.startNodeId, e.endNodeId].forEach(function(nid) {
+        if (nid != null && !seenNodeIds[nid]) {
+          seenNodeIds[nid] = true;
+          batchNodeIds.push(nid);
+        }
+      });
+    });
+
+    var localIdOf = {};  // nodeId -> 'N{n}'
+    xml.push('  <nodes>');
+    batchNodeIds.forEach(function(nid, i) {
+      var node = nodeById[nid];
+      if (!node) return;
+      var lid = 'N' + i;
+      localIdOf[nid] = lid;
+      var urn      = (node.properties && (node.properties.URN || node.properties.urn)) || '';
+      var nodeType = (node.labels && node.labels[0]) || 'Unknown';
+      var name     = getNodeLabel(node);
+      var urnAttr  = urn ? ' urn="' + _xmlEsc(urn) + '"' : '';
+      xml.push('   <node local_id="' + lid + '"' + urnAttr + '>');
+      xml.push('    <attr name="NodeType" value="' + _xmlEsc(nodeType) + '"/>');
+      xml.push('    <attr name="Name" value="' + _xmlEsc(name) + '"/>');
+      xml.push('   </node>');
+    });
+    xml.push('  </nodes>');
+
+    xml.push('  <controls>');
+    bEdges.forEach(function(edge) {
+      var props       = edge.properties || {};
+      var ctrlType    = edge.type || props.ControlType || '';
+      var undirected  = !!_RNEF_UNDIRECTED[ctrlType];
+      var startLid    = localIdOf[edge.startNodeId];
+      var endLid      = localIdOf[edge.endNodeId];
+
+      xml.push('   <control local_id="' + _xmlEsc(String(edge.id || '')) + '">');
+      if (startLid) xml.push('    <link type="' + (undirected ? 'in-out' : 'out') + '" ref="' + startLid + '"/>');
+      if (endLid)   xml.push('    <link type="' + (undirected ? 'in-out' : 'in')  + '" ref="' + endLid   + '"/>');
+
+      // Relation-level attrs (no index)
+      xml.push('    <attr name="ControlType" value="' + _xmlEsc(ctrlType) + '"/>');
+      _RNEF_REL_PROPS.forEach(function(pair) {
+        var val = props[pair[0]];
+        if (val != null && val !== '') {
+          xml.push('    <attr name="' + pair[1] + '" value="' + _xmlEsc(String(val)) + '"/>');
+        }
+      });
+
+      // Indexed reference attrs (from Postgres or inline pathway refs)
+      var refs = [];
+      if (Array.isArray(props.references)) {
+        // Pathway edges embed references directly
+        refs = props.references;
+      } else {
+        // Query edges: look up by RelationID in refsGrouped
+        _computeRelIds(props).forEach(function(rid) {
+          var bucket = refsGrouped[rid];
+          if (bucket && bucket.length) refs = refs.concat(bucket);
+        });
+      }
+
+      refs.forEach(function(ref, idx) {
+        _RNEF_REF_FIELDS.forEach(function(pair) {
+          var val = ref[pair[0]];
+          if (val != null && val !== '') {
+            xml.push('    <attr name="' + pair[1] + '" value="' + _xmlEsc(String(val)) + '" index="' + idx + '"/>');
+          }
+        });
+      });
+
+      xml.push('   </control>');
+    });
+    xml.push('  </controls>');
+    xml.push(' </resnet>');
+  }
+
+  xml.push('</batch>');
+  return xml.join('\n');
+}
+
+// ─── RNEF export — live Cypher query path ─────────────────────────────────────
+// Fetches Neo4j relations + Postgres references for an arbitrary query (or
+// pre-chunked relation-ID set) and writes them as a single .rnef file.
+async function exportQueryRNEF(query, relationIdChunks) {
+  setProgressMsg('⏳ Fetching relations from database…');
+  var refsGrouped = {};
+  var pgPromises  = [];
+  var batchesSeen = 0;
+
+  var ctx = Array.isArray(relationIdChunks)
+    ? await _fetchQueryData(query, relationIdChunks, function(chunk) {
+        batchesSeen++;
+        setProgressMsg(_batchProgressMsg(relationIdChunks, batchesSeen, '  ·  references loading in background'));
+        pgPromises.push(_fetchReferencesForChunk(chunk, [], refsGrouped));
+      })
+    : await _fetchQueryData(query);
+  if (!ctx) { setProgressMsg(null); return; }
+  var { qEdges, nodeById } = ctx;
+
+  if (pgPromises.length) {
+    setProgressMsg('⏳ Finishing reference retrieval…');
+    await Promise.all(pgPromises);
+  } else {
+    // Single-query path: collect all RelationIDs, then batch-fetch refs
+    var relIds = [];
+    qEdges.forEach(function(e) {
+      _computeRelIds(e.properties).forEach(function(id) { relIds.push(id); });
+    });
+    if (relIds.length) {
+      var startTime = Date.now();
+      await _fetchReferencesForChunk(relIds, [], refsGrouped, function(done, total) {
+        var elapsed = (Date.now() - startTime) / 1000;
+        var eta = done > 1 ? formatEta(elapsed / done * (total - done)) : '';
+        setProgressMsg('⏳ Fetching references… (' + Math.min(done * 200, relIds.length) + ' / ' + relIds.length +
+                       (eta ? '  ·  ~' + eta + ' left' : '') + ')');
+      });
+    }
+  }
+
+  if (!qEdges.length) {
+    alert('No data to export — the query returned no edges.');
+    setProgressMsg(null); return;
+  }
+
+  setProgressMsg('⏳ Building RNEF…');
+  await yieldToUI();
+  var rnefText = _buildRNEF(qEdges, nodeById, refsGrouped);
+  setProgressMsg(null);
+  downloadTextFile(rnefText, 'query-export.rnef');
+}
+
+// ─── RNEF export — in-memory pathway path ─────────────────────────────────────
+// Pathway edges already carry their references inline in properties.references,
+// so no database round-trip is needed.
+async function exportPathwayRNEF(pathwayData) {
+  var nodes = (pathwayData.graphData && pathwayData.graphData.nodes) || [];
+  var edges = (pathwayData.graphData && pathwayData.graphData.edges) || [];
+  if (!edges.length) {
+    alert('No data to export — this pathway has no edges.');
+    return;
+  }
+  var nodeById = {};
+  nodes.forEach(function(n) { nodeById[n.id] = n; });
+
+  setProgressMsg('⏳ Building RNEF…');
+  await yieldToUI();
+  // refsGrouped is empty: _buildRNEF falls back to edge.properties.references
+  var rnefText = _buildRNEF(edges, nodeById, {});
+  setProgressMsg(null);
+  downloadTextFile(rnefText, 'pathway-export.rnef');
 }
 
 // Exports an already-in-memory PATHWAY's own nodes/edges (RNEF-derived --
@@ -7079,13 +7954,18 @@ async function loadTableData() {
     var srcNode = nodeById[edge.startNodeId];
     var tgtNode = nodeById[edge.endNodeId];
     var relId = _relId(edge.properties.RelationID);
-    var relIdsArr = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : (relId ? [relId] : []);
+    var relIdsArr = _computeRelIds(edge.properties);
     var relIdDisplay = relIdsArr.join(', ') || relId;
+    // Concatenate EVERY id's reference bucket — see the identical comment in
+    // exportQueryCSVReferences for why "first non-empty id wins" silently
+    // discarded other RelationIDs' rows for a merged/fused relation (this is
+    // the exact bug behind "tooltip shows 28 references, References table
+    // shows 1" for a relation with 2+ RelationIDs).
     var refs = [];
-    for (var ri = 0; ri < relIdsArr.length; ri++) {
-      var _r = refsGrouped[relIdsArr[ri]];
-      if (_r && _r.length) { refs = _r; break; }
-    }
+    relIdsArr.forEach(function(rid) {
+      var _r = refsGrouped[rid];
+      if (_r && _r.length) refs = refs.concat(_r);
+    });
 
     var base = {
       edgeId: edge.id,
@@ -7094,19 +7974,21 @@ async function loadTableData() {
       regulator: nodeLabel(srcNode),
       regulatorMedScan: nodeMedScan(srcNode),
       regulatorType: (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      regulatorURN: (srcNode && srcNode.properties && srcNode.properties.URN) || '',
       target: nodeLabel(tgtNode),
       targetMedScan: nodeMedScan(tgtNode),
       targetType: (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      targetURN: (tgtNode && tgtNode.properties && tgtNode.properties.URN) || '',
       relationType: edge.type,
       effect: normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
       // Derive both counts from the same source to prevent numRefs > numSentences.
       // Inline refs (from PostgreSQL) take priority; fall back to Neo4j stored values.
       numRefs: (Array.isArray(edge.properties.references) && edge.properties.references.length)
         ? calcRefCount(edge.properties.references)
-        : (edge.properties.RelationNumberOfReferences != null ? edge.properties.RelationNumberOfReferences : 0),
+        : _sumRelProp(edge.properties.RelationNumberOfReferences),
       numSentences: (Array.isArray(edge.properties.references) && edge.properties.references.length)
         ? edge.properties.references.length
-        : (edge.properties.RelationNumberOfSentences != null ? Number(edge.properties.RelationNumberOfSentences) : ''),
+        : _sumRelProp(edge.properties.RelationNumberOfSentences),
       // Only meaningful under an active Source filter — always ≤ numRefs above.
       filteredNumRefs: _activeSourceFilter
         ? relIdsArr.reduce(function(sum, id) { return sum + (filteredCounts[id] || 0); }, 0)
@@ -7397,24 +8279,29 @@ async function loadRelationData() {
       edgeId:           edge.id,
       elementId:        edge.elementId || edge.id,
       relId:            (function() {
-                          var ids = Array.isArray(edge.properties.RelationIDs) ? edge.properties.RelationIDs : null;
+                          // _computeRelIds covers BOTH a native Neo4j
+                          // list-valued RelationID and a client-merge's
+                          // plural RelationIDs — never just one or the other.
+                          var ids = _computeRelIds(edge.properties);
                           var primary = _relId(edge.properties.RelationID);
-                          return ids && ids.length > 1 ? ids.join(', ') : primary;
+                          return ids.length > 1 ? ids.join(', ') : primary;
                         })(),
       regulator:        nodeLabel(srcNode),
       regulatorMedScan: nodeMedScan(srcNode),
       regulatorType:    (srcNode && srcNode.labels && srcNode.labels[0]) || '',
+      regulatorURN:     (srcNode && srcNode.properties && srcNode.properties.URN) || '',
       target:           nodeLabel(tgtNode),
       targetMedScan:    nodeMedScan(tgtNode),
       targetType:       (tgtNode && tgtNode.labels && tgtNode.labels[0]) || '',
+      targetURN:        (tgtNode && tgtNode.properties && tgtNode.properties.URN) || '',
       relationType:     edge.type,
       effect:           normEffectDisplay(edge.properties.Effect || edge.properties.effect || ''),
       numRefs:      (Array.isArray(edge.properties.references) && edge.properties.references.length)
                           ? calcRefCount(edge.properties.references)
-                          : (edge.properties.RelationNumberOfReferences != null ? edge.properties.RelationNumberOfReferences : 0),
+                          : _sumRelProp(edge.properties.RelationNumberOfReferences),
       numSentences: (Array.isArray(edge.properties.references) && edge.properties.references.length)
                           ? edge.properties.references.length
-                          : (edge.properties.RelationNumberOfSentences != null ? Number(edge.properties.RelationNumberOfSentences) : '')
+                          : _sumRelProp(edge.properties.RelationNumberOfSentences)
     };
     columnDefs.forEach(function(col) {
       if (col.source === 'neo4j') {
@@ -9865,6 +10752,14 @@ async function mergeSimilarRelations() {
     return msrc.slice(0, 100).replace(/ID\{[^}]*\}/g, '').slice(0, 30);
   }
 
+  // Purely a FUZZY key (DOI/PMID + sentence fragment) — NEVER used alone to
+  // decide whether two DB-sourced refs (both carrying their own unique_id)
+  // are "the same reference"; see the dedup loop below, which uses unique_id
+  // directly for that and this key only for cross-matching a db-confirmed
+  // ref against an inline-only one. Using this fuzzy key for DB-vs-DB
+  // comparisons wrongly collapsed distinct Postgres rows (different
+  // unique_id) that cite the same paper with a similar opening sentence —
+  // same bug class as _refDedupeKey() above.
   function refKey(ref) {
     // Keys are assertion-level: same paper can produce multiple assertions.
     // Combine a paper identifier with the sentence fragment so two assertions
@@ -10162,11 +11057,28 @@ async function mergeSimilarRelations() {
     // always the one kept, regardless of which edge in the group it came from.
     var allRefs = anchor.refs.slice();
     others.forEach(function(e) { allRefs = allRefs.concat(e.refs); });
-    var seenKeys = new Set();
+    var seenKeys = new Set();        // fuzzy keys already covered by a KEPT ref
+    var seenUniqueIds = new Set();   // guards the exact same Postgres row appearing twice
     var dedupedRefs = [];
     var withUniqueId = allRefs.filter(function(ref) { return ref && ref.unique_id != null && String(ref.unique_id).trim() !== ''; });
     var withoutUniqueId = allRefs.filter(function(ref) { return !(ref && ref.unique_id != null && String(ref.unique_id).trim() !== ''); });
-    withUniqueId.concat(withoutUniqueId).forEach(function(ref) {
+    // Pass 1: every DB-confirmed ref is kept UNLESS it's a literal duplicate
+    // Postgres row (same unique_id) — never collapsed by the fuzzy key alone,
+    // since distinct rows can share a DOI and a near-identical opening
+    // sentence (common for templated NLP-extracted text). Each kept ref's
+    // fuzzy key is still recorded so a lower-priority inline-only duplicate
+    // of it gets skipped in pass 2.
+    withUniqueId.forEach(function(ref) {
+      var uid = String(ref.unique_id).trim();
+      if (seenUniqueIds.has(uid)) return;
+      seenUniqueIds.add(uid);
+      seenKeys.add(refKey(ref));
+      dedupedRefs.push(ref);
+    });
+    // Pass 2: inline-only refs — skip any already covered by a DB-confirmed
+    // ref above (cross-matched via the fuzzy key, the only signal available
+    // since inline refs carry no unique_id), dedupe amongst themselves too.
+    withoutUniqueId.forEach(function(ref) {
       var k = refKey(ref);
       if (seenKeys.has(k)) return;
       seenKeys.add(k);
@@ -10200,8 +11112,7 @@ async function mergeSimilarRelations() {
       var key = rids.length ? rids.slice().sort().join(',') : ei.id;
       if (seenRelIdsForCount.has(key)) return;
       seenRelIdsForCount.add(key);
-      var n = ge && ge.properties && ge.properties.RelationNumberOfReferences;
-      if (n != null && !isNaN(Number(n))) refCount += Number(n);
+      refCount += _sumRelProp(ge && ge.properties && ge.properties.RelationNumberOfReferences);
     });
 
     // Update anchor cy edge
@@ -14050,6 +14961,11 @@ function openConnectivityReport(options) {
   // whether any individual row happens to have the field.
   var filteredRefsCol = document.getElementById('cr-col-filteredrefs');
   if (filteredRefsCol) filteredRefsCol.style.display = _activeSourceFilter ? '' : 'none';
+  // "Include relations" defaults to checked every time the dialog opens — see
+  // _crBuildPending(), which reads this to decide whether to include g.edges
+  // in the committed nodes/edges payload.
+  var includeRelCb = document.getElementById('cr-include-relations');
+  if (includeRelCb) includeRelCb.checked = true;
   // Capture a human-readable description for AI tab naming when the user commits.
   _crLastDescription = [options.title, options.summary].filter(Boolean).join(': ');
   var selectAll = document.getElementById('cr-select-all');
@@ -14217,12 +15133,14 @@ function _crSelectedGroups() {
 function _crBuildPending() {
   var selected = _crSelectedGroups();
   if (!selected.length) { alert('Select at least one row first.'); return null; }
+  var includeRelCb = document.getElementById('cr-include-relations');
+  var includeRelations = !includeRelCb || includeRelCb.checked;  // default true if the checkbox is somehow missing
   var nodes = [];
   var edges = [];
   selected.forEach(function(g) {
     nodes.push(g.node);
     (g.targets || []).forEach(function(t) { nodes.push(t); });
-    (g.edges || []).forEach(function(e) { edges.push(e); });
+    if (includeRelations) (g.edges || []).forEach(function(e) { edges.push(e); });
   });
   return { nodes: nodes, edges: edges };
 }
