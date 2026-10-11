@@ -130,11 +130,25 @@ function safeError(err, context) {
   return IS_DEV ? detail : 'Internal server error';
 }
 
+// Resolves a config file path for an env-var-overridable file: an absolute
+// path in the env var is used as-is; a bare filename (or the env var being
+// unset) resolves relative to this script's own directory — same default
+// behavior as before this was made configurable. Lets a second Graph
+// Explorer instance (different PORT/AGENT_PORT, started from the SAME
+// checkout) point at its own settings/users files instead of sharing the
+// default instance's Neo4j/Postgres config — see SETTINGS_FILE/USERS_FILE.
+function _resolveConfigPath(envVarName, defaultFilename) {
+  const val = process.env[envVarName];
+  if (!val) return path.join(__dirname, defaultFilename);
+  return path.isAbsolute(val) ? val : path.join(__dirname, val);
+}
+
 // ─── Persistent settings (settings.json) ─────────────────────────────────────
 // Connection credentials are stored here so admins can update them via the UI
-// without restarting the server.  The file lives next to server.js and is never
-// served to clients (it is outside the public/ directory).
-const SETTINGS_FILE  = path.join(__dirname, 'settings.json');
+// without restarting the server.  The file lives next to server.js (unless
+// SETTINGS_FILE env var overrides it) and is never served to clients (it is
+// outside the public/ directory).
+const SETTINGS_FILE  = _resolveConfigPath('SETTINGS_FILE', 'settings.json');
 const HISTORY_FILE   = path.join(__dirname, 'cypher_history.tsv');
 // Persisted Pathway Collection Search indexes — PER USER (each user points at
 // their own local directory; one JSON file per user, loaded lazily into
@@ -410,7 +424,7 @@ function resolveJwtSecret() {
   return generated;
 }
 const JWT_SECRET = resolveJwtSecret();
-const USERS_FILE = path.join(__dirname, 'users.json');
+const USERS_FILE = _resolveConfigPath('USERS_FILE', 'users.json');
 
 function loadUsers() {
   try {
@@ -2712,35 +2726,52 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
   }
 });
 
+// Shared by GET /api/references/sources. Guards against the DISTINCT query
+// running twice for the same schema when two requests race in before either
+// finishes caching — e.g. two browser tabs on the same schema both loading
+// at once, or a page load overlapping the Source dialog's own fetch — which
+// otherwise both see "not cached yet" and both hit Postgres (and both log
+// "Sources cached"), the same in-flight-request pattern _fetchSchemaForConn
+// already uses for schema (_schemaFetchByDb) below.
+async function _fetchSourcesForSchema(pgPool, schema) {
+  if (_sourcesCacheBySchema.has(schema)) return _sourcesCacheBySchema.get(schema);
+  if (_sourcesFetchByDb.has(schema)) return _sourcesFetchByDb.get(schema);
+  const promise = (async () => {
+    try {
+      const result = await pgPool.query(
+        `SELECT DISTINCT source FROM ${schema}.reference WHERE source IS NOT NULL ORDER BY source ASC`
+      );
+      const sources = result.rows.map(r => r.source).filter(Boolean);
+      // Only cache a non-empty result. An empty list almost always means "this
+      // connection/schema can't see any reference rows yet" (e.g. a permission
+      // grant that hasn't landed) rather than a genuinely source-less database
+      // — caching it would make the dialog stay empty forever after the
+      // permission is fixed, until something happens to invalidate the cache
+      // (a settings save) or the server restarts. Leaving it uncached costs one
+      // extra (cheap) query per dialog-open in that situation, and self-heals
+      // the moment access actually works — no user action required.
+      if (sources.length > 0) {
+        _sourcesCacheBySchema.set(schema, sources);
+        console.log(`Sources cached [${schema}]: ${sources.length} sources`);
+      }
+      return sources;
+    } catch (err) {
+      console.error('[sources] error:', err.message);
+      return [];
+    } finally {
+      _sourcesFetchByDb.delete(schema);
+    }
+  })();
+  _sourcesFetchByDb.set(schema, promise);
+  return promise;
+}
+
 // GET /api/references/sources — returns distinct Source values from the reference table.
 // Result is cached per PG schema for the session lifetime (invalidated on DB reconnect,
 // or on the next request after a settings save — see POST /api/settings/my-postgres).
 app.get('/api/references/sources', dbLimiter, authMiddleware, async (req, res) => {
   if (!req.pg || !req.pg.pool) return res.json([]);
-  const cacheKey = req.pg.schema;
-  if (_sourcesCacheBySchema.has(cacheKey)) return res.json(_sourcesCacheBySchema.get(cacheKey));
-  try {
-    const result = await req.pg.pool.query(
-      `SELECT DISTINCT source FROM ${req.pg.schema}.reference WHERE source IS NOT NULL ORDER BY source ASC`
-    );
-    const sources = result.rows.map(r => r.source).filter(Boolean);
-    // Only cache a non-empty result. An empty list almost always means "this
-    // connection/schema can't see any reference rows yet" (e.g. a permission
-    // grant that hasn't landed) rather than a genuinely source-less database
-    // — caching it would make the dialog stay empty forever after the
-    // permission is fixed, until something happens to invalidate the cache
-    // (a settings save) or the server restarts. Leaving it uncached costs one
-    // extra (cheap) query per dialog-open in that situation, and self-heals
-    // the moment access actually works — no user action required.
-    if (sources.length > 0) {
-      _sourcesCacheBySchema.set(cacheKey, sources);
-      console.log(`Sources cached [${cacheKey}]: ${sources.length} sources`);
-    }
-    res.json(sources);
-  } catch (err) {
-    console.error('[sources] error:', err.message);
-    res.json([]);
-  }
+  res.json(await _fetchSourcesForSchema(req.pg.pool, req.pg.schema));
 });
 
 // GET /api/references/count — total row count of the reference table for the
@@ -2756,6 +2787,38 @@ app.get('/api/references/count', dbLimiter, authMiddleware, async (req, res) => 
   } catch (err) {
     console.error('[references/count] error:', err.message);
     res.json({ count: null });
+  }
+});
+
+// POST /api/references/unique-source-relation-ids — for Database → "Relations
+// unique to filtered source". Returns every RelationID (reference.id) whose
+// Postgres reference rows come EXCLUSIVELY from the given source(s): its
+// filtered row count equals its total row count, i.e. it has zero references
+// from any other source. Computed entirely in one SQL statement — comparing
+// each id's own total COUNT(*) against a FILTER(WHERE source = ANY(...))
+// COUNT(*) — deliberately NOT compared against Neo4j's RelationNumberOfReferences
+// property, which can drift slightly from the true Postgres reference count.
+app.post('/api/references/unique-source-relation-ids', dbLimiter, authMiddleware, async (req, res) => {
+  const { sources } = req.body || {};
+  const safeSources = Array.isArray(sources) && sources.length
+    ? sources.map(String).filter(s => s.length > 0 && s.length < 500)
+    : null;
+  if (!safeSources) return res.status(400).json({ error: 'sources array is required' });
+  if (!req.pg || !req.pg.pool) return res.json({ relationIds: [] });
+  try {
+    const result = await req.pg.pool.query(
+      `SELECT id FROM ${req.pg.schema}.reference
+       GROUP BY id
+       HAVING COUNT(*) = COUNT(*) FILTER (WHERE source = ANY($1::text[]))`,
+      [safeSources]
+    );
+    const relationIds = result.rows
+      .map(r => String(r.id))
+      .filter(s => /^-?\d+$/.test(s));  // defensive: only well-formed integer ids reach the Cypher builder
+    res.json({ relationIds });
+  } catch (err) {
+    console.error('[unique-source-relation-ids] error:', err.message);
+    res.status(500).json({ error: safeError(err) });
   }
 });
 
@@ -3243,19 +3306,32 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     sql = sql.replace(/\{schema\}/g, req.pg.schema);
   }
 
+  // Strip a single trailing semicolon (plus any trailing whitespace after it) —
+  // harmless and commonly pasted from other SQL tools. Semicolons anywhere
+  // else in the statement are still rejected below (stacked-query guard).
+  sql = sql.replace(/;\s*$/, '');
+
+  // Blank out the contents of '...' string literals (doubled '' handled as an
+  // escaped quote) before running the checks below, so a semicolon, comment
+  // marker, or write-keyword-looking word that's actually just literal DATA —
+  // e.g. building a DDL string like SELECT '...);' AS ddl_statement — doesn't
+  // false-positive as a stacked query/comment/write attempt. The ORIGINAL
+  // (unblanked) sql is still what actually gets executed below.
+  const sqlForChecks = sql.replace(/'(?:[^']|'')*'/g, (m) => 'x'.repeat(m.length));
+
   // ── Input validation (defence-in-depth for an admin endpoint) ────────────────
   // 1. Must start with SELECT or WITH (read-only statements only)
-  const trimmed = sql.trim().toUpperCase();
+  const trimmed = sqlForChecks.trim().toUpperCase();
   const isCreateIndex = trimmed.startsWith('CREATE INDEX');
   if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('WITH') && !isCreateIndex) {
     return res.status(400).json({ error: 'Only SELECT / WITH / CREATE INDEX queries are permitted' });
   }
   // 2. Reject stacked queries (semicolons allow injecting additional statements)
-  if (sql.includes(';')) {
+  if (sqlForChecks.includes(';')) {
     return res.status(400).json({ error: 'Semicolons are not permitted' });
   }
   // 3. Reject SQL comments (used to comment out trailing conditions)
-  if (/--|\/\*/.test(sql)) {
+  if (/--|\/\*/.test(sqlForChecks)) {
     return res.status(400).json({ error: 'SQL comments are not permitted' });
   }
   // 4. Reject write keywords even if hidden after a WITH clause
@@ -3263,7 +3339,7 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   const writePattern = isCreateIndex
     ? /(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|GRANT|REVOKE|EXECUTE|COPY)/i
     : /(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXECUTE|COPY)/i;
-  if (writePattern.test(sql)) {
+  if (writePattern.test(sqlForChecks)) {
     return res.status(400).json({ error: 'Write operations are not permitted' });
   }
 
@@ -4457,6 +4533,7 @@ process.on('SIGTERM', () => { if (_agentProc) _agentProc.kill(); process.exit();
 const _schemaCacheByDb = new Map();  // dbName → { labels, relTypes, propKeys }
 const _sourcesCacheBySchema = new Map();   // pgSchema key → string[] of distinct Sources
 const _schemaFetchByDb = new Map();  // dbName → in-flight Promise guard
+const _sourcesFetchByDb = new Map(); // pgSchema key → in-flight Promise guard (see _fetchSourcesForSchema)
 
 async function _fetchSchemaForConn(driver, database) {
   if (_schemaCacheByDb.has(database)) return _schemaCacheByDb.get(database);
@@ -4533,6 +4610,148 @@ app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
   }
 });
 
+
+// ─── Database → Statistics ────────────────────────────────────────────────────
+// Split into four independent endpoints (instead of one combined call) so the
+// frontend can fire all of them in parallel and render each section of the
+// Statistics dialog the moment ITS query finishes, with the still-pending
+// sections visibly marked "unfinished" — which also makes it obvious which
+// single query is the slow one, instead of one opaque multi-minute wait.
+const _statsToNum = (v) => (v && typeof v.toNumber === 'function') ? v.toNumber() : Number(v);
+
+// GET /api/database/statistics/counts — total/per-label/per-type counts.
+// Uses apoc.meta.stats() (metadata the database already maintains) instead of
+// MATCH (n)/MATCH ()-[r]->() full-graph scans, which took minutes on a large
+// graph. Falls back to the scanning queries only if APOC isn't installed.
+app.get('/api/database/statistics/counts', dbLimiter, authMiddleware, async (req, res) => {
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    try {
+      const statsRes = await session.run(
+        'CALL apoc.meta.stats() YIELD nodeCount, relCount, labels, relTypesCount RETURN nodeCount, relCount, labels, relTypesCount'
+      );
+      const rec = statsRes.records[0];
+      const labelsMap = rec.get('labels') || {};
+      const relTypesMap = rec.get('relTypesCount') || {};
+      return res.json({
+        totalNodes: _statsToNum(rec.get('nodeCount')),
+        totalRelations: _statsToNum(rec.get('relCount')),
+        nodesByLabel: Object.keys(labelsMap)
+          .map(k => ({ label: k, count: _statsToNum(labelsMap[k]) }))
+          .sort((a, b) => a.label.localeCompare(b.label)),
+        relationsByType: Object.keys(relTypesMap)
+          .map(k => ({ relType: k.replace(/^:/, ''), count: _statsToNum(relTypesMap[k]) }))
+          .sort((a, b) => a.relType.localeCompare(b.relType)),
+      });
+    } catch (apocErr) {
+      console.warn('database/statistics/counts: apoc.meta.stats() unavailable, falling back to full scan:', apocErr.message);
+      const [totalNodesRes, totalRelsRes, byLabelRes, byRelTypeRes] = await Promise.all([
+        session.run('MATCH (n) RETURN count(n) AS c'),
+        session.run('MATCH ()-[r]->() RETURN count(r) AS c'),
+        // A node can carry several labels, so totals above come from their
+        // own dedicated count — summing this breakdown would overcount.
+        session.run('MATCH (n) UNWIND labels(n) AS label RETURN label, count(*) AS c ORDER BY label'),
+        session.run('MATCH ()-[r]->() RETURN type(r) AS relType, count(*) AS c ORDER BY relType'),
+      ]);
+      res.json({
+        totalNodes: _statsToNum(totalNodesRes.records[0].get('c')),
+        totalRelations: _statsToNum(totalRelsRes.records[0].get('c')),
+        nodesByLabel: byLabelRes.records.map(r => ({ label: r.get('label'), count: Number(r.get('c')) })),
+        relationsByType: byRelTypeRes.records.map(r => ({ relType: r.get('relType'), count: Number(r.get('c')) })),
+      });
+    }
+  } catch (err) {
+    console.error('database/statistics/counts error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+// GET /api/database/statistics/node-props — distinct node property keys.
+app.get('/api/database/statistics/node-props', dbLimiter, authMiddleware, async (req, res) => {
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    const result = await session
+      .run('CALL db.schema.nodeTypeProperties() YIELD propertyName RETURN DISTINCT propertyName ORDER BY propertyName')
+      .catch(() => session.run('MATCH (n) UNWIND keys(n) AS propertyName RETURN DISTINCT propertyName ORDER BY propertyName'));
+    res.json({ nodePropertyKeys: result.records.map(r => r.get('propertyName')).filter(Boolean) });
+  } catch (err) {
+    console.error('database/statistics/node-props error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
+// GET /api/database/statistics/rel-props — distinct relationship property keys
+// (reuses the existing cached schema fetch, which already computes this).
+app.get('/api/database/statistics/rel-props', dbLimiter, authMiddleware, async (req, res) => {
+  try {
+    const schema = await _fetchSchemaForConn(req.neo4j.driver, req.neo4j.database);
+    res.json({ relationPropertyKeys: (schema && schema.propKeys) || [] });
+  } catch (err) {
+    console.error('database/statistics/rel-props error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/database/statistics/postgres/snippets — count(*) from reference.
+// Split from articles/journals below into its own endpoint/query (rather than
+// one query computing all three aggregates) so the three run as genuinely
+// separate queries on separate pool connections — COUNT(DISTINCT unique_ref)
+// and COUNT(DISTINCT journal) each require their own full table scan plus a
+// hash-dedup pass, and bundling them into one statement made that one
+// statement take as long as the slowest of the three combined.
+app.get('/api/database/statistics/postgres/snippets', dbLimiter, authMiddleware, async (req, res) => {
+  if (!req.pg || !req.pg.pool) return res.json({ snippets: null });
+  try {
+    const result = await req.pg.pool.query(`SELECT COUNT(*) AS snippets FROM ${req.pg.schema}.reference`);
+    res.json({ snippets: Number(result.rows[0].snippets) });
+  } catch (err) {
+    console.error('database/statistics/postgres/snippets error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/database/statistics/postgres/articles — count(distinct unique_ref).
+app.get('/api/database/statistics/postgres/articles', dbLimiter, authMiddleware, async (req, res) => {
+  if (!req.pg || !req.pg.pool) return res.json({ articles: null });
+  try {
+    const result = await req.pg.pool.query(`SELECT COUNT(DISTINCT unique_ref) AS articles FROM ${req.pg.schema}.reference`);
+    res.json({ articles: Number(result.rows[0].articles) });
+  } catch (err) {
+    console.error('database/statistics/postgres/articles error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/database/statistics/postgres/journals — count(distinct journal).
+app.get('/api/database/statistics/postgres/journals', dbLimiter, authMiddleware, async (req, res) => {
+  if (!req.pg || !req.pg.pool) return res.json({ journals: null });
+  try {
+    const result = await req.pg.pool.query(`SELECT COUNT(DISTINCT journal) AS journals FROM ${req.pg.schema}.reference`);
+    res.json({ journals: Number(result.rows[0].journals) });
+  } catch (err) {
+    console.error('database/statistics/postgres/journals error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// GET /api/database/statistics/postgres/sources — distinct source values.
+// Reuses the same cached fetch/query the Source-filter dialog already uses
+// (SELECT DISTINCT source FROM {schema}.reference), so a warm cache here
+// returns instantly.
+app.get('/api/database/statistics/postgres/sources', dbLimiter, authMiddleware, async (req, res) => {
+  if (!req.pg || !req.pg.pool) return res.json({ sources: null });
+  try {
+    const sources = await _fetchSourcesForSchema(req.pg.pool, req.pg.schema);
+    res.json({ sources });
+  } catch (err) {
+    console.error('database/statistics/postgres/sources error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
+});
 
 // ─── Distinct values for a relation property ──────────────────────────────────
 // GET /api/schema/prop-values?prop=Effect
@@ -4892,6 +5111,136 @@ function _computeUniqueRef(ref, uniqueIdBigInt) {
   const base = hashIdx >= 0 ? textref.slice(0, hashIdx) : textref;
   return /\d/.test(base) ? base : uniqueIdBigInt.toString();
 }
+
+// ─── Database → Import RNEF ───────────────────────────────────────────────────
+// Bulk-imports a single RNEF file or every *.rnef/*.xml file under a
+// server-side directory into THIS user's own Neo4j + Postgres connections
+// (never shared/admin). See server/rnefImport.js for the actual engine —
+// this just wires it to the user's own connections/helpers and tracks one
+// in-memory job per username, same pattern as the Pathway Collection
+// "Index" job above.
+const { createRnefImporter } = require('./server/rnefImport');
+const _rnefImporter = createRnefImporter({
+  PYTHON_CMD, RNEF_SCRIPT, myhash: _myhash, calcRelationId, quoteCypherIdent,
+  computeRefUniqueId: _computeRefUniqueId, computeUniqueRef: _computeUniqueRef,
+  neo4j,
+});
+const _userRnefImportJobs = new Map();  // username -> job state
+
+function _newRnefImportJob() {
+  return {
+    running: true, done: false,
+    filesTotal: 0, filesDone: 0, currentFile: '',
+    phase: '', phaseStartedAt: 0, lastStderr: '',  // live diagnostics — see server/rnefImport.js
+    relationsParsed: 0, batchIndex: 0, batchTotal: 0,
+    referencesInserted: 0, referencesSkippedMalformed: 0,
+    errors: [], summary: null,
+  };
+}
+
+// Shared by both the server-path endpoint below and the browser-upload
+// session endpoints further down — starts the background job for a
+// directory/file that's already known to exist on the server's own
+// filesystem (either typed in directly, or just written there by an upload
+// session), cleaning up afterward if cleanupDir is given.
+function _startRnefImportJobFor(req, res, targetPath, cleanupDir) {
+  const username = req.user.username;
+  const existing = _userRnefImportJobs.get(username);
+  if (existing && existing.running) {
+    if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true }); } catch (e) {} }
+    return res.status(409).json({ error: 'An RNEF import is already running for your account.' });
+  }
+
+  const job = _newRnefImportJob();
+  _userRnefImportJobs.set(username, job);
+  res.json({ started: true });  // respond immediately — the job continues in the background
+
+  const neo4jConn = req.neo4j;
+  const pg = req.pg;
+  _rnefImporter.runImportJob(job, targetPath, neo4jConn, pg, username)
+    .catch((err) => {
+      console.error('RNEF import error:', err.message);
+      job.errors.push({ error: safeError(err) });
+    })
+    .finally(() => {
+      job.running = false;
+      job.done = true;
+      if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true }); } catch (e) {} }
+    });
+}
+
+// POST /api/import/rnef/start { path } — admin-only (bulk write to shared
+// Neo4j/Postgres). For a path that's already on the SERVER's own filesystem
+// (the browser can't discover or send one — see the upload-session
+// endpoints below for the "pick a file/folder on my own machine" case).
+app.post('/api/import/rnef/start', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { path: targetPath } = req.body || {};
+  if (!targetPath || typeof targetPath !== 'string') return res.status(400).json({ error: 'path required' });
+  if (!fs.existsSync(targetPath)) return res.status(400).json({ error: `Path does not exist on the server: ${targetPath}` });
+  _startRnefImportJobFor(req, res, targetPath, null);
+});
+
+// ── Upload-session endpoints ────────────────────────────────────────────────
+// The browser's File API deliberately never exposes a real filesystem path
+// (even via a native file/folder picker), so "point the importer at a path"
+// doesn't work when the user is picking from their OWN machine rather than
+// typing a path the SERVER can already see. Instead: the browser reads each
+// selected file's content itself (exactly like the existing File -> Load
+// subgraph / POST /api/convert/rnef flow already does for one file) and
+// uploads it here; once every selected file has landed in one server-side
+// temp directory, /finish starts the same import job as the path-based
+// endpoint above, pointed at that directory.
+const _rnefUploadSessions = new Map(); // sessionId -> tmpDir
+
+app.post('/api/import/rnef/upload-session/start', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnefimport-upload-'));
+  const sessionId = path.basename(tmpDir);
+  _rnefUploadSessions.set(sessionId, tmpDir);
+  res.json({ sessionId });
+});
+
+app.post(
+  '/api/import/rnef/upload-session/:sessionId/file',
+  dbLimiter, express.text({ limit: '500mb', type: 'text/plain' }), authMiddleware,
+  (req, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    const tmpDir = _rnefUploadSessions.get(req.params.sessionId);
+    if (!tmpDir) return res.status(404).json({ error: 'Unknown or expired upload session' });
+    const content = req.body;
+    if (!content) return res.status(400).json({ error: 'content required' });
+
+    // Original filename only used to keep a recognizable extension/basename
+    // for progress messages and the *.rnef/*.xml filter — sanitized and
+    // index-prefixed so two same-named files from different subfolders on
+    // the user's machine can never collide once flattened into one temp dir.
+    let rawName = req.get('X-Filename') || 'upload.rnef';
+    try { rawName = decodeURIComponent(rawName); } catch (e) {}  // client percent-encodes it (header values can't carry arbitrary unicode/spaces safely otherwise)
+    const safeBase = path.basename(rawName).replace(/[\\/:*?"<>|]/g, '_') || 'upload.rnef';
+    const idx = fs.readdirSync(tmpDir).length;
+    const destPath = path.join(tmpDir, `${idx}_${safeBase}`);
+    // codeql[js/network-data-written-to-file] - content is RNEF XML from an authenticated admin request; destPath is server-controlled (mkdtemp'd dir + sanitized basename), never served back to clients
+    fs.writeFileSync(destPath, content, 'utf8');
+    res.json({ ok: true });
+  }
+);
+
+app.post('/api/import/rnef/upload-session/:sessionId/finish', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const tmpDir = _rnefUploadSessions.get(req.params.sessionId);
+  if (!tmpDir) return res.status(404).json({ error: 'Unknown or expired upload session' });
+  _rnefUploadSessions.delete(req.params.sessionId);
+  _startRnefImportJobFor(req, res, tmpDir, tmpDir);
+});
+
+// GET /api/import/rnef/progress — poll for live status of THIS user's most
+// recent (or in-progress) RNEF import job.
+app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
+  const job = _userRnefImportJobs.get(req.user.username);
+  if (!job) return res.json({ running: false, done: false, noJob: true });
+  res.json(job);
+});
 
 // GET /api/schema/relation-types  — distinct Neo4j relationship types
 app.get('/api/schema/relation-types', dbLimiter, authMiddleware, async (req, res) => {
