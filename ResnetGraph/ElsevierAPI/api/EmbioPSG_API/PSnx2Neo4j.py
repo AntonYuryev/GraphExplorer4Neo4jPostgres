@@ -19,7 +19,6 @@ class neo4j_nx(GraphDatabase):
     if not APIconfig:
       APIconfig = load_api_config()
 
-    self.NODE_REGISTRY = set()
     self.uri = APIconfig['neo4juri']
     self.database = APIconfig['neo4jdb']
     self.user =  APIconfig['neo4juser']
