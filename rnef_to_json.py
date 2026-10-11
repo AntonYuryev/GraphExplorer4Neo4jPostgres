@@ -47,6 +47,21 @@ def _rnef_hex_color(value):
         return None
     return value[:7]   # '#' + first 6 hex digits; the trailing byte is dropped
 
+def _ci_get(d, *names):
+    """Case-insensitive, multi-alias dict lookup -- real RNEF exports aren't
+    consistent about attribute-name capitalization (see convert_resnet's own
+    comment on this same issue for <resnet name=.. Name=..>), so a reference
+    attr like 'TextRef' must still be found when a different export spells it
+    'textref' or 'TEXTREF'. Returns '' if none of the aliases are present."""
+    if not d:
+        return ''
+    lower_map = {k.lower(): v for k, v in d.items()}
+    for n in names:
+        v = lower_map.get(n.lower())
+        if v:
+            return v
+    return ''
+
 def safe_filename(name):
     s = re.sub(r'[\\/:*?"<>|]', '_', name)
     return s.strip() or 'unnamed'
@@ -90,8 +105,17 @@ def convert_resnet(resnet, out_dir):
             # against, or every edge would fail to resolve to its endpoints.
             nid = node.get('local_id')
             props = {}
+            # raw_attrs preserves EVERY <attr> element verbatim, including
+            # repeats of the same name (e.g. a node with 30+ separate
+            # Alias attrs) -- the props dict above overwrites on repeats, so
+            # only the Database -> Import RNEF pipeline reads raw_attrs (it
+            # needs one Postgres `attr` row per occurrence); the existing
+            # flattened `props`/viewer behavior is untouched.
+            raw_attrs = []
             for attr in node.findall('attr'):
-                props[attr.get('name')] = attr.get('value')
+                name, value = attr.get('name'), attr.get('value')
+                props[name] = value
+                raw_attrs.append({'name': name, 'value': value})
             node_type = props.get('NodeType', 'Unknown')
             # The real, globally-stable identifier is the node's own `urn`
             # attribute -- previously this unconditionally overwrote it with
@@ -113,7 +137,8 @@ def convert_resnet(resnet, out_dir):
                     'id': nid,
                     'elementId': nid,
                     'labels': [node_type],
-                    'properties': props
+                    'properties': props,
+                    'raw_attrs': raw_attrs
                 }
 
     # -- Controls (edges) -----------------------------------------------------
@@ -169,8 +194,19 @@ def convert_resnet(resnet, out_dir):
                     control_type = value
                 elif name == 'Effect':
                     effect = value
-                elif index is not None:
-                    refs_by_idx.setdefault(int(index), {})[name] = value
+                else:
+                    # A control with exactly ONE reference omits `index`
+                    # entirely (confirmed in real samples under TestData\RNEF)
+                    # -- only controls with MULTIPLE references use index="1",
+                    # "2", etc. to disambiguate which attrs belong to which
+                    # reference. Treating a missing index as its own implicit
+                    # bucket (rather than skipping the attr, which the
+                    # previous `elif index is not None` guard did) is required
+                    # -- otherwise every single-reference control silently
+                    # lost its entire reference (Authors/DOI/PMID/Title/...),
+                    # ending up with NumRefs=0 despite clearly citing a paper.
+                    bucket = int(index) if index is not None else 0
+                    refs_by_idx.setdefault(bucket, {})[name] = value
 
             if eid:
                 participant_urns = frozenset(
@@ -183,21 +219,58 @@ def convert_resnet(resnet, out_dir):
                 if m:
                     effect = m.group(1).capitalize()
 
+            # Full column set per the Database -> Import RNEF FRD's Postgres
+            # `reference` table <-> RNEF property mapping. Looked up
+            # case-insensitively (_ci_get) since real exports vary in
+            # capitalization; 'msrc' accepts both the FRD's own 'Msrc' name
+            # and the 'Sentence' name actually seen in real samples (both
+            # represent the same reference-level sentence text).
             references = []
             for idx in sorted(refs_by_idx):
                 r = refs_by_idx[idx]
                 references.append({
-                    'pmid':    r.get('PMID', ''),
-                    'doi':     r.get('DOI', ''),
-                    'title':   r.get('Title', ''),
-                    'pubyear': r.get('PubYear', ''),
-                    'authors': r.get('Authors', ''),
-                    'journal': r.get('Journal', ''),
-                    'msrc':    r.get('Sentence', ''),
-                    'celltype': r.get('CellType', ''),
-                    'celllinename': r.get('CellLineName', ''),
-                    'tissue': r.get('Tissue', ''),
-                    'organ': r.get('Organ', '')
+                    'authors':             _ci_get(r, 'Authors'),
+                    'biomarkertype':       _ci_get(r, 'Biomarkertype', 'BiomarkerType'),
+                    'celllinename':        _ci_get(r, 'Celllinename', 'CellLineName'),
+                    'cellobject':          _ci_get(r, 'Cellobject', 'CellObject'),
+                    'celltype':            _ci_get(r, 'Celltype', 'CellType'),
+                    'changetype':          _ci_get(r, 'Changetype', 'ChangeType'),
+                    'collaborator':        _ci_get(r, 'Collaborator'),
+                    'company':             _ci_get(r, 'Company'),
+                    'condition':           _ci_get(r, 'Condition'),
+                    'doi':                 _ci_get(r, 'Doi', 'DOI'),
+                    'embase':              _ci_get(r, 'Embase', 'EMBASE'),
+                    'essn':                _ci_get(r, 'Essn', 'ESSN'),
+                    'experimental_system': _ci_get(r, 'experimental_system', 'Experimental_System'),
+                    'intervention':        _ci_get(r, 'Intervention'),
+                    'issn':                _ci_get(r, 'Issn', 'ISSN'),
+                    'journal':             _ci_get(r, 'Journal'),
+                    'medlineta':           _ci_get(r, 'Medlineta', 'MedlineTA'),
+                    'mode_of_action':      _ci_get(r, 'mode_of_action', 'Mode_Of_Action'),
+                    'mref':                _ci_get(r, 'Mref', 'MRef'),
+                    'msrc':                _ci_get(r, 'Msrc', 'Sentence'),
+                    'nct_id':              _ci_get(r, 'nct_id', 'NCT_ID', 'NCTID'),
+                    'organ':               _ci_get(r, 'Organ'),
+                    'organism':            _ci_get(r, 'Organism'),
+                    'percent':             _ci_get(r, 'Percent'),
+                    'phase':               _ci_get(r, 'Phase'),
+                    'phenotype':           _ci_get(r, 'Phenotype'),
+                    'pii':                 _ci_get(r, 'Pii', 'PII'),
+                    'pmid':                _ci_get(r, 'Pmid', 'PMID'),
+                    'pubversion':          _ci_get(r, 'Pubversion', 'PubVersion'),
+                    'pubyear':             _ci_get(r, 'PubYear'),
+                    'pui':                 _ci_get(r, 'Pui', 'PUI'),
+                    'px':                  _ci_get(r, 'Px', 'PX'),
+                    'quantitativetype':    _ci_get(r, 'quantitativetype', 'QuantitativeType'),
+                    'source':              _ci_get(r, 'Source'),
+                    'start':               _ci_get(r, 'Start'),
+                    'studytype':           _ci_get(r, 'Studytype', 'StudyType'),
+                    'textmods':            _ci_get(r, 'textmods', 'TextMods'),
+                    'textref':             _ci_get(r, 'textref', 'TextRef'),
+                    'tissue':              _ci_get(r, 'Tissue'),
+                    'title':               _ci_get(r, 'Title'),
+                    'trialstatus':         _ci_get(r, 'Trialstatus', 'TrialStatus'),
+                    'url':                 _ci_get(r, 'url', 'URL'),
                 })
 
             # Hyperedge = a control connecting MORE THAN TWO nodes -- Cytoscape
@@ -700,6 +773,223 @@ def convert(input_path, out_dir):
         convert_resnet(resnet, out_dir)
 
 
+def extract_resnet_core(resnet):
+    """Database -> Import RNEF's own lean extraction: just the Nodes +
+    Controls(edges) data convert_resnet() also builds, WITHOUT any of its
+    layout/style/saved-diagram-position handling (irrelevant for a bulk DB
+    import) and WITHOUT writing a per-resnet-name JSON file to disk.
+
+    The per-resnet-name file-write in convert_resnet()/convert() is fine for
+    the File -> Load subgraph viewer (one real pathway per file, so names
+    essentially never collide there) but is actively WRONG for import: a
+    literature-reference-style RNEF file can contain hundreds or thousands of
+    unnamed <resnet> sections (one per control/relation) -- confirmed with
+    TestData\\RNEF\\Abcuro (KLRG1+ T-cells)\\KLRG1iNKT.pmc.celleffect.rnef,
+    which has 1528 resnets, ALL named 'unnamed' -- writing each to the same
+    'unnamed.json' path would silently keep only the last one. This function
+    instead returns each resnet's data to the caller directly, so nothing
+    ever gets dropped on the floor by a filename collision.
+
+    Returns { name, urn, type, properties, nodes: [...], edges: [...] } --
+    `nodes`/`edges` are plain lists (not the id-keyed dicts convert_resnet
+    uses internally), each node carrying both the flattened `properties` and
+    the repeat-preserving `raw_attrs` described in convert_resnet's own node
+    loop above.
+    """
+    resnet_name = resnet.get('name') or resnet.get('Name') or 'unnamed'
+    resnet_urn  = resnet.get('urn') or resnet.get('URN')
+    resnet_type = resnet.get('type') or resnet.get('Type') or ''
+
+    properties = {}
+    properties_el = resnet.find('properties')
+    if properties_el is not None:
+        for attr in properties_el.findall('attr'):
+            n, v = attr.get('name'), attr.get('value', '')
+            if n:
+                properties[n] = v
+
+    nodes_map = {}
+    nodes_el = resnet.find('nodes')
+    if nodes_el is not None:
+        for node in nodes_el.findall('node'):
+            nid = node.get('local_id')
+            props = {}
+            raw_attrs = []
+            for attr in node.findall('attr'):
+                name, value = attr.get('name'), attr.get('value')
+                props[name] = value
+                raw_attrs.append({'name': name, 'value': value})
+            node_type = props.get('NodeType', 'Unknown')
+            if nid:
+                props['URN'] = node.get('urn') or nid
+            if nid and nid not in nodes_map:
+                nodes_map[nid] = {
+                    'id': nid, 'elementId': nid, 'labels': [node_type],
+                    'properties': props, 'raw_attrs': raw_attrs
+                }
+
+    edges = []
+    controls_el = resnet.find('controls')
+    if controls_el is not None:
+        for ctrl in controls_el.findall('control'):
+            eid = ctrl.get('local_id')
+
+            in_refs, out_refs, inout_refs = [], [], []
+            for link in ctrl.findall('link'):
+                lt  = link.get('type', '')
+                ref = link.get('ref')
+                if lt == 'in':       in_refs.append(ref)
+                elif lt == 'out':    out_refs.append(ref)
+                elif lt == 'in-out': inout_refs.append(ref)
+
+            control_type = 'Regulation'
+            effect = ''
+            # calcRelationId()/the Neo4j relation property both need ONE
+            # relation-level Mechanism value, but real samples tag Mechanism
+            # per-reference with an index (e.g. index="1") -- so the first
+            # non-empty Mechanism seen, indexed or not, becomes the
+            # relation-level value, while an indexed one is ALSO still
+            # bucketed into its own reference below (unchanged either way).
+            mechanism = ''
+            refs_by_idx = {}
+            for attr in ctrl.findall('attr'):
+                name  = attr.get('name', '')
+                value = attr.get('value', '')
+                index = attr.get('index')
+                if name == 'ControlType':
+                    control_type = value
+                elif name == 'Effect':
+                    effect = value
+                else:
+                    if name == 'Mechanism' and not mechanism and value:
+                        mechanism = value
+                    bucket = int(index) if index is not None else 0
+                    refs_by_idx.setdefault(bucket, {})[name] = value
+
+            if not effect and eid:
+                m = re.search(r':(positive|negative|unknown):', eid, re.IGNORECASE)
+                if m:
+                    effect = m.group(1).capitalize()
+
+            references = []
+            for idx in sorted(refs_by_idx):
+                r = refs_by_idx[idx]
+                references.append({
+                    'authors':             _ci_get(r, 'Authors'),
+                    'biomarkertype':       _ci_get(r, 'Biomarkertype', 'BiomarkerType'),
+                    'celllinename':        _ci_get(r, 'Celllinename', 'CellLineName'),
+                    'cellobject':          _ci_get(r, 'Cellobject', 'CellObject'),
+                    'celltype':            _ci_get(r, 'Celltype', 'CellType'),
+                    'changetype':          _ci_get(r, 'Changetype', 'ChangeType'),
+                    'collaborator':        _ci_get(r, 'Collaborator'),
+                    'company':             _ci_get(r, 'Company'),
+                    'condition':           _ci_get(r, 'Condition'),
+                    'doi':                 _ci_get(r, 'Doi', 'DOI'),
+                    'embase':              _ci_get(r, 'Embase', 'EMBASE'),
+                    'essn':                _ci_get(r, 'Essn', 'ESSN'),
+                    'experimental_system': _ci_get(r, 'experimental_system', 'Experimental_System'),
+                    'intervention':        _ci_get(r, 'Intervention'),
+                    'issn':                _ci_get(r, 'Issn', 'ISSN'),
+                    'journal':             _ci_get(r, 'Journal'),
+                    'medlineta':           _ci_get(r, 'Medlineta', 'MedlineTA'),
+                    'mode_of_action':      _ci_get(r, 'mode_of_action', 'Mode_Of_Action'),
+                    'mref':                _ci_get(r, 'Mref', 'MRef'),
+                    'msrc':                _ci_get(r, 'Msrc', 'Sentence'),
+                    'nct_id':              _ci_get(r, 'nct_id', 'NCT_ID', 'NCTID'),
+                    'organ':               _ci_get(r, 'Organ'),
+                    'organism':            _ci_get(r, 'Organism'),
+                    'percent':             _ci_get(r, 'Percent'),
+                    'phase':               _ci_get(r, 'Phase'),
+                    'phenotype':           _ci_get(r, 'Phenotype'),
+                    'pii':                 _ci_get(r, 'Pii', 'PII'),
+                    'pmid':                _ci_get(r, 'Pmid', 'PMID'),
+                    'pubversion':          _ci_get(r, 'Pubversion', 'PubVersion'),
+                    'pubyear':             _ci_get(r, 'PubYear'),
+                    'pui':                 _ci_get(r, 'Pui', 'PUI'),
+                    'px':                  _ci_get(r, 'Px', 'PX'),
+                    'quantitativetype':    _ci_get(r, 'quantitativetype', 'QuantitativeType'),
+                    'source':              _ci_get(r, 'Source'),
+                    'start':               _ci_get(r, 'Start'),
+                    'studytype':           _ci_get(r, 'Studytype', 'StudyType'),
+                    'textmods':            _ci_get(r, 'textmods', 'TextMods'),
+                    'textref':             _ci_get(r, 'textref', 'TextRef'),
+                    'tissue':              _ci_get(r, 'Tissue'),
+                    'title':               _ci_get(r, 'Title'),
+                    'trialstatus':         _ci_get(r, 'Trialstatus', 'TrialStatus'),
+                    'url':                 _ci_get(r, 'url', 'URL'),
+                })
+
+            total_participants = len(in_refs) + len(inout_refs) + len(out_refs)
+            common_props = {
+                'URN': eid, 'Effect': effect, 'Mechanism': mechanism,
+                'NumRefs': len(references), 'references': references
+            }
+
+            if total_participants > 2:
+                # Hyperedge: synthetic hub node (same convention as
+                # convert_resnet) plus one binary edge per participant, all
+                # sharing the hub's ControlType as their own relation type.
+                nodes_map[eid] = {
+                    'id': eid, 'elementId': eid, 'labels': ['HyperEdge'],
+                    'properties': {'NodeType': 'HyperEdge', 'Name': control_type, 'URN': eid},
+                    'raw_attrs': []
+                }
+                for ref in in_refs + inout_refs:
+                    if not ref:
+                        continue
+                    edges.append({
+                        'id': eid + '__s' + ref, 'elementId': eid + '__s' + ref, 'type': control_type,
+                        'startNodeId': ref, 'endNodeId': eid, 'controlId': eid,
+                        'properties': dict(common_props, directed=True)
+                    })
+                for ref in out_refs:
+                    if not ref:
+                        continue
+                    edges.append({
+                        'id': eid + '__p' + ref, 'elementId': eid + '__p' + ref, 'type': control_type,
+                        'startNodeId': eid, 'endNodeId': ref, 'controlId': eid,
+                        'properties': dict(common_props, directed=True)
+                    })
+            else:
+                directed = True
+                if in_refs and out_refs:
+                    start, end = in_refs[0], out_refs[0]
+                elif len(inout_refs) >= 2:
+                    start, end = inout_refs[0], inout_refs[1]
+                    directed = False
+                elif in_refs and inout_refs:
+                    start, end = in_refs[0], inout_refs[0]
+                elif out_refs and inout_refs:
+                    start, end = inout_refs[0], out_refs[0]
+                else:
+                    continue
+                edges.append({
+                    'id': eid, 'elementId': eid, 'type': control_type,
+                    'startNodeId': start, 'endNodeId': end, 'controlId': eid,
+                    'properties': dict(common_props, directed=directed)
+                })
+
+    return {
+        'name': resnet_name, 'urn': resnet_urn, 'type': resnet_type,
+        'properties': properties,
+        'nodes': list(nodes_map.values()),
+        'edges': edges
+    }
+
+
+def convert_for_import(input_path):
+    """Returns every <resnet>'s extract_resnet_core() result as a list --
+    used by the Database -> Import RNEF pipeline instead of convert(), which
+    writes one (name-collidable) JSON file per resnet and is meant for the
+    File -> Load subgraph viewer, not bulk import."""
+    with open(input_path, 'rb') as f:
+        raw = f.read()
+    raw = _strip_large_unused_blocks(raw)
+    root = ET.fromstring(raw)
+    resnets = root.findall('resnet')
+    return [extract_resnet_core(resnet) for resnet in resnets]
+
+
 if __name__ == '__main__':
     # On Windows, stdout/stderr default to the system console codepage (e.g.
     # cp1252) rather than UTF-8 — pathway/resnet names printed to stderr here
@@ -715,6 +1005,19 @@ if __name__ == '__main__':
             pass  # Python < 3.7 — unlikely, but don't hard-fail over it
 
     if len(sys.argv) < 3:
-        print("Usage: python rnef_to_json.py <input.rnef> <output_dir>")
+        print("Usage: python rnef_to_json.py <input.rnef> <output_dir> [--mode=import]")
         sys.exit(1)
-    convert(sys.argv[1], sys.argv[2])
+
+    if len(sys.argv) > 3 and sys.argv[3] == '--mode=import':
+        # Database -> Import RNEF: one combined JSON file, not one-per-resnet-
+        # name (see extract_resnet_core()'s own docstring for why that matters
+        # for files with hundreds/thousands of identically-named resnets).
+        out_dir = sys.argv[2]
+        os.makedirs(out_dir, exist_ok=True)
+        resnets = convert_for_import(sys.argv[1])
+        sys.stderr.write("Found {} resnet(s) in {}\n".format(len(resnets), os.path.basename(sys.argv[1])))
+        out_path = os.path.join(out_dir, '_import.json')
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump({'resnets': resnets}, f, ensure_ascii=False)
+    else:
+        convert(sys.argv[1], sys.argv[2])
