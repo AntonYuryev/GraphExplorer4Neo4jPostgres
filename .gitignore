@@ -9,7 +9,10 @@ github-download.js
 install-autostart.ps1
 autostart.log
 settings.json
+settings-*.json
+!settings.example.json
 users.json
+users-*.json
 GithubToken.txt
 backup/
 
