@@ -681,7 +681,17 @@ def _resolve_schema_cfg(username: str) -> Dict[str, Any]:
 # through every helper function.
 import contextvars
 
-USERS_FILE = Path(__file__).parent / "users.json"
+# Overridable via USERS_FILE env var (set by server.js when it spawns this
+# process — see _doSpawnAgent's env passthrough) so a second Graph Explorer
+# instance started from the SAME checkout, with its own USERS_FILE, resolves
+# per-user Neo4j/Postgres credentials against ITS users.json, not the default
+# instance's. A bare filename resolves relative to this script's own
+# directory, same as the unset-env-var default.
+_users_file_env = os.environ.get("USERS_FILE", "").strip()
+USERS_FILE = (
+    Path(_users_file_env) if (_users_file_env and Path(_users_file_env).is_absolute())
+    else Path(__file__).parent / (_users_file_env or "users.json")
+)
 _current_username: contextvars.ContextVar[str] = contextvars.ContextVar("current_username", default="")
 
 def _load_users() -> List[Dict]:
