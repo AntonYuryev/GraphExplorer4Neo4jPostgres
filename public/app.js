@@ -5923,6 +5923,9 @@ function _showLargeResultModal(pending, firstSentence) {
     'cursor:pointer;font-size:inherit;font-family:inherit">Sankey diagram</button>' +
     ' or export the results to Excel instead.';
   document.getElementById('large-query-modal').style.display = 'flex';
+  // Sync RNEF row visibility with whatever format the dropdown currently shows
+  var fmt = (document.getElementById('lq-format-sel') || {}).value || 'excel';
+  toggleLqRnefOpts(fmt);
 }
 
 // Reads the two dropdowns and dispatches to the appropriate export function.
@@ -6042,6 +6045,19 @@ var _RNEF_REF_FIELDS = [
   ['msrc',      'msrc'],
 ];
 
+// Fast lookup: Postgres column → RNEF attr name (for user-selected ref fields)
+var _RNEF_REF_FIELD_MAP = {};
+_RNEF_REF_FIELDS.forEach(function(p) { _RNEF_REF_FIELD_MAP[p[0]] = p[1]; });
+
+// ─── RNEF property-selection state ───────────────────────────────────────────
+// _rnefNodeProps: array of node attr names (from Postgres attr table) to embed
+//   on <node> elements.  Empty = no extra attrs.
+// _rnefRelProps: array of reference column names to embed as indexed attrs on
+//   <control> elements.  null = use _RNEF_REF_FIELDS defaults.
+var _rnefNodeProps = [];
+var _rnefRelProps  = null;
+var _rnefPropsMode = null;  // 'node' | 'rel' — which sub-dialog is open
+
 // Neo4j edge property names → RNEF relation-level attr names (no index).
 var _RNEF_REL_PROPS = [
   ['Effect',    'Effect'],
@@ -6053,9 +6069,140 @@ var _RNEF_REL_PROPS = [
   ['Comment',   'Comment'],
 ];
 
+// Show / hide the RNEF-specific option buttons when the Format dropdown changes.
+// Also called by _showLargeResultModal so the row is in the right state on open.
+function toggleLqRnefOpts(fmt) {
+  var el = document.getElementById('lq-rnef-opts');
+  if (el) el.style.display = (fmt === 'rnef') ? '' : 'none';
+  _updateRnefBadges();
+}
+
+// Refresh the badge text on the two RNEF option buttons.
+function _updateRnefBadges() {
+  var nodeBadge = document.getElementById('lq-rnef-node-badge');
+  var relBadge  = document.getElementById('lq-rnef-rel-badge');
+  if (nodeBadge) {
+    nodeBadge.textContent = _rnefNodeProps.length
+      ? _rnefNodeProps.length + ' selected'
+      : 'none selected';
+  }
+  if (relBadge) {
+    relBadge.textContent = _rnefRelProps === null
+      ? '14 defaults'
+      : _rnefRelProps.length + ' selected';
+  }
+}
+
+// Opens the property-selection sub-modal for either 'node' or 'rel' mode.
+// Fetches available properties from the server on first open (cached after that).
+var _rnefNodePropsCache = null;  // all available node attr names
+var _rnefRelColsCache   = null;  // all available reference column names
+async function openRnefPropsDialog(mode) {
+  _rnefPropsMode = mode;
+  var titleEl = document.getElementById('rnef-props-title');
+  var descEl  = document.getElementById('rnef-props-desc');
+  var hdrEl   = document.getElementById('rnef-props-section-hdr');
+  var listEl  = document.getElementById('rnef-props-list');
+  if (!listEl) return;
+
+  document.getElementById('rnef-props-modal').style.display = 'flex';
+  listEl.innerHTML = '<span style="color:#7a8099;font-size:12px">Loading…</span>';
+
+  if (mode === 'node') {
+    if (titleEl) titleEl.textContent = 'Node Properties';
+    if (descEl)  descEl.textContent  =
+      'Select attributes to include on each <node> in the RNEF file. ' +
+      'Values are looked up in the Postgres node/attr table by NodeID or URN.';
+    if (hdrEl) hdrEl.textContent = 'node table — attr names';
+
+    if (!_rnefNodePropsCache) {
+      try { _rnefNodePropsCache = await api('/api/nodes/property-names-all', null, 'GET'); }
+      catch(e) { _rnefNodePropsCache = []; }
+    }
+    var selected = new Set(_rnefNodeProps);
+    listEl.innerHTML = '';
+    (_rnefNodePropsCache || []).forEach(function(name) {
+      var lb = document.createElement('label');
+      lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
+      lb.innerHTML = '<input type="checkbox" data-prop="' + escHtml(name) + '"'
+        + (selected.has(name) ? ' checked' : '') + '> ' + escHtml(name);
+      listEl.appendChild(lb);
+    });
+    if (!listEl.children.length) {
+      listEl.innerHTML = '<span style="color:#7a8099;font-size:12px">No node properties found in the database.</span>';
+    }
+
+  } else {
+    if (titleEl) titleEl.textContent = 'Relation / Reference Properties';
+    if (descEl)  descEl.textContent  =
+      'Select columns from the reference table to include as indexed <attr> ' +
+      'elements on each <control> in the RNEF file.';
+    if (hdrEl) hdrEl.textContent = 'reference table — columns';
+
+    if (!_rnefRelColsCache) {
+      try {
+        var schema = await api('/api/schema/columns');
+        _rnefRelColsCache = schema.referenceColumns || [];
+      } catch(e) { _rnefRelColsCache = []; }
+    }
+    // Default selection = _RNEF_REF_FIELDS column names when _rnefRelProps is null
+    var defaultCols = new Set(_RNEF_REF_FIELDS.map(function(p) { return p[0]; }));
+    var selected = _rnefRelProps !== null ? new Set(_rnefRelProps) : defaultCols;
+    listEl.innerHTML = '';
+    (_rnefRelColsCache || []).forEach(function(col) {
+      var displayLabel = (_RNEF_REF_FIELD_MAP[col] || col);
+      var detail = (displayLabel !== col) ? ' <span style="color:#7a8099;font-size:11px">(' + escHtml(col) + ')</span>' : '';
+      var lb = document.createElement('label');
+      lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
+      lb.innerHTML = '<input type="checkbox" data-prop="' + escHtml(col) + '"'
+        + (selected.has(col) ? ' checked' : '') + '> ' + escHtml(displayLabel) + detail;
+      listEl.appendChild(lb);
+    });
+    if (!listEl.children.length) {
+      listEl.innerHTML = '<span style="color:#7a8099;font-size:12px">No reference columns found.</span>';
+    }
+  }
+
+  _attachSelectAll(listEl, hdrEl);
+}
+
+function closeRnefPropsDialog() {
+  var el = document.getElementById('rnef-props-modal');
+  if (el) el.style.display = 'none';
+  _rnefPropsMode = null;
+}
+
+function applyRnefPropsDialog() {
+  var listEl = document.getElementById('rnef-props-list');
+  if (!listEl) { closeRnefPropsDialog(); return; }
+  var checked = Array.from(listEl.querySelectorAll('input[type="checkbox"][data-prop]'))
+    .filter(function(cb) { return cb.checked; })
+    .map(function(cb) { return cb.dataset.prop; });
+
+  if (_rnefPropsMode === 'node') {
+    _rnefNodeProps = checked;
+  } else {
+    // null means "use defaults"; if selection equals defaults exactly, restore null
+    var defaultCols = _RNEF_REF_FIELDS.map(function(p) { return p[0]; });
+    var isDefault = checked.length === defaultCols.length &&
+      defaultCols.every(function(c, i) { return c === checked[i]; });
+    _rnefRelProps = isDefault ? null : checked;
+  }
+
+  closeRnefPropsDialog();
+  _updateRnefBadges();
+}
+
 // Build the full RNEF XML string from arrays of edges+nodes+refs.
 // Splits into <resnet> sections of up to RNEF_BATCH relations each.
-function _buildRNEF(edges, nodeById, refsGrouped) {
+// opts.nodeProps    {string[]}  — extra node attr names to embed on <node>
+// opts.nodePropData {object}    — {nodeDbId|urn → {propName: value}}
+// opts.refCols      {string[]|null} — reference table columns; null = _RNEF_REF_FIELDS defaults
+function _buildRNEF(edges, nodeById, refsGrouped, opts) {
+  var opts          = opts || {};
+  var nodeProps     = opts.nodeProps     || [];
+  var nodePropData  = opts.nodePropData  || {};
+  var activeRefCols = opts.refCols       || null;  // null → use _RNEF_REF_FIELDS
   var RNEF_BATCH = 5000;
   var totalParts = Math.max(1, Math.ceil(edges.length / RNEF_BATCH));
   var xml = ['<?xml version="1.0" encoding="UTF-8"?>', '<batch>'];
@@ -6092,9 +6239,23 @@ function _buildRNEF(edges, nodeById, refsGrouped) {
       var nodeType = (node.labels && node.labels[0]) || 'Unknown';
       var name     = getNodeLabel(node);
       var urnAttr  = urn ? ' urn="' + _xmlEsc(urn) + '"' : '';
+      var nodeDbId = node.properties && node.properties.NodeID != null
+        ? String(node.properties.NodeID) : null;
       xml.push('   <node local_id="' + lid + '"' + urnAttr + '>');
       xml.push('    <attr name="NodeType" value="' + _xmlEsc(nodeType) + '"/>');
       xml.push('    <attr name="Name" value="' + _xmlEsc(name) + '"/>');
+      // Optional Postgres node attributes chosen by the user
+      if (nodeProps.length) {
+        var ndData = (nodeDbId && nodePropData[nodeDbId])
+                  || (urn     && nodePropData[urn])
+                  || {};
+        nodeProps.forEach(function(prop) {
+          var val = ndData[prop];
+          if (val != null && val !== '') {
+            xml.push('    <attr name="' + _xmlEsc(prop) + '" value="' + _xmlEsc(String(val)) + '"/>');
+          }
+        });
+      }
       xml.push('   </node>');
     });
     xml.push('  </nodes>');
@@ -6133,11 +6294,13 @@ function _buildRNEF(edges, nodeById, refsGrouped) {
         });
       }
 
+      var refCols = activeRefCols || _RNEF_REF_FIELDS.map(function(p) { return p[0]; });
       refs.forEach(function(ref, idx) {
-        _RNEF_REF_FIELDS.forEach(function(pair) {
-          var val = ref[pair[0]];
+        refCols.forEach(function(col) {
+          var attrName = _RNEF_REF_FIELD_MAP[col] || col;
+          var val = ref[col];
           if (val != null && val !== '') {
-            xml.push('    <attr name="' + pair[1] + '" value="' + _xmlEsc(String(val)) + '" index="' + idx + '"/>');
+            xml.push('    <attr name="' + _xmlEsc(attrName) + '" value="' + _xmlEsc(String(val)) + '" index="' + idx + '"/>');
           }
         });
       });
@@ -6196,9 +6359,35 @@ async function exportQueryRNEF(query, relationIdChunks) {
     setProgressMsg(null); return;
   }
 
+  // Fetch extra node attributes from Postgres if the user selected any
+  var nodePropData = {};
+  if (_rnefNodeProps.length) {
+    setProgressMsg('⏳ Fetching node properties…');
+    var nodeDbIds = [], nodeUrns = [];
+    ctx.qNodes.forEach(function(n) {
+      if (n.properties) {
+        if (n.properties.NodeID != null) nodeDbIds.push(String(n.properties.NodeID));
+        if (n.properties.URN)            nodeUrns.push(n.properties.URN);
+      }
+    });
+    if (nodeDbIds.length || nodeUrns.length) {
+      try {
+        var propResult = await api('/api/nodes/load-properties',
+          { nodeIds: nodeDbIds, urns: nodeUrns, properties: _rnefNodeProps });
+        Object.assign(nodePropData, propResult.byNodeId || {});
+        var byUrn = propResult.byUrn || {};
+        Object.keys(byUrn).forEach(function(k) { nodePropData[k] = byUrn[k]; });
+      } catch(e) { console.warn('[RNEF] node prop fetch failed:', e.message); }
+    }
+  }
+
   setProgressMsg('⏳ Building RNEF…');
   await yieldToUI();
-  var rnefText = _buildRNEF(qEdges, nodeById, refsGrouped);
+  var rnefText = _buildRNEF(qEdges, nodeById, refsGrouped, {
+    nodeProps:    _rnefNodeProps,
+    nodePropData: nodePropData,
+    refCols:      _rnefRelProps,   // null = use defaults
+  });
   setProgressMsg(null);
   downloadTextFile(rnefText, 'query-export.rnef');
 }
@@ -6216,10 +6405,36 @@ async function exportPathwayRNEF(pathwayData) {
   var nodeById = {};
   nodes.forEach(function(n) { nodeById[n.id] = n; });
 
+  // Fetch extra node attributes from Postgres if the user selected any
+  var nodePropData = {};
+  if (_rnefNodeProps.length) {
+    setProgressMsg('⏳ Fetching node properties…');
+    var nodeDbIds = [], nodeUrns = [];
+    nodes.forEach(function(n) {
+      if (n.properties) {
+        if (n.properties.NodeID != null) nodeDbIds.push(String(n.properties.NodeID));
+        if (n.properties.URN)            nodeUrns.push(n.properties.URN);
+      }
+    });
+    if (nodeDbIds.length || nodeUrns.length) {
+      try {
+        var propResult = await api('/api/nodes/load-properties',
+          { nodeIds: nodeDbIds, urns: nodeUrns, properties: _rnefNodeProps });
+        Object.assign(nodePropData, propResult.byNodeId || {});
+        var byUrn = propResult.byUrn || {};
+        Object.keys(byUrn).forEach(function(k) { nodePropData[k] = byUrn[k]; });
+      } catch(e) { console.warn('[RNEF] node prop fetch failed:', e.message); }
+    }
+  }
+
   setProgressMsg('⏳ Building RNEF…');
   await yieldToUI();
   // refsGrouped is empty: _buildRNEF falls back to edge.properties.references
-  var rnefText = _buildRNEF(edges, nodeById, {});
+  var rnefText = _buildRNEF(edges, nodeById, {}, {
+    nodeProps:    _rnefNodeProps,
+    nodePropData: nodePropData,
+    refCols:      _rnefRelProps,
+  });
   setProgressMsg(null);
   downloadTextFile(rnefText, 'pathway-export.rnef');
 }
@@ -8658,6 +8873,44 @@ function sortTable(col) {
 
 var _colDragSrcIdx = null;
 
+// Attaches a "Select all" checkbox to a section title and keeps it in sync
+// with the individual checkboxes in listEl.  Safe to call on every dialog
+// open — removes any previously-injected control first.
+function _attachSelectAll(listEl, titleEl) {
+  if (!listEl || !titleEl) return;
+  var old = titleEl.querySelector('.sa-ctrl');
+  if (old) old.remove();
+
+  var ctrl = document.createElement('label');
+  ctrl.className = 'sa-ctrl';
+  ctrl.style.cssText = 'float:right;display:inline-flex;align-items:center;gap:5px;' +
+    'font-size:11px;font-weight:400;color:#7a8099;cursor:pointer;user-select:none';
+  var cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.style.cssText = 'cursor:pointer;accent-color:#4a6cf7;width:12px;height:12px';
+  ctrl.appendChild(cb);
+  ctrl.appendChild(document.createTextNode(' Select all'));
+  titleEl.appendChild(ctrl);
+
+  function _sync() {
+    var items = Array.from(listEl.querySelectorAll('input[type="checkbox"]'));
+    if (!items.length) { cb.checked = false; cb.indeterminate = false; return; }
+    var nChecked = items.filter(function(x) { return x.checked; }).length;
+    cb.indeterminate = nChecked > 0 && nChecked < items.length;
+    cb.checked = !cb.indeterminate && nChecked === items.length;
+  }
+
+  cb.addEventListener('change', function() {
+    listEl.querySelectorAll('input[type="checkbox"]').forEach(function(x) {
+      x.checked = cb.checked;
+    });
+    cb.indeterminate = false;
+  });
+
+  listEl.addEventListener('change', _sync);
+  _sync();
+}
+
 async function openColumnsDialog() {
   var refCols = [], sdCols = [];
   try {
@@ -8681,6 +8934,7 @@ async function openColumnsDialog() {
       + (col.visible ? ' checked' : '') + '> ' + escHtml(col.label);
     graphList.appendChild(lb);
   });
+  _attachSelectAll(graphList, document.getElementById('col-graph-title'));
 
   var isRelationView = tableViewMode === 'relation';
 
@@ -8707,6 +8961,7 @@ async function openColumnsDialog() {
         + (col.visible ? ' checked' : '') + '> ' + escHtml(col.label);
       neo4jList.appendChild(lb);
     });
+    _attachSelectAll(neo4jList, neo4jSection.querySelector('.prop-section-title'));
   }
 
   // ── Reference table columns (Reference view only) ──────────────────────
@@ -8737,6 +8992,7 @@ async function openColumnsDialog() {
         + (col.visible ? ' checked' : '') + '> ' + cbLabel;
       refList.appendChild(lb);
     });
+    _attachSelectAll(refList, refSection.querySelector('.prop-section-title'));
   }
 
   // ── Scopus data columns (Reference view only) ──────────────────────────
@@ -8765,6 +9021,7 @@ async function openColumnsDialog() {
         + (col.visible ? ' checked' : '') + '> ' + escHtml(col.label);
       sdList.appendChild(lb);
     });
+    _attachSelectAll(sdList, sdSection.querySelector('.prop-section-title'));
   }
 
   // ── Node properties (both views) ──────────────────────────────────────────
