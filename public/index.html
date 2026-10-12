@@ -570,16 +570,50 @@
       </div>
       <div style="flex:1">
         <label style="font-size:12px;color:#7a8099;display:block;margin-bottom:4px">Format</label>
-        <select id="lq-format-sel" style="width:100%;padding:6px 8px;background:#1e2235;color:#c0c4d8;border:1px solid #3a3f55;border-radius:4px;font-size:13px">
+        <select id="lq-format-sel" onchange="toggleLqRnefOpts(this.value)" style="width:100%;padding:6px 8px;background:#1e2235;color:#c0c4d8;border:1px solid #3a3f55;border-radius:4px;font-size:13px">
           <option value="excel">Excel</option>
           <option value="csv">CSV</option>
           <option value="rnef">RNEF</option>
         </select>
       </div>
     </div>
+    <!-- RNEF-specific property-selection controls (hidden unless Format = RNEF) -->
+    <div id="lq-rnef-opts" style="display:none;margin-bottom:14px">
+      <div style="font-size:11px;color:#7a8099;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">RNEF export options</div>
+      <div style="display:flex;gap:8px">
+        <button id="lq-rnef-node-btn" onclick="openRnefPropsDialog('node')"
+          style="flex:1;padding:6px 10px;background:#1a1f35;color:#c0c4d8;border:1px solid #3a3f55;border-radius:5px;font-size:12px;cursor:pointer;text-align:left">
+          📦 Node properties<br><span id="lq-rnef-node-badge" style="color:#7a8099;font-size:11px">none selected</span>
+        </button>
+        <button id="lq-rnef-rel-btn" onclick="openRnefPropsDialog('rel')"
+          style="flex:1;padding:6px 10px;background:#1a1f35;color:#c0c4d8;border:1px solid #3a3f55;border-radius:5px;font-size:12px;cursor:pointer;text-align:left">
+          🔗 Relation properties<br><span id="lq-rnef-rel-badge" style="color:#7a8099;font-size:11px">14 defaults</span>
+        </button>
+      </div>
+    </div>
     <div class="modal-actions" style="gap:8px">
       <button onclick="largeQueryExport()" style="flex:1;padding:7px 12px;background:#3a6fad;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">Export</button>
       <button onclick="closeLargeQueryModal()" style="min-width:80px;padding:7px 12px;background:transparent;color:#7a8099;border:1px solid #3a3f55;border-radius:5px;cursor:pointer;font-size:13px">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- RNEF property-selection sub-modal (appears on top of large-query-modal) -->
+<div id="rnef-props-modal" class="modal-backdrop" style="display:none;z-index:2100"
+     onclick="if(event.target===this)closeRnefPropsDialog()">
+  <div class="modal-box" style="min-width:440px;max-width:600px;max-height:75vh;display:flex;flex-direction:column"
+       onclick="event.stopPropagation()">
+    <h3 id="rnef-props-title">Select Properties</h3>
+    <p id="rnef-props-desc" style="color:#7a8099;font-size:12px;margin:-8px 0 12px;line-height:1.5"></p>
+    <div id="rnef-props-section-hdr" class="prop-section-title" style="margin-bottom:6px"></div>
+    <div style="overflow-y:auto;flex:1">
+      <div id="rnef-props-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;padding:2px 0">
+        <span style="color:#7a8099;font-size:12px">Loading…</span>
+      </div>
+    </div>
+    <div class="modal-actions" style="margin-top:14px;gap:8px">
+      <button class="btn-ghost" onclick="closeRnefPropsDialog()">Cancel</button>
+      <button class="btn-primary" onclick="applyRnefPropsDialog()">Apply</button>
     </div>
   </div>
 </div>
