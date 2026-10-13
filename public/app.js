@@ -6045,9 +6045,80 @@ var _RNEF_REF_FIELDS = [
   ['msrc',      'msrc'],
 ];
 
-// Fast lookup: Postgres column → RNEF attr name (for user-selected ref fields)
+// Fast lookup: Postgres column (lowercase) → canonical RNEF attr name.
+// Covers both the default _RNEF_REF_FIELDS and every other known relation/node
+// attribute so that the exported XML always uses the correct casing.
 var _RNEF_REF_FIELD_MAP = {};
 _RNEF_REF_FIELDS.forEach(function(p) { _RNEF_REF_FIELD_MAP[p[0]] = p[1]; });
+// Extended canonical-casing table (keyed in lowercase)
+[
+  ['effect',                   'Effect'],
+  ['mechanism',                'Mechanism'],
+  ['issn',                     'ISSN'],
+  ['authors',                  'Authors'],
+  ['pubmonth',                 'PubMonth'],
+  ['pubtypes',                 'PubTypes'],
+  ['essn',                     'ESSN'],
+  ['title',                    'Title'],
+  ['pubday',                   'PubDay'],
+  ['medlineta',                'MedlineTA'],
+  ['journal',                  'Journal'],
+  ['start',                    'Start'],
+  ['pubyear',                  'PubYear'],
+  ['company',                  'Company'],
+  ['collaborator',             'Collaborator'],
+  ['studytype',                'StudyType'],
+  ['trialstatus',              'TrialStatus'],
+  ['intervention',             'Intervention'],
+  ['phase',                    'Phase'],
+  ['condition',                'Condition'],
+  ['pmid',                     'PMID'],
+  ['doi',                      'DOI'],
+  ['pii',                      'PII'],
+  ['pui',                      'PUI'],
+  ['embase',                   'EMBASE'],
+  ['nct id',                   'NCT ID'],
+  ['nctid',                    'NCTID'],
+  ['clinvar',                  'Clinvar'],
+  ['clinvar rcv accession',    'Clinvar RCV Accession'],
+  ['clinvar rcv id',           'Clinvar RCV ID'],
+  ['clinvar id',               'Clinvar ID'],
+  ['elsevier',                 'ELSEVIER'],
+  ['pmc',                      'PMC'],
+  ['reporter',                 'REPORTER'],
+  ['grantnumreporter',         'GRANTNUMREPORTER'],
+  ['patent application number','Patent Application Number'],
+  ['patent grant number',      'Patent Grant Number'],
+  ['msrc',                     'msrc'],
+  ['source',                   'Source'],
+  ['percent',                  'Percent'],
+  ['threshold',                'Threshold'],
+  ['px',                       'pX'],
+  ['url',                      'URL'],
+  ['experimental system',      'Experimental System'],
+  ['textmods',                 'TextMods'],
+  ['biomarkertype',            'BiomarkerType'],
+  ['changetype',               'ChangeType'],
+  ['quantitativetype',         'QuantitativeType'],
+  ['organ',                    'Organ'],
+  ['tissue',                   'Tissue'],
+  ['celltype',                 'CellType'],
+  ['celllinename',             'CellLineName'],
+  ['organism',                 'Organism'],
+  ['confidence',               'Confidence'],
+  ['evidence',                 'Evidence'],
+  ['mref',                     'mref'],
+  ['similarity',               'Similarity'],
+  ['textref',                  'TextRef'],
+].forEach(function(p) {
+  // Only fill gaps — _RNEF_REF_FIELDS entries take precedence
+  if (!_RNEF_REF_FIELD_MAP[p[0]]) _RNEF_REF_FIELD_MAP[p[0]] = p[1];
+});
+
+// Normalise any attr name to its canonical RNEF casing.
+function _rnefAttrName(name) {
+  return _RNEF_REF_FIELD_MAP[name] || _RNEF_REF_FIELD_MAP[name.toLowerCase()] || name;
+}
 
 // ─── RNEF property-selection state ───────────────────────────────────────────
 // _rnefNodeProps: array of node attr names (from Postgres attr table) to embed
@@ -6252,7 +6323,7 @@ function _buildRNEF(edges, nodeById, refsGrouped, opts) {
         nodeProps.forEach(function(prop) {
           var val = ndData[prop];
           if (val != null && val !== '') {
-            xml.push('    <attr name="' + _xmlEsc(prop) + '" value="' + _xmlEsc(String(val)) + '"/>');
+            xml.push('    <attr name="' + _xmlEsc(_rnefAttrName(prop)) + '" value="' + _xmlEsc(String(val)) + '"/>');
           }
         });
       }
@@ -6297,7 +6368,7 @@ function _buildRNEF(edges, nodeById, refsGrouped, opts) {
       var refCols = activeRefCols || _RNEF_REF_FIELDS.map(function(p) { return p[0]; });
       refs.forEach(function(ref, idx) {
         refCols.forEach(function(col) {
-          var attrName = _RNEF_REF_FIELD_MAP[col] || col;
+          var attrName = _rnefAttrName(col);
           var val = ref[col];
           if (val != null && val !== '') {
             xml.push('    <attr name="' + _xmlEsc(attrName) + '" value="' + _xmlEsc(String(val)) + '" index="' + idx + '"/>');
