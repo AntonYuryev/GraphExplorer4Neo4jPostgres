@@ -329,7 +329,12 @@
             <div class="menu-item" onclick="openCypherHistory();closeMenus()">Cypher history</div>
           </div>
         </div>
-        <div class="menu-item" onclick="openSqlDialog();closeMenus()">Postgres SQL</div>
+        <div class="menu-item has-sub">Postgres SQL
+          <div class="menu-submenu">
+            <div class="menu-item" onclick="openSqlDialog();closeMenus()">SQL editor</div>
+            <div class="menu-item" onclick="openSqlHistory();closeMenus()">SQL history</div>
+          </div>
+        </div>
         <div class="menu-separator"></div>
         <div class="menu-item" onclick="openLoadNodePropertiesDialog();closeMenus()">Load node properties</div>
         <div class="menu-item" onclick="loadSimilarRelations();closeMenus()">Load similar relations</div>
@@ -708,6 +713,53 @@
     </div>
     <div class="modal-actions" style="margin-top:12px">
       <button class="btn-ghost" onclick="_chCloseModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- SQL history modal — exact mirror of the Cypher history modal above
+     (same search/dedupe/date-range/sort/scroll-persistence behavior), minus
+     the "Open in" column: SQL results have no Graph/Sankey-style alternate
+     destination the way a Cypher query does, so clicking a row's query text
+     (same as Cypher's click-to-load) is the only navigation action. -->
+<div id="sql-history-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-box" style="min-width:760px;max-width:92vw;max-height:85vh;display:flex;flex-direction:column">
+    <h3 style="margin:0 0 12px">SQL Query History</h3>
+    <p style="margin:0 0 10px;font-size:12px;color:#a0aec0">Click a query row to load it into the SQL editor.</p>
+
+    <!-- Search + filters toolbar -->
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+      <input type="text" id="sh-search-input" placeholder="🔍 Search history…" oninput="_shRender()"
+        style="flex:1;min-width:200px;background:#1a1f35;border:1px solid #3a4060;border-radius:6px;color:#e2e8f0;font-size:13px;padding:6px 10px;outline:none">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#a0aec0;cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="sh-dedupe" onchange="_shRender()"> Latest of each query only
+      </label>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px">
+      <span style="font-size:11px;color:#7a8099">When:</span>
+      <div id="sh-date-chips" style="display:flex;gap:5px">
+        <button class="ch-chip" data-range="all"   onclick="_shSetRange('all')">All time</button>
+        <button class="ch-chip" data-range="today" onclick="_shSetRange('today')">Today</button>
+        <button class="ch-chip" data-range="7d"    onclick="_shSetRange('7d')">Last 7 days</button>
+        <button class="ch-chip" data-range="30d"   onclick="_shSetRange('30d')">Last 30 days</button>
+      </div>
+    </div>
+
+    <div id="sql-history-status" style="color:#a0aec0;font-size:13px;margin-bottom:6px"></div>
+    <div id="sh-scroll-container" style="overflow:auto;flex:1;min-height:0;border:1px solid #2a3050;border-radius:6px">
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="background:#1a1f35;position:sticky;top:0">
+            <th id="sh-th-date" onclick="_shSetSort('date')" style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050;cursor:pointer;user-select:none">Date</th>
+            <th id="sh-th-count" onclick="_shSetSort('count')" style="padding:7px 10px;text-align:right;font-size:12px;color:#a0aec0;font-weight:600;white-space:nowrap;border-bottom:1px solid #2a3050;cursor:pointer;user-select:none">Result Count</th>
+            <th style="padding:7px 10px;text-align:left;font-size:12px;color:#a0aec0;font-weight:600;border-bottom:1px solid #2a3050">SQL Query</th>
+          </tr>
+        </thead>
+        <tbody id="sql-history-tbody"></tbody>
+      </table>
+    </div>
+    <div class="modal-actions" style="margin-top:12px">
+      <button class="btn-ghost" onclick="_shCloseModal()">Close</button>
     </div>
   </div>
 </div>
