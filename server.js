@@ -5354,10 +5354,12 @@ app.post('/api/curation/calculate-relation-id', dbLimiter, authMiddleware, async
 });
 
 // POST /api/curation/write-relation  — MERGE to Neo4j + upsert references in Postgres
-// Requires role === 'user'  (admin cannot curate per spec §1.3)
+// Originally role === 'user' only (admin cannot curate per spec §1.3) — opened
+// up to also allow 'admin' at the explicit request of the sole account on
+// this deployment, whose only login is role:'admin'.
 app.post('/api/curation/write-relation', dbLimiter, authMiddleware, async (req, res) => {
-  if (req.user.role !== 'user')
-    return res.status(403).json({ error: 'Curation requires User role.' });
+  if (req.user.role !== 'user' && req.user.role !== 'admin')
+    return res.status(403).json({ error: 'Curation requires User or Admin role.' });
 
   const { sourceNode, targetNode, relationType, properties = {}, relationId, newRelationId, references = [] } = req.body || {};
   if (!relationType)
