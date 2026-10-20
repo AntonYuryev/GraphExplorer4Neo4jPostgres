@@ -35,6 +35,7 @@ gemini-2.5-flash.txt
 __pycache__/
 *.pyc
 cypher_history.tsv
+sql_history.tsv
 
 # Per-user Pathway Collection Search indexes — derived/rebuildable from each
 # user's own local directory (via Settings → Pathway Collection → Index),
