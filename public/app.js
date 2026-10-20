@@ -2680,6 +2680,7 @@ async function runSqlQuery() {
   resultsEl.innerHTML = '<span style="color:#7a8099">Running…</span>';
   try {
     var data = await api('/api/sql-query', { sql: sql });
+    appendSqlHistory(sql, data.rows ? data.rows.length : 0);
     if (!data.rows || data.rows.length === 0) {
       resultsEl.innerHTML = '<span style="color:#7a8099">No rows returned.</span>';
       return;
@@ -6105,6 +6106,8 @@ _RNEF_REF_FIELDS.forEach(function(p) { _RNEF_REF_FIELD_MAP[p[0]] = p[1]; });
   ['celltype',                 'CellType'],
   ['celllinename',             'CellLineName'],
   ['organism',                 'Organism'],
+  ['pubversion',               'PubVersion'],
+  ['cellobject',               'CellObject'],
   ['confidence',               'Confidence'],
   ['evidence',                 'Evidence'],
   ['mref',                     'mref'],
@@ -6125,9 +6128,44 @@ function _rnefAttrName(name) {
 //   on <node> elements.  Empty = no extra attrs.
 // _rnefRelProps: array of reference column names to embed as indexed attrs on
 //   <control> elements.  null = use _RNEF_REF_FIELDS defaults.
+var _RNEF_NODE_PROPS_KEY = 'graphExplorerRnefNodeProps';
+var _RNEF_REL_PROPS_KEY  = 'graphExplorerRnefRelProps';
+
+function _rnefLoadPersistedProps() {
+  try {
+    var np = localStorage.getItem(_RNEF_NODE_PROPS_KEY);
+    if (np) { var p = JSON.parse(np); if (Array.isArray(p)) _rnefNodeProps = p; }
+  } catch(e) {}
+  try {
+    var rp = localStorage.getItem(_RNEF_REL_PROPS_KEY);
+    if (rp === 'null') { _rnefRelProps = null; }
+    else if (rp) { var r = JSON.parse(rp); if (Array.isArray(r)) _rnefRelProps = r; }
+  } catch(e) {}
+}
+
 var _rnefNodeProps = [];
 var _rnefRelProps  = null;
 var _rnefPropsMode = null;  // 'node' | 'rel' — which sub-dialog is open
+_rnefLoadPersistedProps();
+
+// Sections used to group columns in the Relation properties sub-dialog.
+// cols must be lowercase Postgres column names; order within each section is preserved.
+var _RNEF_REL_SECTIONS = [
+  {
+    title: 'Bibliography properties',
+    cols: ['authors','doi','embase','essn','issn','journal','medlineta','pii','pmid',
+           'pubversion','pubyear','pui','source']
+  },
+  {
+    title: 'Assertion properties',
+    cols: ['biomarkertype','celllinename','cellobject','celltype','changetype','mref','msrc',
+           'organ','organism','percent','quantitativetype','textmods','textref','tissue']
+  },
+  {
+    title: 'Clinical trial properties',
+    cols: ['collaborator','company','condition','intervention','nct_id','phase','start','studytype']
+  }
+];
 
 // Neo4j edge property names → RNEF relation-level attr names (no index).
 var _RNEF_REL_PROPS = [
@@ -6184,7 +6222,7 @@ async function openRnefPropsDialog(mode) {
     if (descEl)  descEl.textContent  =
       'Select attributes to include on each <node> in the RNEF file. ' +
       'Values are looked up in the Postgres node/attr table by NodeID or URN.';
-    if (hdrEl) hdrEl.textContent = 'node table — attr names';
+    if (hdrEl) { hdrEl.style.display = ''; hdrEl.textContent = 'node table — attr names'; }
 
     if (!_rnefNodePropsCache) {
       try { _rnefNodePropsCache = await api('/api/nodes/property-names-all', null, 'GET'); }
@@ -6202,13 +6240,14 @@ async function openRnefPropsDialog(mode) {
     if (!listEl.children.length) {
       listEl.innerHTML = '<span style="color:#7a8099;font-size:12px">No node properties found in the database.</span>';
     }
+    _attachSelectAll(listEl, hdrEl);
 
   } else {
     if (titleEl) titleEl.textContent = 'Relation / Reference Properties';
     if (descEl)  descEl.textContent  =
       'Select columns from the reference table to include as indexed <attr> ' +
       'elements on each <control> in the RNEF file.';
-    if (hdrEl) hdrEl.textContent = 'reference table — columns';
+    if (hdrEl) hdrEl.style.display = 'none'; // sections render their own headers
 
     if (!_rnefRelColsCache) {
       try {
@@ -6216,25 +6255,110 @@ async function openRnefPropsDialog(mode) {
         _rnefRelColsCache = schema.referenceColumns || [];
       } catch(e) { _rnefRelColsCache = []; }
     }
-    // Default selection = _RNEF_REF_FIELDS column names when _rnefRelProps is null
     var defaultCols = new Set(_RNEF_REF_FIELDS.map(function(p) { return p[0]; }));
     var selected = _rnefRelProps !== null ? new Set(_rnefRelProps) : defaultCols;
     listEl.innerHTML = '';
-    (_rnefRelColsCache || []).forEach(function(col) {
-      var displayLabel = (_RNEF_REF_FIELD_MAP[col] || col);
-      var detail = (displayLabel !== col) ? ' <span style="color:#7a8099;font-size:11px">(' + escHtml(col) + ')</span>' : '';
-      var lb = document.createElement('label');
-      lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
-      lb.innerHTML = '<input type="checkbox" data-prop="' + escHtml(col) + '"'
-        + (selected.has(col) ? ' checked' : '') + '> ' + escHtml(displayLabel) + detail;
-      listEl.appendChild(lb);
+
+    var allColsSet     = new Set(_rnefRelColsCache || []);
+    var assignedCols   = new Set();
+    var totalRendered  = 0;
+    var allItemCbs     = [];
+    var sectionSyncFns = [];
+
+    // ── Global Select All ─────────────────────────────────────────────────────
+    var globalWrap = document.createElement('div');
+    globalWrap.style.cssText = 'display:flex;justify-content:flex-end;padding:2px 0 8px;' +
+      'border-bottom:1px solid #2a2f45;margin-bottom:4px';
+    var globalLbl = document.createElement('label');
+    globalLbl.style.cssText = 'display:inline-flex;align-items:center;gap:5px;font-size:12px;' +
+      'font-weight:700;color:#c0c8e0;cursor:pointer;user-select:none';
+    var globalCb = document.createElement('input');
+    globalCb.type = 'checkbox';
+    globalLbl.appendChild(globalCb);
+    globalLbl.appendChild(document.createTextNode(' Select all'));
+    globalWrap.appendChild(globalLbl);
+    listEl.appendChild(globalWrap);
+
+    function _syncGlobal() {
+      var n = allItemCbs.filter(function(c) { return c.checked; }).length;
+      globalCb.indeterminate = n > 0 && n < allItemCbs.length;
+      globalCb.checked = n === allItemCbs.length && allItemCbs.length > 0;
+    }
+    globalCb.addEventListener('change', function() {
+      var v = globalCb.checked;
+      allItemCbs.forEach(function(c) { c.checked = v; });
+      sectionSyncFns.forEach(function(fn) { fn(); });
+      globalCb.indeterminate = false;
+      globalCb.checked = v;
     });
-    if (!listEl.children.length) {
+
+    function _renderRelSection(sectionTitle, sectionCols) {
+      var secItemCbs = [];
+      var hdrDiv = document.createElement('div');
+      hdrDiv.style.cssText = 'display:flex;justify-content:space-between;align-items:center;' +
+        'padding:5px 0 3px;margin-top:10px;border-bottom:1px solid #2a2f45';
+      var hdrTxt = document.createElement('span');
+      hdrTxt.style.cssText = 'font-size:11px;font-weight:700;color:#a0a8c0;' +
+        'text-transform:uppercase;letter-spacing:0.06em';
+      hdrTxt.textContent = sectionTitle;
+      hdrDiv.appendChild(hdrTxt);
+      var secLbl = document.createElement('label');
+      secLbl.style.cssText = 'display:inline-flex;align-items:center;gap:4px;font-size:11px;' +
+        'color:#7a8099;cursor:pointer;user-select:none';
+      var secCb = document.createElement('input');
+      secCb.type = 'checkbox';
+      secLbl.appendChild(secCb);
+      secLbl.appendChild(document.createTextNode(' Select all'));
+      hdrDiv.appendChild(secLbl);
+      listEl.appendChild(hdrDiv);
+
+      sectionCols.forEach(function(col) {
+        var displayName = _rnefAttrName(col);
+        var detail = (displayName !== col)
+          ? ' <span style="color:#7a8099;font-size:11px">(' + escHtml(col) + ')</span>' : '';
+        var lb = document.createElement('label');
+        lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;padding:1px 2px';
+        lb.innerHTML = '<input type="checkbox" data-prop="' + escHtml(col) + '"'
+          + (selected.has(col) ? ' checked' : '') + '> ' + escHtml(displayName) + detail;
+        listEl.appendChild(lb);
+        var cb = lb.querySelector('input');
+        secItemCbs.push(cb);
+        allItemCbs.push(cb);
+      });
+      totalRendered += sectionCols.length;
+
+      function syncSec() {
+        var n = secItemCbs.filter(function(c) { return c.checked; }).length;
+        secCb.indeterminate = n > 0 && n < secItemCbs.length;
+        secCb.checked = n === secItemCbs.length && secItemCbs.length > 0;
+      }
+      sectionSyncFns.push(syncSec);
+      secCb.addEventListener('change', function() {
+        secItemCbs.forEach(function(c) { c.checked = secCb.checked; });
+        syncSec();
+        _syncGlobal();
+      });
+      secItemCbs.forEach(function(cb) {
+        cb.addEventListener('change', function() { syncSec(); _syncGlobal(); });
+      });
+      syncSec();
+    }
+
+    _RNEF_REL_SECTIONS.forEach(function(sec) {
+      var cols = sec.cols.filter(function(c) { return allColsSet.has(c); });
+      if (!cols.length) return;
+      cols.forEach(function(c) { assignedCols.add(c); });
+      _renderRelSection(sec.title, cols);
+    });
+    var otherCols = (_rnefRelColsCache || []).filter(function(c) { return !assignedCols.has(c); });
+    if (otherCols.length) _renderRelSection('Other properties', otherCols);
+
+    if (!totalRendered) {
       listEl.innerHTML = '<span style="color:#7a8099;font-size:12px">No reference columns found.</span>';
+    } else {
+      _syncGlobal();
     }
   }
-
-  _attachSelectAll(listEl, hdrEl);
 }
 
 function closeRnefPropsDialog() {
@@ -6252,12 +6376,14 @@ function applyRnefPropsDialog() {
 
   if (_rnefPropsMode === 'node') {
     _rnefNodeProps = checked;
+    try { localStorage.setItem(_RNEF_NODE_PROPS_KEY, JSON.stringify(_rnefNodeProps)); } catch(e) {}
   } else {
     // null means "use defaults"; if selection equals defaults exactly, restore null
     var defaultCols = _RNEF_REF_FIELDS.map(function(p) { return p[0]; });
     var isDefault = checked.length === defaultCols.length &&
       defaultCols.every(function(c, i) { return c === checked[i]; });
     _rnefRelProps = isDefault ? null : checked;
+    try { localStorage.setItem(_RNEF_REL_PROPS_KEY, _rnefRelProps === null ? 'null' : JSON.stringify(_rnefRelProps)); } catch(e) {}
   }
 
   closeRnefPropsDialog();
@@ -7265,6 +7391,206 @@ function _chRender() {
     tr.appendChild(tdCount);
     tr.appendChild(tdQuery);
     tr.appendChild(tdOpen);
+    tbody.appendChild(tr);
+  });
+}
+
+// ─── SQL history ───────────────────────────────────────────────────────────────
+// Exact mirror of Cypher history above (same server-side NDJSON file pattern,
+// same client-side search/dedupe/date-range/sort/scroll-persistence behavior)
+// — see appendCypherHistory/_ch* for the template this was copied from. The
+// one deliberate difference: no "Open in" dropdown, since a SQL query has no
+// Graph/Sankey-style alternate destination — clicking the query row is the
+// only navigation action, loading it back into the SQL editor.
+function appendSqlHistory(query, count) {
+  // Fire-and-forget — never blocks the UI
+  api('/api/sql/history', { query: query, count: count }).catch(function() {});
+}
+
+var _shAllRows   = [];      // raw rows from the server, each with a parsed timestamp
+var _shRange     = 'all';   // 'all' | 'today' | '7d' | '30d'
+var _shSortField = 'date';  // 'date' | 'count'
+var _shSortDir   = 'desc';  // 'asc' | 'desc'
+
+var SH_SCROLL_KEY = 'sql_history_scroll_v1';
+var _shScrollListenerAttached = false;
+
+function _shScrollTargets() {
+  var inner = document.getElementById('sh-scroll-container');
+  var outer = inner ? inner.closest('.modal-box') : null;
+  return [inner, outer].filter(Boolean);
+}
+
+var _shSuppressSave = false;
+
+function _shSaveScroll(evt) {
+  if (_shSuppressSave) return;
+  var el = (evt && evt.target) || document.getElementById('sh-scroll-container');
+  if (!el) return;
+  try { localStorage.setItem(SH_SCROLL_KEY, String(el.scrollTop)); } catch(e) {}
+}
+
+function _shCloseModal() {
+  _shSuppressSave = true;
+  document.getElementById('sql-history-modal').style.display = 'none';
+  setTimeout(function() { _shSuppressSave = false; }, 150);
+}
+
+function _shRestoreScroll() {
+  var saved = 0;
+  try { saved = parseInt(localStorage.getItem(SH_SCROLL_KEY), 10) || 0; } catch(e) {}
+  requestAnimationFrame(function() {
+    requestAnimationFrame(function() {
+      _shScrollTargets().forEach(function(el) { el.scrollTop = saved; });
+      _shSuppressSave = false;
+    });
+  });
+}
+
+async function openSqlHistory() {
+  var modal  = document.getElementById('sql-history-modal');
+  var status = document.getElementById('sql-history-status');
+  _shSuppressSave = true;
+  document.getElementById('sql-history-tbody').innerHTML = '';
+  document.getElementById('sh-search-input').value = '';
+  var savedDedupe = localStorage.getItem('sh-dedupe-pref');
+  document.getElementById('sh-dedupe').checked = (savedDedupe === 'true');
+  _shRange     = 'all';
+  _shSortField = 'date';
+  _shSortDir   = 'desc';
+  status.textContent = 'Loading…';
+  modal.style.display = 'flex';
+
+  if (!_shScrollListenerAttached) {
+    _shScrollTargets().forEach(function(el) { el.addEventListener('scroll', _shSaveScroll); });
+    _shScrollListenerAttached = true;
+  }
+
+  try {
+    var data = await api('/api/sql/history');
+    _shAllRows = (data.rows || []).map(function(r) {
+      var t = new Date(r.date).getTime();
+      return { date: r.date, query: r.query, count: r.count, _time: isNaN(t) ? 0 : t };
+    });
+    _shUpdateChips();
+    _shUpdateSortHeaders();
+    _shRender();
+    _shRestoreScroll();
+  } catch(e) {
+    status.textContent = 'Error loading history: ' + e.message;
+    _shSuppressSave = false;
+  }
+}
+
+function _shSetRange(range) {
+  _shRange = range;
+  _shUpdateChips();
+  _shRender();
+}
+
+function _shUpdateChips() {
+  document.querySelectorAll('#sh-date-chips .ch-chip').forEach(function(btn) {
+    btn.classList.toggle('active', btn.getAttribute('data-range') === _shRange);
+  });
+}
+
+function _shSetSort(field) {
+  if (_shSortField === field) {
+    _shSortDir = (_shSortDir === 'asc') ? 'desc' : 'asc';
+  } else {
+    _shSortField = field;
+    _shSortDir   = 'desc';
+  }
+  _shUpdateSortHeaders();
+  _shRender();
+}
+
+function _shUpdateSortHeaders() {
+  var arrow   = _shSortDir === 'asc' ? ' ▲' : ' ▼';
+  var dateTh  = document.getElementById('sh-th-date');
+  var countTh = document.getElementById('sh-th-count');
+  dateTh.textContent  = 'Date'         + (_shSortField === 'date'  ? arrow : '');
+  countTh.textContent = 'Result Count' + (_shSortField === 'count' ? arrow : '');
+}
+
+// Reuses _chHighlight/_chEscHtml (identical escaping/highlighting logic —
+// no need for a second copy of the same two helpers).
+function _shRender() {
+  var status = document.getElementById('sql-history-status');
+  var tbody  = document.getElementById('sql-history-tbody');
+  var search = (document.getElementById('sh-search-input').value || '').trim().toLowerCase();
+  var dedupe = document.getElementById('sh-dedupe').checked;
+
+  localStorage.setItem('sh-dedupe-pref', dedupe ? 'true' : 'false');
+
+  var rows  = _shAllRows;
+  var total = rows.length;
+
+  if (_shRange !== 'all') {
+    var cutoff;
+    if (_shRange === 'today') {
+      var d0 = new Date(); d0.setHours(0, 0, 0, 0);
+      cutoff = d0.getTime();
+    } else if (_shRange === '7d')  cutoff = Date.now() - 7  * 24 * 3600 * 1000;
+    else if (_shRange === '30d')   cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+    if (cutoff !== undefined) rows = rows.filter(function(r) { return r._time >= cutoff; });
+  }
+
+  if (search) {
+    rows = rows.filter(function(r) { return (r.query || '').toLowerCase().indexOf(search) !== -1; });
+  }
+
+  if (dedupe) {
+    var latestByQuery = {};
+    rows.forEach(function(r) {
+      var existing = latestByQuery[r.query];
+      if (!existing || r._time > existing._time) latestByQuery[r.query] = r;
+    });
+    rows = Object.keys(latestByQuery).map(function(k) { return latestByQuery[k]; });
+  }
+
+  var shown = rows.length;
+
+  rows = rows.slice().sort(function(a, b) {
+    var av = _shSortField === 'count' ? (Number(a.count) || 0) : a._time;
+    var bv = _shSortField === 'count' ? (Number(b.count) || 0) : b._time;
+    return _shSortDir === 'asc' ? (av - bv) : (bv - av);
+  });
+
+  status.textContent = total === 0
+    ? 'No history yet.'
+    : 'Showing ' + shown.toLocaleString() + ' of ' + total.toLocaleString() + ' quer' + (total === 1 ? 'y' : 'ies') +
+      (shown === 0 ? ' — no matches.' : '');
+
+  tbody.innerHTML = '';
+  rows.forEach(function(r) {
+    var tr = document.createElement('tr');
+    var dt = '';
+    try { dt = new Date(r.date).toLocaleString(); } catch(e) { dt = r.date; }
+
+    var tdDate = document.createElement('td');
+    tdDate.textContent = dt;
+    tdDate.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;color:#a0aec0;font-size:12px;vertical-align:top';
+
+    var tdCount = document.createElement('td');
+    tdCount.textContent = (typeof r.count === 'number' ? r.count.toLocaleString() : r.count);
+    tdCount.style.cssText = 'white-space:nowrap;padding:5px 10px;border-bottom:1px solid #2a3050;text-align:right;color:#7ee8a2;font-size:12px;vertical-align:top';
+
+    // Query text — clicking loads into the SQL editor; search hits highlighted
+    var tdQuery = document.createElement('td');
+    tdQuery.innerHTML = _chHighlight(r.query, search);
+    tdQuery.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;font-family:monospace;font-size:12px;word-break:break-all;cursor:pointer;color:#e2e8f0;vertical-align:top';
+    tdQuery.title = 'Click to open in SQL editor';
+    tdQuery.addEventListener('click', function() {
+      _shCloseModal();
+      openSqlDialog();
+      var ta = document.getElementById('sql-input');
+      if (ta) ta.value = r.query;
+    });
+
+    tr.appendChild(tdDate);
+    tr.appendChild(tdCount);
+    tr.appendChild(tdQuery);
     tbody.appendChild(tr);
   });
 }
