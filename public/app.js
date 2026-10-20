@@ -13749,11 +13749,11 @@ async function ontologyCtxAction(action) {
 
 // ── Menu item state ───────────────────────────────────────────────────────────
 // Called from updateSelectionInfo on every select/deselect event.
-// Visible only for 'user' role; enabled when 2+ nodes or 1 edge are selected.
+// Visible for 'user' and 'admin' roles; enabled when 2+ nodes or 1 edge are selected.
 function rcUpdateMenuState(selNodes, selEdges) {
   var item = document.getElementById('me-create-relation');
   if (item) {
-    if (currentRole !== 'user') {
+    if (currentRole !== 'user' && currentRole !== 'admin') {
       item.style.display = 'none';
     } else {
       item.style.display = '';
@@ -13812,7 +13812,7 @@ function rcUpdateMenuState(selNodes, selEdges) {
 
 // ── Dialog open ───────────────────────────────────────────────────────────────
 async function openRelationCurationDialog() {
-  if (!cy || currentRole !== 'user') return;
+  if (!cy || (currentRole !== 'user' && currentRole !== 'admin')) return;
 
   var selNodes = cy.nodes(':selected').not('[?isClone]');
   var selEdges = cy.edges(':selected');
@@ -14571,7 +14571,7 @@ async function rcSaveToDatabase() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 function openPairRelationDialog() {
-  if (!cy || currentRole !== 'user') return;
+  if (!cy || (currentRole !== 'user' && currentRole !== 'admin')) return;
   var selNodes = cy.nodes(':selected').not('[?isClone]');
   if (selNodes.length !== 2) return;
 
@@ -14622,7 +14622,7 @@ function closePairRelationDialog() {
 
 // Open the pair Create/Edit dialog pre-populated from an existing Cytoscape edge
 function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
-  if (!cy || currentRole !== 'user' || !cyEdge || !cyEdge.length) return;
+  if (!cy || (currentRole !== 'user' && currentRole !== 'admin') || !cyEdge || !cyEdge.length) return;
 
   var srcCy = cy.$id(cyEdge.data('source'));
   var tgtCy = cy.$id(cyEdge.data('target'));
@@ -18284,7 +18284,7 @@ function selectAllClonesFromContext() {
 function openCurationFromContext() {
   hideContextMenu();
   if (!contextTarget) return;
-  if (contextTarget.type === 'edge' && currentRole === 'user') {
+  if (contextTarget.type === 'edge' && (currentRole === 'user' || currentRole === 'admin')) {
     var cyEdge = cy.getElementById(contextTarget.id);
     if (cyEdge && cyEdge.length) {
       // Route based on number of distinct endpoint nodes
@@ -18322,7 +18322,7 @@ function openCurationFromContext() {
 async function openHyperEdgeFromContext() {
   hideContextMenu();
   if (!cy || !contextTarget || contextTarget.type !== 'node') return;
-  if (currentRole !== 'user') return;
+  if (currentRole !== 'user' && currentRole !== 'admin') return;
 
   var hubCy = cy.getElementById(contextTarget.id);
   if (!hubCy || !hubCy.length) return;
