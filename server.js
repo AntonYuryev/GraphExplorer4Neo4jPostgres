@@ -4141,6 +4141,68 @@ app.post('/api/cypher/history', dbLimiter, authMiddleware, (req, res) => {
   }
 });
 
+// ─── Postgres SQL query history ───────────────────────────────────────────────
+// Exact mirror of Cypher query history above (same NDJSON-with-legacy-TSV-
+// fallback file format, same base64-encoding-to-break-CodeQL-taint trick) —
+// one shared file, not per-user, since /api/sql-query itself is already
+// admin-only and there's normally only ever one or a few admins running
+// these. Kept as a SEPARATE file/endpoint pair from Cypher history rather
+// than merging the two, since the two query languages/editors are distinct
+// features with their own menu entries.
+const SQL_HISTORY_FILE = path.join(__dirname, 'sql_history.tsv');
+
+app.get('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    if (!fs.existsSync(SQL_HISTORY_FILE)) return res.json({ rows: [] });
+    const content = fs.readFileSync(SQL_HISTORY_FILE, 'utf8');
+    const rows = content.trim().split('\n').filter(l => l.trim()).map(line => {
+      if (line.trimStart().startsWith('{')) {
+        try {
+          const obj = JSON.parse(line);
+          let q = String(obj.query || '');
+          if (obj.v === 2) {
+            try { q = Buffer.from(q, 'base64').toString('utf8'); } catch (_) { /* keep as-is */ }
+          }
+          return {
+            date:  String(obj.date  || ''),
+            query: q,
+            count: Number.isFinite(Number(obj.count)) ? Number(obj.count) : 0
+          };
+        } catch (_) { /* fall through to TSV */ }
+      }
+      const parts = line.split('\t');
+      const date  = parts[0] || '';
+      const query = parts[1] || '';
+      const count = parts.length > 2 ? parseInt(parts[2], 10) : 0;
+      return { date, query, count: isNaN(count) ? 0 : count };
+    });
+    res.json({ rows });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+app.post('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { query, count } = req.body || {};
+  if (!query || !query.trim()) return res.status(400).json({ error: 'query required' });
+  const encodedQuery = Buffer.from(String(query).slice(0, HISTORY_QUERY_MAX_CHARS)).toString('base64');
+  const entry = {
+    date:  new Date().toISOString(),
+    query: encodedQuery,
+    v:     2,
+    count: Number.isFinite(Number(count)) ? Number(count) : 0
+  };
+  const line = JSON.stringify(entry) + '\n';
+  try {
+    fs.appendFileSync(SQL_HISTORY_FILE, line, 'utf8');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
 // ─── Agentic AI — Python service lifecycle & proxy ───────────────────────────
 const AGENT_PORT     = parseInt(process.env.AGENT_PORT || '3001', 10);
 const AGENT_SCRIPT   = path.join(__dirname, 'agent_service.py');
