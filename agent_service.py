@@ -1673,9 +1673,16 @@ def ping_llm(req: PingRequest = None):
                 "elapsed_s": round(elapsed, 2),
                 "system_prompt_tokens": len(sp) // 4,
                 "reply": reply}
-    except Exception:
+    except Exception as _ping_exc:
         log.exception("Ping failed")
-        return {"ok": False, "error": "Ping failed due to an internal error.", "elapsed_s": round(time.time() - t0, 2), "model": model}
+        # Surface provider HTTP errors (401 invalid key, 404 model, ...) —
+        # a generic "internal error" made a rejected key indistinguishable
+        # from a bug. Text is sanitized the same way the Gemini path does.
+        _code = getattr(_ping_exc, "status_code", None)
+        _detail = "Ping failed due to an internal error."
+        if _code:
+            _detail = f"HTTP {_code}: " + _sanitize_public_text(str(getattr(_ping_exc, "message", "") or _ping_exc), 300)
+        return {"ok": False, "error": _detail, "elapsed_s": round(time.time() - t0, 2), "model": model}
 
 class LLMChatRequest(BaseModel):
     message: str
