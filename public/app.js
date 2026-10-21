@@ -6899,7 +6899,16 @@ async function runQuery(mergeIntoExisting) {
     var startTabIdx = tabs.findIndex(function(t) { return t.id === startTabId; });
     if (startTabIdx < 0) return; // tab was closed while query ran
 
+    // True whenever the query genuinely produced nothing — no graph nodes/
+    // edges AND (no table, or a table with zero rows). Checked once here so
+    // every branch below (table, merge, or normal render) gets the same
+    // explicit "no data" notice instead of just silently showing a blank
+    // canvas or a barely-noticeable "0 rows" table header.
+    var isEmptyResult = (!data.nodes || !data.nodes.length) && (!data.edges || !data.edges.length)
+      && (!data.table || !data.table.rows || !data.table.rows.length);
+
     if (startTabIdx === activeTabIdx) {
+      if (isEmptyResult) showAlignHint('No data found — the query returned no results.');
       // Still on the originating tab — render normally
       if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
         appendCypherHistory(query, 0);   // record aggregate/table queries in history
@@ -7403,8 +7412,11 @@ function _chRender() {
 // Graph/Sankey-style alternate destination — clicking the query row is the
 // only navigation action, loading it back into the SQL editor.
 function appendSqlHistory(query, count) {
-  // Fire-and-forget — never blocks the UI
-  api('/api/sql/history', { query: query, count: count }).catch(function() {});
+  // Fire-and-forget — never blocks the UI. Logged (not swallowed) on failure
+  // so a problem here is visible in the browser console instead of silently
+  // just not showing up in SQL history later.
+  api('/api/sql/history', { query: query, count: count })
+    .catch(function(e) { console.warn('appendSqlHistory failed:', e.message || e); });
 }
 
 var _shAllRows   = [];      // raw rows from the server, each with a parsed timestamp
@@ -14660,16 +14672,43 @@ function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
                     // cy-internal display attributes — must never reach Neo4j
                     edgeURN:1, lineStyle:1, isHyperedge:1 };
   _rcPair.props = [];
-  Object.keys(cyEdge.data()).forEach(function(k) {
-    if (EDGE_SKIP[k]) return;
-    var v = cyEdge.data(k);
-    if (v == null || v === '') return;
-    _rcPair.props.push({ id: ++_rcPair._pid, key: k,
-      value: Array.isArray(v) ? v.join(';') : String(v) });
-  });
+  // Prefer the edge's FULL Neo4j properties (graphData) over cyEdge.data():
+  // the Cytoscape data only carries the handful of display fields
+  // _buildCyEdgeData() copies (effect, mechanism, confidence, ...), so
+  // annotations like Source, Tissue, CellType, Organ... were never shown.
+  var gEdge = null;
+  if (typeof graphData !== 'undefined' && graphData && graphData.edges) {
+    var _cid = String(cyEdge.id());
+    gEdge = graphData.edges.find(function(e) { return String(e.id) === _cid; }) || null;
+  }
+  var PAIR_PROP_SKIP = { references:1, URN:1, NumRefs:1, directed:1,
+                         Date_created:1, Date_modified:1, date_created:1, date_modified:1 };
+  if (gEdge && gEdge.properties) {
+    Object.keys(gEdge.properties).forEach(function(k) {
+      if (EDGE_SKIP[k] || PAIR_PROP_SKIP[k]) return;
+      var v = gEdge.properties[k];
+      if (v == null || v === '') return;
+      _rcPair.props.push({ id: ++_rcPair._pid, key: k,
+        value: Array.isArray(v) ? v.join(';') : String(v) });
+    });
+  } else {
+    Object.keys(cyEdge.data()).forEach(function(k) {
+      if (EDGE_SKIP[k]) return;
+      var v = cyEdge.data(k);
+      if (v == null || v === '') return;
+      _rcPair.props.push({ id: ++_rcPair._pid, key: k,
+        value: Array.isArray(v) ? v.join(';') : String(v) });
+    });
+  }
 
-  // Set relation type in dropdown after populating
-  document.getElementById('rcp-rel-id').textContent = '—';
+  // RelationID shown/used while the dialog is open = the stored one (same
+  // value the tooltip shows, from the database) — never recomputed on open.
+  var _storedIds = cyEdge.data('relIds');
+  var _storedRelId = (Array.isArray(_storedIds) && _storedIds.length) ? String(_storedIds[0])
+                   : (cyEdge.data('relId') ? String(cyEdge.data('relId')) : null);
+  _rcPair.currentRelId = _storedRelId;
+  _rcPair._allowCalc = false;
+  document.getElementById('rcp-rel-id').textContent = _storedRelId || '—';
   document.getElementById('rcp-edge-urn').textContent = '—';
   document.getElementById('rcp-title').textContent = 'Create/Edit Binary Relation';
 
@@ -14677,6 +14716,10 @@ function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
   rcPairHideRefsPanel();
 
   document.getElementById('rc-pair-modal').style.display = 'flex';
+
+  // Right-clicked a specific row in the References table — open the
+  // References panel straight away (RelationID is already known, see above).
+  if (_rcPair.targetRefUniqueId) rcPairToggleRefs();
 
   var loadingEl = document.getElementById('rcp-schema-loading');
 
@@ -14877,6 +14920,11 @@ function rcPairCalcEdgeURN() {
 }
 
 async function rcPairCalcRelId() {
+  // Editing an EXISTING relation: its RelationID is the stored one (loaded
+  // from the edge/tooltip, i.e. from the database when the dialog opened) and
+  // stays fixed while the user edits. It is recomputed only when they press
+  // "Save to Database" — rcPairSaveToDatabase() sets _allowCalc for that.
+  if (_rcPair.existingEdge && !_rcPair._allowCalc) { rcPairCalcEdgeURN(); return; }
   var relType = document.getElementById('rcp-reltype').value;
   var src = _rcPair.flipped ? _rcPair.nodeB : _rcPair.nodeA;
   var tgt = _rcPair.flipped ? _rcPair.nodeA : _rcPair.nodeB;
@@ -14944,10 +14992,24 @@ function rcPairHideRefsPanel() {
 async function rcPairLoadRefs() {
   if (_rcPair._debounce) { clearTimeout(_rcPair._debounce); await rcPairCalcRelId(); }
   var dbRefs = [];
-  if (_rcPair.currentRelId) {
+  // Fetch by the edge's own STORED RelationID(s) as well as the one just
+  // recomputed from the dialog's current properties. The recomputed id only
+  // matches the stored one while every hash input (NodeIDs, type, effect,
+  // mechanism, ...) round-trips identically; relying on it alone left the
+  // reference card blank for any relation whose recomputed id differed or
+  // wasn't ready yet, even though Postgres holds rows for the stored id.
+  var _idList = [];
+  var _ex = _rcPair.existingEdge;
+  if (_ex && _ex.length) {
+    var _stored = _ex.data('relIds');
+    if (Array.isArray(_stored) && _stored.length) _stored.forEach(function(i) { _idList.push(String(i)); });
+    else if (_ex.data('relId')) _idList.push(String(_ex.data('relId')));
+  }
+  if (_rcPair.currentRelId && _idList.indexOf(String(_rcPair.currentRelId)) < 0) _idList.push(String(_rcPair.currentRelId));
+  if (_idList.length) {
     try {
-      var res = await api('/api/references/batch', { relationIds: [_rcPair.currentRelId], scopusColumns: [] });
-      dbRefs = res[_rcPair.currentRelId] || [];
+      var res = await api('/api/references/batch', { relationIds: _idList, scopusColumns: [] });
+      _idList.forEach(function(id) { dbRefs = dbRefs.concat(res[id] || []); });
     } catch(e) {}
   }
   // Combine with references embedded in the source file for this edge — the
@@ -15196,7 +15258,13 @@ async function rcPairSaveToDatabase() {
     // (default A→B is acceptable; just ensure relType is set — already checked above)
   }
 
-  if (_rcPair._debounce) { clearTimeout(_rcPair._debounce); await rcPairCalcRelId(); }
+  // Save is the ONLY point where an existing relation's RelationID is
+  // recomputed (from the dialog's possibly-edited type/effect/mechanism/
+  // direction). origRelId (the stored one) is read below, before this result
+  // is used, so a changed hash is saved as newRelationId.
+  if (_rcPair._debounce) clearTimeout(_rcPair._debounce);
+  _rcPair._allowCalc = true;
+  try { await rcPairCalcRelId(); } finally { _rcPair._allowCalc = false; }
   if (!_rcPair.currentRelId) {
     alert('Could not calculate RelationID. Ensure nodes have NodeIDs and a relation type is selected.');
     return;
