@@ -47,6 +47,8 @@ def _rnef_hex_color(value):
         return None
     return value[:7]   # '#' + first 6 hex digits; the trailing byte is dropped
 
+_ci_cache = [None, None]   # [last dict seen, its lowercase-keyed copy]
+
 def _ci_get(d, *names):
     """Case-insensitive, multi-alias dict lookup -- real RNEF exports aren't
     consistent about attribute-name capitalization (see convert_resnet's own
@@ -55,7 +57,13 @@ def _ci_get(d, *names):
     'textref' or 'TEXTREF'. Returns '' if none of the aliases are present."""
     if not d:
         return ''
-    lower_map = {k.lower(): v for k, v in d.items()}
+    # One reference dict is queried ~43 times in a row — build its lowercase
+    # map once and reuse it (the cache holds the dict itself, so an identity
+    # match can never be a recycled id of a different, freed dict).
+    if _ci_cache[0] is not d:
+        _ci_cache[0] = d
+        _ci_cache[1] = {k.lower(): v for k, v in d.items()}
+    lower_map = _ci_cache[1]
     for n in names:
         v = lower_map.get(n.lower())
         if v:
@@ -219,58 +227,25 @@ def convert_resnet(resnet, out_dir):
                 if m:
                     effect = m.group(1).capitalize()
 
-            # Full column set per the Database -> Import RNEF FRD's Postgres
-            # `reference` table <-> RNEF property mapping. Looked up
-            # case-insensitively (_ci_get) since real exports vary in
-            # capitalization; 'msrc' accepts both the FRD's own 'Msrc' name
-            # and the 'Sentence' name actually seen in real samples (both
-            # represent the same reference-level sentence text).
+            # Viewer path: keep the reference dict LEAN. A pathway can carry
+            # thousands of references per edge, and the viewer only ever reads
+            # these fields — the full 43-column mapping lives in
+            # extract_resnet_core() (Database -> Import RNEF), where it is needed.
             references = []
             for idx in sorted(refs_by_idx):
                 r = refs_by_idx[idx]
                 references.append({
-                    'authors':             _ci_get(r, 'Authors'),
-                    'biomarkertype':       _ci_get(r, 'Biomarkertype', 'BiomarkerType'),
-                    'celllinename':        _ci_get(r, 'Celllinename', 'CellLineName'),
-                    'cellobject':          _ci_get(r, 'Cellobject', 'CellObject'),
-                    'celltype':            _ci_get(r, 'Celltype', 'CellType'),
-                    'changetype':          _ci_get(r, 'Changetype', 'ChangeType'),
-                    'collaborator':        _ci_get(r, 'Collaborator'),
-                    'company':             _ci_get(r, 'Company'),
-                    'condition':           _ci_get(r, 'Condition'),
-                    'doi':                 _ci_get(r, 'Doi', 'DOI'),
-                    'embase':              _ci_get(r, 'Embase', 'EMBASE'),
-                    'essn':                _ci_get(r, 'Essn', 'ESSN'),
-                    'experimental_system': _ci_get(r, 'experimental_system', 'Experimental_System'),
-                    'intervention':        _ci_get(r, 'Intervention'),
-                    'issn':                _ci_get(r, 'Issn', 'ISSN'),
-                    'journal':             _ci_get(r, 'Journal'),
-                    'medlineta':           _ci_get(r, 'Medlineta', 'MedlineTA'),
-                    'mode_of_action':      _ci_get(r, 'mode_of_action', 'Mode_Of_Action'),
-                    'mref':                _ci_get(r, 'Mref', 'MRef'),
-                    'msrc':                _ci_get(r, 'Msrc', 'Sentence'),
-                    'nct_id':              _ci_get(r, 'nct_id', 'NCT_ID', 'NCTID'),
-                    'organ':               _ci_get(r, 'Organ'),
-                    'organism':            _ci_get(r, 'Organism'),
-                    'percent':             _ci_get(r, 'Percent'),
-                    'phase':               _ci_get(r, 'Phase'),
-                    'phenotype':           _ci_get(r, 'Phenotype'),
-                    'pii':                 _ci_get(r, 'Pii', 'PII'),
-                    'pmid':                _ci_get(r, 'Pmid', 'PMID'),
-                    'pubversion':          _ci_get(r, 'Pubversion', 'PubVersion'),
-                    'pubyear':             _ci_get(r, 'PubYear'),
-                    'pui':                 _ci_get(r, 'Pui', 'PUI'),
-                    'px':                  _ci_get(r, 'Px', 'PX'),
-                    'quantitativetype':    _ci_get(r, 'quantitativetype', 'QuantitativeType'),
-                    'source':              _ci_get(r, 'Source'),
-                    'start':               _ci_get(r, 'Start'),
-                    'studytype':           _ci_get(r, 'Studytype', 'StudyType'),
-                    'textmods':            _ci_get(r, 'textmods', 'TextMods'),
-                    'textref':             _ci_get(r, 'textref', 'TextRef'),
-                    'tissue':              _ci_get(r, 'Tissue'),
-                    'title':               _ci_get(r, 'Title'),
-                    'trialstatus':         _ci_get(r, 'Trialstatus', 'TrialStatus'),
-                    'url':                 _ci_get(r, 'url', 'URL'),
+                    'pmid':    r.get('PMID', ''),
+                    'doi':     r.get('DOI', ''),
+                    'title':   r.get('Title', ''),
+                    'pubyear': r.get('PubYear', ''),
+                    'authors': r.get('Authors', ''),
+                    'journal': r.get('Journal', ''),
+                    'msrc':    r.get('Sentence', ''),
+                    'celltype': r.get('CellType', ''),
+                    'celllinename': r.get('CellLineName', ''),
+                    'tissue': r.get('Tissue', ''),
+                    'organ': r.get('Organ', '')
                 })
 
             # Hyperedge = a control connecting MORE THAN TWO nodes -- Cytoscape
@@ -733,7 +708,10 @@ def convert_resnet(resnet, out_dir):
     fname    = safe_filename(resnet_name) + '.json'
     out_path = os.path.join(out_dir, fname)
     with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+        # Compact (no indent): this file is only read back by the server and
+        # sent on to the browser; pretty-printing a large pathway roughly
+        # doubled both the write time and the payload size.
+        json.dump(out, f, ensure_ascii=False, separators=(',', ':'))
 
     sys.stderr.write(
         "  OK  '{}'\n"
@@ -761,7 +739,7 @@ def _strip_large_unused_blocks(raw):
     return _LARGE_UNUSED_BLOCK_RE.sub(b'', raw)
 
 
-def convert(input_path, out_dir):
+def convert(input_path, out_dir, only_name=None):
     os.makedirs(out_dir, exist_ok=True)
     with open(input_path, 'rb') as f:
         raw = f.read()
@@ -769,6 +747,14 @@ def convert(input_path, out_dir):
     root = ET.fromstring(raw)
     resnets = root.findall('resnet')
     sys.stderr.write("Found {} resnet(s) in {}\n".format(len(resnets), os.path.basename(input_path)))
+    if only_name:
+        # Opening ONE pathway out of a multi-pathway batch file: convert just
+        # the requested resnet (the expensive layout/style/position work in
+        # convert_resnet is skipped for all the others). Falls back to
+        # converting everything if no resnet carries that exact name.
+        wanted = [r for r in resnets if (r.get('name') or r.get('Name') or 'unnamed') == only_name]
+        if wanted:
+            resnets = wanted
     for resnet in resnets:
         convert_resnet(resnet, out_dir)
 
@@ -1019,5 +1005,7 @@ if __name__ == '__main__':
         out_path = os.path.join(out_dir, '_import.json')
         with open(out_path, 'w', encoding='utf-8') as f:
             json.dump({'resnets': resnets}, f, ensure_ascii=False)
+    elif len(sys.argv) > 4 and sys.argv[3] == '--only-name':
+        convert(sys.argv[1], sys.argv[2], only_name=sys.argv[4])
     else:
         convert(sys.argv[1], sys.argv[2])
