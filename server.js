@@ -3300,8 +3300,11 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   let { sql } = req.body;
   if (!sql || typeof sql !== 'string') return res.status(400).json({ error: 'sql required' });
 
-  // Replace {schema} placeholder with the user's actual PostgreSQL schema name
-  // so users can paste queries like: SELECT * FROM {schema}.reference LIMIT 10
+  // Backward compatibility only (no longer documented in the UI): saved/older
+  // queries may still contain the {schema} placeholder — substitute it with the
+  // user's schema. Queries without it rely on the search_path set at execution
+  // time below, which resolves bare table names (reference, node, attr,
+  // scopus_data) against that same schema.
   if (req.pg && req.pg.schema) {
     sql = sql.replace(/\{schema\}/g, req.pg.schema);
   }
@@ -3355,8 +3358,28 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     // because the entire query text — not just a value — is the user-supplied
     // input; that is the intentional design of an admin ad-hoc SQL runner,
     // not an injection bug layered on top of it.
-    const result = await req.pg.pool.query(sql);
-    res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
+    // Unqualified table names (reference, node, attr, scopus_data) resolve
+    // against the user's configured schema: search_path is set for this one
+    // transaction only (SET LOCAL), so it never leaks to other pooled
+    // connections. Explicitly schema-qualified names keep working too.
+    // CREATE INDEX CONCURRENTLY can't run inside a transaction block, so for
+    // that one case use a session-level SET and RESET it before releasing.
+    const useTx = !/^\s*CREATE\s+INDEX\s+CONCURRENTLY/i.test(sql);
+    const qSchema = req.pg.schema ? '"' + String(req.pg.schema).replace(/"/g, '""') + '"' : null;
+    const client = await req.pg.pool.connect();
+    try {
+      if (useTx) await client.query('BEGIN');
+      if (qSchema) await client.query(`${useTx ? 'SET LOCAL' : 'SET'} search_path TO ${qSchema}, public`);
+      const result = await client.query(sql);
+      if (useTx) await client.query('COMMIT');
+      res.json({ rows: result.rows, fields: result.fields.map(function(f) { return f.name; }) });
+    } catch (err) {
+      if (useTx) { try { await client.query('ROLLBACK'); } catch (_) {} }
+      throw err;
+    } finally {
+      if (!useTx) { try { await client.query('RESET search_path'); } catch (_) {} }
+      client.release();
+    }
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
