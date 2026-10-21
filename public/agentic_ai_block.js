@@ -714,6 +714,22 @@ function _renderSummarizeReply(text, container) {
     return id;
   }
 
+  // LLMs often emit inline LaTeX for arrows/symbols ($\rightarrow$, $\to$, ...)
+  // even though this panel is plain text/markdown — shown raw it looks like
+  // "glucose-6-phosphate $\rightarrow$ pyruvic acid". Convert the common
+  // ones to Unicode, and unwrap any remaining simple $\cmd$ to its glyph.
+  var _LATEX_SYMBOLS = {
+    rightarrow: '→', to: '→', longrightarrow: '→', leftarrow: '←',
+    leftrightarrow: '↔', Rightarrow: '⇒', Leftarrow: '⇐',
+    Leftrightarrow: '⇔', uparrow: '↑', downarrow: '↓',
+    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ',
+    kappa: 'κ', mu: 'μ', gt: '>', lt: '<', geq: '≥', leq: '≤',
+    pm: '±', times: '×', approx: '≈', neq: '≠', infty: '∞'
+  };
+  text = String(text).replace(/\$\s*\\([A-Za-z]+)\s*\$/g, function(whole, cmd) {
+    return Object.prototype.hasOwnProperty.call(_LATEX_SYMBOLS, cmd) ? _LATEX_SYMBOLS[cmd] : whole;
+  });
+
   var lines = text.split('\n');
   var i = 0;
   var prevWasBlank = true; // treat start-of-text as "after a blank line"
@@ -737,10 +753,12 @@ function _renderSummarizeReply(text, container) {
     var line = lines[i];
     var trimmed = line.trim();
 
-    if (/^###\s+/.test(line)) {
+    if (/^#{3,6}\s+/.test(line)) {
+      // ### through ###### — deeper levels render like ### rather than
+      // falling through to plain text with literal "####" showing.
       var h = document.createElement('div');
       h.style.cssText = 'font-weight:700;font-size:13px;color:#8ab4e8;margin-top:12px;margin-bottom:4px;border-bottom:1px solid #2a3a5a;padding-bottom:3px';
-      var _raw = line.replace(/^###\s+/, '');
+      var _raw = line.replace(/^#{3,6}\s+/, '');
       _registerHeading(_raw, h);
       renderInlineMarkdown(_raw, h);
       container.appendChild(h);
@@ -1571,14 +1589,29 @@ async function llmsUserTestConnection() {
   resultEl.style.color = '#a0b0d0';
   
   try {
+    // Resolve the provider NAME to its URL (as app.js's own version does) —
+    // sending the bare name as `url` meant the agent was never pinged against
+    // the real endpoint. A masked placeholder key is sent as empty so the
+    // server falls back to the user's saved key.
+    var provObj = (typeof _llmProviders !== 'undefined' && _llmProviders.find)
+      ? (_llmProviders.find(function(p) { return p.name === provider; }) || {}) : {};
     var result = await api('/api/agent/ping-llm', {
       llm: {
-        url:        provider,
-        apikey:     apiKey,
+        url:        provObj.url || provider,
+        apikey:     (apiKey === '••••••••') ? '' : apiKey,
         model_name: modelName
       }
     });
-    
+
+    // The agent answers HTTP 200 even when the LLM call itself failed
+    // (e.g. 401 Invalid API Key) and signals that via ok:false — checking
+    // only that the request didn't throw reported "Connection OK" for a
+    // rejected key.
+    if (!result || result.ok === false) {
+      resultEl.textContent = '✗ ' + ((result && result.error) || 'Connection failed');
+      resultEl.style.color = '#e07070';
+      return;
+    }
     resultEl.textContent = '✓ Connection OK — ' + (result.model || modelName);
     resultEl.style.color = '#70d070';
   } catch(e) {
