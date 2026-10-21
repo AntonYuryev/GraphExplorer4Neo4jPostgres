@@ -4184,9 +4184,15 @@ app.get('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
 });
 
 app.post('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (req.user.role !== 'admin') {
+    console.warn(`[sql-history] POST rejected: user "${req.user.username}" has role "${req.user.role}", not admin`);
+    return res.status(403).json({ error: 'Admin only' });
+  }
   const { query, count } = req.body || {};
-  if (!query || !query.trim()) return res.status(400).json({ error: 'query required' });
+  if (!query || !query.trim()) {
+    console.warn('[sql-history] POST rejected: no query in request body', req.body);
+    return res.status(400).json({ error: 'query required' });
+  }
   const encodedQuery = Buffer.from(String(query).slice(0, HISTORY_QUERY_MAX_CHARS)).toString('base64');
   const entry = {
     date:  new Date().toISOString(),
@@ -4197,8 +4203,10 @@ app.post('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
   const line = JSON.stringify(entry) + '\n';
   try {
     fs.appendFileSync(SQL_HISTORY_FILE, line, 'utf8');
+    console.log(`[sql-history] appended 1 entry to ${SQL_HISTORY_FILE} (count=${entry.count})`);
     res.json({ ok: true });
   } catch (err) {
+    console.error(`[sql-history] FAILED to write ${SQL_HISTORY_FILE}:`, err.message);
     res.status(500).json({ error: safeError(err) });
   }
 });
