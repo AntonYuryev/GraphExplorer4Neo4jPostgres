@@ -1875,6 +1875,9 @@ function _isPathInsideDir(candidatePath, rootDir) {
 // one RNEF file can be a <batch> of several pathways) directly in the graph
 // viewer, without requiring the browser to have its own file-system access
 // to that path (unlike the existing File → Load subgraph picker).
+const _pathwayOpenCache = new Map();     // cacheKey -> converted pathway JSON (insertion order = LRU order)
+const _pathwayOpenInflight = new Map();  // cacheKey -> Promise of an in-progress conversion
+const PATHWAY_OPEN_CACHE_MAX = 15;
 app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
   const { sourceFile, pathwayName } = req.body || {};
   const dir = _resolvePathwayCollectionDirForUser(req.user.username);
@@ -1911,28 +1914,59 @@ app.post('/api/pathways/open', dbLimiter, authMiddleware, async (req, res) => {
 
     // .rnef / .xml — convert (a batch file may yield several pathways; find
     // the one the user actually clicked by name).
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwopen-'));
-    const outDir = path.join(tmpDir, 'out');
-    fs.mkdirSync(outDir);
-    try {
-      await new Promise((resolve, reject) => {
-        execFile(PYTHON_CMD, [RNEF_SCRIPT, canonicalSourceFile, outDir],
-          { timeout: 600000 },
-          (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
-        );
-      });
-      const files = fs.readdirSync(outDir).filter(f => f.endsWith('.json'));
-      let match = null;
-      for (const f of files) {
-        const data = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8'));
-        if (!pathwayName || data.name === pathwayName) { match = data; break; }
-      }
-      if (!match && files.length) match = JSON.parse(fs.readFileSync(path.join(outDir, files[0]), 'utf8'));
-      if (!match) return res.status(404).json({ error: 'Pathway not found in the converted file' });
-      res.json({ name: match.name || pathwayName || '', data: match });
-    } finally {
-      try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+    //
+    // Speed-ups for the delay between clicking a pathway and it opening:
+    //  1. Converted results are cached (keyed by file + mtime + pathway name),
+    //     so re-opening the same pathway skips Python entirely.
+    //  2. Concurrent requests for the same key share ONE conversion (a
+    //     double-click no longer spawns two Python processes).
+    //  3. Python is told to convert only the requested pathway
+    //     (--only-name) instead of every pathway in a batch file.
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(canonicalSourceFile).mtimeMs; } catch (_) {}
+    const cacheKey = canonicalSourceFile + '|' + mtimeMs + '|' + (pathwayName || '');
+    if (_pathwayOpenCache.has(cacheKey)) {
+      const hit = _pathwayOpenCache.get(cacheKey);
+      _pathwayOpenCache.delete(cacheKey); _pathwayOpenCache.set(cacheKey, hit);  // LRU touch
+      return res.json({ name: hit.name || pathwayName || '', data: hit });
     }
+    let pending = _pathwayOpenInflight.get(cacheKey);
+    if (!pending) {
+      pending = (async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pwopen-'));
+        const outDir = path.join(tmpDir, 'out');
+        fs.mkdirSync(outDir);
+        try {
+          const args = [RNEF_SCRIPT, canonicalSourceFile, outDir];
+          if (pathwayName) args.push('--only-name', String(pathwayName));
+          await new Promise((resolve, reject) => {
+            execFile(PYTHON_CMD, args,
+              { timeout: 600000 },
+              (err, stdout, stderr) => { if (err) reject(new Error(stderr || err.message)); else resolve(stdout); }
+            );
+          });
+          const files = fs.readdirSync(outDir).filter(f => f.endsWith('.json'));
+          let match = null;
+          for (const f of files) {
+            const data = JSON.parse(fs.readFileSync(path.join(outDir, f), 'utf8'));
+            if (!pathwayName || data.name === pathwayName) { match = data; break; }
+          }
+          if (!match && files.length) match = JSON.parse(fs.readFileSync(path.join(outDir, files[0]), 'utf8'));
+          return match;
+        } finally {
+          try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+        }
+      })();
+      _pathwayOpenInflight.set(cacheKey, pending);
+      pending.finally(() => _pathwayOpenInflight.delete(cacheKey)).catch(() => {});
+    }
+    const match = await pending;
+    if (!match) return res.status(404).json({ error: 'Pathway not found in the converted file' });
+    _pathwayOpenCache.set(cacheKey, match);
+    while (_pathwayOpenCache.size > PATHWAY_OPEN_CACHE_MAX) {
+      _pathwayOpenCache.delete(_pathwayOpenCache.keys().next().value);
+    }
+    res.json({ name: match.name || pathwayName || '', data: match });
   } catch (err) {
     console.error('Pathway open error:', String(err.message).replace(_LOG_CONTROL_CHARS_RE, ' '));
     res.status(500).json({ error: safeError(err, 'Pathway open') });
