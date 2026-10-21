@@ -488,11 +488,14 @@
     <div class="modal-box" style="width:1200px;max-width:95vw" onclick="event.stopPropagation()">
       <h3>Postgres SQL Query</h3>
       <p style="font-size:11px;color:#7a8099;margin:-4px 0 8px">
-        Tip: use <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">{schema}</code> instead of your schema name
-        — e.g. <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">SELECT * FROM {schema}.reference LIMIT 20</code> —
-        and the app will substitute your current Postgres schema (from Settings → My Connection → Postgres) automatically.
+        Tables available for querying:
+        <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">reference</code>,
+        <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">node</code>,
+        <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">attr</code>,
+        <code style="background:#1a1f33;padding:1px 5px;border-radius:3px;color:#8899cc">scopus_data</code>.
+        Type the table name alone — your current schema (Settings → My Connection → Postgres) is applied automatically when you press Run.
       </p>
-      <textarea id="sql-input" rows="4" placeholder="SELECT * FROM {schema}.reference LIMIT 20" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#12151f;color:#e0e0e0;border:1px solid #2d3147;border-radius:6px;font-family:'Courier New',monospace;font-size:12px;resize:vertical;outline:none;margin-bottom:10px"></textarea>
+      <textarea id="sql-input" rows="4" placeholder="SELECT * FROM reference LIMIT 20" style="width:100%;box-sizing:border-box;padding:8px 10px;background:#12151f;color:#e0e0e0;border:1px solid #2d3147;border-radius:6px;font-family:'Courier New',monospace;font-size:12px;resize:vertical;outline:none;margin-bottom:10px"></textarea>
       <div id="sql-results" style="max-height:70vh;overflow:auto;font-size:12px"></div>
       <div class="modal-actions" style="margin-top:12px">
         <button class="btn-ghost" onclick="document.getElementById('sql-modal').style.display='none'">Close</button>
