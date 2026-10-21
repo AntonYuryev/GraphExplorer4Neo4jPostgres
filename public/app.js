@@ -16711,6 +16711,10 @@ function _phRender(resetPage) {
 // Excel-only large-result modal instead of straight into the graph viewer).
 async function _phReopen(r) {
   if (!r.sourceFile) return;
+  var _key = String(r.sourceFile) + '|' + String(r.name);
+  if (_pathwayOpenInFlight[_key]) return;   // already opening — ignore repeat clicks
+  _pathwayOpenInFlight[_key] = true;
+  setProgressMsg('⏳ Opening pathway “' + r.name + '”…');
   try {
     var result = await api('/api/pathways/open', { sourceFile: r.sourceFile, pathwayName: r.name }, 'POST');
     if (!result.data || !result.data.graphData) { alert('Invalid pathway data returned for ' + r.name); return; }
@@ -16730,10 +16734,31 @@ async function _phReopen(r) {
     openRnefPathway(result.data, r.filePath, r.sourceFile);
   } catch (err) {
     alert('Could not reopen pathway: ' + err.message);
+  } finally {
+    delete _pathwayOpenInFlight[_key];
+    setProgressMsg(null);
   }
 }
 
+// Opening a pathway can take a few seconds (server-side conversion). Without
+// feedback users re-clicked the same name, and every click eventually opened
+// ANOTHER tab. This wrapper shows an immediate "Opening…" message and ignores
+// repeat clicks on a pathway that is already being opened.
+var _pathwayOpenInFlight = {};
 async function openPathwaySearchResult(row, overlapUrns) {
+  var _key = String(row.sourceFile) + '|' + String(row.name);
+  if (_pathwayOpenInFlight[_key]) return false;
+  _pathwayOpenInFlight[_key] = true;
+  setProgressMsg('⏳ Opening pathway “' + row.name + '”…');
+  try {
+    return await _openPathwaySearchResultImpl(row, overlapUrns);
+  } finally {
+    delete _pathwayOpenInFlight[_key];
+    setProgressMsg(null);
+  }
+}
+
+async function _openPathwaySearchResultImpl(row, overlapUrns) {
   try {
     var result = await api('/api/pathways/open', { sourceFile: row.sourceFile, pathwayName: row.name }, 'POST');
     if (!result.data || !result.data.graphData) { alert('Invalid pathway data returned for ' + row.name); return false; }
