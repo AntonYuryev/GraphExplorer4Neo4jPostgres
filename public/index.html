@@ -521,27 +521,18 @@
     <div class="modal-box" style="width:720px;max-width:95vw" onclick="event.stopPropagation()">
       <h3>Database → Import RNEF</h3>
       <p style="font-size:11px;color:#7a8099;margin-bottom:10px">
-        Imports a single <code>.rnef</code> file, or every <code>.rnef</code>/<code>.xml</code> file found in a folder (including subfolders), into the shared Neo4j and Postgres databases.
+        Imports a single <code>.rnef</code> file, or every <code>.rnef</code>/<code>.xml</code> file found in a folder (including subfolders), into the shared Neo4j and Postgres databases. Only the <b>path</b> is sent — nothing is uploaded; the file is read on the server, a portion at a time, so very large files are fine.
       </p>
       <div id="irn-error" class="error-msg" style="display:none"></div>
 
-      <!-- Native pickers — the browser never exposes a real filesystem path,
-           so picking a file/folder here uploads its content to the server
-           (same mechanism File -> Load subgraph already uses for one file),
-           rather than sending a path. -->
-      <input type="file" id="irn-file-input" accept=".rnef,.xml" style="display:none" onchange="_irnFilesPicked(this.files)">
-      <input type="file" id="irn-dir-input" webkitdirectory directory multiple style="display:none" onchange="_irnFilesPicked(this.files)">
-      <div style="display:flex;gap:10px">
-        <button type="button" class="btn-ghost" onclick="document.getElementById('irn-file-input').click()">📄 Choose File…</button>
-        <button type="button" class="btn-ghost" onclick="document.getElementById('irn-dir-input').click()">📁 Choose Folder…</button>
+      <!-- Native Windows dialogs, opened by the server on the machine it runs on: they return a real
+           local path (nothing is uploaded) — import_rnef reads the file itself, one <resnet> at a time. -->
+      <div style="display:flex;gap:10px;margin-bottom:8px">
+        <button type="button" class="btn-ghost" id="irn-browse-file" onclick="_irnBrowse('file')">📄 Choose File…</button>
+        <button type="button" class="btn-ghost" id="irn-browse-folder" onclick="_irnBrowse('folder')">📁 Choose Folder…</button>
       </div>
-      <div id="irn-picked-summary" style="font-size:12px;color:#7a8099;margin-top:8px"></div>
-
-      <div style="display:flex;align-items:center;gap:10px;margin:14px 0;color:#5a6080;font-size:11px">
-        <div style="flex:1;height:1px;background:#2d3147"></div>— or, if the server can already see it —<div style="flex:1;height:1px;background:#2d3147"></div>
-      </div>
-      <label style="font-size:12px;color:#7a8099">File or directory path (as seen by the server)</label>
-      <input type="text" id="irn-path" placeholder="e.g. C:\GraphExplorer\TestData\RNEF\Abcuro (KLRG1+ T-cells)" autocomplete="off" oninput="_irnPathTyped()" onkeydown="if(event.key==='Enter')runRnefImport()">
+      <label style="font-size:12px;color:#7a8099">Path of an RNEF file, or of a folder containing RNEF files (or type/paste it)</label>
+      <input type="text" id="irn-path" placeholder="e.g. C:\GraphExplorer\TestData\RNEF\Abcuro (KLRG1+ T-cells)  — Explorer: Shift+right-click → Copy as path" autocomplete="off" oninput="_irnPathTyped()" onkeydown="if(event.key==='Enter')runRnefImport()">
 
       <!-- Runtime messages printed by import_rnef (rnef_import_runner.py), streamed live;
            the same messages are written to a log file opened via the button below. -->
