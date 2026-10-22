@@ -5246,8 +5246,9 @@ function _computeUniqueRef(ref, uniqueIdBigInt) {
 
 // ─── Database → Import RNEF ───────────────────────────────────────────────────
 // The import itself is import_rnef() in rnef_import_runner.py. This side only:
-//   1. builds the list of RNEF files — every *.rnef/*.xml under a directory
-//      (recursive), or a single-element list when one file was chosen;
+//   1. builds the list of RNEF files from the PATH the user typed — every *.rnef/*.xml
+//      under a directory (recursive), or a single-element list for one file. Nothing is
+//      ever uploaded or read here: import_rnef reads the files itself, a portion at a time;
 //   2. builds APIconfig from THIS user's own Neo4j/Postgres settings (never the
 //      shared/admin credentials);
 //   3. runs rnef_import_runner.py, which calls import_rnef inside a Tee so the
@@ -5296,18 +5297,17 @@ function _pushImportMsg(job, line) {
   }
 }
 
-function _startRnefImport(req, res, target, cleanupDir) {
+function _startRnefImport(req, res, target) {
   const username = req.user.username;
-  const cleanup = () => { if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true }); } catch (e) {} } };
   const existing = _userRnefImportJobs.get(username);
-  if (existing && existing.running) { cleanup(); return res.status(409).json({ error: 'An RNEF import is already running for your account.' }); }
+  if (existing && existing.running) { return res.status(409).json({ error: 'An RNEF import is already running for your account.' }); }
 
   let files, apiConfig;
   try {
     files = _collectRnefFiles(target);
     if (!files.length) throw new Error('No .rnef/.xml files found.');
     apiConfig = _buildImportApiConfig(username);
-  } catch (e) { cleanup(); return res.status(400).json({ error: e.message }); }
+  } catch (e) { return res.status(400).json({ error: e.message }); }
 
   fs.mkdirSync(RNEF_IMPORT_LOG_DIR, { recursive: true });
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
@@ -5346,59 +5346,68 @@ function _startRnefImport(req, res, target, cleanupDir) {
     job.running = false; job.done = true; job.exitCode = code;
     if (err) job.error = err; else if (code !== 0) job.error = `The import script exited with code ${code}.`;
     try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
-    cleanup();
   };
   child.on('error', (err) => finish(-1, `Could not start Python (${PYTHON_CMD}): ${err.message}`));
   child.on('close', (code) => finish(code, null));
 }
 
+// POST /api/import/rnef/browse { kind: 'file' | 'folder' } — opens a native Windows
+// file/folder dialog ON THE MACHINE RUNNING THIS SERVER and returns the chosen local
+// path ({ path } or { path: null } if cancelled). A browser can't expose real paths,
+// and import_rnef needs one: it reads the local file itself, one <resnet> at a time.
+// Nothing is uploaded. Only meaningful when the server runs on the user's own desktop.
+const POWERSHELL_CMD = process.env.POWERSHELL_CMD || 'powershell.exe';
+const _BROWSE_PS1 = `
+param([string]$Kind)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+# invisible always-on-top owner so the dialog opens in front of the browser instead of behind it
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true; $owner.ShowInTaskbar = $false; $owner.StartPosition = 'CenterScreen'
+$owner.Size = New-Object System.Drawing.Size(1,1); $owner.Opacity = 0; $owner.Show(); $owner.Activate()
+if ($Kind -eq 'folder') {
+  $d = New-Object System.Windows.Forms.FolderBrowserDialog
+  $d.Description = 'Select the folder containing RNEF files (subfolders are included)'
+  $d.ShowNewFolderButton = $false
+  if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }
+} else {
+  $d = New-Object System.Windows.Forms.OpenFileDialog
+  $d.Title = 'Select an RNEF file'
+  $d.Filter = 'RNEF files (*.rnef;*.xml)|*.rnef;*.xml|All files (*.*)|*.*'
+  if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.FileName) }
+}
+$owner.Close()
+`;
+let _rnefBrowseBusy = false;
+app.post('/api/import/rnef/browse', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (process.platform !== 'win32') return res.status(501).json({ error: 'The file/folder dialog is only available when the server runs on Windows — type the path instead.' });
+  if (_rnefBrowseBusy) return res.status(409).json({ error: 'A file dialog is already open on the server machine.' });
+  const kind = (req.body || {}).kind === 'folder' ? 'folder' : 'file';
+  const ps1 = path.join(os.tmpdir(), `rnef-browse-${process.pid}.ps1`);
+  fs.writeFileSync(ps1, '﻿' + _BROWSE_PS1, 'utf8');   // BOM so PowerShell reads it as UTF-8
+  _rnefBrowseBusy = true;
+  execFile(POWERSHELL_CMD, ['-STA', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, kind],
+    { timeout: 10 * 60 * 1000, encoding: 'utf8' },
+    (err, stdout) => {
+      _rnefBrowseBusy = false;
+      try { fs.rmSync(ps1, { force: true }); } catch (e) {}
+      if (err) return res.status(500).json({ error: 'Could not open the dialog: ' + err.message });
+      const chosen = String(stdout || '').trim();
+      res.json({ path: chosen || null });
+    });
+});
+
 // POST /api/import/rnef/start { path } — admin-only (bulk write to shared
 // Neo4j/Postgres). For a path the SERVER can already see (file or directory).
 app.post('/api/import/rnef/start', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { path: targetPath } = req.body || {};
+  let targetPath = (req.body || {}).path;
   if (!targetPath || typeof targetPath !== 'string') return res.status(400).json({ error: 'path required' });
+  targetPath = targetPath.trim().replace(/^"(.*)"$/, '$1');   // Explorer's "Copy as path" wraps it in quotes
   if (!fs.existsSync(targetPath)) return res.status(400).json({ error: `Path does not exist on the server: ${targetPath}` });
-  _startRnefImport(req, res, targetPath, null);
-});
-
-// ── Upload-session endpoints ────────────────────────────────────────────────
-// A browser file/folder picker never exposes a real path, so picked files are
-// uploaded into one server-side temp directory (same text/plain mechanism as
-// POST /api/convert/rnef); /finish then starts the import on that directory.
-const _rnefUploadSessions = new Map(); // sessionId -> tmpDir
-
-app.post('/api/import/rnef/upload-session/start', dbLimiter, authMiddleware, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnefimport-upload-'));
-  const sessionId = path.basename(tmpDir);
-  _rnefUploadSessions.set(sessionId, tmpDir);
-  res.json({ sessionId });
-});
-
-app.post('/api/import/rnef/upload-session/:sessionId/file',
-  dbLimiter, express.text({ limit: '500mb', type: 'text/plain' }), authMiddleware,
-  (req, res) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-    const tmpDir = _rnefUploadSessions.get(req.params.sessionId);
-    if (!tmpDir) return res.status(404).json({ error: 'Unknown or expired upload session' });
-    if (!req.body) return res.status(400).json({ error: 'content required' });
-    let rawName = req.get('X-Filename') || 'upload.rnef';
-    try { rawName = decodeURIComponent(rawName); } catch (e) {}
-    const safeBase = path.basename(rawName).replace(/[\\/:*?"<>|]/g, '_') || 'upload.rnef';
-    // index prefix: same-named files from different subfolders must not collide once flattened
-    const destPath = path.join(tmpDir, `${fs.readdirSync(tmpDir).length}_${safeBase}`);
-    // codeql[js/network-data-written-to-file] - authenticated admin upload; destPath is a mkdtemp'd dir + sanitized basename, never served back
-    fs.writeFileSync(destPath, req.body, 'utf8');
-    res.json({ ok: true });
-  });
-
-app.post('/api/import/rnef/upload-session/:sessionId/finish', dbLimiter, authMiddleware, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const tmpDir = _rnefUploadSessions.get(req.params.sessionId);
-  if (!tmpDir) return res.status(404).json({ error: 'Unknown or expired upload session' });
-  _rnefUploadSessions.delete(req.params.sessionId);
-  _startRnefImport(req, res, tmpDir, tmpDir);
+  _startRnefImport(req, res, targetPath);
 });
 
 // GET /api/import/rnef/progress?since=N — runtime messages from index N on.
