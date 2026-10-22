@@ -1025,7 +1025,7 @@ class neo4j_nx(GraphDatabase):
       relTypeCounter[relType] += count
     print(f"Imported {total_created_rel} out of {len(new_rels)} new relations into Neo4j in {execution_time(start)}.",flush=True)
     print(f"Created relation type breakdown: {dict(relTypeCounter)}",flush=True)
-    print(f"Created triples breakdown: {dict(stats)}",flush=True)
+    print(f"Created triples breakdown: {dict(stats)}\n",flush=True)
     return total_created_rel
    
   ########################### CURATION METHODS ########################### CURATION METHODS ###########################
