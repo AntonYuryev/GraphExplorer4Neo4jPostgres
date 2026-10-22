@@ -543,9 +543,13 @@
       <label style="font-size:12px;color:#7a8099">File or directory path (as seen by the server)</label>
       <input type="text" id="irn-path" placeholder="e.g. C:\GraphExplorer\TestData\RNEF\Abcuro (KLRG1+ T-cells)" autocomplete="off" oninput="_irnPathTyped()" onkeydown="if(event.key==='Enter')runRnefImport()">
 
-      <div id="irn-progress" style="display:none;margin-top:12px;font-size:12px;color:#c0c4d4;line-height:1.8"></div>
+      <!-- Runtime messages printed by import_rnef (rnef_import_runner.py), streamed live;
+           the same messages are written to a log file opened via the button below. -->
+      <div id="irn-status" style="display:none;margin-top:12px;font-size:12px;color:#c0c4d4"></div>
+      <pre id="irn-messages" style="display:none;margin:6px 0 0;height:260px;overflow:auto;background:#0d1020;border:1px solid #2d3147;border-radius:6px;padding:8px 10px;font-size:11px;line-height:1.45;color:#b8c0e0;white-space:pre-wrap;word-break:break-word"></pre>
       <div id="irn-summary" style="display:none;margin-top:10px;font-size:12px"></div>
       <div class="modal-actions" style="margin-top:12px">
+        <button class="btn-ghost" id="irn-log-btn" style="display:none" onclick="openRnefImportLog()">📄 Open log file</button>
         <button class="btn-ghost" onclick="document.getElementById('import-rnef-modal').style.display='none'">Close</button>
         <button class="btn-primary" id="irn-run-btn" onclick="runRnefImport()" disabled>Import</button>
       </div>
