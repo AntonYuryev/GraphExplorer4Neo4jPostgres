@@ -50,3 +50,6 @@ Screenshots/
 DatabasePowerRelease.zip
 *.rnef
 *.zip
+
+# Database -> Import RNEF run logs (one per run; contain runtime messages)
+import_logs/
