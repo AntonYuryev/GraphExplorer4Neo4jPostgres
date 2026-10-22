@@ -1612,8 +1612,10 @@ function _acTrigger(ta) {
   if (inStr) { _acHide(); return; }
 
   // Context: after (: or [: → node label / rel type
-  var mLabel = before.match(/\((?:[^()]*:)?\s*([\w]*)$/);
-  var mRel   = before.match(/\[(?:[^\[\]]*:)?\s*([\w]*)$/);
+  // Alternatives are separated by '|' — [r:TypeA|TypeB] / (n:LabelA|LabelB) — and node
+  // label expressions also allow '&', so the separator set is [:|&] (relationship types: [:|]).
+  var mLabel = before.match(/\((?:[^()]*[:|&])?\s*([\w]*)$/);
+  var mRel   = before.match(/\[(?:[^\[\]]*[:|])?\s*([\w]*)$/);
 
   // Context: after . or { → property key
   var mProp  = before.match(/[\w\)}\]]\.([\w]*)$/) || before.match(/\{[^{}]*([\w]*)$/);
@@ -1625,20 +1627,34 @@ function _acTrigger(ta) {
     var suggestions = [];
     var typed = '';
 
+    // Names already listed in the same [..] / (..) (e.g. GeneticChange in [r:GeneticChange|),
+    // so the next suggestion is a different one.
+    function usedIn(open, close) {
+      var start = before.lastIndexOf(open);
+      if (start < 0 || before.indexOf(close, start) >= 0) return {};   // cursor isn't inside an open [..] / (..)
+      var parts = before.slice(start + 1).split(/[:|&]/).slice(1);   // first piece is the variable name
+      parts.pop();                                  // last piece is what is being typed now
+      var used = {};
+      parts.forEach(function(x) { x = x.trim(); if (x) used[x.toLowerCase()] = true; });
+      return used;
+    }
+
     if (mRel) {
       // relationship type context
       typed = mRel[1] || '';
       var pool = schema ? schema.relTypes : [];
+      var usedRel = usedIn('[', ']');
       suggestions = pool
-        .filter(function(t) { return t.toLowerCase().startsWith(typed.toLowerCase()); })
+        .filter(function(t) { return !usedRel[t.toLowerCase()] && t.toLowerCase().startsWith(typed.toLowerCase()); })
         .slice(0, 20)
         .map(function(t) { return { text: t, kind: 'reltype' }; });
     } else if (mLabel) {
       // node label context
       typed = mLabel[1] || '';
       var pool = schema ? schema.labels : [];
+      var usedLbl = usedIn('(', ')');
       suggestions = pool
-        .filter(function(l) { return l.toLowerCase().startsWith(typed.toLowerCase()); })
+        .filter(function(l) { return !usedLbl[l.toLowerCase()] && l.toLowerCase().startsWith(typed.toLowerCase()); })
         .slice(0, 20)
         .map(function(l) { return { text: l, kind: 'label' }; });
     } else if (mProp) {
@@ -1680,6 +1696,12 @@ function onCypherInput(ta) {
   showCypherLint(null);   // clear panel while EXPLAIN is pending
   // Debounce Neo4j EXPLAIN lint
   if (_lintDebounce) clearTimeout(_lintDebounce);
+  // Just typed '|' with the closing ] or ) right after the cursor: the query is
+  // intentionally incomplete while the user picks the next label/type from the
+  // suggestion list — don't flash "Invalid input '|'" at them. Linting resumes
+  // on the next keystroke.
+  var _caret = ta.selectionStart;
+  if (ta.value[_caret - 1] === '|' && /[\])]/.test(ta.value[_caret] || '')) return;
   _lintDebounce = setTimeout(function() {
     _lintDebounce = null;
     runCypherExplainLint(ta.value);
