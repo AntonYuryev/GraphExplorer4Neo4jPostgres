@@ -2832,7 +2832,6 @@ function _statCountTable(rows, labelHeader) {
 var _irnPollHandle = null;
 var _irnSince = 0;        // index of the next runtime message to fetch
 var _irnRunning = false;  // an import is in progress (dialog reopen must not wipe its output)
-var _irnPickedFiles = null;  // FileList from the native file/folder picker, or null if using the path input instead
 
 function openImportRnefDialog() {
   document.getElementById('import-rnef-modal').style.display = 'flex';
@@ -2845,44 +2844,38 @@ function openImportRnefDialog() {
   document.getElementById('irn-summary').style.display = 'none';
   document.getElementById('irn-summary').innerHTML = '';
   document.getElementById('irn-path').value = '';
-  document.getElementById('irn-picked-summary').textContent = '';
-  document.getElementById('irn-file-input').value = '';
-  document.getElementById('irn-dir-input').value = '';
-  _irnPickedFiles = null;
   document.getElementById('irn-run-btn').disabled = true;
 }
 
-// Native picker chosen — a folder pick (webkitdirectory) returns EVERY file
-// under it, so filter down to the ones the importer actually cares about.
-function _irnFilesPicked(fileList) {
-  var files = Array.prototype.filter.call(fileList, function(f) {
-    return /\.(rnef|xml)$/i.test(f.name);
-  });
-  var summaryEl = document.getElementById('irn-picked-summary');
-  if (!files.length) {
-    _irnPickedFiles = null;
-    summaryEl.textContent = 'No .rnef/.xml files found in that selection.';
-    document.getElementById('irn-run-btn').disabled = true;
-    return;
+// Opens a native file/folder dialog on the machine running the server and puts the chosen
+// local path into the box — only the path is used; the file itself is never uploaded.
+async function _irnBrowse(kind) {
+  var errEl = document.getElementById('irn-error');
+  var btns = [document.getElementById('irn-browse-file'), document.getElementById('irn-browse-folder')];
+  errEl.style.display = 'none';
+  btns.forEach(function(b) { b.disabled = true; });
+  var statusEl = document.getElementById('irn-status');
+  var prevStatus = statusEl.innerHTML, prevDisplay = statusEl.style.display;
+  statusEl.style.display = '';
+  statusEl.innerHTML = '<span style="color:#8fb8ff">The ' + (kind === 'folder' ? 'folder' : 'file') + ' dialog is open on the server machine (it may be behind this window)…</span>';
+  try {
+    var res = await api('/api/import/rnef/browse', { kind: kind });
+    if (res.path) {
+      document.getElementById('irn-path').value = res.path;
+      _irnPathTyped();
+    }
+  } catch (e) {
+    errEl.textContent = e.message || String(e);
+    errEl.style.display = '';
+  } finally {
+    btns.forEach(function(b) { b.disabled = false; });
+    statusEl.innerHTML = prevStatus; statusEl.style.display = prevDisplay;
   }
-  _irnPickedFiles = files;
-  document.getElementById('irn-path').value = '';  // picked files take priority over a typed path
-  summaryEl.textContent = files.length + ' file' + (files.length !== 1 ? 's' : '') + ' selected: ' +
-    files.slice(0, 3).map(function(f) { return f.name; }).join(', ') + (files.length > 3 ? ', …' : '');
-  document.getElementById('irn-run-btn').disabled = false;
 }
 
-// Typing a path clears any previously-picked files, so Import always acts on
-// whichever source the user touched most recently.
+// Import is enabled once a path has been typed.
 function _irnPathTyped() {
-  var val = document.getElementById('irn-path').value.trim();
-  if (val) {
-    _irnPickedFiles = null;
-    document.getElementById('irn-picked-summary').textContent = '';
-    document.getElementById('irn-file-input').value = '';
-    document.getElementById('irn-dir-input').value = '';
-  }
-  document.getElementById('irn-run-btn').disabled = !val && !_irnPickedFiles;
+  document.getElementById('irn-run-btn').disabled = !document.getElementById('irn-path').value.trim();
 }
 
 async function runRnefImport() {
@@ -2902,14 +2895,11 @@ async function runRnefImport() {
   statusEl.style.display = '';
 
   try {
-    if (_irnPickedFiles && _irnPickedFiles.length) {
-      await _irnUploadAndStart(_irnPickedFiles, statusEl);
-    } else {
-      var targetPath = document.getElementById('irn-path').value.trim();
-      if (!targetPath) { errEl.textContent = 'Choose a file/folder, or enter a server path.'; errEl.style.display = ''; statusEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
-      statusEl.textContent = 'Starting…';
-      await api('/api/import/rnef/start', { path: targetPath });
-    }
+    var targetPath = document.getElementById('irn-path').value.trim();
+    if (!targetPath) { errEl.textContent = 'Enter the path of an RNEF file or folder.'; errEl.style.display = ''; statusEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
+    statusEl.textContent = 'Starting…';
+    // Only the path is sent — import_rnef reads the file(s) itself, a portion at a time.
+    await api('/api/import/rnef/start', { path: targetPath });
   } catch (e) {
     errEl.textContent = e.message || String(e);
     errEl.style.display = '';
@@ -2922,44 +2912,6 @@ async function runRnefImport() {
   msgEl.style.display = '';
   if (_irnPollHandle) clearTimeout(_irnPollHandle);
   _pollRnefImportProgress();
-}
-
-// Uploads every picked file's own text content to a fresh upload session
-// (4 at a time — same worker-pool concurrency already used elsewhere in this
-// app, e.g. _fetchReferencesForChunk), then starts the import job against
-// that session's server-side temp directory.
-async function _irnUploadAndStart(files, statusEl) {
-  statusEl.textContent = 'Starting upload session…';
-  var session = await api('/api/import/rnef/upload-session/start', {});
-  var sessionId = session.sessionId;
-
-  var uploaded = 0;
-  var CONCURRENCY = 4;
-  var nextIdx = 0;
-  async function worker() {
-    while (nextIdx < files.length) {
-      var idx = nextIdx++;
-      var file = files[idx];
-      var content = await file.text();
-      await fetch('/api/import/rnef/upload-session/' + sessionId + '/file', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'text/plain',
-          'X-Filename': encodeURIComponent(file.name),
-          'Authorization': 'Bearer ' + authToken
-        },
-        body: content
-      }).then(function(res) {
-        if (!res.ok) throw new Error('Upload failed for ' + file.name + ' (HTTP ' + res.status + ')');
-      });
-      uploaded++;
-      statusEl.textContent = 'Uploading… ' + uploaded + ' / ' + files.length;
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, files.length) }, worker));
-
-  statusEl.textContent = 'Starting import…';
-  await api('/api/import/rnef/upload-session/' + sessionId + '/finish', {});
 }
 
 // Polls for the messages import_rnef has printed since the last poll
