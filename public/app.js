@@ -2830,12 +2830,18 @@ function _statCountTable(rows, labelHeader) {
 
 // ── Database -> Import RNEF ────────────────────────────────────────────────
 var _irnPollHandle = null;
+var _irnSince = 0;        // index of the next runtime message to fetch
+var _irnRunning = false;  // an import is in progress (dialog reopen must not wipe its output)
 var _irnPickedFiles = null;  // FileList from the native file/folder picker, or null if using the path input instead
 
 function openImportRnefDialog() {
   document.getElementById('import-rnef-modal').style.display = 'flex';
+  if (_irnRunning) return;   // reopened mid-run: keep showing its live output
   document.getElementById('irn-error').style.display = 'none';
-  document.getElementById('irn-progress').style.display = 'none';
+  document.getElementById('irn-status').style.display = 'none';
+  document.getElementById('irn-messages').style.display = 'none';
+  document.getElementById('irn-messages').textContent = '';
+  document.getElementById('irn-log-btn').style.display = 'none';
   document.getElementById('irn-summary').style.display = 'none';
   document.getElementById('irn-summary').innerHTML = '';
   document.getElementById('irn-path').value = '';
@@ -2881,32 +2887,39 @@ function _irnPathTyped() {
 
 async function runRnefImport() {
   var errEl = document.getElementById('irn-error');
-  var progressEl = document.getElementById('irn-progress');
+  var statusEl = document.getElementById('irn-status');
+  var msgEl = document.getElementById('irn-messages');
   var summaryEl = document.getElementById('irn-summary');
   errEl.style.display = 'none';
   summaryEl.style.display = 'none';
   summaryEl.innerHTML = '';
+  document.getElementById('irn-log-btn').style.display = 'none';
+  msgEl.textContent = '';
+  msgEl.style.display = 'none';
+  _irnSince = 0;
 
   document.getElementById('irn-run-btn').disabled = true;
-  progressEl.style.display = '';
+  statusEl.style.display = '';
 
   try {
     if (_irnPickedFiles && _irnPickedFiles.length) {
-      await _irnUploadAndStart(_irnPickedFiles, progressEl);
+      await _irnUploadAndStart(_irnPickedFiles, statusEl);
     } else {
       var targetPath = document.getElementById('irn-path').value.trim();
-      if (!targetPath) { errEl.textContent = 'Choose a file/folder, or enter a server path.'; errEl.style.display = ''; progressEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
-      progressEl.textContent = 'Starting…';
+      if (!targetPath) { errEl.textContent = 'Choose a file/folder, or enter a server path.'; errEl.style.display = ''; statusEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
+      statusEl.textContent = 'Starting…';
       await api('/api/import/rnef/start', { path: targetPath });
     }
   } catch (e) {
     errEl.textContent = e.message || String(e);
     errEl.style.display = '';
-    progressEl.style.display = 'none';
+    statusEl.style.display = 'none';
     document.getElementById('irn-run-btn').disabled = false;
     return;
   }
 
+  _irnRunning = true;
+  msgEl.style.display = '';
   if (_irnPollHandle) clearTimeout(_irnPollHandle);
   _pollRnefImportProgress();
 }
@@ -2915,8 +2928,8 @@ async function runRnefImport() {
 // (4 at a time — same worker-pool concurrency already used elsewhere in this
 // app, e.g. _fetchReferencesForChunk), then starts the import job against
 // that session's server-side temp directory.
-async function _irnUploadAndStart(files, progressEl) {
-  progressEl.textContent = 'Starting upload session…';
+async function _irnUploadAndStart(files, statusEl) {
+  statusEl.textContent = 'Starting upload session…';
   var session = await api('/api/import/rnef/upload-session/start', {});
   var sessionId = session.sessionId;
 
@@ -2940,65 +2953,68 @@ async function _irnUploadAndStart(files, progressEl) {
         if (!res.ok) throw new Error('Upload failed for ' + file.name + ' (HTTP ' + res.status + ')');
       });
       uploaded++;
-      progressEl.textContent = 'Uploading… ' + uploaded + ' / ' + files.length;
+      statusEl.textContent = 'Uploading… ' + uploaded + ' / ' + files.length;
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, files.length) }, worker));
 
-  progressEl.textContent = 'Starting import…';
+  statusEl.textContent = 'Starting import…';
   await api('/api/import/rnef/upload-session/' + sessionId + '/finish', {});
 }
 
+// Polls for the messages import_rnef has printed since the last poll
+// and appends them to the message pane (auto-scrolling only if the user was
+// already at the bottom, so scrolling back to read earlier output isn't fought).
 async function _pollRnefImportProgress() {
-  var progressEl = document.getElementById('irn-progress');
+  var statusEl = document.getElementById('irn-status');
+  var msgEl = document.getElementById('irn-messages');
   var summaryEl = document.getElementById('irn-summary');
   try {
-    var job = await api('/api/import/rnef/progress', null, 'GET');
-    if (job.noJob) return;
+    var job = await api('/api/import/rnef/progress?since=' + _irnSince, null, 'GET');
+    if (job.noJob) { _irnRunning = false; return; }
 
-    var lines = [];
-    lines.push('Files: ' + job.filesDone + ' / ' + job.filesTotal + (job.currentFile ? ' (' + escHtml(job.currentFile) + ')' : ''));
-    if (job.phase) {
-      var elapsed = job.phaseStartedAt ? Math.max(0, Math.round((Date.now() - job.phaseStartedAt) / 1000)) : null;
-      lines.push('<span style="color:#8fb8ff">Phase: ' + escHtml(job.phase) + (elapsed != null ? ' (' + elapsed + 's)' : '') + '</span>');
+    if (job.messages && job.messages.length) {
+      var atBottom = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight < 30;
+      msgEl.textContent += (msgEl.textContent ? '\n' : '') + job.messages.join('\n');
+      if (atBottom) msgEl.scrollTop = msgEl.scrollHeight;
     }
-    lines.push('Relations parsed: ' + job.relationsParsed.toLocaleString());
-    if (job.batchTotal) lines.push('Batch: ' + job.batchIndex + ' / ' + job.batchTotal);
-    lines.push('References inserted: ' + job.referencesInserted.toLocaleString());
-    lines.push('References skipped (no identifier): ' + job.referencesSkippedMalformed.toLocaleString());
-    if (job.lastStderr) {
-      lines.push('<details style="margin-top:4px"><summary style="cursor:pointer;color:#7a8099">Parser output (last lines)</summary>'
-        + '<pre style="white-space:pre-wrap;font-size:10px;color:#9aa0c0;max-height:120px;overflow:auto;margin:4px 0 0">' + escHtml(job.lastStderr) + '</pre></details>');
-    }
-    progressEl.innerHTML = lines.join('<br>');
+    _irnSince = job.next;
+    statusEl.innerHTML = job.done
+      ? ''
+      : '<span style="color:#8fb8ff">⏳ Importing ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + '…</span>';
 
     if (job.done) {
+      _irnRunning = false;
       document.getElementById('irn-run-btn').disabled = false;
-      var errCount = (job.errors || []).length;
-      var html = '<b>Import finished.</b>';
-      if (errCount) {
-        html += '<div style="margin-top:6px;color:#e0a040">' + errCount + ' item(s) need review:</div>'
-          + '<div style="max-height:200px;overflow:auto;border:1px solid #2d3147;border-radius:5px;margin-top:4px">'
-          + '<table style="border-collapse:collapse;width:100%;font-size:11px">'
-          + '<thead><tr><th style="padding:3px 8px;background:#1a1f33;text-align:left">RelationID</th><th style="padding:3px 8px;background:#1a1f33;text-align:left">Issue</th><th style="padding:3px 8px;background:#1a1f33;text-align:left">Title/File</th></tr></thead><tbody>'
-          + job.errors.slice(0, 500).map(function(e) {
-              return '<tr>'
-                + '<td style="padding:3px 8px;border-top:1px solid #1e2340">' + escHtml(e.relationId != null ? String(e.relationId) : '') + '</td>'
-                + '<td style="padding:3px 8px;border-top:1px solid #1e2340">' + escHtml(e.error || '') + '</td>'
-                + '<td style="padding:3px 8px;border-top:1px solid #1e2340">' + escHtml(e.title || e.file || e.textref || '') + '</td>'
-                + '</tr>';
-            }).join('')
-          + '</tbody></table></div>';
-      }
-      summaryEl.innerHTML = html;
+      var ok = !job.error && job.exitCode === 0;
+      summaryEl.innerHTML = ok
+        ? '<b style="color:#7ee8a2">Import finished.</b>'
+        : '<b style="color:#e05560">Import failed.</b> ' + escHtml(job.error || '');
       summaryEl.style.display = '';
+      // The log file holds every message of the run — offer it once the run is over.
+      if (job.logFile) document.getElementById('irn-log-btn').style.display = '';
+      msgEl.scrollTop = msgEl.scrollHeight;
       return;
     }
 
-    _irnPollHandle = setTimeout(_pollRnefImportProgress, 1500);
+    _irnPollHandle = setTimeout(_pollRnefImportProgress, 1000);
   } catch (e) {
-    progressEl.innerHTML += '<br><span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+    statusEl.innerHTML += '<br><span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
     document.getElementById('irn-run-btn').disabled = false;
+    _irnRunning = false;
+  }
+}
+
+// Opens this run's log file in a new browser tab. Fetched with the auth header
+// (a plain link couldn't send it) and shown from a blob URL.
+async function openRnefImportLog() {
+  try {
+    var res = await fetch('/api/import/rnef/log', { headers: { 'Authorization': 'Bearer ' + authToken } });
+    if (!res.ok) { var d = await res.json().catch(function() { return {}; }); throw new Error(d.error || ('HTTP ' + res.status)); }
+    var blob = new Blob([await res.text()], { type: 'text/plain;charset=utf-8' });
+    window.open(URL.createObjectURL(blob), '_blank');
+  } catch (e) {
+    alert('Could not open the log file: ' + e.message);
   }
 }
 
