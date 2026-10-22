@@ -5240,84 +5240,127 @@ function _computeUniqueRef(ref, uniqueIdBigInt) {
 }
 
 // ─── Database → Import RNEF ───────────────────────────────────────────────────
-// Bulk-imports a single RNEF file or every *.rnef/*.xml file under a
-// server-side directory into THIS user's own Neo4j + Postgres connections
-// (never shared/admin). See server/rnefImport.js for the actual engine —
-// this just wires it to the user's own connections/helpers and tracks one
-// in-memory job per username, same pattern as the Pathway Collection
-// "Index" job above.
-const { createRnefImporter } = require('./server/rnefImport');
-const _rnefImporter = createRnefImporter({
-  PYTHON_CMD, RNEF_SCRIPT, myhash: _myhash, calcRelationId, quoteCypherIdent,
-  computeRefUniqueId: _computeRefUniqueId, computeUniqueRef: _computeUniqueRef,
-  neo4j,
-});
-const _userRnefImportJobs = new Map();  // username -> job state
+// The import itself is import_rnef() in rnef_import_runner.py. This side only:
+//   1. builds the list of RNEF files — every *.rnef/*.xml under a directory
+//      (recursive), or a single-element list when one file was chosen;
+//   2. builds APIconfig from THIS user's own Neo4j/Postgres settings (never the
+//      shared/admin credentials);
+//   3. runs rnef_import_runner.py, which calls import_rnef inside a Tee so the
+//      runtime messages go both to stdout (streamed to the dialog) and a log file;
+//   4. serves that log file so the user can open it when the run is over.
+const RNEF_IMPORT_RUNNER   = process.env.RNEF_IMPORT_RUNNER || path.join(__dirname, 'rnef_import_runner.py');
+const RNEF_IMPORT_LOG_DIR  = path.join(__dirname, 'import_logs');
+const RNEF_IMPORT_MAX_MSGS = 20000;     // messages kept in memory for the dialog; the log file has everything
+const _userRnefImportJobs  = new Map(); // username -> job
 
-function _newRnefImportJob() {
+function _collectRnefFiles(target) {
+  if (fs.statSync(target).isFile()) return [target];
+  const out = [];
+  (function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (/\.(rnef|xml)$/i.test(e.name)) out.push(full);
+    }
+  })(target);
+  return out.sort();
+}
+
+// Key names (including Python's own "postgreSQschema" spelling) are exactly
+// what PSnx2Neo4j.neo4j_nx / PostgreSQL read from APIconfig.
+function _buildImportApiConfig(username) {
+  const n = _resolveNeo4jCfgForUser(username);
+  const p = _resolvePgCfgForUser(username);
+  if (!n.url || !n.username || !n.database) throw new Error('Neo4j connection is not configured (Settings → My Connection → Neo4j).');
+  if (!p.host || !p.username || !p.database) throw new Error('Postgres connection is not configured (Settings → My Connection → Postgres).');
   return {
-    running: true, done: false,
-    filesTotal: 0, filesDone: 0, currentFile: '',
-    phase: '', phaseStartedAt: 0, lastStderr: '',  // live diagnostics — see server/rnefImport.js
-    relationsParsed: 0, batchIndex: 0, batchTotal: 0,
-    referencesInserted: 0, referencesSkippedMalformed: 0,
-    errors: [], summary: null,
+    postgreSQLhost: String(p.host), postgreSQLpswd: String(p.password || ''),
+    postgreSQLport: String(p.port || 5432), postgreSQLdb: String(p.database),
+    postgreSQLuser: String(p.username), postgreSQschema: String(p.schema || 'public'),
+    neo4jURL: String(n.url), neo4juri: String(n.url),
+    neo4jpswd: String(n.password || ''), neo4juser: String(n.username), neo4jdb: String(n.database),
   };
 }
 
-// Shared by both the server-path endpoint below and the browser-upload
-// session endpoints further down — starts the background job for a
-// directory/file that's already known to exist on the server's own
-// filesystem (either typed in directly, or just written there by an upload
-// session), cleaning up afterward if cleanupDir is given.
-function _startRnefImportJobFor(req, res, targetPath, cleanupDir) {
-  const username = req.user.username;
-  const existing = _userRnefImportJobs.get(username);
-  if (existing && existing.running) {
-    if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true }); } catch (e) {} }
-    return res.status(409).json({ error: 'An RNEF import is already running for your account.' });
+function _pushImportMsg(job, line) {
+  job.messages.push(line);
+  if (job.messages.length > RNEF_IMPORT_MAX_MSGS) {
+    const drop = Math.floor(RNEF_IMPORT_MAX_MSGS / 4);
+    job.messages.splice(0, drop);
+    job.base += drop;
   }
+}
 
-  const job = _newRnefImportJob();
+function _startRnefImport(req, res, target, cleanupDir) {
+  const username = req.user.username;
+  const cleanup = () => { if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true }); } catch (e) {} } };
+  const existing = _userRnefImportJobs.get(username);
+  if (existing && existing.running) { cleanup(); return res.status(409).json({ error: 'An RNEF import is already running for your account.' }); }
+
+  let files, apiConfig;
+  try {
+    files = _collectRnefFiles(target);
+    if (!files.length) throw new Error('No .rnef/.xml files found.');
+    apiConfig = _buildImportApiConfig(username);
+  } catch (e) { cleanup(); return res.status(400).json({ error: e.message }); }
+
+  fs.mkdirSync(RNEF_IMPORT_LOG_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const logPath = path.join(RNEF_IMPORT_LOG_DIR, `import_rnef_${username.replace(/[^A-Za-z0-9_-]/g, '_')}_${stamp}.log`);
+
+  // Credentials go to the runner via a private temp file (deleted by the
+  // runner as soon as it has read it), not argv, so they never show up in a
+  // process listing.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnefjob-'));
+  const jobFile = path.join(tmpDir, 'job.json');
+  fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig, rnef_files: files, batch_size: 50000, log_file: logPath }), { mode: 0o600 });
+
+  const job = { running: true, done: false, exitCode: null, error: null, filesTotal: files.length,
+                logFile: path.basename(logPath), logPath, messages: [], base: 0, startedAt: Date.now() };
   _userRnefImportJobs.set(username, job);
-  res.json({ started: true });  // respond immediately — the job continues in the background
+  res.json({ started: true, filesTotal: files.length });
 
-  const neo4jConn = req.neo4j;
-  const pg = req.pg;
-  _rnefImporter.runImportJob(job, targetPath, neo4jConn, pg, username)
-    .catch((err) => {
-      console.error('RNEF import error:', err.message);
-      job.errors.push({ error: safeError(err) });
-    })
-    .finally(() => {
-      job.running = false;
-      job.done = true;
-      if (cleanupDir) { try { fs.rmSync(cleanupDir, { recursive: true }); } catch (e) {} }
-    });
+  const child = spawn(PYTHON_CMD, ['-u', RNEF_IMPORT_RUNNER, jobFile],
+    { cwd: __dirname, env: Object.assign({}, process.env, { PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' }) });
+  const lineFeeder = () => {
+    let buf = '';
+    return (chunk) => {
+      buf += chunk.toString('utf8');
+      let m;
+      while ((m = /\r\n|\n|\r/.exec(buf))) {
+        _pushImportMsg(job, buf.slice(0, m.index));
+        buf = buf.slice(m.index + m[0].length);
+      }
+      if (buf.length > 4000) { _pushImportMsg(job, buf); buf = ''; }   // very long unterminated line
+    };
+  };
+  child.stdout.on('data', lineFeeder());
+  child.stderr.on('data', lineFeeder());
+  const finish = (code, err) => {
+    if (job.done) return;
+    job.running = false; job.done = true; job.exitCode = code;
+    if (err) job.error = err; else if (code !== 0) job.error = `The import script exited with code ${code}.`;
+    try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
+    cleanup();
+  };
+  child.on('error', (err) => finish(-1, `Could not start Python (${PYTHON_CMD}): ${err.message}`));
+  child.on('close', (code) => finish(code, null));
 }
 
 // POST /api/import/rnef/start { path } — admin-only (bulk write to shared
-// Neo4j/Postgres). For a path that's already on the SERVER's own filesystem
-// (the browser can't discover or send one — see the upload-session
-// endpoints below for the "pick a file/folder on my own machine" case).
+// Neo4j/Postgres). For a path the SERVER can already see (file or directory).
 app.post('/api/import/rnef/start', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { path: targetPath } = req.body || {};
   if (!targetPath || typeof targetPath !== 'string') return res.status(400).json({ error: 'path required' });
   if (!fs.existsSync(targetPath)) return res.status(400).json({ error: `Path does not exist on the server: ${targetPath}` });
-  _startRnefImportJobFor(req, res, targetPath, null);
+  _startRnefImport(req, res, targetPath, null);
 });
 
 // ── Upload-session endpoints ────────────────────────────────────────────────
-// The browser's File API deliberately never exposes a real filesystem path
-// (even via a native file/folder picker), so "point the importer at a path"
-// doesn't work when the user is picking from their OWN machine rather than
-// typing a path the SERVER can already see. Instead: the browser reads each
-// selected file's content itself (exactly like the existing File -> Load
-// subgraph / POST /api/convert/rnef flow already does for one file) and
-// uploads it here; once every selected file has landed in one server-side
-// temp directory, /finish starts the same import job as the path-based
-// endpoint above, pointed at that directory.
+// A browser file/folder picker never exposes a real path, so picked files are
+// uploaded into one server-side temp directory (same text/plain mechanism as
+// POST /api/convert/rnef); /finish then starts the import on that directory.
 const _rnefUploadSessions = new Map(); // sessionId -> tmpDir
 
 app.post('/api/import/rnef/upload-session/start', dbLimiter, authMiddleware, (req, res) => {
@@ -5328,45 +5371,47 @@ app.post('/api/import/rnef/upload-session/start', dbLimiter, authMiddleware, (re
   res.json({ sessionId });
 });
 
-app.post(
-  '/api/import/rnef/upload-session/:sessionId/file',
+app.post('/api/import/rnef/upload-session/:sessionId/file',
   dbLimiter, express.text({ limit: '500mb', type: 'text/plain' }), authMiddleware,
   (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
     const tmpDir = _rnefUploadSessions.get(req.params.sessionId);
     if (!tmpDir) return res.status(404).json({ error: 'Unknown or expired upload session' });
-    const content = req.body;
-    if (!content) return res.status(400).json({ error: 'content required' });
-
-    // Original filename only used to keep a recognizable extension/basename
-    // for progress messages and the *.rnef/*.xml filter — sanitized and
-    // index-prefixed so two same-named files from different subfolders on
-    // the user's machine can never collide once flattened into one temp dir.
+    if (!req.body) return res.status(400).json({ error: 'content required' });
     let rawName = req.get('X-Filename') || 'upload.rnef';
-    try { rawName = decodeURIComponent(rawName); } catch (e) {}  // client percent-encodes it (header values can't carry arbitrary unicode/spaces safely otherwise)
+    try { rawName = decodeURIComponent(rawName); } catch (e) {}
     const safeBase = path.basename(rawName).replace(/[\\/:*?"<>|]/g, '_') || 'upload.rnef';
-    const idx = fs.readdirSync(tmpDir).length;
-    const destPath = path.join(tmpDir, `${idx}_${safeBase}`);
-    // codeql[js/network-data-written-to-file] - content is RNEF XML from an authenticated admin request; destPath is server-controlled (mkdtemp'd dir + sanitized basename), never served back to clients
-    fs.writeFileSync(destPath, content, 'utf8');
+    // index prefix: same-named files from different subfolders must not collide once flattened
+    const destPath = path.join(tmpDir, `${fs.readdirSync(tmpDir).length}_${safeBase}`);
+    // codeql[js/network-data-written-to-file] - authenticated admin upload; destPath is a mkdtemp'd dir + sanitized basename, never served back
+    fs.writeFileSync(destPath, req.body, 'utf8');
     res.json({ ok: true });
-  }
-);
+  });
 
 app.post('/api/import/rnef/upload-session/:sessionId/finish', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const tmpDir = _rnefUploadSessions.get(req.params.sessionId);
   if (!tmpDir) return res.status(404).json({ error: 'Unknown or expired upload session' });
   _rnefUploadSessions.delete(req.params.sessionId);
-  _startRnefImportJobFor(req, res, tmpDir, tmpDir);
+  _startRnefImport(req, res, tmpDir, tmpDir);
 });
 
-// GET /api/import/rnef/progress — poll for live status of THIS user's most
-// recent (or in-progress) RNEF import job.
+// GET /api/import/rnef/progress?since=N — runtime messages from index N on.
 app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
   const job = _userRnefImportJobs.get(req.user.username);
   if (!job) return res.json({ running: false, done: false, noJob: true });
-  res.json(job);
+  const since = Math.max(parseInt(req.query.since, 10) || 0, job.base);
+  res.json({ running: job.running, done: job.done, exitCode: job.exitCode, error: job.error,
+             filesTotal: job.filesTotal, logFile: job.logFile,
+             messages: job.messages.slice(since - job.base), next: job.base + job.messages.length });
+});
+
+// GET /api/import/rnef/log — this user's most recent import log file.
+app.get('/api/import/rnef/log', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const job = _userRnefImportJobs.get(req.user.username);
+  if (!job || !job.logPath || !fs.existsSync(job.logPath)) return res.status(404).json({ error: 'No import log available yet.' });
+  res.type('text/plain; charset=utf-8').sendFile(job.logPath);   // logPath is server-generated, never user input
 });
 
 // GET /api/schema/relation-types  — distinct Neo4j relationship types
