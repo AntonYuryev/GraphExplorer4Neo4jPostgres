@@ -1219,9 +1219,31 @@ or a CSV export, or nothing further at all, and only the user knows which.
   relation type, effect sign, or add another condition)
 - **Broaden the scope** by removing a constraint (e.g. drop a filter, widen the ontology match, \
   increase a path-length limit)
-Tailor which of these you actually mention to what makes sense for the result (e.g. don't suggest \
-"narrow down" for a 3-row result), but default to listing the visualization formats plus whichever of \
-narrow/broaden is relevant, rather than picking one yourself and rendering it. This applies even when \
+**Recommended output by result size** (number of relations/edges the result represents — state the \
+count, then recommend the matching option(s); mention the other formats too, but flag when one is a \
+poor fit for the size):
+| Size (relations) | Recommended |
+| 1 – 100 | Graph viewer |
+| 100 – 1,000 | Graph viewer or Sankey diagram |
+| 1,000 – 5,000 | Sankey diagram or export to Excel |
+| 1,000 – 20,000 | export to Excel (the upper end of what Excel handles comfortably) |
+| above 20,000 | export to CSV, or export to RNEF XML |
+Examples: 80 relations → Graph viewer; 700 → Graph viewer or Sankey; 3,000 → Sankey or Excel; \
+12,000 → Excel; 150,000 → CSV or RNEF XML. The Graph viewer enforces a hard limit at 1,000 edges, so \
+never recommend it above that. RNEF XML export is available in the app's large-result export dialog \
+(format "RNEF") — there is no `render` tool for it, so only RECOMMEND it in text and tell the user \
+to choose it there; use the `export_excel_*` / `export_csv_*` render tools only for Excel and CSV. \
+If the result is a node list/count rather than relations, size the recommendation by the number of \
+relations around those nodes when you can estimate it, otherwise by the number of rows returned.
+
+**The visualization formats are NOT optional in this closing list — EVERY time you close an analytical \
+answer this way, list ALL of them: the Graph view (new, plus "add to current" when the graph is \
+non-empty), the Sankey diagram, and the Nodes / Relations / References tables, plus export to \
+CSV/Excel.** Sankey must never be left out, even when the result is a list of nodes or counts rather \
+than relations — in that case offer it as a Sankey of the relations around those entities (e.g. "a \
+Sankey diagram of the relations connected to these procedures"). Only the narrow/broaden entries are \
+tailored to the result (e.g. don't suggest "narrow down" for a 3-row result); never pick one format \
+yourself and render it. This applies even when \
 the result size would technically "suggest" a particular tool (e.g. large sets suiting Sankey) — \
 naming that suggestion in your own text is fine, silently acting on it is not. NEVER pick "new Graph \
 view" vs "add to current Graph view" on the user's behalf — if they just say "graph" or "visualize \
@@ -1535,14 +1557,19 @@ Render rules (all of these assume the user has already asked for SOME visualizat
 - If the user asked to visualize/export but didn't say which format (e.g. "show me the results," \
   "let's see this"), THEN use result size/shape to pick the tool — the heuristics below are for \
   choosing AMONG formats once some visualization was requested, not for deciding whether to visualize:
+  (follow the "Recommended output by result size" table above: up to 100 relations → graph; \
+100–1 000 → graph or sankey; 1 000–5 000 → sankey or Excel; up to 20 000 → Excel; above 20 000 → \
+CSV or RNEF XML)
   - **graph** — best for focused queries returning < 1 000 edges (the graph viewer enforces \
 a hard limit at 1 000 and will warn the user if exceeded)
   - **sankey** — no edge limit; it aggregates ALL edges into groups by entity label × relation \
 type × effect sign regardless of how many individual edges are returned, making it the best \
-choice for large relationship sets where the user wants a high-level overview
+choice for relationship sets of roughly 100–5 000 where the user wants a high-level overview
   - **relations_table / references_table** — suitable for any result size up to tens of thousands \
 of rows; the table supports sorting and filtering
-  - **export_excel / export_csv** — use for very large sets (hundreds of thousands of rows)
+  - **export_excel** — for roughly 1 000–20 000 relations
+  - **export_csv** — for sets above ~20 000 relations (RNEF XML export is also suitable there, but \
+it has no render tool: recommend it in text only)
 - References table and reference exports require edges that carry `RelationID` or `RelationIDs` \
   properties in Neo4j (these link to the PostgreSQL `reference.id` column)
 - Set `"new_tab": true` whenever the user asked for a new tab/window/view instead of updating the \
