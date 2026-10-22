@@ -4270,6 +4270,11 @@ app.post('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
 
 // ─── Agentic AI — Python service lifecycle & proxy ───────────────────────────
 const AGENT_PORT     = parseInt(process.env.AGENT_PORT || '3001', 10);
+// How long to wait for the Python sidecar's /health before giving up and restarting it.
+// Its imports alone (pandas, torch, torch_geometric, langgraph, ...) take 25-40 s on a cold
+// or antivirus-scanned machine, so a short fixed limit killed it mid-import and restarted it
+// forever. Override with AGENT_STARTUP_TIMEOUT_S.
+const AGENT_STARTUP_TIMEOUT_S = Math.max(30, parseInt(process.env.AGENT_STARTUP_TIMEOUT_S || '180', 10) || 180);
 const AGENT_SCRIPT   = path.join(__dirname, 'agent_service.py');
 const AGENT_AUTOSTART = !/^(0|false|no)$/i.test(
   String(process.env.AGENT_AUTOSTART || '1').trim()
@@ -4367,10 +4372,10 @@ function _doSpawnAgent() {
         }, 500);
       }
     }).on('error', () => {});
-    if (attempts > 60) {
+    if (attempts > AGENT_STARTUP_TIMEOUT_S * 2) {   // polled every 500 ms
       clearInterval(poll);
       if (!_agentReady) {
-        console.error('[agent] startup timeout: /health did not become ready within 30s; restarting sidecar');
+        console.error(`[agent] startup timeout: /health did not become ready within ${AGENT_STARTUP_TIMEOUT_S}s; restarting sidecar`);
         _agentReady = false;
         _agentRestarting = false;
         try {
