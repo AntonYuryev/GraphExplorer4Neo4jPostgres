@@ -1,6 +1,6 @@
 
-import time,sys,os,json, requests,re,traceback,urllib3,unicodedata,certifi,http.client,socket,ssl,hashlib
-import numpy as np
+import time,sys,os,json, requests,re,traceback,urllib3,unicodedata
+import certifi,http.client,socket,ssl,hashlib,psutil
 from urllib.parse import quote as urlencode
 from collections import Counter
 from itertools import chain as iterchain
@@ -342,16 +342,10 @@ def tokenize(s:str):
   return tokens
 
 
-def tokenize2str(s:str):
-  text = normalize(s)
-  tokens = text.lower().split()  # Split into words and convert to lowercase
-  return " ".join(tokens)
-
-
 def match_tokens(tokens1:list,tokens2:list):
   if len(tokens1) == len(tokens2):
     for i, token1 in enumerate(tokens1):
-      if token1 != tokens2[i]:
+      if token1 != tokens2[1]:
           return False
     return True
   else:
@@ -619,28 +613,21 @@ def processRNEF(path2rnef:str,how2process_function,**kwargs):
     print(f'Finished processing {node_counter} nodes, {control_counter} controls, {pathway_counter} pathways from "{path2rnef}" in {elapsed_time}')
 
 
-
-def deterministic_hash64(text):
+def deterministic_hash64(text:str):
   """Return a deterministic signed 64-bit hash for text or bytes."""
+  text = text.encode("utf8")
+  # use md5 to create a hash
+  digest = hashlib.md5(text).hexdigest()
+  dint = int(digest, 16)  # create 128 bit integer
 
-  if isinstance(text, str):
-    text = text.encode("utf8")
+  # xor high and low halves
+  result = ((dint >> 64) ^ dint) & 0xFFFFFFFFFFFFFFFF
+  # if greater than max 64bit signed int, make negative. python doesn't wrap on overflow
+  # because it never overflows
+  if result > 0x7FFFFFFFFFFFFFFF:
+    result = -(result & 0x7FFFFFFFFFFFFFFF)
 
-    # use md5 to create a hash
-    digest = hashlib.md5(text).hexdigest()
-    dint = int(digest, 16)  # create 128 bit integer
-
-    # xor high and low halves
-    result = ((dint >> 64) ^ dint) & 0xFFFFFFFFFFFFFFFF
-    # if greater than max 64bit signed int, make negative. python doesn't wrap on overflow
-    # because it never overflows
-    if result > 0x7FFFFFFFFFFFFFFF:
-        result = -(result & 0x7FFFFFFFFFFFFFFF)
-
-    return result
-
-  # Backward-compatible alias for older imports/usages.
-  myhash = deterministic_hash64
+  return result
 
 
 def set_root_dir(root_dir_name='ElsevierAPI_Project'):
@@ -649,6 +636,43 @@ def set_root_dir(root_dir_name='ElsevierAPI_Project'):
   if root_dir_str not in sys.path:
     sys.path.append(root_dir_str)
   return root_dir_str
+
+
+def measure_bytes_per_item(build_chunk_func,sample_items:list,sample_size=50)->int:
+  '''
+  Measures real peak memory allocated by "build_chunk_func(sample)" using tracemalloc.
+  input:
+    build_chunk_func - callable(list_of_items) that allocates the same kind of objects as production code
+    (e.g. builds a subgraph and serializes it to an RNEF string) for one chunk
+  output:
+    average bytes allocated per item during the call, 0 if sample_items is empty
+  '''
+  sample = sample_items[:sample_size] if len(sample_items) > sample_size else sample_items
+  if not sample:
+    return 0
+
+  import tracemalloc
+  tracemalloc.start()
+  try:
+    baseline,_ = tracemalloc.get_traced_memory()
+    build_chunk_func(sample)
+    peak_bytes,_ = tracemalloc.get_traced_memory()
+  finally:
+    tracemalloc.stop()
+
+  return max(1,int((peak_bytes-baseline)/len(sample)))
+
+
+@staticmethod
+def _memory_safe_workers(chunk_count:int,chunk_size:int,avg_relation_bytes=5000)->int:
+  '''
+  Estimates max_workers for RNEF dump threads from available RAM and chunk size to avoid memory swap.
+  Each worker holds a subgraph copy + serialized RNEF string of up to "chunk_size" relations in memory.
+  '''
+  available_bytes = psutil.virtual_memory().available
+  est_bytes_per_worker = chunk_size * avg_relation_bytes
+  workers_by_memory = max(1, int(available_bytes // (est_bytes_per_worker * 2)))  # keep 50% headroom
+  return max(1, min(chunk_count, workers_by_memory))
 
 
 class Tee(object):
