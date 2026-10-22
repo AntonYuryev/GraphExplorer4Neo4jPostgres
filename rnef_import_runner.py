@@ -41,6 +41,7 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000):
     total_imported = 0
     for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size):
         total_imported += neo4j.importGraph(nodes, rels)
+        print(f"Imported so far {len(nodes)} nodes and {len(rels)} relations\n\n", flush=True)
     print(f"Total imported count: {total_imported}")
     print(f"Total execution time: {execution_time(start)}")
 
