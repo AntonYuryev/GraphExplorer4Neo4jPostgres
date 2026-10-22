@@ -8,7 +8,11 @@ from collections import defaultdict
 from pydantic import BaseModel, ConfigDict, Field
 from ResnetGraph.ElsevierAPI.api.ResnetAPI.ResnetGraph import ResnetGraph, PSObject, PSRelation, Reference, PUBYEAR, CLOSENESS
 from ResnetGraph.ElsevierAPI.api.ResnetAPI.NetworkxObjects import MECHANISM,OBJECT_TYPE, EFFECT, RELATIONID, EFFECT, TITLE, SENTENCE, JOURNAL
-from ResnetGraph.ElsevierAPI.api.EmbioPSG_API.PSnx2Neo4j import neo4j_nx, ANATOMICAL_CONCEPTS_NEO4J
+from ResnetGraph.ElsevierAPI.api.EmbioPSG_API.PSnx2Neo4j import neo4j_nx
+# Defined here (not imported): PSnx2Neo4j.py is synced with the upstream GitHub repo, whose
+# version doesn't have this constant, so a download silently removed it and broke the
+# Summarize routes with "cannot import name ANATOMICAL_CONCEPTS_NEO4J".
+ANATOMICAL_CONCEPTS_NEO4J = ['CellObject','Organ','Tissue','CellType']
 from ResnetGraph.ElsevierAPI.api.ResnetAPI.PSPathway import PSPathway
 from ResnetGraph.ElsevierAPI.utils.utils import tokenize, unpack,ThreadPoolExecutor 
 
