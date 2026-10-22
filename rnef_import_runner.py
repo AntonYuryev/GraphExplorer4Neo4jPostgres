@@ -38,12 +38,21 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000):
 
     neo4j = neo4j_nx(APIconfig)
     start = time.time()
-    total_imported = 0
+    total_imported_rels = 0
+    total_imported_refs = 0
+    total_created_nodes = 0
+    batch_counter = 0
     for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size):
-        total_imported += neo4j.importGraph(nodes, rels)
-        print(f"Imported so far {len(nodes)} nodes and {len(rels)} relations\n\n", flush=True)
-    print(f"Total imported count: {total_imported}")
-    print(f"Total execution time: {execution_time(start)}")
+        batch_counter += 1
+        imported_nodes, imported_rels, imported_refs = neo4j.importGraph(nodes, rels)
+        total_created_nodes += imported_nodes
+        total_imported_rels += imported_rels
+        total_imported_refs += imported_refs
+        print(f"Batch {batch_counter} of size {batch_size} relations: Imported {imported_nodes} nodes, {imported_rels} relations, and {imported_refs} references", flush=True)
+        print(f"Imported so far {total_created_nodes} nodes, {total_imported_rels} relations, and {total_imported_refs} references\n\n", flush=True)
+    # color final statistics in red
+    print(f"\033[91mTotal imported count: {total_created_nodes} nodes, {total_imported_rels} relations and {total_imported_refs} references\033[0m")
+    print(f"\033[94mTotal execution time: {execution_time(start)}\033[0m")
 
 
 def main() -> int:
