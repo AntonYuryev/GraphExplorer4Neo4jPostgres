@@ -1151,13 +1151,62 @@ function updatePasteMenuItem() {
   var el = document.getElementById('mi-paste');
   if (el) el.classList.toggle('disabled', !graphClipboard);
 }
+// ── Table-result export (Cypher result table and SQL editor) ──────────────
+// Tab/newline/CR inside a cell are flattened to spaces so every record stays one TSV line.
+var _lastTsv = { cypher: '', sql: '' };
+function _tsvFromTable(columns, rows) {
+  function cell(v) {
+    if (v === null || v === undefined) return '';
+    return String(typeof v === 'object' ? JSON.stringify(v) : v).replace(/[\t\r\n]+/g, ' ');
+  }
+  var lines = [columns.map(cell).join('\t')];
+  rows.forEach(function (r) { lines.push(r.map(cell).join('\t')); });
+  return lines.join('\n') + '\n';
+}
+function _flashBtn(btn, text) {
+  if (!btn) return;
+  var old = btn.getAttribute('data-label') || btn.textContent;
+  btn.setAttribute('data-label', old);
+  btn.textContent = text;
+  setTimeout(function () { btn.textContent = old; }, 1500);
+}
+function copyResultTable(which, btn) {
+  var text = _lastTsv[which] || '';
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    _flashBtn(btn, ok ? 'Copied ✓' : 'Copy failed');
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { _flashBtn(btn, 'Copied ✓'); }, fallback);
+  } else fallback();
+}
+function saveResultTableTsv(which) {
+  var blob = new Blob([_lastTsv[which] || ''], { type: 'text/tab-separated-values;charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (which === 'sql' ? 'sql_result' : 'query_result') + '.tsv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+var _QR_BTNS = function (which) {
+  return '<button class="qr-btn" onclick="copyResultTable(\'' + which + '\', this)">Copy result</button>'
+       + '<button class="qr-btn" onclick="saveResultTableTsv(\'' + which + '\')">Save as TSV</button>';
+};
+
 function showQueryResultTable(table) {
   var overlay = document.getElementById('query-result-overlay');
   if (!overlay) return;
   var rowCount = table.rows.length;
+  _lastTsv.cypher = _tsvFromTable(table.columns, table.rows);
   var html = '<div class="qr-header">'
     + '<span class="qr-title">Query Result</span>'
     + '<span class="qr-count">' + rowCount + ' row' + (rowCount !== 1 ? 's' : '') + '</span>'
+    + _QR_BTNS('cypher')
     + '<button class="qr-close" onclick="hideQueryResultTable()">&#x2715;</button>'
     + '</div><div class="qr-table-wrap"><table class="qr-table"><thead><tr>';
   table.columns.forEach(function(col) {
@@ -2724,7 +2773,10 @@ async function runSqlQuery() {
       }).join('') + '</tr>';
     });
     html += '</tbody></table>';
-    html += '<div style="color:#7a8099;font-size:11px;margin-top:6px">' + data.rows.length + ' row' + (data.rows.length !== 1 ? 's' : '') + '</div>';
+    _lastTsv.sql = _tsvFromTable(cols, data.rows.map(function (row) { return cols.map(function (c) { return row[c]; }); }));
+    var bar = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="color:#7a8099;font-size:11px">' + data.rows.length + ' row' + (data.rows.length !== 1 ? 's' : '') + '</span>'
+      + '<span style="display:flex;gap:6px">' + _QR_BTNS('sql') + '</span></div>';
+    html = bar + html;
     resultsEl.innerHTML = html;
   } catch(e) {
     resultsEl.innerHTML = '<span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
@@ -2905,6 +2957,38 @@ function _irnPathTyped() {
   document.getElementById('irn-run-btn').disabled = !document.getElementById('irn-path').value.trim();
 }
 
+// Appends lines to the message pane, turning ANSI colour codes (e.g. the red/blue totals that
+// import_rnef prints) into coloured spans. Text goes in as text nodes, so nothing is parsed as HTML.
+var _IRN_ANSI_COLORS = { 30: '#9aa0a6', 31: '#ff6b6b', 32: '#7ee8a2', 33: '#ffd166', 34: '#6cb2ff', 35: '#d6a2ff', 36: '#6fe3e3', 37: '#e8e8e8',
+                         90: '#9aa0a6', 91: '#ff6b6b', 92: '#7ee8a2', 93: '#ffd166', 94: '#6cb2ff', 95: '#d6a2ff', 96: '#6fe3e3', 97: '#ffffff' };
+var _irnAnsiColor = null;
+function _irnAppendAnsi(el, lines) {
+  var text = (el.childNodes.length ? '\n' : '') + lines.join('\n');
+  var re = /\x1b\[([0-9;]*)m/g, last = 0, m;
+  function put(s) {
+    if (!s) return;
+    if (_irnAnsiColor) {
+      var span = document.createElement('span');
+      span.style.color = _irnAnsiColor;
+      span.style.fontWeight = 'bold';
+      span.textContent = s;
+      el.appendChild(span);
+    } else {
+      el.appendChild(document.createTextNode(s));
+    }
+  }
+  while ((m = re.exec(text))) {
+    put(text.slice(last, m.index));
+    last = re.lastIndex;
+    (m[1] || '0').split(';').forEach(function (c) {
+      c = parseInt(c, 10);
+      if (c === 0 || c === 39) _irnAnsiColor = null;
+      else if (_IRN_ANSI_COLORS[c]) _irnAnsiColor = _IRN_ANSI_COLORS[c];
+    });
+  }
+  put(text.slice(last).replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''));
+}
+
 async function runRnefImport() {
   var errEl = document.getElementById('irn-error');
   var statusEl = document.getElementById('irn-status');
@@ -2916,6 +3000,7 @@ async function runRnefImport() {
   document.getElementById('irn-log-btn').style.display = 'none';
   msgEl.textContent = '';
   msgEl.style.display = 'none';
+  _irnAnsiColor = null;
   _irnSince = 0;
 
   document.getElementById('irn-run-btn').disabled = true;
@@ -2977,7 +3062,9 @@ async function _irnReattach() {
 
     var msgEl = document.getElementById('irn-messages');
     msgEl.style.display = '';
-    msgEl.textContent = (job.messages || []).join('\n');
+    msgEl.textContent = '';
+    _irnAnsiColor = null;
+    _irnAppendAnsi(msgEl, job.messages || []);
     msgEl.scrollTop = msgEl.scrollHeight;
     _irnSince = job.next;
     document.getElementById('irn-status').style.display = '';
@@ -3003,7 +3090,7 @@ async function _pollRnefImportProgress() {
 
     if (job.messages && job.messages.length) {
       var atBottom = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight < 30;
-      msgEl.textContent += (msgEl.textContent ? '\n' : '') + job.messages.join('\n');
+      _irnAppendAnsi(msgEl, job.messages);
       if (atBottom) msgEl.scrollTop = msgEl.scrollHeight;
     }
     _irnSince = job.next;
@@ -6848,10 +6935,31 @@ function _analyzeCypherReturn(query) {
   var has_graph_funcs = GRAPH_RE.test(afterReturn);
   var has_properties = PROP_RE.test(afterReturn);
 
+  // A bare variable is a node/relationship unless it is a scalar alias defined earlier
+  // (e.g. "CALL { … RETURN count(r) AS outgoingCount } … RETURN outgoingCount, a + b AS total").
+  var priorAliases = {}, am, aliasRe = /\bAS\s+([A-Za-z_][A-Za-z0-9_]*)/gi;
+  var beforeReturn = query.slice(0, lastReturnIdx);
+  while ((am = aliasRe.exec(beforeReturn)) !== null) priorAliases[am[1]] = true;
+  var has_bare_entity = false;
+  var items = [], depth = 0, cur = '';
+  for (var ci = 0; ci < afterReturn.length; ci++) {
+    var ch = afterReturn[ci];
+    if ('([{'.indexOf(ch) >= 0) depth++;
+    else if (')]}'.indexOf(ch) >= 0) depth--;
+    if (ch === ',' && depth === 0) { items.push(cur); cur = ''; } else cur += ch;
+  }
+  if (cur.trim()) items.push(cur);
+  items.forEach(function (it) {
+    var expr = it.replace(/\s+AS\s+[A-Za-z_][A-Za-z0-9_]*\s*$/i, '').trim();
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(expr) && !priorAliases[expr]) has_bare_entity = true;
+    else if (expr === '*') has_bare_entity = true;
+  });
+
   var types_found = [];
   if (has_stats)                         types_found.push('statistics');
   if (has_graph_funcs)                   types_found.push('graph_data');
-  if (!has_stats && !has_properties)     types_found.push('graph_data');   // bare variables → nodes/rels
+  if (!has_stats && !has_properties && has_bare_entity) types_found.push('graph_data');   // bare variables → nodes/rels
+  if (!has_stats && !has_properties && !has_bare_entity && !has_graph_funcs) types_found.push('tabular_properties');   // scalar expressions only
   if (has_properties && !has_stats)      types_found.push('tabular_properties');
 
   var primary_type;
