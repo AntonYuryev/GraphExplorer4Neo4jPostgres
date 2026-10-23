@@ -752,3 +752,11 @@ body.col-resizing * { cursor: col-resize !important; user-select: none; }
   pointer-events: auto;
 }
 
+
+.qr-btn {
+  background: #1a1f33; border: 1px solid #2d3147; color: #c8cde4;
+  cursor: pointer; font-size: 12px; padding: 3px 10px; border-radius: 4px;
+}
+.qr-btn:hover { background: #242a45; border-color: #4a5270; }
+.qr-header .qr-btn:first-of-type { margin-left: auto; }
+.qr-header .qr-btn + .qr-close { margin-left: 4px; }
