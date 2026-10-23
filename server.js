@@ -5300,7 +5300,7 @@ function _pushImportMsg(job, line) {
   }
 }
 
-function _startRnefImport(req, res, target) {
+function _startRnefImport(req, res, target, addSource) {
   const username = req.user.username;
   const existing = _userRnefImportJobs.get(username);
   if (existing && existing.running) { return res.status(409).json({ error: 'An RNEF import is already running for your account.' }); }
@@ -5321,7 +5321,7 @@ function _startRnefImport(req, res, target) {
   // process listing.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnefjob-'));
   const jobFile = path.join(tmpDir, 'job.json');
-  fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig, rnef_files: files, batch_size: 50000, log_file: logPath }), { mode: 0o600 });
+  fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig, rnef_files: files, batch_size: 50000, log_file: logPath, add_source: addSource }), { mode: 0o600 });
 
   const job = { running: true, done: false, exitCode: null, error: null, filesTotal: files.length,
                 logFile: path.basename(logPath), logPath, messages: [], base: 0, startedAt: Date.now() };
@@ -5410,7 +5410,8 @@ app.post('/api/import/rnef/start', dbLimiter, authMiddleware, (req, res) => {
   if (!targetPath || typeof targetPath !== 'string') return res.status(400).json({ error: 'path required' });
   targetPath = targetPath.trim().replace(/^"(.*)"$/, '$1');   // Explorer's "Copy as path" wraps it in quotes
   if (!fs.existsSync(targetPath)) return res.status(400).json({ error: `Path does not exist on the server: ${targetPath}` });
-  _startRnefImport(req, res, targetPath);
+  const addSource = String((req.body || {}).addSource || '').trim().slice(0, 200);   // optional Source value stamped on imported relations
+  _startRnefImport(req, res, targetPath, addSource);
 });
 
 // GET /api/import/rnef/progress?since=N — runtime messages from index N on.
