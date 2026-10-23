@@ -1154,6 +1154,7 @@ function updatePasteMenuItem() {
 // ── Table-result export (Cypher result table and SQL editor) ──────────────
 // Tab/newline/CR inside a cell are flattened to spaces so every record stays one TSV line.
 var _lastTsv = { cypher: '', sql: '' };
+var _lastQueryText = { cypher: '', sql: '' };   // query that produced the table now shown
 function _tsvFromTable(columns, rows) {
   function cell(v) {
     if (v === null || v === undefined) return '';
@@ -1170,8 +1171,9 @@ function _flashBtn(btn, text) {
   btn.textContent = text;
   setTimeout(function () { btn.textContent = old; }, 1500);
 }
-function copyResultTable(which, btn) {
+function copyResultTable(which, btn, withQuery) {
   var text = _lastTsv[which] || '';
+  if (withQuery) text = (_lastQueryText[which] || '').trim() + '\n' + text;
   function fallback() {
     var ta = document.createElement('textarea');
     ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
@@ -1194,7 +1196,8 @@ function saveResultTableTsv(which) {
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
 }
 var _QR_BTNS = function (which) {
-  return '<button class="qr-btn" onclick="copyResultTable(\'' + which + '\', this)">Copy result</button>'
+  return '<button class="qr-btn" onclick="copyResultTable(\'' + which + '\', this, true)">Copy query+result</button>'
+       + '<button class="qr-btn" onclick="copyResultTable(\'' + which + '\', this)">Copy result</button>'
        + '<button class="qr-btn" onclick="saveResultTableTsv(\'' + which + '\')">Save as TSV</button>';
 };
 
@@ -1203,6 +1206,7 @@ function showQueryResultTable(table) {
   if (!overlay) return;
   var rowCount = table.rows.length;
   _lastTsv.cypher = _tsvFromTable(table.columns, table.rows);
+  _lastQueryText.cypher = currentQuery || '';
   var html = '<div class="qr-header">'
     + '<span class="qr-title">Query Result</span>'
     + '<span class="qr-count">' + rowCount + ' row' + (rowCount !== 1 ? 's' : '') + '</span>'
@@ -2773,6 +2777,7 @@ async function runSqlQuery() {
       }).join('') + '</tr>';
     });
     html += '</tbody></table>';
+    _lastQueryText.sql = sql;
     _lastTsv.sql = _tsvFromTable(cols, data.rows.map(function (row) { return cols.map(function (c) { return row[c]; }); }));
     var bar = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span style="color:#7a8099;font-size:11px">' + data.rows.length + ' row' + (data.rows.length !== 1 ? 's' : '') + '</span>'
       + '<span style="display:flex;gap:6px">' + _QR_BTNS('sql') + '</span></div>';
@@ -7062,7 +7067,7 @@ async function runQuery(mergeIntoExisting) {
       && (!data.table || !data.table.rows || !data.table.rows.length);
 
     if (startTabIdx === activeTabIdx) {
-      if (isEmptyResult) showAlignHint('No data found — the query returned no results.');
+      if (isEmptyResult) showAlignHint('No data found — the query returned no results.', true);
       // Still on the originating tab — render normally
       if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
         appendCypherHistory(query, 0);   // record aggregate/table queries in history
@@ -12981,7 +12986,7 @@ async function runExploreConfigQuery() {
       if (document.getElementById('table-view').style.display !== 'none') _reloadCurrentTableMode();
       console.log('[findBetween] added ' + fbResult.addedNodes + ' node(s), ' + fbResult.addedEdges + ' edge(s)');
       if (fbResult.addedEdges === 0 && fbResult.addedNodes === 0) {
-        showAlignHint('No new relations found between selected and unselected nodes.');
+        showAlignHint('No new relations found between selected and unselected nodes.', true);
       } else {
         showAlignHint('Added ' + fbResult.addedEdges + ' relation(s)' +
           (fbResult.addedNodes > 0 ? ' and ' + fbResult.addedNodes + ' node(s)' : '') + ' to the graph.');
@@ -13350,7 +13355,7 @@ async function _expandOntologyNode(node) {
     node.loading  = false;
     node.children = [];
     _renderOntologyTree();
-    showAlignHint('Error loading children: ' + (e.message || e));
+    showAlignHint('Error loading children: ' + (e.message || e), true);
   }
 }
 
@@ -13630,7 +13635,7 @@ async function ontologyCtxAction(action) {
     try {
       var graphUrns = _getGraphUrns();
       if (!graphUrns.length) {
-        showAlignHint('No graph nodes in scope.');
+        showAlignHint('No graph nodes in scope.', true);
         setProgressMsg(null);
         return;
       }
@@ -13639,7 +13644,7 @@ async function ontologyCtxAction(action) {
 
       var snodes = subtree.nodes || [], sedges = subtree.edges || [];
       if (!snodes.length) {
-        showAlignHint('No ontology nodes found for "' + node.name + '".');
+        showAlignHint('No ontology nodes found for "' + node.name + '".', true);
         return;
       }
 
@@ -13770,7 +13775,7 @@ async function ontologyCtxAction(action) {
     setProgressMsg(null);
 
     if (!descendantUrnSet.size) {
-      showAlignHint('No graph nodes belong to "' + node.name + '".');
+      showAlignHint('No graph nodes belong to "' + node.name + '".', true);
       return;
     }
 
@@ -13781,7 +13786,7 @@ async function ontologyCtxAction(action) {
         return u && descendantUrnSet.has(String(u));
       });
       if (!srcNodes.length) {
-        showAlignHint('No Sankey nodes found for "' + node.name + '".');
+        showAlignHint('No Sankey nodes found for "' + node.name + '".', true);
         return;
       }
       var matchedIdSet = new Set(srcNodes.map(function(n) { return String(n.id); }));
@@ -13842,7 +13847,7 @@ async function ontologyCtxAction(action) {
       });
 
       if (!matchedNodes.length) {
-        showAlignHint('No graph nodes found for "' + node.name + '".');
+        showAlignHint('No graph nodes found for "' + node.name + '".', true);
         return;
       }
 
@@ -18578,7 +18583,7 @@ async function openHyperEdgeFromContext() {
   // Collect all edges touching the hub and their non-hub endpoints
   var participantEdges = hubCy.connectedEdges();
   if (!participantEdges.length) {
-    showAlignHint('This HyperEdge hub has no connected edges in the current graph view.');
+    showAlignHint('This HyperEdge hub has no connected edges in the current graph view.', true);
     return;
   }
 
@@ -18619,7 +18624,7 @@ async function openHyperEdgeFromContext() {
   });
 
   if (_rc.nodes.length < 2) {
-    showAlignHint('Could not find enough participant nodes for this HyperEdge in the current graph view.');
+    showAlignHint('Could not find enough participant nodes for this HyperEdge in the current graph view.', true);
     return;
   }
 
@@ -18777,13 +18782,24 @@ function setFocusNode(id) {
 }
 
 var _alignHintTimer = null;
-function showAlignHint(msg) {
+// persistent=true: stays until the user closes it with the ✕ (otherwise auto-hides after 3 s).
+function showAlignHint(msg, persistent) {
   var toast = document.getElementById('align-toast');
   if (!toast) return;
-  toast.textContent = msg;
-  toast.style.display = 'block';
   clearTimeout(_alignHintTimer);
-  _alignHintTimer = setTimeout(function() { toast.style.display = 'none'; }, 3000);
+  toast.textContent = msg;
+  toast.style.pointerEvents = 'none';
+  if (persistent) {
+    var x = document.createElement('span');
+    x.textContent = '✕';
+    x.title = 'Close';
+    x.style.cssText = 'margin-left:14px;cursor:pointer;color:#8a90a8;font-size:13px';
+    x.onclick = function() { toast.style.display = 'none'; };
+    toast.appendChild(x);
+    toast.style.pointerEvents = 'auto';
+  }
+  toast.style.display = 'block';
+  if (!persistent) _alignHintTimer = setTimeout(function() { toast.style.display = 'none'; }, 3000);
 }
 
 function alignNodesHorizontally() {
