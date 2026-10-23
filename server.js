@@ -5260,7 +5260,10 @@ const RNEF_IMPORT_MAX_MSGS = 20000;     // messages kept in memory for the dialo
 const _userRnefImportJobs  = new Map(); // username -> job
 
 function _collectRnefFiles(target) {
-  if (fs.statSync(target).isFile()) return [target];
+  if (fs.statSync(target).isFile()) {
+    if (!/\.(rnef|xml)$/i.test(target)) throw new Error('Only files with the extensions .rnef and .xml can be imported.');
+    return [target];
+  }
   const out = [];
   (function walk(dir) {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -5415,8 +5418,15 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
   const job = _userRnefImportJobs.get(req.user.username);
   if (!job) return res.json({ running: false, done: false, noJob: true });
   const since = Math.max(parseInt(req.query.since, 10) || 0, job.base);
+  // Keep the login alive for as long as an import is running: an import can outlast the
+  // 12 h token, and once it expired the dialog lost its live view (the import itself keeps
+  // running — it is a separate process). While the job runs, every poll that has less than
+  // 6 h left on its token gets a fresh 12 h one in X-Auth-Token; the client swaps it in.
+  if (job.running && req.user.exp && req.user.exp - Math.floor(Date.now() / 1000) < 6 * 3600) {
+    res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h' }));
+  }
   res.json({ running: job.running, done: job.done, exitCode: job.exitCode, error: job.error,
-             filesTotal: job.filesTotal, logFile: job.logFile,
+             startedAt: job.startedAt, filesTotal: job.filesTotal, logFile: job.logFile,
              messages: job.messages.slice(since - job.base), next: job.base + job.messages.length });
 });
 
