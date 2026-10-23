@@ -95,13 +95,14 @@ class PostgreSQL:
     self.futures = [] # futures of reference retrieval
     
     try:
-      self.db = psycopg2.connect(
+      self.conn_params = dict(
           database = APIconfig['postgreSQLdb'],
           host = APIconfig['postgreSQLhost'],
           user = APIconfig['postgreSQLuser'],
           password = APIconfig['postgreSQLpswd'],
           port = APIconfig['postgreSQLport']
         )
+      self.db = psycopg2.connect(**self.conn_params)
       print('Connected to Postgres')
     except Exception as e:
       self.db = None
@@ -737,17 +738,27 @@ class PostgreSQL:
       Identifier(self.schema), Identifier('reference'),
       Identifier(RELATION_ID), SQL(' OR ').join(clauses)
     )
-    positions,idtype2id,relids = zip(*search4refs)
-    parameters = [list(positions), [Json(ids) for ids in idtype2id], list(relids)]
-    with self.db.cursor() as cur:
+    def query_chunk(chunk:list)->list[int]:
+      # psycopg2 serializes queries on a connection, so each chunk needs its own connection to run in parallel.
+      conn = psycopg2.connect(**self.conn_params)
       try:
-        #sql_str = cur.mogrify(query, parameters).decode(self.db.encoding) # for debug only
-        #sql_template = query.as_string(self.db) # for debug only
-        cur.execute(query, parameters)
-        missing_positions.update(row[0] for row in cur.fetchall())
-      except Exception:
-        self.db.rollback()
-        raise
+        conn.set_session(readonly=True, autocommit=True)
+        positions,idtype2id,relids = zip(*chunk)
+        parameters = [list(positions), [Json(ids) for ids in idtype2id], list(relids)]
+        with conn.cursor() as cur:
+          #sql_str = cur.mogrify(query, parameters).decode(conn.encoding) # for debug only
+          cur.execute(query, parameters)
+          return [row[0] for row in cur.fetchall()]
+      finally:
+        conn.close()
+
+    QUERY_CHUNK_ROWS = 20000
+    MAX_QUERY_THREADS = 8
+    chunks = [search4refs[start:start + QUERY_CHUNK_ROWS] for start in range(0, len(search4refs), QUERY_CHUNK_ROWS)]
+    with ThreadPoolExecutor(max_workers=min(MAX_QUERY_THREADS, len(chunks)), thread_name_prefix='RefsNotExist') as ex:
+      futures = [ex.submit(query_chunk, chunk) for chunk in chunks]
+      for future in as_completed(futures):
+        missing_positions.update(future.result())
 
     for position in missing_positions:
       ids, relid, ref = identifiers[position]
