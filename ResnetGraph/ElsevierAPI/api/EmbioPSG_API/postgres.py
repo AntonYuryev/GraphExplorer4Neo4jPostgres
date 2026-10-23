@@ -671,7 +671,7 @@ class PostgreSQL:
           chunk = node_rows[start:start + INSERT_CHUNK_ROWS]
           cur.execute(node_sql, [list(values) for values in zip(*chunk)])
           inserted_count += cur.rowcount
-        print(f'Inserted {inserted_count} out of {len(node_rows)} nodes into Postgres.')
+        print(f'Inserted {inserted_count} out of {len(node_rows)} nodes in chunks of {INSERT_CHUNK_ROWS} into Postgres')
     return inserted_count
 
 
@@ -823,7 +823,7 @@ class PostgreSQL:
           self.db.rollback()
           raise e
   
-    print(f'Inserted {inserted_count} references; skipped {len(rows)-inserted_count} duplicate rows')
+    print(f'Inserted {inserted_count} references in chunks of {INSERT_CHUNK_ROWS}; skipped {len(rows)-inserted_count} duplicate rows')
     return inserted_count
 
 
