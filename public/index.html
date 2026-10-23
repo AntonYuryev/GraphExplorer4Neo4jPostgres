@@ -535,6 +535,10 @@
       <label style="font-size:12px;color:#7a8099">Path of an RNEF file, or of a folder containing RNEF files (or type/paste it)</label>
       <input type="text" id="irn-path" placeholder="e.g. C:\GraphExplorer\TestData\RNEF\Abcuro (KLRG1+ T-cells)  — Explorer: Shift+right-click → Copy as path" autocomplete="off" oninput="_irnPathTyped()" onkeydown="if(event.key==='Enter')runRnefImport()">
 
+      <label style="font-size:12px;color:#7a8099;display:block;margin-top:10px">Source for imported relations (pick an existing value or type a new one; optional)</label>
+      <input type="text" id="irn-source" list="irn-source-list" placeholder="Source" autocomplete="off">
+      <datalist id="irn-source-list"></datalist>
+
       <!-- Runtime messages printed by import_rnef (rnef_import_runner.py), streamed live;
            the same messages are written to a log file opened via the button below. -->
       <div id="irn-status" style="display:none;margin-top:12px;font-size:12px;color:#c0c4d4"></div>
