@@ -2911,6 +2911,19 @@ var _irnPollHandle = null;
 var _irnSince = 0;        // index of the next runtime message to fetch
 var _irnRunning = false;  // an import is in progress (dialog reopen must not wipe its output)
 
+// Fills the Source drop-down with the distinct Source values in Postgres (the same list the
+// "Sources" filter button uses); any other value can still be typed in.
+function _irnFillSources() {
+  function fill() {
+    var dl = document.getElementById('irn-source-list');
+    dl.innerHTML = _allSources.map(function (v) { return '<option value="' + escHtml(String(v)) + '"></option>'; }).join('');
+  }
+  if (_allSources.length) { fill(); return; }
+  api('/api/references/sources', null, 'GET')
+    .then(function (sources) { _allSources = Array.isArray(sources) ? sources : []; fill(); })
+    .catch(function () {});
+}
+
 function openImportRnefDialog() {
   document.getElementById('import-rnef-modal').style.display = 'flex';
   if (_irnRunning) return;   // reopened mid-run: keep showing its live output
@@ -2923,6 +2936,7 @@ function openImportRnefDialog() {
   document.getElementById('irn-summary').innerHTML = '';
   document.getElementById('irn-path').value = '';
   document.getElementById('irn-run-btn').disabled = true;
+  _irnFillSources();
   _irnReattach();
 }
 
@@ -3011,7 +3025,7 @@ async function runRnefImport() {
     if (!targetPath) { errEl.textContent = 'Enter the path of an RNEF file or folder.'; errEl.style.display = ''; statusEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
     statusEl.textContent = 'Starting…';
     // Only the path is sent — import_rnef reads the file(s) itself, a portion at a time.
-    await api('/api/import/rnef/start', { path: targetPath });
+    await api('/api/import/rnef/start', { path: targetPath, addSource: document.getElementById('irn-source').value.trim() });
   } catch (e) {
     errEl.textContent = e.message || String(e);
     errEl.style.display = '';
