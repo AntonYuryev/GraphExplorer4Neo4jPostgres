@@ -27,7 +27,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)   # makes the `ResnetGraph...` package importable
 
 
-def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000):
+def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_source=''):
     """Reads the RNEF files in batches and imports each batch into Neo4j and Postgres.
     APIconfig: connection settings (built by the App from the user's Neo4j/Postgres settings)."""
     # imported here (not at module level) so a missing/broken dependency is raised
@@ -44,11 +44,12 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000):
     batch_counter = 0
     for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size):
         batch_counter += 1
+        [rel.set_property('Source',add_source) for rel in rels]
         imported_nodes, imported_rels, imported_refs = neo4j.importGraph(nodes, rels)
         total_created_nodes += imported_nodes
         total_imported_rels += imported_rels
         total_imported_refs += imported_refs
-        print(f"Batch {batch_counter} of size {batch_size} relations: Imported {imported_nodes} nodes, {imported_rels} relations, and {imported_refs} references", flush=True)
+        print(f"Batch {batch_counter} with {len(rels)} relations: Imported {imported_nodes} nodes, {imported_rels} relations, and {imported_refs} references", flush=True)
         print(f"Imported so far {total_created_nodes} nodes, {total_imported_rels} relations, and {total_imported_refs} references\n\n", flush=True)
     # color final statistics in red
     print(f"\033[91mTotal imported count: {total_created_nodes} nodes, {total_imported_rels} relations and {total_imported_refs} references\033[0m")
@@ -78,6 +79,7 @@ def main() -> int:
     rnef_files = job['rnef_files']
     batch_size = int(job.get('batch_size') or 50000)
     log_file = job['log_file']
+    add_source = (job.get('add_source') or '').strip()
 
     from ResnetGraph.ElsevierAPI.utils.utils import Tee
     err_stream = sys.stderr
@@ -92,7 +94,7 @@ def main() -> int:
                 print(f'  ... and {len(rnef_files) - 5} more', flush=True)
             started = time.time()
 
-            import_rnef(api_config, rnef_files, batch_size=batch_size)
+            import_rnef(api_config, rnef_files, batch_size=batch_size, add_source=add_source)
 
             print(f'Import finished OK in {time.time() - started:.1f}s', flush=True)
         except BaseException:
