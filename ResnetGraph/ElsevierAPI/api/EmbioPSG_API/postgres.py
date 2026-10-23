@@ -661,6 +661,7 @@ class PostgreSQL:
 
     INSERT_CHUNK_ROWS = 20000
     inserted_count = 0
+    print(f'Inserting {len(node_rows)} nodes and {len(attributes)} attributes in chunks of {INSERT_CHUNK_ROWS} into Postgres')
     with self.db:
       with self.db.cursor() as cur:
         attribute_rows = list(attributes.values())
@@ -671,7 +672,7 @@ class PostgreSQL:
           chunk = node_rows[start:start + INSERT_CHUNK_ROWS]
           cur.execute(node_sql, [list(values) for values in zip(*chunk)])
           inserted_count += cur.rowcount
-        print(f'Inserted {inserted_count} out of {len(node_rows)} nodes in chunks of {INSERT_CHUNK_ROWS} into Postgres')
+        print(f'Inserted {inserted_count} out of {len(node_rows)} nodes into Postgres')
     return inserted_count
 
 
@@ -811,6 +812,7 @@ class PostgreSQL:
     # all-or-nothing.
     INSERT_CHUNK_ROWS = 20000
     inserted_count = 0
+    print(f'Inserting {len(rows)} references in chunks of {INSERT_CHUNK_ROWS}')
     with self.db:
       with self.db.cursor() as cur:
         try:
@@ -823,7 +825,7 @@ class PostgreSQL:
           self.db.rollback()
           raise e
   
-    print(f'Inserted {inserted_count} references in chunks of {INSERT_CHUNK_ROWS}; skipped {len(rows)-inserted_count} duplicate rows')
+    print(f'Inserted {inserted_count} references; skipped {len(rows)-inserted_count} duplicate rows')
     return inserted_count
 
 
