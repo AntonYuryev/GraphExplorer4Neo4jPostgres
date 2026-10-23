@@ -778,9 +778,11 @@ class PostgreSQL:
     Return inserted row count.
     '''
     rows = []
+    missing_ref_count = 0
     for relid, missing_refs in relid2refs.items():
       for ref in missing_refs:
         rows.extend(ref.postgres_refs(relid))
+        missing_ref_count += 1
 
     if not rows:
       return 0
@@ -812,7 +814,7 @@ class PostgreSQL:
     # all-or-nothing.
     INSERT_CHUNK_ROWS = 20000
     inserted_count = 0
-    print(f'Inserting {len(rows)} references in chunks of {INSERT_CHUNK_ROWS}')
+    print(f'Inserting {len(rows)} rows for {missing_ref_count} references in chunks of {INSERT_CHUNK_ROWS}')
     with self.db:
       with self.db.cursor() as cur:
         try:
@@ -825,7 +827,7 @@ class PostgreSQL:
           self.db.rollback()
           raise e
   
-    print(f'Inserted {inserted_count} references; skipped {len(rows)-inserted_count} duplicate rows')
+    print(f'Inserted {inserted_count} rows; skipped {len(rows)-inserted_count} duplicate rows')
     return inserted_count
 
 
