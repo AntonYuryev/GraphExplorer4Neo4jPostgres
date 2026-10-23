@@ -850,6 +850,10 @@ async function api(path, body, methodOrAuth) {
   if (body !== null && body !== undefined) opts.body = JSON.stringify(body);
 
   var res = await fetch(path, opts);
+  // The server hands back a renewed token while a long-running job (Import RNEF) is polled,
+  // so a login that would expire mid-import keeps working.
+  var _renewed = res.headers.get('X-Auth-Token');
+  if (_renewed && auth) { authToken = _renewed; try { sessionStorage.setItem('authToken', _renewed); } catch (e) {} }
   var data = await res.json().catch(function() { return {}; });
   if (res.status === 401) {
     // Token expired or invalid — log out and return to login screen automatically.
@@ -2867,6 +2871,7 @@ function openImportRnefDialog() {
   document.getElementById('irn-summary').innerHTML = '';
   document.getElementById('irn-path').value = '';
   document.getElementById('irn-run-btn').disabled = true;
+  _irnReattach();
 }
 
 // Opens a native file/folder dialog on the machine running the server and puts the chosen
@@ -2939,6 +2944,55 @@ async function runRnefImport() {
 // Polls for the messages import_rnef has printed since the last poll
 // and appends them to the message pane (auto-scrolling only if the user was
 // already at the bottom, so scrolling back to read earlier output isn't fought).
+// Final state of a run: summary line, the log button, and a note (kept in localStorage) that
+// this run's outcome has been shown, so reopening the dialog later starts clean again.
+function _irnShowDone(job) {
+  _irnRunning = false;
+  document.getElementById('irn-run-btn').disabled = false;
+  var ok = !job.error && job.exitCode === 0;
+  var summaryEl = document.getElementById('irn-summary');
+  summaryEl.innerHTML = ok
+    ? '<b style="color:#7ee8a2">Import finished.</b>'
+    : '<b style="color:#e05560">Import failed.</b> ' + escHtml(job.error || '');
+  summaryEl.style.display = '';
+  // The log file holds every message of the run — offer it once the run is over.
+  if (job.logFile) document.getElementById('irn-log-btn').style.display = '';
+  document.getElementById('irn-status').innerHTML = '';
+  var msgEl = document.getElementById('irn-messages');
+  msgEl.scrollTop = msgEl.scrollHeight;
+  try { localStorage.setItem('irn_seen_done', String(job.startedAt)); } catch (e) {}
+}
+
+// Opening the dialog (e.g. after logging in again, or reloading the page) reattaches to an
+// import that is still running — or one that finished while nobody was watching — and shows
+// its messages so far. The import itself never depended on the browser: it is a separate
+// process on the server.
+async function _irnReattach() {
+  try {
+    var job = await api('/api/import/rnef/progress?since=0', null, 'GET');
+    if (job.noJob) return;
+    var seen = null;
+    try { seen = localStorage.getItem('irn_seen_done'); } catch (e) {}
+    if (!job.running && String(job.startedAt) === seen) return;   // outcome already shown before
+
+    var msgEl = document.getElementById('irn-messages');
+    msgEl.style.display = '';
+    msgEl.textContent = (job.messages || []).join('\n');
+    msgEl.scrollTop = msgEl.scrollHeight;
+    _irnSince = job.next;
+    document.getElementById('irn-status').style.display = '';
+    if (job.running) {
+      _irnRunning = true;
+      document.getElementById('irn-run-btn').disabled = true;
+      document.getElementById('irn-status').innerHTML = '<span style="color:#8fb8ff">⏳ An import is running — reattached (' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + ')…</span>';
+      if (_irnPollHandle) clearTimeout(_irnPollHandle);
+      _irnPollHandle = setTimeout(_pollRnefImportProgress, 1000);
+    } else {
+      _irnShowDone(job);
+    }
+  } catch (e) { /* no job / not logged in: nothing to show */ }
+}
+
 async function _pollRnefImportProgress() {
   var statusEl = document.getElementById('irn-status');
   var msgEl = document.getElementById('irn-messages');
@@ -2957,19 +3011,7 @@ async function _pollRnefImportProgress() {
       ? ''
       : '<span style="color:#8fb8ff">⏳ Importing ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + '…</span>';
 
-    if (job.done) {
-      _irnRunning = false;
-      document.getElementById('irn-run-btn').disabled = false;
-      var ok = !job.error && job.exitCode === 0;
-      summaryEl.innerHTML = ok
-        ? '<b style="color:#7ee8a2">Import finished.</b>'
-        : '<b style="color:#e05560">Import failed.</b> ' + escHtml(job.error || '');
-      summaryEl.style.display = '';
-      // The log file holds every message of the run — offer it once the run is over.
-      if (job.logFile) document.getElementById('irn-log-btn').style.display = '';
-      msgEl.scrollTop = msgEl.scrollHeight;
-      return;
-    }
+    if (job.done) { _irnShowDone(job); return; }
 
     _irnPollHandle = setTimeout(_pollRnefImportProgress, 1000);
   } catch (e) {
