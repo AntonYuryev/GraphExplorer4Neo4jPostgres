@@ -5435,7 +5435,12 @@ app.get('/api/import/rnef/log', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const job = _userRnefImportJobs.get(req.user.username);
   if (!job || !job.logPath || !fs.existsSync(job.logPath)) return res.status(404).json({ error: 'No import log available yet.' });
-  res.type('text/plain; charset=utf-8').sendFile(job.logPath);   // logPath is server-generated, never user input
+  // logPath is server-generated, never user input. The file keeps the raw ANSI colour codes
+  // (red/blue totals); a browser tab can't render them, so they are stripped when served.
+  fs.readFile(job.logPath, 'utf8', (err, text) => {
+    if (err) return res.status(500).json({ error: 'Cannot read the import log.' });
+    res.type('text/plain; charset=utf-8').send(text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''));
+  });
 });
 
 // GET /api/schema/relation-types  — distinct Neo4j relationship types
