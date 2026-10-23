@@ -658,14 +658,20 @@ class PostgreSQL:
       'AS incoming(id, name, value) ON CONFLICT (id) DO NOTHING'
     ).format(Identifier(self.schema), Identifier('attr'))
 
+    INSERT_CHUNK_ROWS = 20000
+    inserted_count = 0
     with self.db:
       with self.db.cursor() as cur:
-        if attributes:
-          cur.execute(attr_sql, [list(values) for values in zip(*attributes.values())])
-        cur.execute(node_sql, [list(values) for values in zip(*node_rows)])
-        inserted_count = cur.rowcount
+        attribute_rows = list(attributes.values())
+        for start in range(0, len(attribute_rows), INSERT_CHUNK_ROWS):
+          chunk = attribute_rows[start:start + INSERT_CHUNK_ROWS]
+          cur.execute(attr_sql, [list(values) for values in zip(*chunk)])
+        for start in range(0, len(node_rows), INSERT_CHUNK_ROWS):
+          chunk = node_rows[start:start + INSERT_CHUNK_ROWS]
+          cur.execute(node_sql, [list(values) for values in zip(*chunk)])
+          inserted_count += cur.rowcount
         print(f'Inserted {inserted_count} out of {len(node_rows)} nodes into Postgres.')
-    return len(node_rows)
+    return inserted_count
 
 
   def refExists(self, ref:Reference, _4relid:int)->bool:
