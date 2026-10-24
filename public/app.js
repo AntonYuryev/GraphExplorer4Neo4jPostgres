@@ -2929,6 +2929,30 @@ function _irnFillSources() {
     .catch(function () {});
 }
 
+var _irnLogPath = '';   // full path of the current import's log file (from the progress poll)
+
+function closeImportRnefDialog() {
+  document.getElementById('import-rnef-modal').style.display = 'none';
+  if (_irnRunning) {
+    showAlignHint('Import will continue to run in the background. You can check its status by opening log file ' + (_irnLogPath || 'import_logs'), true);
+  }
+}
+
+async function stopRnefImport() {
+  if (!_irnRunning) return;
+  if (!confirm('Stop the running import?\n\nBatches already imported stay in the databases; the batch in progress is lost. Re-running the import later is safe.')) return;
+  var btn = document.getElementById('irn-stop-btn');
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/import/rnef/stop', {});
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    var errEl = document.getElementById('irn-error');
+    errEl.textContent = e.message || String(e);
+    errEl.style.display = '';
+  }
+}
+
 function openImportRnefDialog() {
   document.getElementById('import-rnef-modal').style.display = 'flex';
   if (_irnRunning) return;   // reopened mid-run: keep showing its live output
@@ -2972,8 +2996,18 @@ async function _irnBrowse(kind) {
 }
 
 // Import is enabled once a path has been typed.
+// While an import runs the Import button, the pickers and the inputs are locked.
+function _irnSetBusy(busy) {
+  _irnRunning = busy;
+  var stopBtn = document.getElementById('irn-stop-btn');
+  if (stopBtn) { stopBtn.style.display = busy ? '' : 'none'; stopBtn.disabled = false; }
+  ['irn-browse-file', 'irn-browse-folder', 'irn-path', 'irn-source'].forEach(function(id) {
+    var el = document.getElementById(id); if (el) el.disabled = busy;
+  });
+  _irnPathTyped();
+}
 function _irnPathTyped() {
-  document.getElementById('irn-run-btn').disabled = !document.getElementById('irn-path').value.trim();
+  document.getElementById('irn-run-btn').disabled = _irnRunning || !document.getElementById('irn-path').value.trim();
 }
 
 // Appends lines to the message pane, turning ANSI colour codes (e.g. the red/blue totals that
@@ -3009,6 +3043,7 @@ function _irnAppendAnsi(el, lines) {
 }
 
 async function runRnefImport() {
+  if (_irnRunning) return;   // Enter in the path box must not start a second import
   var errEl = document.getElementById('irn-error');
   var statusEl = document.getElementById('irn-status');
   var msgEl = document.getElementById('irn-messages');
@@ -3022,12 +3057,12 @@ async function runRnefImport() {
   _irnAnsiColor = null;
   _irnSince = 0;
 
-  document.getElementById('irn-run-btn').disabled = true;
+  _irnSetBusy(true);
   statusEl.style.display = '';
 
   try {
     var targetPath = document.getElementById('irn-path').value.trim();
-    if (!targetPath) { errEl.textContent = 'Enter the path of an RNEF file or folder.'; errEl.style.display = ''; statusEl.style.display = 'none'; document.getElementById('irn-run-btn').disabled = false; return; }
+    if (!targetPath) { errEl.textContent = 'Enter the path of an RNEF file or folder.'; errEl.style.display = ''; statusEl.style.display = 'none'; _irnSetBusy(false); return; }
     statusEl.textContent = 'Starting…';
     // Only the path is sent — import_rnef reads the file(s) itself, a portion at a time.
     await api('/api/import/rnef/start', { path: targetPath, addSource: document.getElementById('irn-source').value.trim() });
@@ -3035,7 +3070,7 @@ async function runRnefImport() {
     errEl.textContent = e.message || String(e);
     errEl.style.display = '';
     statusEl.style.display = 'none';
-    document.getElementById('irn-run-btn').disabled = false;
+    _irnSetBusy(false);
     return;
   }
 
@@ -3051,8 +3086,7 @@ async function runRnefImport() {
 // Final state of a run: summary line, the log button, and a note (kept in localStorage) that
 // this run's outcome has been shown, so reopening the dialog later starts clean again.
 function _irnShowDone(job) {
-  _irnRunning = false;
-  document.getElementById('irn-run-btn').disabled = false;
+  _irnSetBusy(false);
   var ok = !job.error && job.exitCode === 0;
   var summaryEl = document.getElementById('irn-summary');
   summaryEl.innerHTML = ok
@@ -3075,6 +3109,7 @@ async function _irnReattach() {
   try {
     var job = await api('/api/import/rnef/progress?since=0', null, 'GET');
     if (job.noJob) return;
+    if (job.logPath) _irnLogPath = job.logPath;
     var seen = null;
     try { seen = localStorage.getItem('irn_seen_done'); } catch (e) {}
     if (!job.running && String(job.startedAt) === seen) return;   // outcome already shown before
@@ -3088,8 +3123,7 @@ async function _irnReattach() {
     _irnSince = job.next;
     document.getElementById('irn-status').style.display = '';
     if (job.running) {
-      _irnRunning = true;
-      document.getElementById('irn-run-btn').disabled = true;
+      _irnSetBusy(true);
       document.getElementById('irn-status').innerHTML = '<span style="color:#8fb8ff">⏳ An import is running — reattached (' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + ')…</span>';
       if (_irnPollHandle) clearTimeout(_irnPollHandle);
       _irnPollHandle = setTimeout(_pollRnefImportProgress, 1000);
@@ -3105,7 +3139,8 @@ async function _pollRnefImportProgress() {
   var summaryEl = document.getElementById('irn-summary');
   try {
     var job = await api('/api/import/rnef/progress?since=' + _irnSince, null, 'GET');
-    if (job.noJob) { _irnRunning = false; return; }
+    if (job.noJob) { _irnSetBusy(false); return; }
+    if (job.logPath) _irnLogPath = job.logPath;
 
     if (job.messages && job.messages.length) {
       var atBottom = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight < 30;
@@ -3122,8 +3157,7 @@ async function _pollRnefImportProgress() {
     _irnPollHandle = setTimeout(_pollRnefImportProgress, 1000);
   } catch (e) {
     statusEl.innerHTML += '<br><span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
-    document.getElementById('irn-run-btn').disabled = false;
-    _irnRunning = false;
+    _irnSetBusy(false);
   }
 }
 
