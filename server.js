@@ -5330,6 +5330,7 @@ function _startRnefImport(req, res, target, addSource) {
 
   const child = spawn(PYTHON_CMD, ['-u', RNEF_IMPORT_RUNNER, jobFile],
     { cwd: __dirname, env: Object.assign({}, process.env, { PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' }) });
+  job.child = child;   // kept so POST /api/import/rnef/stop can end it
   const lineFeeder = () => {
     let buf = '';
     return (chunk) => {
@@ -5347,7 +5348,9 @@ function _startRnefImport(req, res, target, addSource) {
   const finish = (code, err) => {
     if (job.done) return;
     job.running = false; job.done = true; job.exitCode = code;
-    if (err) job.error = err; else if (code !== 0) job.error = `The import script exited with code ${code}.`;
+    if (job.stopRequested) job.error = 'Import was stopped by the user.';
+    else if (err) job.error = err; else if (code !== 0) job.error = `The import script exited with code ${code}.`;
+    job.child = null;
     try { fs.rmSync(tmpDir, { recursive: true }); } catch (e) {}
   };
   child.on('error', (err) => finish(-1, `Could not start Python (${PYTHON_CMD}): ${err.message}`));
@@ -5427,8 +5430,25 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
     res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h' }));
   }
   res.json({ running: job.running, done: job.done, exitCode: job.exitCode, error: job.error,
-             startedAt: job.startedAt, filesTotal: job.filesTotal, logFile: job.logFile,
+             startedAt: job.startedAt, filesTotal: job.filesTotal, logFile: job.logFile, logPath: job.logPath,
              messages: job.messages.slice(since - job.base), next: job.base + job.messages.length });
+});
+
+// POST /api/import/rnef/stop — ends this user's running import by killing the Python process
+// (and anything it started). Batches already committed to Neo4j/Postgres stay; the batch in
+// flight is lost (a dropped Postgres connection rolls its transaction back).
+app.post('/api/import/rnef/stop', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const job = _userRnefImportJobs.get(req.user.username);
+  if (!job || !job.running || !job.child) return res.status(409).json({ error: 'No import is running.' });
+  job.stopRequested = true;
+  const msg = 'Import stopped by the user.';
+  _pushImportMsg(job, '\x1b[93m' + msg + '\x1b[0m');
+  try { fs.appendFileSync(job.logPath, '\n' + msg + '\n'); } catch (e) {}
+  const pid = job.child.pid;
+  if (process.platform === 'win32') execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
+  else { try { job.child.kill('SIGKILL'); } catch (e) {} }
+  res.json({ stopping: true });
 });
 
 // GET /api/import/rnef/log — this user's most recent import log file.
