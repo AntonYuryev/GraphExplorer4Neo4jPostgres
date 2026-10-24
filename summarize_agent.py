@@ -88,6 +88,15 @@ class ChatMessage(BaseModel):
     cypher: Optional[str] = None
 
 
+# the default summary outline, in order: focus mode -> section title
+DEFAULT_SECTIONS = {
+    'introduction':   'Introduction',
+    'molecular_cell': 'Molecular and Cellular Interactions',
+    'physiology':     'Physiology',
+    'organ_system':   'Organ System',
+}
+
+
 class SummarizeRequest(BaseModel):
     llm: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -685,6 +694,9 @@ Make sure to mention {graph2analyze.name()} and {context_names}."""
 
       use_default_context, context_nodes, focus_mode, pubyear_range, use_general_knowledge = self.parse_message()
 
+      if _is_summary_request(self.message):
+        focus_mode = None   # default summary: always the four-section outline, never Methods/Procedures
+
       if pubyear_range:
         graph2analyze = graph2analyze.filter_rels_by_year(min_year=pubyear_range[0], max_year=pubyear_range[1])
         intro_line += f"Will filter supporting sentences to those published between {pubyear_range[0]} and {pubyear_range[1]}.\n"
@@ -700,14 +712,18 @@ Make sure to mention {graph2analyze.name()} and {context_names}."""
       prompt = self.prompt_introduction(graph2analyze, use_general_knowledge=use_general_knowledge)
       prompt += self.focus_nodes_section(context_nodes)
       if focus_mode:
-        prompts.append(prompt+self.focus_section("follow-up", graph2analyze, context_nodes))
+        # "methods" -> "Experimental Methods", "procedures" -> "Medical Procedures": dedicated prompts
+        prompts.append(prompt+self.focus_section(focus_mode, graph2analyze, context_nodes))
       else:
         if is_followup:
           prompts.append(self.focus_section("follow-up", graph2analyze, context_nodes))
         else:
-          sections = ["introduction", "molecular_cell", "physiology", "organ_system"]
-          for mode in sections:
-            prompts.append(prompt+self.focus_section(mode, graph2analyze, context_nodes))
+          for mode in DEFAULT_SECTIONS:
+            title = DEFAULT_SECTIONS[mode]
+            prompts.append(prompt + self.focus_section(mode, graph2analyze, context_nodes)
+              + f"\n\nOUTPUT FORMAT (mandatory): the first line of your reply must be exactly \"## {title}\". "
+                "Then write plain paragraphs. Do NOT add any other headings, sub-sections, titles or bullet lists, "
+                "and do not write sections for any other topic — the other sections are written separately.\n")
 
       # Strings are immutable — `p += ...` in a for-loop rebinds the local var
       # and leaves the list unchanged.  Use a list comprehension instead.
@@ -863,7 +879,11 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
         req.neo4j_node_types = _runtime_("neo4j_node_types")()
         req.neo4j_relation_types = _runtime_("neo4j_relation_types")()
         is_followup = False
-        if req.history:
+        if _is_summary_request(req.message):
+          # the app's own "Summarize…" buttons (or a bare "summarize") always get the default outline,
+          # even when the graph scope is "all" or the chat already has history
+          is_followup = False
+        elif req.history:
           is_followup = True
         elif req.scope != "selected" and req.message:
           # if req.scope == "selected" agent gets default message but it's not considered a follow-up
@@ -884,6 +904,9 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
             return {"reply": intro_line, "llm_reference_count": 0, "was_truncated": False}
 
         futures = []
+        # prompts of the default outline carry their mandatory section title (see _system_prompts_)
+        section_titles = [(m.group(1) if m else None) for m in
+                          (re.search(r'must be exactly "## ([^"]+)"', p) for p in system_prompts)]
         reply_text = intro_line
         was_truncated = False
         # Each worker thread needs its OWN copy of the current context so that
@@ -902,7 +925,7 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
                 thread_ctx = contextvars.copy_context()
                 futures.append(executor.submit(thread_ctx.run, _call_summarize_llm, messages, llm, prompt))
 
-            for future in futures:
+            for f_idx, future in enumerate(futures):
                 try:
                     prompt_reply, prompt_reply_was_truncated = future.result()
                     if prompt_reply_was_truncated:
@@ -913,6 +936,10 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
                     _reply_body = re.sub(r'^#+[^\n]*\n?', '', prompt_reply.strip(),
                                           flags=re.MULTILINE).strip()
                     if prompt_reply and not _reply_body.lower().startswith("no information available"):
+                        if section_titles[f_idx]:
+                            # enforce the default outline: drop any heading the model wrote itself
+                            # and start the section with its canonical title
+                            prompt_reply = f"## {section_titles[f_idx]}\n\n{_reply_body}"
                         reply_text += "\n\n" + prompt_reply
                 except Exception as section_exc:
                     log.error("Section LLM call failed: %s", section_exc, exc_info=True)
@@ -1047,6 +1074,14 @@ def _uses_general_knowledge_(message: str) -> bool:
         r'what\s+do\s+you\s+know|known\s+(?:in\s+literature|from\s+literature))\b',
         msg, re.IGNORECASE
     ))
+
+
+def _is_summary_request(message: str) -> bool:
+    '''True for the default "summarize" requests (the Summarize buttons' messages or a bare
+    "summarize"/"summary"), which must produce the fixed outline rather than a free-form answer.'''
+    msg = str(message or '').strip()
+    return bool(re.match(r'^(please\s+)?(summari[sz]e|summary)\s*[.!]?\s*$', msg, re.IGNORECASE)
+                or re.match(r'^summari[sz]e\s+(all\s+relations|the\s+\d+\s+selected)', msg, re.IGNORECASE))
 
 
 def _focusON_(message: str) -> Optional[str]:
