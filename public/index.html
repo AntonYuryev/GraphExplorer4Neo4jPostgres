@@ -546,7 +546,8 @@
       <div id="irn-summary" style="display:none;margin-top:10px;font-size:12px"></div>
       <div class="modal-actions" style="margin-top:12px">
         <button class="btn-ghost" id="irn-log-btn" style="display:none" onclick="openRnefImportLog()">📄 Open log file</button>
-        <button class="btn-ghost" onclick="document.getElementById('import-rnef-modal').style.display='none'">Close</button>
+        <button class="btn-ghost" id="irn-stop-btn" style="display:none;color:#e05560;border-color:#e05560" onclick="stopRnefImport()">■ Stop</button>
+        <button class="btn-ghost" onclick="closeImportRnefDialog()">Close</button>
         <button class="btn-primary" id="irn-run-btn" onclick="runRnefImport()" disabled>Import</button>
       </div>
     </div>
