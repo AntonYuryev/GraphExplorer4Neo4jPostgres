@@ -751,6 +751,7 @@ function showApp() {
     // Database endpoint (URL/host) configuration is admin-only
     document.getElementById('settings-db-admin-section').style.display = '';
     document.getElementById('mi-import-rnef').style.display = '';
+    document.getElementById('mi-curate').style.display = '';
   }
   // Initialise Agentic AI (show button, load LLM config)
   window._currentUser = { name: currentUser, role: currentRole };
@@ -2927,6 +2928,215 @@ function _irnFillSources() {
   api('/api/references/sources', null, 'GET')
     .then(function (sources) { _allSources = Array.isArray(sources) ? sources : []; fill(); })
     .catch(function () {});
+}
+
+// ── Database → Curate ───────────────────────────────────────────────────────
+// Steps come from the server (parsed from GraphCurator.cypher); each has a checkbox. The run itself
+// is a background job on the server: closing the dialog (or reloading the page) does not stop it,
+// and reopening the dialog reattaches to it.
+var _curSteps = [];          // [{id, num, name, label}]
+var _curRunning = false;
+var _curSince = 0;
+var _curPollHandle = null;
+var _CUR_ICON = { pending: '○', running: '⏳', done: '✓', error: '✗', stopped: '■', skipped: '–' };
+var _CUR_COLOR = { pending: '#7a8099', running: '#8fb8ff', done: '#7ee8a2', error: '#e05560', stopped: '#ffd166', skipped: '#4a5068' };
+
+var _curClockSkew = 0;   // server clock minus browser clock, so live timers match the server's timestamps
+// 45.2 s | 3 min 07 s | 2 h 05 min 09 s  (same format as the server's log)
+function _curFmt(ms) {
+  var total = Math.max(0, Math.round(ms / 1000));
+  var h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  if (h) return h + ' h ' + pad(m) + ' min ' + pad(s) + ' s';
+  if (m) return m + ' min ' + pad(s) + ' s';
+  return (Math.max(0, ms) / 1000).toFixed(1) + ' s';
+}
+
+function _curStepLabel(s) { return s.num ? 'Step ' + s.num : 'Postgres'; }
+
+function _curRenderSteps(jobSteps) {
+  var box = document.getElementById('cur-steps');
+  var prevChecked = {};
+  Array.prototype.forEach.call(box.querySelectorAll('input[type=checkbox]'), function (cb) { prevChecked[cb.value] = cb.checked; });
+  var byId = {};
+  (jobSteps || []).forEach(function (s) { byId[s.id] = s; });
+  var TD = 'padding:4px 6px;vertical-align:middle;text-align:left;border-bottom:1px solid #1a1f33;';
+  var rows = _curSteps.map(function (s) {
+    var js = byId[s.id];
+    var checked = js ? js.status !== 'skipped' : (s.id in prevChecked ? prevChecked[s.id] : true);
+    var status = js && js.status !== 'skipped' ? js.status : '';
+    var extra = js && js.result !== undefined ? ' <span style="color:#7a8099;white-space:nowrap">(' + Number(js.result).toLocaleString() + ' changed)</span>' : '';
+    var elapsed = '';
+    if (js && js.status === 'running' && js.startedAt) elapsed = _curFmt(Date.now() + _curClockSkew - js.startedAt);
+    else if (js && js.elapsedMs !== undefined) elapsed = _curFmt(js.elapsedMs);
+    var cbId = 'cur-cb-' + s.id;
+    return '<tr title="' + escHtml(s.label || '') + '">'
+      + '<td style="' + TD + 'text-align:center"><input type="checkbox" id="' + cbId + '" value="' + escHtml(s.id) + '"' + (checked ? ' checked' : '') + (_curRunning ? ' disabled' : '') + ' onchange="_curUpdateCount()" style="width:auto;margin:0;vertical-align:middle"></td>'
+      + '<td style="' + TD + 'text-align:center;color:' + (_CUR_COLOR[status] || '#7a8099') + '">' + (status ? _CUR_ICON[status] : '') + '</td>'
+      + '<td style="' + TD + 'color:#7a8099;white-space:nowrap"><label for="' + cbId + '" style="margin:0;display:inline;cursor:pointer">' + _curStepLabel(s) + '</label></td>'
+      + '<td style="' + TD + 'color:' + (status === 'running' ? '#8fb8ff' : '#c8cde4') + '"><label for="' + cbId + '" style="margin:0;display:inline;cursor:pointer;color:inherit">' + escHtml(s.name) + '</label>' + extra + '</td>'
+      + '<td style="' + TD + 'text-align:right;white-space:nowrap;color:' + (status === 'running' ? '#8fb8ff' : '#7a8099') + '">' + elapsed + '</td>'
+      + '</tr>';
+  }).join('');
+  box.innerHTML = '<table style="width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px">'
+    + '<colgroup><col style="width:34px"><col style="width:30px"><col style="width:76px"><col><col style="width:118px"></colgroup>'
+    + '<tbody>' + rows + '</tbody></table>';
+  _curUpdateCount();
+}
+
+function _curChecked() {
+  return Array.prototype.map.call(document.querySelectorAll('#cur-steps input[type=checkbox]:checked'), function (cb) { return cb.value; });
+}
+function _curUpdateCount() {
+  var n = _curChecked().length;
+  document.getElementById('cur-count').textContent = n + ' of ' + _curSteps.length + ' steps selected';
+  document.getElementById('cur-run-btn').disabled = _curRunning || n === 0;
+}
+function _curSelectAll(on) {
+  if (_curRunning) return;
+  Array.prototype.forEach.call(document.querySelectorAll('#cur-steps input[type=checkbox]'), function (cb) { cb.checked = on; });
+  _curUpdateCount();
+}
+function _curSetBusy(busy) {
+  _curRunning = busy;
+  var stopBtn = document.getElementById('cur-stop-btn');
+  if (stopBtn) { stopBtn.style.display = busy ? '' : 'none'; stopBtn.disabled = false; }
+  ['cur-all-btn', 'cur-none-btn'].forEach(function (id) { document.getElementById(id).disabled = busy; });
+  _curUpdateCount();
+}
+
+async function openCurateDialog() {
+  document.getElementById('curate-modal').style.display = 'flex';
+  var errEl = document.getElementById('cur-error');
+  errEl.style.display = 'none';
+  if (_curRunning) return;   // reopened mid-run: keep the live view
+  try {
+    var data = await api('/api/curate/steps', null, 'GET');
+    _curSteps = data.steps || [];
+    document.getElementById('cur-file').textContent = data.file ? data.file.split('\\').join('/') : 'GraphCurator.cypher';
+    _curRenderSteps(null);
+  } catch (e) {
+    errEl.textContent = e.message || String(e);
+    errEl.style.display = '';
+    return;
+  }
+  _curReattach();
+}
+
+// Interrupts the run: the server terminates the running Neo4j transaction (Neo4j rolls it back) and
+// cancels the running Postgres query. Steps that already finished stay applied.
+async function stopCurate() {
+  if (!_curRunning) return;
+  if (!confirm('Stop the curation run?\n\nThe step in progress is rolled back; steps that already finished stay applied and the remaining steps will not run.')) return;
+  var btn = document.getElementById('cur-stop-btn');
+  if (btn) btn.disabled = true;
+  document.getElementById('cur-status').innerHTML = '<span style="color:#ffd166">■ Stopping…</span>';
+  try {
+    await api('/api/curate/stop', {});
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    var errEl = document.getElementById('cur-error');
+    errEl.textContent = e.message || String(e);
+    errEl.style.display = '';
+  }
+}
+
+function closeCurateDialog() {
+  document.getElementById('curate-modal').style.display = 'none';
+  if (_curRunning) showAlignHint('Curation will continue to run in the background. Reopen Database → Curate to see its progress.', true);
+}
+
+async function runCurate() {
+  if (_curRunning) return;
+  var ids = _curChecked();
+  if (!ids.length) return;
+  if (!confirm('Run ' + ids.length + ' curation step(s) on the current Neo4j database?\n\nThe steps merge and delete relations and cannot be undone.')) return;
+  var errEl = document.getElementById('cur-error');
+  errEl.style.display = 'none';
+  var msgEl = document.getElementById('cur-messages');
+  msgEl.textContent = '';
+  _irnAnsiColor = null;
+  _curSince = 0;
+  _curSetBusy(true);
+  try {
+    await api('/api/curate/start', { steps: ids });
+  } catch (e) {
+    errEl.textContent = e.message || String(e);
+    errEl.style.display = '';
+    _curSetBusy(false);
+    return;
+  }
+  document.getElementById('cur-progress').style.display = '';
+  msgEl.style.display = '';
+  if (_curPollHandle) clearTimeout(_curPollHandle);
+  _pollCurate();
+}
+
+// Reopening the dialog (or a page reload) reattaches to a run that is still going, or shows the
+// outcome of the last one.
+async function _curReattach() {
+  try {
+    var job = await api('/api/curate/progress?since=0', null, 'GET');
+    if (job.noJob) return;
+    var msgEl = document.getElementById('cur-messages');
+    msgEl.style.display = '';
+    msgEl.textContent = '';
+    _irnAnsiColor = null;
+    _irnAppendAnsi(msgEl, job.messages || []);
+    msgEl.scrollTop = msgEl.scrollHeight;
+    _curSince = job.next;
+    document.getElementById('cur-progress').style.display = '';
+    _curApplyJob(job);
+    if (job.running) {
+      _curSetBusy(true);
+      _curRenderSteps(job.steps);
+      if (_curPollHandle) clearTimeout(_curPollHandle);
+      _curPollHandle = setTimeout(_pollCurate, 1000);
+    }
+  } catch (e) { /* no job / not allowed: nothing to show */ }
+}
+
+function _curApplyJob(job) {
+  if (job.serverNow) _curClockSkew = job.serverNow - Date.now();
+  _curRenderSteps(job.steps);
+  var totalElapsed = job.done && job.totalMs != null ? job.totalMs : (job.startedAt ? Date.now() + _curClockSkew - job.startedAt : 0);
+  var totalHtml = ' <span style="color:#7a8099">— ' + (job.done ? 'total elapsed time ' : 'elapsed ') + _curFmt(totalElapsed) + '</span>';
+  var sel = (job.steps || []).filter(function (s) { return s.status !== 'skipped'; });
+  var done = sel.filter(function (s) { return s.status === 'done'; }).length;
+  document.getElementById('cur-bar').style.width = (sel.length ? Math.round(100 * done / sel.length) : 0) + '%';
+  var st = document.getElementById('cur-status');
+  if (job.running && job.current) {
+    st.innerHTML = '<span style="color:#8fb8ff">⏳ ' + job.current.index + ' of ' + job.current.total + ' — '
+      + escHtml((job.current.num ? 'Step ' + job.current.num + ': ' : '') + job.current.name) + '</span>' + totalHtml
+      + (job.detail ? '<br><span style="color:#7a8099">' + escHtml(job.detail) + '</span>' : '');
+  } else if (job.done) {
+    st.innerHTML = job.stopped
+      ? '<b style="color:#ffd166">Curation stopped.</b> ' + done + ' step(s) completed before the stop; the step in progress was rolled back.'
+      : job.error
+      ? '<b style="color:#e05560">Curation failed.</b> ' + escHtml(job.error)
+      : '<b style="color:#7ee8a2">Curation finished.</b> ' + done + ' step(s) completed.';
+    st.innerHTML += totalHtml;
+  }
+}
+
+async function _pollCurate() {
+  var msgEl = document.getElementById('cur-messages');
+  try {
+    var job = await api('/api/curate/progress?since=' + _curSince, null, 'GET');
+    if (job.noJob) { _curSetBusy(false); return; }
+    if (job.messages && job.messages.length) {
+      var atBottom = msgEl.scrollHeight - msgEl.scrollTop - msgEl.clientHeight < 30;
+      _irnAppendAnsi(msgEl, job.messages);
+      if (atBottom) msgEl.scrollTop = msgEl.scrollHeight;
+    }
+    _curSince = job.next;
+    _curApplyJob(job);
+    if (job.done) { _curSetBusy(false); _curRenderSteps(job.steps); return; }
+    _curPollHandle = setTimeout(_pollCurate, 1000);
+  } catch (e) {
+    document.getElementById('cur-status').innerHTML += '<br><span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+    _curSetBusy(false);
+  }
 }
 
 var _irnLogPath = '';   // full path of the current import's log file (from the progress poll)
