@@ -345,6 +345,7 @@
         <div class="menu-separator"></div>
         <!-- Admin only — bulk write to the shared Neo4j/Postgres databases. Shown via showApp() like the other admin-only menu items. -->
         <div class="menu-item" id="mi-import-rnef" style="display:none" onclick="openImportRnefDialog();closeMenus()">Import RNEF</div>
+        <div class="menu-item" id="mi-curate" style="display:none" onclick="openCurateDialog();closeMenus()">Curate</div>
         <div class="menu-separator"></div>
         <div class="menu-item" onclick="openStatisticsDialog();closeMenus()">Statistics</div>
       </div>
@@ -512,6 +513,34 @@
       <div class="modal-actions" style="margin-top:12px">
         <button class="btn-ghost" onclick="document.getElementById('statistics-modal').style.display='none'">Close</button>
         <button class="btn-primary" onclick="refreshStatistics()">↻ Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Curate modal (admin only — runs GraphCurator.cypher against the current Neo4j database) -->
+  <div id="curate-modal" class="modal-backdrop" style="display:none">
+    <div class="modal-box" style="width:960px;max-width:96vw" onclick="event.stopPropagation()">
+      <h3>Database → Curate</h3>
+      <p style="font-size:11px;color:#7a8099;margin-bottom:8px">
+        Runs the curation steps of <code id="cur-file">GraphCurator.cypher</code> against the current Neo4j database. First the reference and sentence counts are refreshed from Postgres; then each ticked step runs in order.
+        <b>The steps merge and delete relations and cannot be undone.</b>
+      </p>
+      <div id="cur-error" class="error-msg" style="display:none"></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;font-size:12px">
+        <button type="button" class="btn-ghost" id="cur-all-btn" onclick="_curSelectAll(true)">Select all</button>
+        <button type="button" class="btn-ghost" id="cur-none-btn" onclick="_curSelectAll(false)">Select none</button>
+        <span id="cur-count" style="color:#7a8099"></span>
+      </div>
+      <div id="cur-steps" style="max-height:420px;overflow:auto;border:1px solid #2d3147;border-radius:6px;padding:6px 8px;background:#0d1020;font-size:12px"></div>
+      <div id="cur-progress" style="display:none;margin-top:10px">
+        <div style="height:8px;background:#1a1f33;border-radius:4px;overflow:hidden"><div id="cur-bar" style="height:100%;width:0;background:#4a7bd0;transition:width .3s"></div></div>
+        <div id="cur-status" style="margin-top:6px;font-size:12px;color:#c0c4d4"></div>
+      </div>
+      <pre id="cur-messages" style="display:none;margin:8px 0 0;height:150px;overflow:auto;background:#0d1020;border:1px solid #2d3147;border-radius:6px;padding:8px 10px;font-size:11px;line-height:1.4;white-space:pre-wrap;color:#c8cde4"></pre>
+      <div class="modal-actions" style="margin-top:12px">
+        <button class="btn-ghost" id="cur-stop-btn" style="display:none;color:#e05560;border-color:#e05560" onclick="stopCurate()">■ Stop</button>
+        <button class="btn-ghost" onclick="closeCurateDialog()">Close</button>
+        <button class="btn-primary" id="cur-run-btn" onclick="runCurate()" disabled>Run curation</button>
       </div>
     </div>
   </div>
