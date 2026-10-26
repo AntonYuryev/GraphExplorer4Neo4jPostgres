@@ -346,6 +346,7 @@
         <!-- Admin only — bulk write to the shared Neo4j/Postgres databases. Shown via showApp() like the other admin-only menu items. -->
         <div class="menu-item" id="mi-import-rnef" style="display:none" onclick="openImportRnefDialog();closeMenus()">Import RNEF</div>
         <div class="menu-item" id="mi-curate" style="display:none" onclick="openCurateDialog();closeMenus()">Curate</div>
+        <div class="menu-item" id="mi-refcount" style="display:none" onclick="openCurateDialog('refcount');closeMenus()">Refresh Reference count</div>
         <div class="menu-separator"></div>
         <div class="menu-item" onclick="openStatisticsDialog();closeMenus()">Statistics</div>
       </div>
@@ -520,8 +521,8 @@
   <!-- Curate modal (admin only — runs GraphCurator.cypher against the current Neo4j database) -->
   <div id="curate-modal" class="modal-backdrop" style="display:none">
     <div class="modal-box" style="width:960px;max-width:96vw" onclick="event.stopPropagation()">
-      <h3>Database → Curate</h3>
-      <p style="font-size:11px;color:#7a8099;margin-bottom:8px">
+      <h3 id="cur-title">Database → Curate</h3>
+      <p id="cur-desc" style="font-size:11px;color:#7a8099;margin-bottom:8px">
         Runs the curation steps of <code id="cur-file">GraphCurator.cypher</code> against the current Neo4j database. First the reference and sentence counts are refreshed from Postgres; then each ticked step runs in order.
         <b>The steps merge and delete relations and cannot be undone.</b>
       </p>
