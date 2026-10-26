@@ -51,5 +51,5 @@ DatabasePowerRelease.zip
 *.rnef
 *.zip
 
-# Database -> Import RNEF run logs (one per run; contain runtime messages)
-import_logs/
+# Run logs: logs/import_logs (Database -> Import RNEF) and logs/curation_logs (Database -> Curate), one file per run
+logs/
