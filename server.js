@@ -5529,7 +5529,7 @@ function _pushCurateMsg(job, line) {
   }
 }
 
-// Step 1 of a curation run: refresh RelationNumberOfSentences / RelationNumberOfReferences from Postgres. The work is
+// The first row of a curation run: refresh RelationNumberOfSentences / RelationNumberOfReferences from Postgres. The work is
 // done by neo4j_nx.update_refcount() (ResnetGraph/ElsevierAPI/api/EmbioPSG_API/PSnx2Neo4j.py), started through
 // curation_runner.py the way Import RNEF starts rnef_import_runner.py: the neo4j_nx instance is built from the
 // current user's own Neo4j/Postgres settings (APIconfig), passed through a private job file that the runner deletes
@@ -5540,7 +5540,7 @@ function _curateStepUpdateRefcount(job, username) {
     try { apiConfig = _buildImportApiConfig(username); } catch (e) { return reject(e); }
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curatejob-'));
     const jobFile = path.join(tmpDir, 'job.json');
-    fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig }), { mode: 0o600 });
+    fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig, only_greater: job.onlyGreater !== false }), { mode: 0o600 });
     const cleanup = () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {} };
 
     const child = spawn(PYTHON_CMD, ['-u', CURATION_RUNNER, jobFile],
@@ -5601,8 +5601,154 @@ async function _curateInterrupt(job, neo) {
   await Promise.all(tasks);
 }
 
+// The driving statement and the batch size of an apoc.periodic.iterate(...) call, read from the step's own Cypher
+// (first string argument; "//" comment lines before it are skipped). null when the step has no such call.
+function _curateParseIterate(query) {
+  const i = query.search(/apoc\.periodic\.iterate\s*\(/i);
+  if (i < 0) return null;
+  let p = query.indexOf('(', i) + 1;
+  for (;;) {
+    while (p < query.length && /\s/.test(query[p])) p++;
+    if (query.startsWith('//', p)) { p = query.indexOf('\n', p); if (p < 0) return null; } else break;
+  }
+  const q = query[p];
+  if (q !== '"' && q !== "'") return null;
+  let j = p + 1, driving = '';
+  while (j < query.length && query[j] !== q) {
+    if (query[j] === '\\') { driving += query[j + 1]; j += 2; } else driving += query[j++];
+  }
+  const bs = query.match(/batchSize\s*:\s*(\d+)/i);
+  return { driving: driving.trim(), batchSize: bs ? Number(bs[1]) : 10000 };
+}
+
+// A step that runs through apoc.periodic.iterate / apoc.periodic.commit sits in ONE blocking call and only returns its
+// totals when it is finished. While it runs, this monitor polls, from a second session every few seconds:
+//   * CALL apoc.periodic.list()  — whatever periodic jobs APOC reports (shown only when it returns something);
+//   * the relationship count (the count store answers instantly) — merging relations makes it fall, so the drop since
+//     the step started is the number of relations merged away so far.
+// For apoc.periodic.iterate steps it also makes a ROUGH estimate of what is left, without touching the database:
+//   * the number of start nodes of the driving statement gives the number of transactions (nodes / batchSize);
+//   * the number of relations the step will merge away is estimated by running the step's grouping read-only on a random
+//     sample of ~20,000 start nodes and scaling up to all of them;
+//   * progress = merged so far / expected, and the time left follows from the rate so far.
+// The latest state is the status line (job.detail); a message is logged when it changes, at most every 30 s.
+function _curateMonitorPeriodic(job, neo, step) {
+  const POLL_MS = 5000, LOG_EVERY_MS = 30000, SAMPLE_NODES = 10000, MIN_TX_FOR_ESTIMATE = 20, EST_TX_TIMEOUT_MS = 15 * 60 * 1000;
+  const started = Date.now();
+  let stopped = false, wake = null, baseline = null, lastText = '', lastLogged = 0, listError = null;
+  let startNodes = null, expectedMerges = null, estNote = 'estimating the size of the step…';
+  const fmt = n => Number(n).toLocaleString('en-US');
+  const val = v => (v && typeof v.toNumber === 'function' ? v.toNumber() : (v === null || v === undefined ? '' : v));
+  const sleep = ms => new Promise(r => { wake = r; setTimeout(r, ms); });
+  const info = step && step.query ? _curateParseIterate(step.query) : null;
+  if (!info) estNote = '';
+
+  // estimate of the size of the step, in the background (its own session; queries time out by themselves)
+  if (info) {
+    (async () => {
+      const session = neo.driver.session({ database: neo.database });
+      const tx = Object.assign({}, _curateTx(job), { timeout: EST_TX_TIMEOUT_MS });
+      try {
+        const r1 = await session.run('CALL { ' + info.driving + ' } RETURN count(*) AS n', {}, tx);
+        startNodes = Number(val(r1.records[0].get('n')));
+        const txs = Math.ceil(startNodes / info.batchSize);
+        _pushCurateMsg(job, `    ${fmt(startNodes)} start nodes → about ${fmt(txs)} transaction(s) of ${fmt(info.batchSize)}`);
+        if (stopped || !startNodes) { estNote = ''; return; }
+        // A time estimate is pointless for a short step, and the sample is extra load on Neo4j's shared transaction-memory
+        // limit while the step's own batches are running — so only large steps get one.
+        if (txs < MIN_TX_FOR_ESTIMATE) { estNote = ''; return; }
+        const p = Math.min(1, SAMPLE_NODES / startNodes);
+        // Which sample query to run: a step can carry its own in a comment line  //ESTIMATE: <cypher>  (it must use $p, and
+        // {DRIVING} stands for the driving statement; it returns sampleN and merges = relations the step will merge away).
+        // Without one, a step whose driving statement returns the start node a is treated like Step 1 (same-type merge).
+        const annotated = (step.query.match(/^[ \t]*\/\/[ \t]*ESTIMATE:[ \t]*(.+)$/m) || [])[1];
+        let estQuery = annotated ? annotated.split('{DRIVING}').join(info.driving) : null;
+        if (!estQuery && /RETURN\s+a\s*$/i.test(info.driving)) {
+          estQuery = 'CALL { ' + info.driving + ' } WITH a WHERE rand() < $p WITH collect(a) AS sample ' +
+            'UNWIND sample AS a MATCH (a)-[r]->(b) ' +
+            'WITH size(sample) AS sampleN, a, b, type(r) AS t, count(r) AS c WHERE c > 1 ' +
+            'RETURN sampleN, sum(c - 1) AS merges';
+        }
+        if (!estQuery) { estNote = ''; return; }   // nothing to estimate for this step (e.g. a one-for-one conversion)
+        const r2 = await session.run(estQuery, { p }, tx);
+        if (r2.records.length) {
+          const sampleN = Number(val(r2.records[0].get('sampleN'))), merges = Number(val(r2.records[0].get('merges')));
+          if (sampleN > 0) {
+            expectedMerges = Math.round(merges * startNodes / sampleN);
+            _pushCurateMsg(job, `    estimated ${fmt(expectedMerges)} relations to merge away (sample of ${fmt(sampleN)} of ${fmt(startNodes)} — rough: very large nodes make it uncertain)`);
+          }
+        }
+        estNote = expectedMerges ? '' : 'could not estimate the total (the sample found nothing to merge)';
+      } catch (e) {
+        estNote = '';
+        if (!stopped) _pushCurateMsg(job, '    no time estimate' + (/memory/i.test(e.message) ? ' (Neo4j transaction memory limit reached while sampling)' : ': ' + e.message));
+      } finally { await session.close(); }
+    })().catch(() => {});
+  }
+
+  const progressEstimate = (merged) => {
+    if (!info || !startNodes) return { stable: estNote, timeLeft: '' };
+    const txTotal = Math.ceil(startNodes / info.batchSize);
+    if (!expectedMerges) return { stable: `about ${fmt(txTotal)} transactions in total` + (estNote ? ' — ' + estNote : ''), timeLeft: '' };
+    const elapsed = Date.now() - started;
+    if (merged < 100 || elapsed < 30000) return { stable: `about ${fmt(txTotal)} transactions in total — collecting data for a time estimate…`, timeLeft: '' };
+    const frac = Math.min(0.99, merged / expectedMerges);
+    const left = elapsed * (1 - frac) / frac;
+    return { stable: `~${Math.round(frac * 100)}% (about transaction ${fmt(Math.max(1, Math.round(frac * txTotal)))} of ${fmt(txTotal)})`,
+             timeLeft: `roughly ${_fmtDuration(left)} left (rough estimate)` };
+  };
+
+  const loop = (async () => {
+    const session = neo.driver.session({ database: neo.database });
+    try {
+      while (!stopped && !job.cancelRequested) {
+        let periodic = [];
+        try {
+          const res = await session.run('CALL apoc.periodic.list()');   // standalone call: returns all of its columns
+          periodic = res.records.map(r => r.keys.map(k => k + '=' + val(r.get(k))).join(', '));
+        } catch (e) { if (!listError) { listError = e.message; _pushCurateMsg(job, 'apoc.periodic.list() is not available: ' + e.message); } }
+        let relText = '', merged = 0;
+        try {
+          const c = await session.run('MATCH ()-[r]->() RETURN count(r) AS c');
+          const n = val(c.records[0].get('c'));
+          if (baseline === null) baseline = n;
+          merged = Math.max(0, baseline - n);
+          relText = (merged ? fmt(merged) + ' relationships merged away so far (' + fmt(n) + ' left in the database)' : fmt(n) + ' relationships in the database');
+        } catch (e) { /* the count is a bonus; ignore */ }
+        const listText = periodic.length ? 'apoc.periodic.list(): ' + periodic.join(' | ') : '';   // apoc.periodic.iterate batches are normally not listed there
+        const est = progressEstimate(merged);
+        const stable = [listText, relText, est.stable].filter(Boolean).join(' — ');
+        const text = est.timeLeft ? stable + ' — ' + est.timeLeft : stable;
+        job.detail = text + ' — running for ' + _fmtDuration(Date.now() - started);
+        // the time left changes on every poll — it must not make the line "new"; only real progress does
+        if (stable !== lastText && Date.now() - lastLogged >= LOG_EVERY_MS) {
+          _pushCurateMsg(job, '    progress: ' + text);
+          lastLogged = Date.now();
+          lastText = stable;
+        }
+        if (!stopped && !job.cancelRequested) await sleep(POLL_MS);
+      }
+    } finally { await session.close(); }
+  })().catch(() => {});
+
+  return { stop: async () => { stopped = true; if (wake) wake(); await loop; } };
+}
+
+async function _curateRelCount(neo) {
+  const session = neo.driver.session({ database: neo.database });
+  try {
+    const r = await session.run('MATCH ()-[r]->() RETURN count(r) AS c');
+    const v = r.records[0].get('c');
+    return v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v);
+  } catch (e) { return null; }
+  finally { await session.close(); }
+}
+
 async function _runCurate(job, selected, neo) {
   const total = selected.length;
+  const fmtN = n => Number(n).toLocaleString('en-US');
+  job.relsBefore = await _curateRelCount(neo);
+  if (job.relsBefore !== null) _pushCurateMsg(job, 'Relationships in the database before the run: ' + fmtN(job.relsBefore));
   try {
     for (let i = 0; i < total; i++) {
       if (job.cancelRequested) throw new Error('Stopped by the user');
@@ -5617,16 +5763,33 @@ async function _runCurate(job, selected, neo) {
           await _curateStepUpdateRefcount(job, job.username);
         } else {
           const session = neo.driver.session({ database: neo.database });
+          const monitor = /apoc\.periodic\.(iterate|commit)/i.test(step.query) ? _curateMonitorPeriodic(job, neo, step) : null;
           try {
             const res = await session.run(step.query, {}, _curateTx(job));
+            const num = v => (v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v || 0));
             const out = res.records.map(r => {
-              const c = r.get('mergedCount');
-              const n = c && typeof c.toNumber === 'function' ? c.toNumber() : c;
+              const n = num(r.get('mergedCount'));
               js.result = n;
-              return `${r.get('merge_type')}: ${Number(n).toLocaleString('en-US')}`;
+              let text = `${r.get('merge_type')}: ${n.toLocaleString('en-US')}`;
+              // apoc.periodic.iterate steps also return failedCount and errors (a map: message -> number of times)
+              if (r.keys.includes('failedCount')) {
+                const failed = num(r.get('failedCount'));
+                js.failed = failed;
+                if (failed > 0) {
+                  text += ', \x1b[91m' + failed.toLocaleString('en-US') + ' failed\x1b[0m';
+                  const errs = r.get('errors') || {};
+                  Object.keys(errs).slice(0, 5).forEach(msg =>
+                    _pushCurateMsg(job, '\x1b[91m    failed (' + num(errs[msg]).toLocaleString('en-US') + 'x): ' + String(msg).slice(0, 400) + '\x1b[0m'));
+                  if (Object.keys(errs).length > 5) _pushCurateMsg(job, '\x1b[91m    … and ' + (Object.keys(errs).length - 5) + ' more error message(s)\x1b[0m');
+                }
+              }
+              return text;
             });
-            _pushCurateMsg(job, '    → ' + (out.join('; ') || 'no rows returned'));
-          } finally { await session.close(); }
+            _pushCurateMsg(job, '    → ' + (out.join('; ') || 'no rows returned') + (js.failed > 0 ? ' — the failed operations were rolled back; run the step again to retry them' : ''));
+          } finally {
+            if (monitor) await monitor.stop();
+            await session.close();
+          }
         }
         js.status = 'done';
       } catch (e) {
@@ -5651,6 +5814,13 @@ async function _runCurate(job, selected, neo) {
   } finally {
     job.finishedAt = Date.now();
     job.totalMs = job.finishedAt - job.startedAt;
+    job.relsAfter = await _curateRelCount(neo);
+    if (job.relsAfter !== null) {
+      const diff = job.relsBefore === null ? null : job.relsBefore - job.relsAfter;
+      _pushCurateMsg(job, '\x1b[92mRelationships in the database after the run: ' + fmtN(job.relsAfter) +
+        (job.relsBefore === null ? '' : ' (before: ' + fmtN(job.relsBefore) + ', ' + (diff >= 0 ? fmtN(diff) + ' fewer' : fmtN(-diff) + ' more') + ')') +
+        (job.error ? ' — the run did not finish' : '') + '\x1b[0m');
+    }
     // per-step summary, then the total (steps that did not run are left out)
     const ran = job.steps.filter(s => s.elapsedMs !== undefined);
     if (ran.length) {
@@ -5680,7 +5850,9 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   let all;
   try { all = [PG_COUNTS_STEP].concat(_loadCuratorSteps()); }
   catch (e) { return res.status(500).json({ error: 'Cannot read GraphCurator.cypher: ' + e.message }); }
-  const wanted = new Set(Array.isArray((req.body || {}).steps) ? req.body.steps.map(String) : []);
+  // mode 'refcount' (Database -> Refresh Reference count): only the Postgres-counts step, with only_greater = False
+  const mode = (req.body || {}).mode === 'refcount' ? 'refcount' : 'curate';
+  const wanted = mode === 'refcount' ? new Set([PG_COUNTS_STEP.id]) : new Set(Array.isArray((req.body || {}).steps) ? req.body.steps.map(String) : []);
   const selected = all.filter(s => wanted.has(s.id));
   if (!selected.length) return res.status(400).json({ error: 'Select at least one step.' });
   if (!req.neo4j || !req.neo4j.driver) return res.status(400).json({ error: 'Neo4j connection is not configured.' });
@@ -5688,6 +5860,7 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   const job = {
     running: true, done: false, error: null, startedAt: Date.now(), detail: '', current: null,
     token: _crypto.randomBytes(12).toString('hex'), cancelRequested: false, stopped: false, username,
+    kind: mode, onlyGreater: mode !== 'refcount',
     neo: req.neo4j,
     steps: all.map(s => ({ id: s.id, num: s.num, name: s.name, status: wanted.has(s.id) ? 'pending' : 'skipped' })),
     messages: [], base: 0,
@@ -5695,11 +5868,12 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   try {
     fs.mkdirSync(CURATE_LOG_DIR, { recursive: true });
     const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    job.logPath = path.join(CURATE_LOG_DIR, `curation_${username.replace(/[^A-Za-z0-9_-]/g, '_')}_${stamp}.log`);
+    job.logPath = path.join(CURATE_LOG_DIR, `${mode === 'refcount' ? 'refcount' : 'curation'}_${username.replace(/[^A-Za-z0-9_-]/g, '_')}_${stamp}.log`);
     fs.writeFileSync(job.logPath, '');
   } catch (e) { job.logPath = null; console.warn('[curate] cannot create log file:', e.message); }
   _userCurateJobs.set(username, job);
   if (job.logPath) _pushCurateMsg(job, `Log file: ${job.logPath}`);
+  if (mode === 'refcount') _pushCurateMsg(job, 'Refresh Reference count: update_refcount(only_greater=False) — every relation whose sentence count differs from Postgres is updated');
   _pushCurateMsg(job, `Selected ${selected.length} step(s): ${selected.map(s => s.num ? 'Step ' + s.num : 'Postgres counts').join(', ')}`);
   res.json({ started: true, selected: selected.length });
   _runCurate(job, selected, req.neo4j);   // not awaited: runs on the server, independent of the browser
@@ -5724,7 +5898,7 @@ app.get('/api/curate/progress', dbLimiter, authMiddleware, (req, res) => {
   if (job.running && req.user.exp && req.user.exp - Math.floor(Date.now() / 1000) < 6 * 3600) {
     res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h' }));
   }
-  res.json({ running: job.running, done: job.done, error: job.error, stopped: job.stopped,
+  res.json({ running: job.running, done: job.done, error: job.error, stopped: job.stopped, kind: job.kind || 'curate',
              stopping: job.cancelRequested && job.running, startedAt: job.startedAt,
              serverNow: Date.now(), finishedAt: job.finishedAt || null, totalMs: job.totalMs || null,
              current: job.current, detail: job.detail, steps: job.steps,
