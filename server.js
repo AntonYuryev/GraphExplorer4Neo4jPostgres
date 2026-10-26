@@ -3360,8 +3360,14 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
   // 1. Must start with SELECT or WITH (read-only statements only)
   const trimmed = sqlForChecks.trim().toUpperCase();
   const isCreateIndex = trimmed.startsWith('CREATE INDEX');
-  if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('WITH') && !isCreateIndex) {
-    return res.status(400).json({ error: 'Only SELECT / WITH / CREATE INDEX queries are permitted' });
+  // EXPLAIN [ANALYZE] [VERBOSE] [BUFFERS] [FORMAT x] / EXPLAIN (options) is allowed, but only in front of a
+  // SELECT/WITH query (the write-keyword check below still applies to the whole text, so EXPLAIN ANALYZE
+  // cannot be used to run a write).
+  const explainMatch = trimmed.match(/^EXPLAIN(?:\s*\([^)]*\)|(?:\s+(?:ANALYZE|ANALYSE|VERBOSE|COSTS|BUFFERS|SUMMARY|FORMAT\s+\w+))*)?\s+/);
+  const isExplain = !!explainMatch;
+  const coreSql = isExplain ? trimmed.slice(explainMatch[0].length) : trimmed;
+  if (!coreSql.startsWith('SELECT') && !coreSql.startsWith('WITH') && !isCreateIndex) {
+    return res.status(400).json({ error: 'Only SELECT / WITH / EXPLAIN SELECT / CREATE INDEX queries are permitted' });
   }
   // 2. Reject stacked queries (semicolons allow injecting additional statements)
   if (sqlForChecks.includes(';')) {
@@ -5255,7 +5261,38 @@ function _computeUniqueRef(ref, uniqueIdBigInt) {
 //      runtime messages go both to stdout (streamed to the dialog) and a log file;
 //   4. serves that log file so the user can open it when the run is over.
 const RNEF_IMPORT_RUNNER   = process.env.RNEF_IMPORT_RUNNER || path.join(__dirname, 'rnef_import_runner.py');
-const RNEF_IMPORT_LOG_DIR  = path.join(__dirname, 'import_logs');
+// All run logs live under logs/: logs/import_logs (Import RNEF) and logs/curation_logs (Curate).
+const LOGS_DIR             = path.join(__dirname, 'logs');
+const RNEF_IMPORT_LOG_DIR  = path.join(LOGS_DIR, 'import_logs');
+const CURATE_LOG_DIR       = path.join(LOGS_DIR, 'curation_logs');
+// one-time rename of logs written by the previous naming (logs/curate_logs/curate_*.log -> logs/curation_logs/curation_*.log)
+(function migrateOldCurateLogs() {
+  const oldDir = path.join(LOGS_DIR, 'curate_logs');
+  try {
+    if (!fs.existsSync(oldDir)) return;
+    fs.mkdirSync(CURATE_LOG_DIR, { recursive: true });
+    for (const f of fs.readdirSync(oldDir)) {
+      const dest = path.join(CURATE_LOG_DIR, f.replace(/^curate_/, 'curation_'));
+      if (!fs.existsSync(dest)) fs.renameSync(path.join(oldDir, f), dest);
+    }
+    if (!fs.readdirSync(oldDir).length) fs.rmdirSync(oldDir);
+    console.log('[logs] moved logs/curate_logs/ to logs/curation_logs/');
+  } catch (e) { console.warn('[logs] could not move logs/curate_logs/:', e.message); }
+})();
+// one-time move of logs written by earlier versions (<app>/import_logs -> logs/import_logs)
+(function migrateOldImportLogs() {
+  const oldDir = path.join(__dirname, 'import_logs');
+  try {
+    if (!fs.existsSync(oldDir)) return;
+    fs.mkdirSync(RNEF_IMPORT_LOG_DIR, { recursive: true });
+    for (const f of fs.readdirSync(oldDir)) {
+      const dest = path.join(RNEF_IMPORT_LOG_DIR, f);
+      if (!fs.existsSync(dest)) fs.renameSync(path.join(oldDir, f), dest);
+    }
+    if (!fs.readdirSync(oldDir).length) fs.rmdirSync(oldDir);
+    console.log('[logs] moved import_logs/ to logs/import_logs/');
+  } catch (e) { console.warn('[logs] could not move import_logs/:', e.message); }
+})();
 const RNEF_IMPORT_MAX_MSGS = 20000;     // messages kept in memory for the dialog; the log file has everything
 const _userRnefImportJobs  = new Map(); // username -> job
 
@@ -5431,6 +5468,266 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
   }
   res.json({ running: job.running, done: job.done, exitCode: job.exitCode, error: job.error,
              startedAt: job.startedAt, filesTotal: job.filesTotal, logFile: job.logFile, logPath: job.logPath,
+             messages: job.messages.slice(since - job.base), next: job.base + job.messages.length });
+});
+
+// ─── Database → Curate ──────────────────────────────────────────────────────
+// Runs ResnetGraph/scripts/neo4j/GraphCurator.cypher against the current user's Neo4j database.
+// The file is ONE query made of many parts joined by UNION; the parts are split here and run one
+// at a time so the user can pick which steps run and watch which one is executing. Before the
+// Cypher steps, RelationNumberOfReferences / RelationNumberOfSentences are refreshed in Neo4j
+// from Postgres (the script sorts and merges relations by RelationNumberOfReferences).
+// Step names are inferred from the script's own "//STEP n. title" comments, so editing the
+// script is enough — nothing is hardcoded here. Admin only (bulk write to the shared DBs);
+// uses the caller's own Neo4j/Postgres connections.
+const GRAPH_CURATOR_FILE = path.join(__dirname, 'ResnetGraph', 'scripts', 'neo4j', 'GraphCurator.cypher');
+const PG_COUNTS_STEP = { id: 'pg-counts', num: 0, name: 'Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres', label: '' };
+const _userCurateJobs = new Map();   // username -> job
+const CURATE_MAX_MSGS = 5000;
+const CURATION_RUNNER = process.env.CURATION_RUNNER || path.join(__dirname, 'curation_runner.py');
+
+function _loadCuratorSteps() {
+  const text = fs.readFileSync(GRAPH_CURATOR_FILE, 'utf8').replace(/\r\n?/g, '\n');
+  const parts = text.split(/\n[ \t]*UNION[ \t]*\n/);
+  const steps = [];
+  parts.forEach((part) => {
+    const query = part.trim().replace(/;\s*$/, '');
+    if (!query) return;
+    const head = query.match(/^\s*\/\/\s*STEP\s+(\d+)\s*\.?\s*([^\n]*)/i);
+    const label = (query.match(/RETURN\s+["']([^"']+)["']\s+AS\s+merge_type/i) || [])[1] || '';
+    const num = head ? parseInt(head[1], 10) : steps.length + 1;
+    const name = (head ? head[2].trim().replace(/:\s*$/, '') : label) || ('Step ' + num);
+    steps.push({ id: 'cy' + steps.length, num, name, label, query });
+  });
+  // identical titles (e.g. "Merge same type relations" twice) are told apart by the step's result label
+  const seen = {};
+  steps.forEach(s => { seen[s.name] = (seen[s.name] || 0) + 1; });
+  steps.forEach(s => { if (seen[s.name] > 1 && s.label) s.name += ' (' + s.label + ')'; });
+  return steps;
+}
+
+// 45.2 s | 3 min 07 s | 2 h 05 min 09 s
+function _fmtDuration(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  const pad = n => String(n).padStart(2, '0');
+  if (h) return `${h} h ${pad(m)} min ${pad(s)} s`;
+  if (m) return `${m} min ${pad(s)} s`;
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+function _pushCurateMsg(job, line) {
+  // every message also goes to the run's log file (time-stamped; ANSI colour codes kept as printed)
+  if (job.logPath) {
+    try { fs.appendFileSync(job.logPath, `[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${line}\n`); } catch (e) {}
+  }
+  job.messages.push(line);
+  if (job.messages.length > CURATE_MAX_MSGS) {
+    const drop = Math.floor(CURATE_MAX_MSGS / 4);
+    job.messages.splice(0, drop);
+    job.base += drop;
+  }
+}
+
+// Step 1 of a curation run: refresh RelationNumberOfSentences / RelationNumberOfReferences from Postgres. The work is
+// done by neo4j_nx.update_refcount() (ResnetGraph/ElsevierAPI/api/EmbioPSG_API/PSnx2Neo4j.py), started through
+// curation_runner.py the way Import RNEF starts rnef_import_runner.py: the neo4j_nx instance is built from the
+// current user's own Neo4j/Postgres settings (APIconfig), passed through a private job file that the runner deletes
+// as soon as it has read it. Whatever the Python code prints becomes the run's messages.
+function _curateStepUpdateRefcount(job, username) {
+  return new Promise((resolve, reject) => {
+    let apiConfig;
+    try { apiConfig = _buildImportApiConfig(username); } catch (e) { return reject(e); }
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curatejob-'));
+    const jobFile = path.join(tmpDir, 'job.json');
+    fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig }), { mode: 0o600 });
+    const cleanup = () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {} };
+
+    const child = spawn(PYTHON_CMD, ['-u', CURATION_RUNNER, jobFile],
+      { cwd: __dirname, env: Object.assign({}, process.env, { PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' }) });
+    job.child = child;   // lets Stop end it
+    const lineFeeder = () => {
+      let buf = '';
+      const emit = (line) => {
+        if (!line.trim()) return;
+        _pushCurateMsg(job, line);
+        job.detail = line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();   // the dialog's status line shows the latest message
+      };
+      return (chunk) => {
+        buf += chunk.toString('utf8');
+        let m;
+        while ((m = /\r\n|\n|\r/.exec(buf))) { emit(buf.slice(0, m.index)); buf = buf.slice(m.index + m[0].length); }
+        if (buf.length > 4000) { emit(buf); buf = ''; }
+      };
+    };
+    child.stdout.on('data', lineFeeder());
+    child.stderr.on('data', lineFeeder());
+    child.on('error', (err) => { cleanup(); job.child = null; reject(new Error('Could not start Python (' + PYTHON_CMD + '): ' + err.message)); });
+    child.on('close', (code) => {
+      cleanup(); job.child = null;
+      if (job.cancelRequested) reject(new Error('Stopped by the user'));
+      else if (code !== 0) reject(new Error('update_refcount exited with code ' + code + ' — see the messages above.'));
+      else resolve();
+    });
+  });
+}
+
+// Every Cypher transaction of a run carries this metadata so Stop can find it with SHOW TRANSACTIONS.
+function _curateTx(job) { return { metadata: { curateJob: job.token } }; }
+
+// Interrupts whatever the run is doing right now: terminates its Neo4j transactions (rolled back by Neo4j) and ends
+// the Python process of Step 1 (its connections drop, so Neo4j rolls back what it had open). The run's own error
+// handling then sees job.cancelRequested and reports a user stop instead of a failure.
+async function _curateInterrupt(job, neo) {
+  const tasks = [];
+  tasks.push((async () => {
+    const session = neo.driver.session({ database: neo.database });
+    try {
+      const res = await session.run(
+        'SHOW TRANSACTIONS YIELD transactionId, metaData WHERE metaData.curateJob = $job RETURN transactionId', { job: job.token });
+      for (const rec of res.records) {
+        const id = String(rec.get('transactionId'));
+        if (/^[A-Za-z0-9_.:-]+$/.test(id)) await session.run("TERMINATE TRANSACTIONS '" + id + "'");
+      }
+    } catch (e) {
+      _pushCurateMsg(job, 'Could not terminate the Neo4j transaction directly (' + e.message + ') — it will stop when the current statement ends.');
+    } finally { await session.close(); }
+  })());
+  if (job.child) {
+    const pid = job.child.pid;
+    if (process.platform === 'win32') execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => {});
+    else { try { job.child.kill('SIGKILL'); } catch (e) {} }
+  }
+  await Promise.all(tasks);
+}
+
+async function _runCurate(job, selected, neo) {
+  const total = selected.length;
+  try {
+    for (let i = 0; i < total; i++) {
+      if (job.cancelRequested) throw new Error('Stopped by the user');
+      const step = selected[i];
+      const js = job.steps.find(s => s.id === step.id);
+      js.status = 'running'; js.startedAt = Date.now();
+      job.current = { index: i + 1, total, id: step.id, num: step.num, name: step.name };
+      job.detail = '';
+      _pushCurateMsg(job, `[${i + 1}/${total}] ${step.num ? 'Step ' + step.num + ': ' : ''}${step.name}`);
+      try {
+        if (step.id === PG_COUNTS_STEP.id) {
+          await _curateStepUpdateRefcount(job, job.username);
+        } else {
+          const session = neo.driver.session({ database: neo.database });
+          try {
+            const res = await session.run(step.query, {}, _curateTx(job));
+            const out = res.records.map(r => {
+              const c = r.get('mergedCount');
+              const n = c && typeof c.toNumber === 'function' ? c.toNumber() : c;
+              js.result = n;
+              return `${r.get('merge_type')}: ${Number(n).toLocaleString('en-US')}`;
+            });
+            _pushCurateMsg(job, '    → ' + (out.join('; ') || 'no rows returned'));
+          } finally { await session.close(); }
+        }
+        js.status = 'done';
+      } catch (e) {
+        if (job.cancelRequested) { js.status = 'stopped'; throw new Error('Stopped by the user'); }
+        js.status = 'error'; js.error = e.message;
+        throw new Error(`${step.num ? 'Step ' + step.num : 'Postgres counts'} failed: ${e.message}`);
+      } finally {
+        js.elapsedMs = Date.now() - js.startedAt;
+      }
+      _pushCurateMsg(job, `    ✓ done in ${_fmtDuration(js.elapsedMs)}`);
+    }
+    _pushCurateMsg(job, '\x1b[92mCuration finished.\x1b[0m');
+  } catch (e) {
+    if (job.cancelRequested) {
+      job.stopped = true;
+      job.error = 'Stopped by the user.';
+      _pushCurateMsg(job, '\x1b[93mCuration stopped by the user — the step in progress was rolled back and the remaining steps were not run.\x1b[0m');
+    } else {
+      job.error = e.message;
+      _pushCurateMsg(job, '\x1b[91m' + e.message + ' — the remaining steps were not run.\x1b[0m');
+    }
+  } finally {
+    job.finishedAt = Date.now();
+    job.totalMs = job.finishedAt - job.startedAt;
+    // per-step summary, then the total (steps that did not run are left out)
+    const ran = job.steps.filter(s => s.elapsedMs !== undefined);
+    if (ran.length) {
+      _pushCurateMsg(job, 'Elapsed time per step:');
+      ran.forEach(s => _pushCurateMsg(job, `    ${s.num ? 'Step ' + s.num : 'Postgres counts'} (${s.name}): ${_fmtDuration(s.elapsedMs)}${s.status === 'done' ? '' : ' [' + s.status + ']'}`));
+    }
+    _pushCurateMsg(job, '\x1b[94mTotal elapsed time: ' + _fmtDuration(job.totalMs) + '\x1b[0m');
+    job.running = false; job.done = true; job.detail = '';
+  }
+}
+
+app.get('/api/curate/steps', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const steps = _loadCuratorSteps().map(s => ({ id: s.id, num: s.num, name: s.name, label: s.label }));
+    res.json({ steps: [PG_COUNTS_STEP].concat(steps), file: path.relative(__dirname, GRAPH_CURATOR_FILE) });
+  } catch (e) {
+    res.status(500).json({ error: 'Cannot read GraphCurator.cypher: ' + e.message });
+  }
+});
+
+app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const username = req.user.username;
+  const existing = _userCurateJobs.get(username);
+  if (existing && existing.running) return res.status(409).json({ error: 'A curation run is already in progress for your account.' });
+  let all;
+  try { all = [PG_COUNTS_STEP].concat(_loadCuratorSteps()); }
+  catch (e) { return res.status(500).json({ error: 'Cannot read GraphCurator.cypher: ' + e.message }); }
+  const wanted = new Set(Array.isArray((req.body || {}).steps) ? req.body.steps.map(String) : []);
+  const selected = all.filter(s => wanted.has(s.id));
+  if (!selected.length) return res.status(400).json({ error: 'Select at least one step.' });
+  if (!req.neo4j || !req.neo4j.driver) return res.status(400).json({ error: 'Neo4j connection is not configured.' });
+
+  const job = {
+    running: true, done: false, error: null, startedAt: Date.now(), detail: '', current: null,
+    token: _crypto.randomBytes(12).toString('hex'), cancelRequested: false, stopped: false, username,
+    neo: req.neo4j,
+    steps: all.map(s => ({ id: s.id, num: s.num, name: s.name, status: wanted.has(s.id) ? 'pending' : 'skipped' })),
+    messages: [], base: 0,
+  };
+  try {
+    fs.mkdirSync(CURATE_LOG_DIR, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    job.logPath = path.join(CURATE_LOG_DIR, `curation_${username.replace(/[^A-Za-z0-9_-]/g, '_')}_${stamp}.log`);
+    fs.writeFileSync(job.logPath, '');
+  } catch (e) { job.logPath = null; console.warn('[curate] cannot create log file:', e.message); }
+  _userCurateJobs.set(username, job);
+  if (job.logPath) _pushCurateMsg(job, `Log file: ${job.logPath}`);
+  _pushCurateMsg(job, `Selected ${selected.length} step(s): ${selected.map(s => s.num ? 'Step ' + s.num : 'Postgres counts').join(', ')}`);
+  res.json({ started: true, selected: selected.length });
+  _runCurate(job, selected, req.neo4j);   // not awaited: runs on the server, independent of the browser
+});
+
+app.post('/api/curate/stop', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const job = _userCurateJobs.get(req.user.username);
+  if (!job || !job.running) return res.status(409).json({ error: 'No curation run is in progress.' });
+  job.cancelRequested = true;
+  _pushCurateMsg(job, '\x1b[93mStop requested — interrupting the running Neo4j and Postgres statements…\x1b[0m');
+  res.json({ stopping: true });
+  _curateInterrupt(job, job.neo).catch(() => {});
+});
+
+app.get('/api/curate/progress', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const job = _userCurateJobs.get(req.user.username);
+  if (!job) return res.json({ running: false, done: false, noJob: true });
+  const since = Math.max(parseInt(req.query.since, 10) || 0, job.base);
+  // same login-keepalive as the RNEF import: a long run must not lose its live view when the token ages
+  if (job.running && req.user.exp && req.user.exp - Math.floor(Date.now() / 1000) < 6 * 3600) {
+    res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h' }));
+  }
+  res.json({ running: job.running, done: job.done, error: job.error, stopped: job.stopped,
+             stopping: job.cancelRequested && job.running, startedAt: job.startedAt,
+             serverNow: Date.now(), finishedAt: job.finishedAt || null, totalMs: job.totalMs || null,
+             current: job.current, detail: job.detail, steps: job.steps,
              messages: job.messages.slice(since - job.base), next: job.base + job.messages.length });
 });
 
