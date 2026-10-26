@@ -1,5 +1,5 @@
 """
-Database -> Curate, step 1: refreshes RelationNumberOfSentences / RelationNumberOfReferences of the Neo4j
+Database -> Curate, first row ("Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres"): refreshes RelationNumberOfSentences / RelationNumberOfReferences of the Neo4j
 relations from Postgres (neo4j_nx.update_refcount). Started by the App (server.js, _curateStepUpdateRefcount) as:
 
   python curation_runner.py <job.json>
@@ -7,7 +7,8 @@ relations from Postgres (neo4j_nx.update_refcount). Started by the App (server.j
 job.json (written by the App, deleted here as soon as it has been read since it
 contains database credentials):
   {
-    "APIconfig": { ... built by the App from the current user's Neo4j/Postgres settings ... }
+    "APIconfig": { ... built by the App from the current user's Neo4j/Postgres settings ... },
+    "only_greater": true      (optional, default true)
   }
 
 Every line printed here is streamed by the App into the Curate run's messages, which it also writes to
@@ -24,8 +25,10 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)   # makes the `ResnetGraph...` package importable
 
 
-def update_refcount(APIconfig: dict):
-    """APIconfig: connection settings built by the App from the current user's Neo4j/Postgres settings."""
+def update_refcount(APIconfig: dict, only_greater: bool = True):
+    """APIconfig: connection settings built by the App from the current user's Neo4j/Postgres settings.
+    only_greater: True (Database -> Curate) updates only the relations whose sentence count in Postgres exceeds
+    RelationNumberOfSentences in Neo4j; False (Database -> Refresh Reference count) updates every relation whose count differs."""
     # imported here (not at module level) so a missing/broken dependency is raised
     # inside main()'s try block and lands in the run's messages
     from ResnetGraph.ElsevierAPI.api.EmbioPSG_API.PSnx2Neo4j import neo4j_nx
@@ -33,7 +36,8 @@ def update_refcount(APIconfig: dict):
 
     start = time.time()
     neo4j = neo4j_nx(APIconfig)
-    neo4j.update_refcount()
+    print(f"update_refcount(only_greater={only_greater})", flush=True)
+    neo4j.update_refcount(only_greater=only_greater)
     print(f"\033[94mTotal execution time: {execution_time(start)}\033[0m", flush=True)
 
 
@@ -58,7 +62,7 @@ def main() -> int:
 
     sys.stderr = sys.stdout          # library warnings/tracebacks also reach the run's messages
     try:
-        update_refcount(job['APIconfig'])
+        update_refcount(job['APIconfig'], only_greater=bool(job.get('only_greater', True)))
         return 0
     except BaseException:
         traceback.print_exc(file=sys.stdout)
