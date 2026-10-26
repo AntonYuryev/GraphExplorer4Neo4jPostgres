@@ -752,6 +752,7 @@ function showApp() {
     document.getElementById('settings-db-admin-section').style.display = '';
     document.getElementById('mi-import-rnef').style.display = '';
     document.getElementById('mi-curate').style.display = '';
+    document.getElementById('mi-refcount').style.display = '';
   }
   // Initialise Agentic AI (show button, load LLM config)
   window._currentUser = { name: currentUser, role: currentRole };
@@ -2936,6 +2937,12 @@ function _irnFillSources() {
 // and reopening the dialog reattaches to it.
 var _curSteps = [];          // [{id, num, name, label}]
 var _curRunning = false;
+var _curMode = 'curate';      // 'curate' (Database -> Curate) or 'refcount' (Database -> Refresh Reference count)
+var _curRunMode = 'curate';   // mode of the run that is going, if any
+var _curAllSteps = [];        // every step the server offers; _curSteps is what the current mode shows
+var _CUR_DESC_CURATE = null;  // original description markup of the dialog
+var _curChecking = false;    // the dialog is asking the server whether a run is already going
+var _curPollFailures = 0;    // consecutive failed progress polls
 var _curSince = 0;
 var _curPollHandle = null;
 var _CUR_ICON = { pending: '○', running: '⏳', done: '✓', error: '✗', stopped: '■', skipped: '–' };
@@ -2966,6 +2973,7 @@ function _curRenderSteps(jobSteps) {
     var checked = js ? js.status !== 'skipped' : (s.id in prevChecked ? prevChecked[s.id] : true);
     var status = js && js.status !== 'skipped' ? js.status : '';
     var extra = js && js.result !== undefined ? ' <span style="color:#7a8099;white-space:nowrap">(' + Number(js.result).toLocaleString() + ' changed)</span>' : '';
+    if (js && js.failed > 0) extra += ' <span style="color:#e05560;white-space:nowrap">(' + Number(js.failed).toLocaleString() + ' failed)</span>';
     var elapsed = '';
     if (js && js.status === 'running' && js.startedAt) elapsed = _curFmt(Date.now() + _curClockSkew - js.startedAt);
     else if (js && js.elapsedMs !== undefined) elapsed = _curFmt(js.elapsedMs);
@@ -2990,7 +2998,8 @@ function _curChecked() {
 function _curUpdateCount() {
   var n = _curChecked().length;
   document.getElementById('cur-count').textContent = n + ' of ' + _curSteps.length + ' steps selected';
-  document.getElementById('cur-run-btn').disabled = _curRunning || n === 0;
+  // Run is available only when nothing is running — and not while the dialog is still asking the server whether a run is going
+  document.getElementById('cur-run-btn').disabled = _curRunning || _curChecking || n === 0;
 }
 function _curSelectAll(on) {
   if (_curRunning) return;
@@ -3005,22 +3014,49 @@ function _curSetBusy(busy) {
   _curUpdateCount();
 }
 
-async function openCurateDialog() {
+// One dialog, two entry points: Database -> Curate (all steps) and Database -> Refresh Reference count (only the first row,
+// "Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres", run with only_greater = False, so every relation whose sentence count differs from Postgres is updated).
+function _curApplyMode(mode) {
+  _curMode = mode === 'refcount' ? 'refcount' : 'curate';
+  var refcount = _curMode === 'refcount';
+  var desc = document.getElementById('cur-desc');
+  if (_CUR_DESC_CURATE === null) _CUR_DESC_CURATE = desc.innerHTML;
+  document.getElementById('cur-title').textContent = refcount ? 'Database \u2192 Refresh Reference count' : 'Database \u2192 Curate';
+  desc.innerHTML = refcount
+    ? 'Refreshes <code>RelationNumberOfSentences</code> and <code>RelationNumberOfReferences</code> of the Neo4j relations from Postgres (the first row of Database \u2192 Curate). Unlike in Curate, <b>every relation whose sentence count differs from Postgres is updated</b> (<code>only_greater = False</code>), not only those whose count has grown.'
+    : _CUR_DESC_CURATE;
+  document.getElementById('cur-run-btn').textContent = refcount ? 'Refresh' : 'Run curation';
+  ['cur-all-btn', 'cur-none-btn'].forEach(function (id) { document.getElementById(id).style.display = refcount ? 'none' : ''; });
+  if (_curAllSteps.length) _curSteps = refcount ? _curAllSteps.filter(function (s) { return s.id === 'pg-counts'; }) : _curAllSteps;
+}
+
+async function openCurateDialog(mode) {
   document.getElementById('curate-modal').style.display = 'flex';
   var errEl = document.getElementById('cur-error');
   errEl.style.display = 'none';
-  if (_curRunning) return;   // reopened mid-run: keep the live view
+  if (_curRunning) {         // reopened mid-run: keep the live view (of the run that is going, whichever entry point started it)
+    _curApplyMode(_curRunMode);
+    _curRenderSteps(null);
+    return;
+  }
+  _curApplyMode(mode);
+  _curChecking = true;       // Run stays disabled until the server has said whether a run is already going
+  document.getElementById('cur-run-btn').disabled = true;
   try {
     var data = await api('/api/curate/steps', null, 'GET');
-    _curSteps = data.steps || [];
-    document.getElementById('cur-file').textContent = data.file ? data.file.split('\\').join('/') : 'GraphCurator.cypher';
+    _curAllSteps = data.steps || [];
+    _curApplyMode(_curMode);
+    var fileEl = document.getElementById('cur-file');   // only in the Curate description; Refresh Reference count has its own text
+    if (fileEl) fileEl.textContent = data.file ? data.file.split('\\').join('/') : 'GraphCurator.cypher';
     _curRenderSteps(null);
+    await _curReattach();
   } catch (e) {
     errEl.textContent = e.message || String(e);
     errEl.style.display = '';
-    return;
+  } finally {
+    _curChecking = false;
+    _curUpdateCount();
   }
-  _curReattach();
 }
 
 // Interrupts the run: the server terminates the running Neo4j transaction (Neo4j rolls it back) and
@@ -3050,20 +3086,25 @@ async function runCurate() {
   if (_curRunning) return;
   var ids = _curChecked();
   if (!ids.length) return;
-  if (!confirm('Run ' + ids.length + ' curation step(s) on the current Neo4j database?\n\nThe steps merge and delete relations and cannot be undone.')) return;
+  if (_curMode === 'refcount') {
+    if (!confirm('Refresh RelationNumberOfSentences and RelationNumberOfReferences of every Neo4j relation whose sentence count differs from Postgres?\n\nThis can take a long time on a large database.')) return;
+  } else if (!confirm('Run ' + ids.length + ' curation step(s) on the current Neo4j database?\n\nThe steps merge and delete relations and cannot be undone.')) return;
   var errEl = document.getElementById('cur-error');
   errEl.style.display = 'none';
   var msgEl = document.getElementById('cur-messages');
   msgEl.textContent = '';
   _irnAnsiColor = null;
   _curSince = 0;
+  _curRunMode = _curMode;
   _curSetBusy(true);
   try {
-    await api('/api/curate/start', { steps: ids });
+    await api('/api/curate/start', { steps: ids, mode: _curMode });
   } catch (e) {
     errEl.textContent = e.message || String(e);
     errEl.style.display = '';
     _curSetBusy(false);
+    // the server says a run is already going (e.g. started from another tab): show that run and stay locked
+    if (/already in progress/i.test(e.message || '')) _curReattach();
     return;
   }
   document.getElementById('cur-progress').style.display = '';
@@ -3078,6 +3119,13 @@ async function _curReattach() {
   try {
     var job = await api('/api/curate/progress?since=0', null, 'GET');
     if (job.noJob) return;
+    var jobKind = job.kind || 'curate';
+    if (jobKind !== _curMode) {
+      if (!job.running) return;
+      _curRunMode = jobKind;
+      _curApplyMode(jobKind);
+      _curRenderSteps(null);
+    }
     var msgEl = document.getElementById('cur-messages');
     msgEl.style.display = '';
     msgEl.textContent = '';
@@ -3088,6 +3136,7 @@ async function _curReattach() {
     document.getElementById('cur-progress').style.display = '';
     _curApplyJob(job);
     if (job.running) {
+      _curRunMode = jobKind;
       _curSetBusy(true);
       _curRenderSteps(job.steps);
       if (_curPollHandle) clearTimeout(_curPollHandle);
@@ -3133,8 +3182,14 @@ async function _pollCurate() {
     _curApplyJob(job);
     if (job.done) { _curSetBusy(false); _curRenderSteps(job.steps); return; }
     _curPollHandle = setTimeout(_pollCurate, 1000);
+    _curPollFailures = 0;
   } catch (e) {
-    document.getElementById('cur-status').innerHTML += '<br><span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+    // A failed poll (network blip, token refresh) does NOT mean the run has ended — it keeps running on the server.
+    // Stay locked and retry; only after many failures in a row give up (a new start is still refused by the server).
+    _curPollFailures++;
+    document.getElementById('cur-status').innerHTML = '<span style="color:#e0a050">Lost contact with the server (' + escHtml(e.message || String(e)) + ') — retrying…</span>';
+    if (_curPollFailures < 30) { _curPollHandle = setTimeout(_pollCurate, 3000); return; }
+    _curPollFailures = 0;
     _curSetBusy(false);
   }
 }
