@@ -2809,8 +2809,37 @@ function closeStatisticsModal(e) {
 var _STAT_UNFINISHED_HTML = '<span style="color:#c9a227">⏳ unfinished…</span>';
 var _statsCache = null;  // null until the first fetch cycle completes; then { elId: innerHTML, ... }
 
+var _statTab = 'stats';
+function switchStatTab(tab) {
+  _statTab = tab;
+  document.getElementById('statistics-body').style.display = tab === 'stats' ? '' : 'none';
+  document.getElementById('stat-bysource').style.display = tab === 'bysource' ? '' : 'none';
+  document.getElementById('stat-tab-stats').style.background = tab === 'stats' ? '#252a40' : '';
+  document.getElementById('stat-tab-bysource').style.background = tab === 'bysource' ? '#252a40' : '';
+}
+
+function _renderStatBySource(d) {
+  if (!d.relTypes.length) return '<span style="color:#7a8099">None</span>';
+  var th = 'padding:3px 10px;background:#1a1f33;border:1px solid #2d3147;color:#8899cc;white-space:nowrap;position:sticky;top:0;';
+  var td = 'padding:3px 10px;border:1px solid #1e2340;color:#c8cde4;text-align:right;';
+  var html = '<table style="border-collapse:collapse;font-size:11px"><thead><tr>'
+    + '<th style="' + th + 'text-align:left;left:0;z-index:2">Relation type</th>'
+    + d.sources.map(function(s) { return '<th style="' + th + 'text-align:right">' + escHtml(s) + '</th>'; }).join('')
+    + '</tr></thead><tbody>';
+  d.relTypes.forEach(function(t) {
+    html += '<tr><td style="' + td + 'text-align:left;position:sticky;left:0;background:#13172a">' + escHtml(t) + '</td>'
+      + d.sources.map(function(s) {
+          var n = d.counts[t][s];
+          return '<td style="' + td + '">' + (n ? n.toLocaleString() : '') + '</td>';
+        }).join('')
+      + '</tr>';
+  });
+  return html + '</tbody></table>';
+}
+
 function openStatisticsDialog() {
   document.getElementById('statistics-modal').style.display = 'flex';
+  switchStatTab(_statTab);
   _renderStatisticsSkeleton();
   if (_statsCache) {
     Object.keys(_statsCache).forEach(function(elId) {
@@ -2836,10 +2865,50 @@ function refreshStatistics() {
   _statFetchSection('/api/database/statistics/postgres/snippets', 'stat-sec-pg-snippets', function(d) { return _statNumberOrNotConnected(d.snippets); });
   _statFetchSection('/api/database/statistics/postgres/articles', 'stat-sec-pg-articles', function(d) { return _statNumberOrNotConnected(d.articles); });
   _statFetchSection('/api/database/statistics/postgres/journals', 'stat-sec-pg-journals', function(d) { return _statNumberOrNotConnected(d.journals); });
-  _statFetchSection('/api/database/statistics/postgres/sources', 'stat-sec-pg-sources', _renderStatSources);
+  // full relationship scan: runs in the background, the user can look at the stats above meanwhile
+  _statFetchSection('/api/database/statistics/by-source', 'stat-bysource', _renderStatBySource);
+}
+
+// Plain-text version of the dialog: headings and "label: value" lines as shown, tables as tab-separated rows
+function _statisticsText() {
+  var lines = [];
+  function walk(el) {
+    if (el.tagName === 'TABLE') {
+      lines.push('');
+      Array.prototype.forEach.call(el.rows, function (tr) {
+        lines.push(Array.prototype.map.call(tr.cells, function (c) { return c.textContent.trim(); }).join('\t'));
+      });
+      lines.push('');
+    } else if (el.querySelector('table, h4, div')) {
+      Array.prototype.forEach.call(el.children, walk);
+    } else {
+      var t = el.textContent.trim();
+      if (t) lines.push(el.tagName === 'H4' ? '\n' + t : t);
+    }
+  }
+  var root = document.getElementById(_statTab === 'bysource' ? 'stat-bysource' : 'statistics-body');
+  Array.prototype.forEach.call(root.children, walk);
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+
+function copyStatistics(btn) {
+  var text = _statisticsText();
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    _flashBtn(btn, ok ? 'Copied ✓' : 'Copy failed');
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { _flashBtn(btn, 'Copied ✓'); }, fallback);
+  } else fallback();
 }
 
 function _renderStatisticsSkeleton() {
+  document.getElementById('stat-bysource').innerHTML = _STAT_UNFINISHED_HTML;
   document.getElementById('statistics-body').innerHTML = ''
     + '<h4 style="margin:0 0 8px;color:#e0e0e0">Neo4j</h4>'
     + '<div id="stat-sec-counts" style="margin-bottom:12px">' + _STAT_UNFINISHED_HTML + '</div>'
@@ -2850,14 +2919,7 @@ function _renderStatisticsSkeleton() {
     + '<div><span style="color:#7a8099">Snippets:</span> <span id="stat-sec-pg-snippets">' + _STAT_UNFINISHED_HTML + '</span></div>'
     + '<div><span style="color:#7a8099">Articles:</span> <span id="stat-sec-pg-articles">' + _STAT_UNFINISHED_HTML + '</span></div>'
     + '<div><span style="color:#7a8099">Journals:</span> <span id="stat-sec-pg-journals">' + _STAT_UNFINISHED_HTML + '</span></div>'
-    + '</div>'
-    + '<div style="margin-top:10px"><span style="color:#7a8099">Sources:</span> <span id="stat-sec-pg-sources">' + _STAT_UNFINISHED_HTML + '</span></div>';
-}
-
-function _renderStatSources(d) {
-  if (!d.sources) return '<span style="color:#7a8099">N/A</span>';
-  if (!d.sources.length) return '<span style="color:#7a8099">None</span>';
-  return escHtml(d.sources.join(', '));
+    + '</div>';
 }
 
 function _statNumberOrNotConnected(v) {
@@ -2959,7 +3021,7 @@ function _curFmt(ms) {
   return (Math.max(0, ms) / 1000).toFixed(1) + ' s';
 }
 
-function _curStepLabel(s) { return s.num ? 'Step ' + s.num : 'Postgres'; }
+function _curStepLabel(s) { return s.num ? 'Step ' + s.num : (s.id === 'sum-lists' ? 'Sum lists' : 'Postgres'); }
 
 function _curRenderSteps(jobSteps) {
   var box = document.getElementById('cur-steps');
@@ -3023,11 +3085,11 @@ function _curApplyMode(mode) {
   if (_CUR_DESC_CURATE === null) _CUR_DESC_CURATE = desc.innerHTML;
   document.getElementById('cur-title').textContent = refcount ? 'Database \u2192 Refresh Reference count' : 'Database \u2192 Curate';
   desc.innerHTML = refcount
-    ? 'Refreshes <code>RelationNumberOfSentences</code> and <code>RelationNumberOfReferences</code> of the Neo4j relations from Postgres (the first row of Database \u2192 Curate). Unlike in Curate, <b>every relation whose sentence count differs from Postgres is updated</b> (<code>only_greater = False</code>), not only those whose count has grown.'
+    ? 'Two steps, run together or on their own. <b>1.</b> Refreshes <code>RelationNumberOfSentences</code> and <code>RelationNumberOfReferences</code> of the Neo4j relations from Postgres (the first row of Database \u2192 Curate). Unlike in Curate, <b>every relation whose sentence count differs from Postgres is updated</b> (<code>only_greater = False</code>), not only those whose count has grown. <b>2.</b> Relations that exist only in Neo4j and were merged by Curate may still hold <b>lists</b> in these two properties; each list is replaced by the <b>sum</b> of its values. Step 2 runs after step 1.'
     : _CUR_DESC_CURATE;
   document.getElementById('cur-run-btn').textContent = refcount ? 'Refresh' : 'Run curation';
-  ['cur-all-btn', 'cur-none-btn'].forEach(function (id) { document.getElementById(id).style.display = refcount ? 'none' : ''; });
-  if (_curAllSteps.length) _curSteps = refcount ? _curAllSteps.filter(function (s) { return s.id === 'pg-counts'; }) : _curAllSteps;
+  ['cur-all-btn', 'cur-none-btn'].forEach(function (id) { document.getElementById(id).style.display = ''; });
+  if (_curAllSteps.length) _curSteps = _curAllSteps.filter(function (s) { return refcount ? (s.id === 'pg-counts' || s.id === 'sum-lists') : s.id !== 'sum-lists'; });
 }
 
 async function openCurateDialog(mode) {
@@ -3087,7 +3149,10 @@ async function runCurate() {
   var ids = _curChecked();
   if (!ids.length) return;
   if (_curMode === 'refcount') {
-    if (!confirm('Refresh RelationNumberOfSentences and RelationNumberOfReferences of every Neo4j relation whose sentence count differs from Postgres?\n\nThis can take a long time on a large database.')) return;
+    var what = [];
+    if (ids.indexOf('pg-counts') >= 0) what.push('refresh RelationNumberOfSentences and RelationNumberOfReferences of every Neo4j relation whose sentence count differs from Postgres');
+    if (ids.indexOf('sum-lists') >= 0) what.push('replace list-valued RelationNumberOfSentences / RelationNumberOfReferences by the sum of the list');
+    if (!confirm('Run: ' + what.join(', then ') + '?\n\nThis can take a long time on a large database.')) return;
   } else if (!confirm('Run ' + ids.length + ' curation step(s) on the current Neo4j database?\n\nThe steps merge and delete relations and cannot be undone.')) return;
   var errEl = document.getElementById('cur-error');
   errEl.style.display = 'none';
@@ -14624,10 +14689,20 @@ async function rcLoadRefs() {
   if (_rc._debounce) { clearTimeout(_rc._debounce); await rcCalcRelId(); }
 
   var dbRefs = [];
-  if (_rc.currentRelId) {
+  // every RelationID the edge carries (a relation merged by Database -> Curate has several),
+  // plus the one calculated from the dialog's current properties
+  var _idList = [];
+  var _ex = _rc.existingEdge;
+  if (_ex && _ex.length) {
+    var _stored = _ex.data('relIds');
+    if (Array.isArray(_stored) && _stored.length) _stored.forEach(function(i) { _idList.push(String(i)); });
+    else if (_ex.data('relId')) _idList.push(String(_ex.data('relId')));
+  }
+  if (_rc.currentRelId && _idList.indexOf(String(_rc.currentRelId)) < 0) _idList.push(String(_rc.currentRelId));
+  if (_idList.length) {
     try {
-      var res = await api('/api/references/batch', { relationIds: [_rc.currentRelId], scopusColumns: [] });
-      dbRefs = res[_rc.currentRelId] || [];
+      var res = await api('/api/references/batch', { relationIds: _idList, scopusColumns: [] });
+      _idList.forEach(function(id) { dbRefs = dbRefs.concat(res[id] || []); });
     } catch(e) { /* no refs */ }
   }
   // Combine with references embedded in the source file for this edge (see
@@ -15166,7 +15241,11 @@ function openPairRelationDialogForEdge(cyEdge, targetRefUniqueId) {
                    : (cyEdge.data('relId') ? String(cyEdge.data('relId')) : null);
   _rcPair.currentRelId = _storedRelId;
   _rcPair._allowCalc = false;
-  document.getElementById('rcp-rel-id').textContent = _storedRelId || '—';
+  // A relation merged by Database -> Curate carries several RelationIDs: show them all
+  // (the references of every one of them are fetched in rcPairLoadRefs)
+  var _allStored = (Array.isArray(_storedIds) ? _storedIds.map(String) : []);
+  if (_storedRelId && _allStored.indexOf(_storedRelId) < 0) _allStored.unshift(_storedRelId);
+  document.getElementById('rcp-rel-id').textContent = _allStored.length ? _allStored.join(', ') : '—';
   document.getElementById('rcp-edge-urn').textContent = '—';
   document.getElementById('rcp-title').textContent = 'Create/Edit Binary Relation';
 
