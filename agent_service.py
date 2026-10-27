@@ -31,8 +31,8 @@ from pydantic import BaseModel
 import uvicorn
 # Note: register_summarize_routes is imported lazily in startup handler to improve initial startup speed
 
-def _is_anthropic_url(url: str) -> bool:
-    """Return True only when the URL hostname is exactly anthropic.com or a subdomain.
+def _url_host_matches(url: str, domain: str) -> bool:
+    """Return True only when the URL hostname is exactly ``domain`` or one of its subdomains.
 
     Replaces bare substring checks like ``"anthropic.com" in url`` which are
     flagged by CodeQL py/incomplete-url-substring-sanitization (CWE-20): a URL
@@ -44,9 +44,14 @@ def _is_anthropic_url(url: str) -> bool:
         return False
     try:
         host = (_urlparse(url).hostname or "").lower()
-        return host == "anthropic.com" or host.endswith(".anthropic.com")
     except Exception:
         return False
+    d = domain.lower()
+    return host == d or host.endswith("." + d)
+
+
+def _is_anthropic_url(url: str) -> bool:
+    return _url_host_matches(url, "anthropic.com")
 
 # ── Optional heavy deps — imported lazily so the service starts even if missing ──
 try:
@@ -1299,7 +1304,7 @@ def _openai_client(llm: Dict):
         raise RuntimeError("openai package not installed — run: pip install openai")
     model    = llm.get("model_name", "")
     url      = llm.get("url", "") or ""
-    is_gemini = _is_gemini_model(model) or "generativelanguage.googleapis.com" in url
+    is_gemini = _is_gemini_model(model) or _url_host_matches(url, "generativelanguage.googleapis.com")
     # Auto-select Gemini base URL when model is gemini-* and no custom URL was set
     default_url = GEMINI_BASE_URL if is_gemini else None
     base_url = llm.get("url") or default_url
@@ -1319,7 +1324,7 @@ def _openai_client(llm: Dict):
     # and uses standard Authorization: Bearer <key> — the key goes in api_key, not
     # a custom header. Keep x-portkey-api-key only for portkey.ai itself.
     url_lower = (base_url or url or "").lower()
-    if "portkey.ai" in url_lower:
+    if _url_host_matches(base_url or url, "portkey.ai"):
         kwargs["api_key"]          = "sk-portkey"          # SDK requires non-empty; ignored by gateway
         kwargs["default_headers"]  = {"x-portkey-api-key": api_key}
         log.info("[openai_client] Portkey.ai gateway: base_url=%s key_len=%d key_present=%s",
@@ -1411,15 +1416,15 @@ def _call_llm(messages: List[Dict], llm: Dict, system_prompt: str = "") -> tuple
     # but has since switched to a Gemini/OpenAI/Groq provider URL.  Clear the
     # stale model so the user is prompted to pick a correct one.
     if model and not is_anthropic:
-        if "generativelanguage.googleapis.com" in url and not model.startswith("gemini"):
+        if _url_host_matches(url, "generativelanguage.googleapis.com") and not model.startswith("gemini"):
             model = ""
-        elif "openai.com" in url and model.startswith("claude"):
+        elif _url_host_matches(url, "openai.com") and model.startswith("claude"):
             model = ""
-        elif "groq.com" in url and model.startswith("claude"):
+        elif _url_host_matches(url, "groq.com") and model.startswith("claude"):
             model = ""
-        elif "together.xyz" in url and model.startswith("claude"):
+        elif _url_host_matches(url, "together.xyz") and model.startswith("claude"):
             model = ""
-        elif "replicate.com" in url and model.startswith("claude"):
+        elif _url_host_matches(url, "replicate.com") and model.startswith("claude"):
             model = ""
 
     # If model still not set, try the user's saved model from users.json
@@ -1675,13 +1680,22 @@ def ping_llm(req: PingRequest = None):
                 "reply": reply}
     except Exception as _ping_exc:
         log.exception("Ping failed")
-        # Surface provider HTTP errors (401 invalid key, 404 model, ...) —
-        # a generic "internal error" made a rejected key indistinguishable
-        # from a bug. Text is sanitized the same way the Gemini path does.
+        # Surface provider HTTP errors (401 invalid key, 404 model, ...) — a generic "internal error" made a
+        # rejected key indistinguishable from a bug. Only the numeric status code is used, mapped to a fixed
+        # explanation: the exception's own text is never returned to the client (it stays in the log above).
+        _PING_HINTS = {
+            400: "the provider rejected the request — check the model name",
+            401: "invalid or missing API key",
+            403: "access denied — the key has no permission for this model or endpoint",
+            404: "model or endpoint not found — check the model name and URL",
+            408: "the provider timed out",
+            429: "rate limit or quota exceeded",
+        }
         _code = getattr(_ping_exc, "status_code", None)
         _detail = "Ping failed due to an internal error."
-        if _code:
-            _detail = f"HTTP {_code}: " + _sanitize_public_text(str(getattr(_ping_exc, "message", "") or _ping_exc), 300)
+        if isinstance(_code, int):
+            _hint = _PING_HINTS.get(_code) or ("provider error" if _code >= 500 else "request failed")
+            _detail = f"HTTP {_code}: {_hint}"
         return {"ok": False, "error": _detail, "elapsed_s": round(time.time() - t0, 2), "model": model}
 
 class LLMChatRequest(BaseModel):
