@@ -39,3 +39,8 @@ psycopg2-binary>=2.9.9
 # Utility
 python-multipart>=0.0.9   # for FastAPI form uploads (library file imports)
 debugpy>=1.8.0            # optional: enables VS Code attach debugging for the spawned agent process
+
+# Used by the Import RNEF / Curate / Refresh Reference count runners (ResnetGraph subset)
+requests>=2.31.0
+scipy>=1.11.0
+numpy>=1.26.0
