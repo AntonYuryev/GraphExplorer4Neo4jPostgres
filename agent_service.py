@@ -1718,7 +1718,7 @@ def llm_chat(req: LLMChatRequest, request: Request):
     messages.append({"role": "user", "content": req.message})
 
     reply, _was_truncated = _call_llm_with_retries(messages, llm, system_prompt)
-    log.info("[llm-chat] user=%s truncated=%s", username, _was_truncated)
+    log.info("[llm-chat] user=%r truncated=%s", username, _was_truncated)  # %r escapes CR/LF (log injection)
     return {"reply": reply}
 
 
@@ -2315,14 +2315,27 @@ if __name__ == "__main__":
     # a debugger or after an unclean shutdown, since the previous process
     # may still be running (e.g. auto-restarted by server.js).
     import subprocess, sys as _sys
-    if _sys.platform == "win32":
-        subprocess.call(
-            f'FOR /F "tokens=5" %a IN (\'netstat -ano ^| findstr :{port} ^| findstr LISTENING\') DO taskkill /F /PID %a',
-            shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL
-        )
-    else:
-        subprocess.call(f'lsof -ti tcp:{port} | xargs kill -9', shell=True,
-                        stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    # No shell is used: the port is an int and commands are passed as argument lists.
+    try:
+        _pids = set()
+        if _sys.platform == "win32":
+            _out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=30).stdout
+            for _line in _out.splitlines():
+                _cols = _line.split()
+                if len(_cols) >= 5 and _cols[3] == "LISTENING" and _cols[1].endswith(f":{port}"):
+                    _pids.add(_cols[4])
+            for _pid in _pids:
+                if _pid.isdigit() and int(_pid) != os.getpid():
+                    subprocess.call(["taskkill", "/F", "/PID", _pid],
+                                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        else:
+            _out = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True, timeout=30).stdout
+            for _pid in _out.split():
+                if _pid.isdigit() and int(_pid) != os.getpid():
+                    subprocess.call(["kill", "-9", _pid],
+                                    stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
     import time as _time; _time.sleep(0.5)  # brief pause after kill
 
     # 127.0.0.1 only — this service is an internal sidecar for server.js's own
