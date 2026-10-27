@@ -5486,7 +5486,7 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
 });
 
 // ─── Database → Curate ──────────────────────────────────────────────────────
-// Runs ResnetGraph/scripts/neo4j/GraphCurator.cypher against the current user's Neo4j database.
+// Runs ResnetGraph/scripts/Neo4j/GraphCurator.cypher against the current user's Neo4j database.
 // The file is ONE query made of many parts joined by UNION; the parts are split here and run one
 // at a time so the user can pick which steps run and watch which one is executing. Before the
 // Cypher steps, RelationNumberOfReferences / RelationNumberOfSentences are refreshed in Neo4j
@@ -5494,7 +5494,7 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
 // Step names are inferred from the script's own "//STEP n. title" comments, so editing the
 // script is enough — nothing is hardcoded here. Admin only (bulk write to the shared DBs);
 // uses the caller's own Neo4j/Postgres connections.
-const GRAPH_CURATOR_FILE = path.join(__dirname, 'ResnetGraph', 'scripts', 'neo4j', 'GraphCurator.cypher');
+const GRAPH_CURATOR_FILE = path.join(__dirname, 'ResnetGraph', 'scripts', 'Neo4j', 'GraphCurator.cypher');
 const PG_COUNTS_STEP = { id: 'pg-counts', num: 0, short: 'Postgres counts', name: 'Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres', label: '' };
 // Second row of Database -> Refresh Reference count (not part of Database -> Curate): relations that are only in Neo4j and were
 // merged by GraphCurator got list-valued counts, which are replaced by the sum of the list. Runs after the Postgres update so
