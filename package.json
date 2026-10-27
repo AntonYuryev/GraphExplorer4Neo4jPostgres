@@ -1,7 +1,7 @@
 {
   "name": "graph-explorer",
-  "version": "2.4.0",
-  "description": "Web app for exploring, visualizing, and curating Neo4j biological knowledge graphs with PostgreSQL literature references and an integrated LLM chat agent that can query, visualize, and (with confirmation) write back to the graph.",
+  "version": "3.0.0",
+  "description": "Web app for exploring, visualizing, and curating Neo4j biological knowledge graphs with PostgreSQL literature references, RNEF import, database curation tools (Import RNEF, Curate, Refresh Reference count, Statistics), and an integrated LLM chat agent that can query, visualize, and (with confirmation) write back to the graph.",
   "main": "server.js",
   "keywords": [
     "neo4j",
@@ -11,15 +11,21 @@
     "knowledge-graph",
     "llm-agent",
     "cypher",
-    "biology"
+    "biology",
+    "rnef",
+    "curation",
+    "apoc",
+    "pathway-studio"
   ],
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "https://github.com/elsevier-health/psg-graphexplorer-neo4j-postgres"
+    "url": "git+https://github.com/elsevier-health/psg-graphexplorer-neo4j-postgres.git"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "audit": "npm audit --omit=dev",
+    "check:syntax": "node --check server.js && node --check public/app.js && node --check github-upload.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -33,5 +39,9 @@
   },
   "engines": {
     "node": ">=18"
-  }
+  },
+  "bugs": {
+    "url": "https://github.com/elsevier-health/psg-graphexplorer-neo4j-postgres/issues"
+  },
+  "homepage": "https://github.com/elsevier-health/psg-graphexplorer-neo4j-postgres#readme"
 }
