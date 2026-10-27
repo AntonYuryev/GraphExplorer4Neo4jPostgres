@@ -1,4 +1,9 @@
-import xml.etree.ElementTree as ET
+try:
+    import defusedxml.ElementTree as ET   # hardened against XXE / entity-expansion (billion laughs)
+    _DEFUSED = True
+except ImportError:
+    import xml.etree.ElementTree as ET    # stdlib: no external entities, but see _reject_entity_declarations()
+    _DEFUSED = False
 import json, sys, os, re
 from datetime import datetime, timezone
 
@@ -704,10 +709,19 @@ def _strip_large_unused_blocks(raw):
     return _LARGE_UNUSED_BLOCK_RE.sub(b'', raw)
 
 
+def _reject_entity_declarations(raw):
+    # RNEF files never declare entities. When defusedxml is not installed, refuse any
+    # file carrying an entity declaration so the stdlib parser cannot be fed an
+    # entity-expansion ("billion laughs") payload.
+    if not _DEFUSED and b'<!ENTITY' in raw:
+        raise ValueError('RNEF file declares XML entities, which is not allowed')
+
+
 def convert(input_path, out_dir, only_name=None):
     os.makedirs(out_dir, exist_ok=True)
     with open(input_path, 'rb') as f:
         raw = f.read()
+    _reject_entity_declarations(raw)
     raw = _strip_large_unused_blocks(raw)
     root = ET.fromstring(raw)
     resnets = root.findall('resnet')
