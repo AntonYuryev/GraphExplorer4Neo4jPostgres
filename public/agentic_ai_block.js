@@ -1172,7 +1172,7 @@ async function agentLibraryRefresh() {
     _agentLibraryFiles = data.files || [];
     _renderLibraryList(_agentLibraryFiles);
   } catch(e) {
-    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load library: ' + e.message + '</div>';
+    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load library: ' + escHtml(String(e && e.message)) + '</div>';
   }
 }
 
@@ -1199,8 +1199,8 @@ function _renderLibraryList(files) {
         '<div style="font-size:13px;color:#e0e0e0;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escHtml(f.name) + '</div>' +
         '<div style="font-size:11px;color:#5a6080;margin-top:2px">' + desc + '</div>' +
       '</div>' +
-      '<button onclick="agentLibraryLoad(\'' + f.id + '\')" style="padding:4px 10px;background:#4f8ef7;border:none;border-radius:4px;color:#fff;font-size:11px;cursor:pointer;white-space:nowrap">Load</button>' +
-      '<button onclick="agentLibraryDelete(\'' + f.id + '\',this)" style="padding:4px 10px;background:transparent;border:1px solid #4a1c1c;border-radius:4px;color:#ff6b6b;font-size:11px;cursor:pointer;white-space:nowrap">Delete</button>';
+      '<button onclick="agentLibraryLoad(\'' + String(f.id).replace(/[^A-Za-z0-9_.-]/g, '') + '\')" style="padding:4px 10px;background:#4f8ef7;border:none;border-radius:4px;color:#fff;font-size:11px;cursor:pointer;white-space:nowrap">Load</button>' +
+      '<button onclick="agentLibraryDelete(\'' + String(f.id).replace(/[^A-Za-z0-9_.-]/g, '') + '\',this)" style="padding:4px 10px;background:transparent;border:1px solid #4a1c1c;border-radius:4px;color:#ff6b6b;font-size:11px;cursor:pointer;white-space:nowrap">Delete</button>';
     list.appendChild(row);
   });
 }
@@ -1455,8 +1455,8 @@ async function openLLMSettings() {
         data.custom_providers.forEach(function(provider, index) {
           var row = document.createElement('div');
           row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:8px;background:#252a40;border-radius:4px;border:1px solid #3a3f55';
-          row.innerHTML = '<input type="text" placeholder="Provider name" value="' + (provider.name || '') + '" data-index="' + index + '" class="llms-provider-name" style="flex:1;background:#1a1f30;border:1px solid #3a3f55;border-radius:3px;color:#e0e0e0;padding:5px 8px;font-size:12px">' +
-                          '<input type="text" placeholder="API URL" value="' + (provider.url || '') + '" data-index="' + index + '" class="llms-provider-url" style="flex:1;background:#1a1f30;border:1px solid #3a3f55;border-radius:3px;color:#e0e0e0;padding:5px 8px;font-size:12px">' +
+          row.innerHTML = '<input type="text" placeholder="Provider name" value="' + escHtml(String(provider.name || '')) + '" data-index="' + index + '" class="llms-provider-name" style="flex:1;background:#1a1f30;border:1px solid #3a3f55;border-radius:3px;color:#e0e0e0;padding:5px 8px;font-size:12px">' +
+                          '<input type="text" placeholder="API URL" value="' + escHtml(String(provider.url || '')) + '" data-index="' + index + '" class="llms-provider-url" style="flex:1;background:#1a1f30;border:1px solid #3a3f55;border-radius:3px;color:#e0e0e0;padding:5px 8px;font-size:12px">' +
                           '<button type="button" onclick="llmsRemoveProvider(' + index + ')" style="padding:3px 8px;background:#3a2a2a;border:1px solid #5a3a3a;border-radius:3px;color:#d0a0a0;font-size:11px;cursor:pointer">Remove</button>';
           providersList.appendChild(row);
         });
