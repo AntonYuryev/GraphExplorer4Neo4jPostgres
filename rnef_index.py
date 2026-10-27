@@ -115,7 +115,12 @@ single JSON blob, so mixing that with progress lines would break parsing;
 that fallback is for manual testing only, server.js always passes out_path.
 """
 
-import xml.etree.ElementTree as ET
+try:
+    import defusedxml.ElementTree as ET   # hardened against XXE / entity-expansion (billion laughs)
+    _DEFUSED = True
+except ImportError:
+    import xml.etree.ElementTree as ET    # stdlib: no external entities, but see _reject_entity_declarations()
+    _DEFUSED = False
 import json, sys, os, re
 import multiprocessing as mp
 from collections import Counter
@@ -574,6 +579,12 @@ def extract_pathways_from_file(path):
     split them from real pathway entries before either goes through its own
     (very different) further processing."""
     out = []
+    if not _DEFUSED:
+        # RNEF files never declare entities; without defusedxml refuse any that do
+        # (entity-expansion / "billion laughs" guard for the stdlib parser).
+        with open(path, 'rb') as _f:
+            if b'<!ENTITY' in _f.read(65536):
+                raise ValueError('RNEF file declares XML entities, which is not allowed')
     # Sample data confirms <resnet> elements are always direct, non-nested
     # children of <batch> (or the file's own root) -- no depth tracking
     # needed. Each is fully built by iterparse's 'end' event, processed, then
