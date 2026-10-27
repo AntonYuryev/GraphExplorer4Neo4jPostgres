@@ -1341,7 +1341,7 @@ function populateSelectByLabelMenu() {
   }
   sub.innerHTML = labels.map(function(lbl) {
     var count = cy.nodes('[nodeType="' + lbl + '"]').not('[?isClone]').length;
-    var escaped = lbl.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    var escaped = escHtml(lbl);
     return '<div class="menu-item" data-select-label="' + escaped + '">'
       + escaped + ' <span style="color:#7a8099;font-size:11px">(' + count + ')</span></div>';
   }).join('');
@@ -1381,7 +1381,7 @@ function populateSelectByEdgeTypeMenu() {
   }
   sub.innerHTML = types.map(function(t) {
     var count = cy.edges('[relType="' + t + '"]').length;
-    var esc = t.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+    var esc = escHtml(t);
     return '<div class="menu-item" data-select-edge-type="' + esc + '">'
       + esc + ' <span style="color:#7a8099;font-size:11px">(' + count + ')</span></div>';
   }).join('');
@@ -8322,8 +8322,8 @@ function updateLegend() {
     var isDirect = DIRECT_TYPES.has(type);
     var div = document.createElement('div');
     div.className = 'legend-item';
-    div.innerHTML = '<span class="legend-color-dot" style="background:' + color + '"></span>'
-      + '<span title="' + (isDirect ? 'Direct' : 'Indirect') + '">' + type + '</span>';
+    div.innerHTML = '<span class="legend-color-dot" style="background:' + escHtml(String(color)) + '"></span>'
+      + '<span title="' + (isDirect ? 'Direct' : 'Indirect') + '">' + escHtml(type) + '</span>';
     container.appendChild(div);
   });
 }
@@ -23104,7 +23104,7 @@ async function agentLibraryRefresh() {
     _agentLibraryFiles = data.files || [];
     _renderLibraryList(_agentLibraryFiles);
   } catch(e) {
-    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load library: ' + e.message + '</div>';
+    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load library: ' + escHtml(String(e && e.message)) + '</div>';
   }
 }
 
@@ -23223,7 +23223,7 @@ async function agentExamplesRefresh() {
     _agentExamplesCache = data.examples || [];
     _aexRender();
   } catch(e) {
-    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load examples: ' + e.message + '</div>';
+    list.innerHTML = '<div style="color:#ff6b6b;font-size:12px;padding:10px">Failed to load examples: ' + escHtml(String(e && e.message)) + '</div>';
   }
 }
 
@@ -24250,7 +24250,7 @@ async function agentVocabRefresh() {
     _vocabData = data.mappings || [];
     _renderVocabRows();
   } catch(e) {
-    tbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#e57373">Failed to load: ' + e.message + '</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="padding:20px;text-align:center;color:#e57373">Failed to load: ' + escHtml(String(e && e.message)) + '</td></tr>';
   }
 }
 
