@@ -4806,6 +4806,35 @@ app.get('/api/database/statistics/counts', dbLimiter, authMiddleware, async (req
   }
 });
 
+// GET /api/database/statistics/by-source — relation counts per relation type and Source value.
+// Needs a full relationship scan, so the dialog fires it in the background and shows it on its own tab.
+// Source can hold a list of values: a relation is then counted under each of them.
+app.get('/api/database/statistics/by-source', dbLimiter, authMiddleware, async (req, res) => {
+  const session = req.neo4j.driver.session({ database: req.neo4j.database });
+  try {
+    const result = await session.run(
+      'MATCH ()-[r]->() WITH type(r) AS relType, r.Source AS src, count(*) AS c RETURN relType, src, c');
+    const counts = {}, sources = new Set();
+    for (const rec of result.records) {
+      const relType = rec.get('relType'), c = _statsToNum(rec.get('c'));
+      const raw = rec.get('src');
+      const vals = (Array.isArray(raw) ? raw : [raw]).map(v => (v == null || v === '') ? '(none)' : String(v));
+      const row = counts[relType] || (counts[relType] = {});
+      for (const v of new Set(vals)) { sources.add(v); row[v] = (row[v] || 0) + c; }
+    }
+    res.json({
+      relTypes: Object.keys(counts).sort((a, b) => a.localeCompare(b)),
+      sources: [...sources].sort((a, b) => a.localeCompare(b)),
+      counts,
+    });
+  } catch (err) {
+    console.error('database/statistics/by-source error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  } finally {
+    await session.close();
+  }
+});
+
 // GET /api/database/statistics/node-props — distinct node property keys.
 app.get('/api/database/statistics/node-props', dbLimiter, authMiddleware, async (req, res) => {
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
@@ -4872,21 +4901,6 @@ app.get('/api/database/statistics/postgres/journals', dbLimiter, authMiddleware,
     res.json({ journals: Number(result.rows[0].journals) });
   } catch (err) {
     console.error('database/statistics/postgres/journals error:', err.message);
-    res.status(500).json({ error: safeError(err) });
-  }
-});
-
-// GET /api/database/statistics/postgres/sources — distinct source values.
-// Reuses the same cached fetch/query the Source-filter dialog already uses
-// (SELECT DISTINCT source FROM {schema}.reference), so a warm cache here
-// returns instantly.
-app.get('/api/database/statistics/postgres/sources', dbLimiter, authMiddleware, async (req, res) => {
-  if (!req.pg || !req.pg.pool) return res.json({ sources: null });
-  try {
-    const sources = await _fetchSourcesForSchema(req.pg.pool, req.pg.schema);
-    res.json({ sources });
-  } catch (err) {
-    console.error('database/statistics/postgres/sources error:', err.message);
     res.status(500).json({ error: safeError(err) });
   }
 });
@@ -5481,7 +5495,20 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
 // script is enough — nothing is hardcoded here. Admin only (bulk write to the shared DBs);
 // uses the caller's own Neo4j/Postgres connections.
 const GRAPH_CURATOR_FILE = path.join(__dirname, 'ResnetGraph', 'scripts', 'neo4j', 'GraphCurator.cypher');
-const PG_COUNTS_STEP = { id: 'pg-counts', num: 0, name: 'Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres', label: '' };
+const PG_COUNTS_STEP = { id: 'pg-counts', num: 0, short: 'Postgres counts', name: 'Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres', label: '' };
+// Second row of Database -> Refresh Reference count (not part of Database -> Curate): relations that are only in Neo4j and were
+// merged by GraphCurator got list-valued counts, which are replaced by the sum of the list. Runs after the Postgres update so
+// that every relation Postgres knows already has its integer count and only the leftovers are touched.
+const SUM_LISTS_STEP = {
+  id: 'sum-lists', num: 0, short: 'Sum list counts', label: 'relations converted', refcountOnly: true,
+  name: 'Convert list-valued RelationNumberOfReferences and RelationNumberOfSentences to integers (sum of the list)',
+  query: `CALL apoc.periodic.iterate(
+  "MATCH ()-[r]->() WHERE valueType(r.RelationNumberOfReferences) STARTS WITH 'LIST' OR valueType(r.RelationNumberOfSentences) STARTS WITH 'LIST' RETURN r",
+  "SET r.RelationNumberOfReferences = CASE WHEN valueType(r.RelationNumberOfReferences) STARTS WITH 'LIST' THEN reduce(t = 0, v IN r.RelationNumberOfReferences | t + coalesce(toInteger(v), 0)) ELSE r.RelationNumberOfReferences END, r.RelationNumberOfSentences = CASE WHEN valueType(r.RelationNumberOfSentences) STARTS WITH 'LIST' THEN reduce(t = 0, v IN r.RelationNumberOfSentences | t + coalesce(toInteger(v), 0)) ELSE r.RelationNumberOfSentences END",
+  {batchSize: 10000, parallel: false, retries: 3})
+YIELD committedOperations, failedOperations, errorMessages
+RETURN 'relations converted' AS merge_type, committedOperations AS mergedCount, failedOperations AS failedCount, errorMessages AS errors`,
+};
 const _userCurateJobs = new Map();   // username -> job
 const CURATE_MAX_MSGS = 5000;
 const CURATION_RUNNER = process.env.CURATION_RUNNER || path.join(__dirname, 'curation_runner.py');
@@ -5763,7 +5790,7 @@ async function _runCurate(job, selected, neo) {
           await _curateStepUpdateRefcount(job, job.username);
         } else {
           const session = neo.driver.session({ database: neo.database });
-          const monitor = /apoc\.periodic\.(iterate|commit)/i.test(step.query) ? _curateMonitorPeriodic(job, neo, step) : null;
+          const monitor = !step.refcountOnly && /apoc\.periodic\.(iterate|commit)/i.test(step.query) ? _curateMonitorPeriodic(job, neo, step) : null;
           try {
             const res = await session.run(step.query, {}, _curateTx(job));
             const num = v => (v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v || 0));
@@ -5795,7 +5822,7 @@ async function _runCurate(job, selected, neo) {
       } catch (e) {
         if (job.cancelRequested) { js.status = 'stopped'; throw new Error('Stopped by the user'); }
         js.status = 'error'; js.error = e.message;
-        throw new Error(`${step.num ? 'Step ' + step.num : 'Postgres counts'} failed: ${e.message}`);
+        throw new Error(`${step.num ? 'Step ' + step.num : step.short} failed: ${e.message}`);
       } finally {
         js.elapsedMs = Date.now() - js.startedAt;
       }
@@ -5825,7 +5852,7 @@ async function _runCurate(job, selected, neo) {
     const ran = job.steps.filter(s => s.elapsedMs !== undefined);
     if (ran.length) {
       _pushCurateMsg(job, 'Elapsed time per step:');
-      ran.forEach(s => _pushCurateMsg(job, `    ${s.num ? 'Step ' + s.num : 'Postgres counts'} (${s.name}): ${_fmtDuration(s.elapsedMs)}${s.status === 'done' ? '' : ' [' + s.status + ']'}`));
+      ran.forEach(s => _pushCurateMsg(job, `    ${s.num ? 'Step ' + s.num : s.short} (${s.name}): ${_fmtDuration(s.elapsedMs)}${s.status === 'done' ? '' : ' [' + s.status + ']'}`));
     }
     _pushCurateMsg(job, '\x1b[94mTotal elapsed time: ' + _fmtDuration(job.totalMs) + '\x1b[0m');
     job.running = false; job.done = true; job.detail = '';
@@ -5836,7 +5863,7 @@ app.get('/api/curate/steps', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     const steps = _loadCuratorSteps().map(s => ({ id: s.id, num: s.num, name: s.name, label: s.label }));
-    res.json({ steps: [PG_COUNTS_STEP].concat(steps), file: path.relative(__dirname, GRAPH_CURATOR_FILE) });
+    res.json({ steps: [PG_COUNTS_STEP, SUM_LISTS_STEP].concat(steps).map(({ query, ...s }) => s), file: path.relative(__dirname, GRAPH_CURATOR_FILE) });
   } catch (e) {
     res.status(500).json({ error: 'Cannot read GraphCurator.cypher: ' + e.message });
   }
@@ -5848,11 +5875,15 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   const existing = _userCurateJobs.get(username);
   if (existing && existing.running) return res.status(409).json({ error: 'A curation run is already in progress for your account.' });
   let all;
-  try { all = [PG_COUNTS_STEP].concat(_loadCuratorSteps()); }
+  try { all = [PG_COUNTS_STEP, SUM_LISTS_STEP].concat(_loadCuratorSteps()); }
   catch (e) { return res.status(500).json({ error: 'Cannot read GraphCurator.cypher: ' + e.message }); }
-  // mode 'refcount' (Database -> Refresh Reference count): only the Postgres-counts step, with only_greater = False
+  // mode 'refcount' (Database -> Refresh Reference count): the Postgres-counts step (only_greater = False) and/or the
+  // sum-lists step, as selected; mode 'curate' never runs the sum-lists step
   const mode = (req.body || {}).mode === 'refcount' ? 'refcount' : 'curate';
-  const wanted = mode === 'refcount' ? new Set([PG_COUNTS_STEP.id]) : new Set(Array.isArray((req.body || {}).steps) ? req.body.steps.map(String) : []);
+  const asked = new Set(Array.isArray((req.body || {}).steps) ? req.body.steps.map(String) : []);
+  const wanted = mode === 'refcount'
+    ? new Set([PG_COUNTS_STEP.id, SUM_LISTS_STEP.id].filter(id => asked.has(id)))
+    : new Set([...asked].filter(id => id !== SUM_LISTS_STEP.id));
   const selected = all.filter(s => wanted.has(s.id));
   if (!selected.length) return res.status(400).json({ error: 'Select at least one step.' });
   if (!req.neo4j || !req.neo4j.driver) return res.status(400).json({ error: 'Neo4j connection is not configured.' });
@@ -5873,8 +5904,8 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   } catch (e) { job.logPath = null; console.warn('[curate] cannot create log file:', e.message); }
   _userCurateJobs.set(username, job);
   if (job.logPath) _pushCurateMsg(job, `Log file: ${job.logPath}`);
-  if (mode === 'refcount') _pushCurateMsg(job, 'Refresh Reference count: update_refcount(only_greater=False) — every relation whose sentence count differs from Postgres is updated');
-  _pushCurateMsg(job, `Selected ${selected.length} step(s): ${selected.map(s => s.num ? 'Step ' + s.num : 'Postgres counts').join(', ')}`);
+  if (mode === 'refcount') _pushCurateMsg(job, 'Refresh Reference count: Postgres update uses only_greater=False (every relation whose sentence count differs from Postgres is updated); list-valued counts are then summed to integers');
+  _pushCurateMsg(job, `Selected ${selected.length} step(s): ${selected.map(s => s.num ? 'Step ' + s.num : s.short).join(', ')}`);
   res.json({ started: true, selected: selected.length });
   _runCurate(job, selected, req.neo4j);   // not awaited: runs on the server, independent of the browser
 });
