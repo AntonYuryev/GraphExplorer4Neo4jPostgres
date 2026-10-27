@@ -3425,7 +3425,9 @@ app.post('/api/sql-query', dbLimiter, authMiddleware, async (req, res) => {
     const qSchema = req.pg.schema ? '"' + String(req.pg.schema).replace(/"/g, '""') + '"' : null;
     const client = await req.pg.pool.connect();
     try {
-      if (useTx) await client.query('BEGIN');
+      // Everything except CREATE INDEX runs in a READ ONLY transaction, so even a statement that slips past the
+      // keyword checks above (e.g. a function with side effects) cannot change data.
+      if (useTx) await client.query(isCreateIndex ? 'BEGIN' : 'BEGIN READ ONLY');
       if (qSchema) await client.query(`${useTx ? 'SET LOCAL' : 'SET'} search_path TO ${qSchema}, public`);
       const result = await client.query(sql);
       if (useTx) await client.query('COMMIT');
@@ -5354,13 +5356,29 @@ const CURATE_LOG_DIR       = path.join(LOGS_DIR, 'curation_logs');
 const RNEF_IMPORT_MAX_MSGS = 20000;     // messages kept in memory for the dialog; the log file has everything
 const _userRnefImportJobs  = new Map(); // username -> job
 
-function _collectRnefFiles(target) {
+// Import RNEF reads LOCAL, SERVER-SIDE paths typed or chosen by an administrator — that is the feature (files are never
+// uploaded through the browser). The path is normalised (absolute, symlinks resolved, no NUL byte) and, when the
+// RNEF_IMPORT_ROOTS environment variable lists folders (separated by ';' on Windows, ':' elsewhere), it must lie inside one of them.
+const RNEF_IMPORT_ROOTS = (process.env.RNEF_IMPORT_ROOTS || '').split(path.delimiter).map(r => r.trim()).filter(Boolean).map(r => path.resolve(r));
+function _resolveImportTarget(raw) {
+  if (typeof raw !== 'string' || !raw.trim() || raw.includes('\0')) throw new Error('A file or folder path is required.');
+  const resolved = fs.realpathSync(path.resolve(raw.trim()));
+  if (RNEF_IMPORT_ROOTS.length && !RNEF_IMPORT_ROOTS.some(r => resolved === r || resolved.startsWith(r + path.sep))) {
+    throw new Error('This path is outside the folders allowed for import (RNEF_IMPORT_ROOTS).');
+  }
+  return resolved;
+}
+
+function _collectRnefFiles(rawTarget) {
+  const target = _resolveImportTarget(rawTarget);
+  // codeql[js/path-injection] admin-only; the path is normalised and optionally confined to RNEF_IMPORT_ROOTS by _resolveImportTarget(); only .rnef/.xml files are returned
   if (fs.statSync(target).isFile()) {
     if (!/\.(rnef|xml)$/i.test(target)) throw new Error('Only files with the extensions .rnef and .xml can be imported.');
     return [target];
   }
   const out = [];
   (function walk(dir) {
+    // codeql[js/path-injection] same as above: dir is the resolved import folder or a sub-folder of it
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, e.name);
       if (e.isDirectory()) walk(full);
@@ -5486,14 +5504,17 @@ app.post('/api/import/rnef/browse', dbLimiter, authMiddleware, (req, res) => {
   if (process.platform !== 'win32') return res.status(501).json({ error: 'The file/folder dialog is only available when the server runs on Windows — type the path instead.' });
   if (_rnefBrowseBusy) return res.status(409).json({ error: 'A file dialog is already open on the server machine.' });
   const kind = (req.body || {}).kind === 'folder' ? 'folder' : 'file';
-  const ps1 = path.join(os.tmpdir(), `rnef-browse-${process.pid}.ps1`);
-  fs.writeFileSync(ps1, '﻿' + _BROWSE_PS1, 'utf8');   // BOM so PowerShell reads it as UTF-8
+  // The script is written into its own freshly created private folder (random name, owner-only) — never to a
+  // predictable name in the shared temp folder, where another local user could swap it before PowerShell runs it.
+  const ps1Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rnef-browse-'));
+  const ps1 = path.join(ps1Dir, 'browse.ps1');
+  fs.writeFileSync(ps1, '﻿' + _BROWSE_PS1, { encoding: 'utf8', mode: 0o600, flag: 'wx' });   // BOM so PowerShell reads it as UTF-8
   _rnefBrowseBusy = true;
   execFile(POWERSHELL_CMD, ['-STA', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1, kind],
     { timeout: 10 * 60 * 1000, encoding: 'utf8' },
     (err, stdout) => {
       _rnefBrowseBusy = false;
-      try { fs.rmSync(ps1, { force: true }); } catch (e) {}
+      try { fs.rmSync(ps1Dir, { recursive: true, force: true }); } catch (e) {}
       if (err) return res.status(500).json({ error: 'Could not open the dialog: ' + err.message });
       const chosen = String(stdout || '').trim();
       res.json({ path: chosen || null });
@@ -5507,7 +5528,8 @@ app.post('/api/import/rnef/start', dbLimiter, authMiddleware, (req, res) => {
   let targetPath = (req.body || {}).path;
   if (!targetPath || typeof targetPath !== 'string') return res.status(400).json({ error: 'path required' });
   targetPath = targetPath.trim().replace(/^"(.*)"$/, '$1');   // Explorer's "Copy as path" wraps it in quotes
-  if (!fs.existsSync(targetPath)) return res.status(400).json({ error: `Path does not exist on the server: ${targetPath}` });
+  try { targetPath = _resolveImportTarget(targetPath); }
+  catch (e) { return res.status(400).json({ error: e.code === 'ENOENT' ? 'Path does not exist on the server: ' + targetPath : e.message }); }
   const addSource = String((req.body || {}).addSource || '').trim().slice(0, 200);   // optional Source value stamped on imported relations
   _startRnefImport(req, res, targetPath, addSource);
 });
