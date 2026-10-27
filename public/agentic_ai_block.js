@@ -6,41 +6,41 @@
 /**
  * _safeDoiUrl(rawUrl, doiId) → string
  *
- * Returns a safe https:// URL for use in anchor href attributes.
- * Never assigns untrusted strings directly to DOM href — addresses CodeQL
- * CWE-79 / "DOM text reinterpreted as HTML" (agentic_ai_block.js #183).
+ * Returns a safe https://doi.org/ URL for use in anchor href attributes.
+ * The text comes from LLM output, so it is never used as a link as-is (CodeQL
+ * "DOM text reinterpreted as HTML"): the link is always REBUILT on https://doi.org/
+ * from a validated DOI, with the DOI percent-encoded.
  *
  * Resolution order:
- *  1. If rawUrl is a valid https:// URL → use it as-is.
- *  2. If rawUrl starts with //doi.org or doi.org → rewrite to https://doi.org/…
- *  3. If doiId looks like a real DOI (starts with 10.) → build https://doi.org/{doiId}
- *  4. Fall back to https://doi.org/
+ *  1. rawUrl, but only when it points at doi.org / dx.doi.org — its DOI is taken from the path and rebuilt.
+ *     Any other host (or scheme such as javascript:) is ignored.
+ *  2. doiId, when it looks like a real DOI (10.NNNN/suffix)
+ *  3. https://doi.org/
  */
 function _safeDoiUrl(rawUrl, doiId) {
+  function buildFromDoi(id) {
+    id = String(id || '').trim();
+    var slash = id.indexOf('/');
+    if (slash < 0 || !/^10\.\d{4,9}$/.test(id.slice(0, slash)) || slash === id.length - 1) return null;
+    return 'https://doi.org/' + encodeURIComponent(id.slice(0, slash)) + '/' +
+           encodeURIComponent(id.slice(slash + 1)).replace(/%2F/gi, '/');
+  }
   if (rawUrl) {
+    var s = String(rawUrl).trim();
+    if (/^\/\/doi\.org\//i.test(s)) s = 'https:' + s;
+    else if (/^(dx\.)?doi\.org\//i.test(s)) s = 'https://' + s;
     try {
-      var parsed = new URL(String(rawUrl));
-      if (parsed.protocol === 'https:') {
-        return parsed.href;
-      }
-      // http:// doi.org → upgrade to https://
-      if (parsed.protocol === 'http:' && parsed.hostname.toLowerCase().includes('doi.org')) {
-        parsed.protocol = 'https:';
-        return parsed.href;
+      var parsed = new URL(s);
+      var host = parsed.hostname.toLowerCase();
+      if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && (host === 'doi.org' || host === 'dx.doi.org')) {
+        var fromUrl = buildFromDoi(decodeURIComponent(parsed.pathname.replace(/^\//, '')));
+        if (fromUrl) return fromUrl;
       }
     } catch (e) {
-      // rawUrl is not a full URL — try treating it as a bare doi.org path
-      var s = String(rawUrl).trim();
-      if (/^\/\/doi\.org\//i.test(s)) return 'https:' + s;
-      if (/^doi\.org\//i.test(s))    return 'https://' + s;
+      // not a URL (or malformed %-escapes) — fall through to doiId
     }
   }
-  // Fall back to building from doiId
-  var id = String(doiId || '').trim();
-  if (/^10\.\d{4,9}\//.test(id)) {
-    return 'https://doi.org/' + id;
-  }
-  return 'https://doi.org/';
+  return buildFromDoi(doiId) || 'https://doi.org/';
 }
 
 // ── Panel resize (drag left border) ─────────────────────────────────────────
@@ -593,7 +593,8 @@ function _renderSummarizeReply(text, container) {
       var doiRefsMatch = !pmidMatch && matched.indexOf('[DOI refs](__DOISDAT__') === 0;
       var doiMatch     = !pmidMatch && !doiRefsMatch && /^DOIs?\b/i.test(matched);
       if (pmidMatch) {
-        var pmids = matched.match(/\d{1,9}/g) || [];
+        // PMIDs are converted to real numbers, so only digits can ever end up in the PubMed URL below
+        var pmids = (matched.match(/\d{1,9}/g) || []).map(function (x) { return parseInt(x, 10); });
         var pmidsCapped = pmids.slice(0, 25);  // PubMed URL cap
         var a = document.createElement('a');
         // Single PMID → direct article page; multiple PMIDs → one "Pubmed references"
