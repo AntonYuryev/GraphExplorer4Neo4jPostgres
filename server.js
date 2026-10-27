@@ -85,9 +85,19 @@ app.use((err, req, res, next) => {
   }
   next(err);
 });
-app.use(express.static(path.join(__dirname, 'public')));
+app.disable('x-powered-by');
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
+// Generous limiter for static asset / HTML serving (filesystem access).
+const staticLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: 'Too many requests. Please slow down and try again shortly.'
+});
+app.use(staticLimiter, express.static(path.join(__dirname, 'public')));
+
 // Strict limiter for login — prevents brute-force password attacks.
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,   // 15 minutes
@@ -203,7 +213,7 @@ function saveAppSettings(s) {
   // codeql[js/network-data-written-to-file] - `s` is always the validated and
   // live-tested appSettings object (credentials verified against the real DB
   // before reaching this call); no raw network data is written.
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2));
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2), { mode: 0o600 });   // credentials: owner-only where the OS supports it
 }
 
 let appSettings = loadAppSettings();
@@ -350,7 +360,12 @@ function makePgPool(cfg) {
     database: cfg.database,
     user:     cfg.username,
     password: cfg.password,
-    ssl: { rejectUnauthorized: false },
+    // Certificate validation is ON by default. For a database using a
+    // self-signed / private-CA certificate, opt in explicitly with the
+    // environment variable PG_SSL_ALLOW_SELF_SIGNED=1 (or "allowSelfSigned": true
+    // under "postgres" in settings.json).
+    ssl: { rejectUnauthorized: !(/^(1|true|yes)$/i.test(String(process.env.PG_SSL_ALLOW_SELF_SIGNED || '')) ||
+                                 (appSettings && appSettings.postgres && appSettings.postgres.allowSelfSigned === true)) },
     max: 10,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 10000
@@ -434,18 +449,20 @@ function loadUsers() {
     // File does not exist — create default admin atomically (flag 'wx' fails if
     // the file was created by another process between our read and write, eliminating
     // the TOCTOU race condition).
+    // No well-known default password: the first admin gets a random one, shown once on this console.
+    const firstAdminSecret = _crypto.randomBytes(12).toString('base64url');
     const defaultUsers = [{
       username: 'admin',
-      password: bcrypt.hashSync('admin123', 10),
+      password: bcrypt.hashSync(firstAdminSecret, 10),
       role: 'admin'
     }];
     try {
       fs.writeFileSync(USERS_FILE, JSON.stringify(defaultUsers, null, 2), { flag: 'wx' });
       console.log('\n========================================');
-      console.log('Default admin account created:');
+      console.log('First-run admin account created:');
       console.log('  Username: admin');
-      console.log('  Password: admin123');
-      console.log('Change this password after first login!');
+      console.log('  One-time password: ' + firstAdminSecret);
+      console.log('Log in and change this password now (Settings > Change Password). It is not stored anywhere in clear text.');
       console.log('========================================\n');
       return defaultUsers;
     } catch (writeErr) {
@@ -535,7 +552,7 @@ function saveUsers(users) {
   // codeql[js/network-data-written-to-file] - `safe` contains only regex match[0]
   // values (NAME_RE / BCRYPT_RE), hardcoded role literals, and length/type-checked
   // connection-credential strings used solely as driver/client auth parameters.
-  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2));
+  fs.writeFileSync(USERS_FILE, JSON.stringify(safe, null, 2), { mode: 0o600 });
 }
 
 function adminMiddleware(req, res, next) {
@@ -550,7 +567,7 @@ function authMiddleware(req, res, next) {
   }
   let user;
   try {
-    user = jwt.verify(header.slice(7), JWT_SECRET);
+    user = jwt.verify(header.slice(7), JWT_SECRET, { algorithms: ['HS256'] });
   } catch {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
@@ -720,7 +737,7 @@ function processValue(val, nodesMap, edgesMap) {
 
 app.post('/api/auth/login', loginLimiter, (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') return res.status(400).json({ error: 'Username and password required' });
 
   const users = loadUsers();
   const user = users.find(u => u.username === username);
@@ -728,13 +745,13 @@ app.post('/api/auth/login', loginLimiter, (req, res) => {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
 
-  const token = jwt.sign({ username, role: user.role }, JWT_SECRET, { expiresIn: '12h' });
+  const token = jwt.sign({ username, role: user.role }, JWT_SECRET, { expiresIn: '12h', algorithm: 'HS256' });
   res.json({ token, username, role: user.role });
 });
 
 app.post('/api/auth/change-password', dbLimiter, authMiddleware, (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
-  if (!newPassword || newPassword.length < 6) {
+  if (typeof newPassword !== 'string' || typeof currentPassword !== 'string' || newPassword.length < 6) {
     return res.status(400).json({ error: 'New password must be at least 6 characters' });
   }
   const users = loadUsers();
@@ -758,13 +775,13 @@ app.get('/api/auth/users', dbLimiter, authMiddleware, (req, res) => {
 app.post('/api/auth/users', dbLimiter, authMiddleware, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { username, password, role } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
+  if (!username || !password || typeof username !== 'string' || typeof password !== 'string') return res.status(400).json({ error: 'Username and password required' });
 
   const users = loadUsers();
   if (users.find(u => u.username === username)) {
     return res.status(400).json({ error: 'User already exists' });
   }
-  users.push({ username, password: bcrypt.hashSync(password, 10), role: role || 'user' });
+  users.push({ username, password: bcrypt.hashSync(password, 10), role: role === 'admin' ? 'admin' : 'user' });
   saveUsers(users);
   res.json({ message: 'User created' });
 });
@@ -2140,7 +2157,7 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
 
   // Annotation values are always plain text -- coerced to strings and
   // blank/whitespace-only keys dropped, regardless of what the client sent.
-  const cleanProps = {};
+  const cleanProps = Object.create(null);
   for (const [k, v] of Object.entries(properties)) {
     const key = String(k).trim();
     if (key) cleanProps[key] = String(v);
@@ -2238,7 +2255,7 @@ app.post('/api/pathways/annotation', dbLimiter, authMiddleware, async (req, res)
 function _pwSanitizeGraphSavePayload(graphData, properties) {
   const nodes = Array.isArray(graphData && graphData.nodes) ? graphData.nodes : [];
   const edges = Array.isArray(graphData && graphData.edges) ? graphData.edges : [];
-  const cleanProps = {};
+  const cleanProps = Object.create(null);
   for (const [k, v] of Object.entries(properties || {})) {
     const key = String(k).trim();
     if (key) cleanProps[key] = String(v);
@@ -2738,7 +2755,7 @@ app.post('/api/graph/enrich-by-urn', dbLimiter, authMiddleware, async (req, res)
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(cypher, { urns: safeUrns });
-    const enriched = {};
+    const enriched = Object.create(null);
     result.records.forEach(record => {
       const node = record.get('n');
       const urnVal = node.properties[NEO4J_URN_PROP];
@@ -2954,7 +2971,7 @@ app.post('/api/references/batch', exportLimiter, authMiddleware, async (req, res
     const result = await req.pg.pool.query(sql, queryParams);
 
     // Group by relation id (string key to preserve full 64-bit precision)
-    const grouped = {};
+    const grouped = Object.create(null);
     result.rows.forEach(row => {
       const key = String(row.id);
       if (!grouped[key]) grouped[key] = [];
@@ -3046,8 +3063,8 @@ app.post('/api/nodes/load-properties', dbLimiter, authMiddleware, async (req, re
   const safeProps = properties.filter(p => typeof p === 'string' && PROP_RE.test(p));
   if (!safeProps.length) return res.json({ byNodeId: {}, byUrn: {} });
 
-  const byNodeId = {};
-  const byUrn    = {};
+  const byNodeId = Object.create(null);
+  const byUrn = Object.create(null);
 
   // ── Query by numeric NodeID ──────────────────────────────────────────────────
   const validIds = nodeIds.map(String).filter(id => /^-?\d+$/.test(id));
@@ -4253,7 +4270,7 @@ app.post('/api/sql/history', dbLimiter, authMiddleware, (req, res) => {
   }
   const { query, count } = req.body || {};
   if (!query || !query.trim()) {
-    console.warn('[sql-history] POST rejected: no query in request body', req.body);
+    console.warn('[sql-history] POST rejected: no query in request body');
     return res.status(400).json({ error: 'query required' });
   }
   const encodedQuery = Buffer.from(String(query).slice(0, HISTORY_QUERY_MAX_CHARS)).toString('base64');
@@ -4303,11 +4320,38 @@ function _killPortProcess(port, cb) {
   // Kill any existing process LISTENING on the agent port (stale Python from a previous run).
   // Filters for LISTENING state only to avoid killing unrelated processes that merely
   // have ESTABLISHED connections to the port (e.g. the Node proxy itself).
-  const isWin = process.platform === 'win32';
-  const cmd   = isWin
-    ? `FOR /F "tokens=5" %a IN ('netstat -ano ^| findstr :${port} ^| findstr LISTENING') DO taskkill /F /PID %a`
-    : `lsof -ti tcp:${port} | xargs kill -9`;
-  require('child_process').exec(cmd, () => cb && cb());
+  // No shell involved: the port is validated as an integer and the PIDs are
+  // parsed in JS and passed to taskkill / process.kill individually.
+  const portNum = Number(port);
+  const done = () => { if (cb) cb(); };
+  if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return done();
+  const killPids = (pids) => {
+    const own = process.pid;
+    const uniq = Array.from(new Set(pids.filter(p => /^\d+$/.test(p) && Number(p) > 0 && Number(p) !== own)));
+    if (!uniq.length) return done();
+    let left = uniq.length;
+    const one = () => { if (--left === 0) done(); };
+    uniq.forEach(p => {
+      if (process.platform === 'win32') execFile('taskkill', ['/F', '/PID', p], () => one());
+      else { try { process.kill(Number(p), 'SIGKILL'); } catch (e) {} one(); }
+    });
+  };
+  if (process.platform === 'win32') {
+    execFile('netstat', ['-ano'], { maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return done();
+      const pids = [];
+      String(stdout || '').split(/\r?\n/).forEach(line => {
+        const cols = line.trim().split(/\s+/);
+        // Proto  Local-Address  Foreign-Address  State  PID
+        if (cols.length >= 5 && /LISTENING/i.test(cols[3]) && cols[1].endsWith(':' + portNum)) pids.push(cols[4]);
+      });
+      killPids(pids);
+    });
+  } else {
+    execFile('lsof', ['-ti', 'tcp:' + portNum], (err, stdout) => {
+      killPids(String(stdout || '').split(/\s+/).filter(Boolean));
+    });
+  }
 }
 
 function _startAgentService() {
@@ -4510,7 +4554,7 @@ function _enrichCurrentGraphWithReferences(body) {
   // 1. Direct references from inline edge properties (if frontend sends full edge data)
   // 2. From _graphData.edges (if frontend sends both current_graph and full graph data)
   
-  const refsByEdgeId = {};
+  const refsByEdgeId = Object.create(null);
   
   // Source 1: Extract from _graphData if provided
   if (body._graphData && body._graphData.edges && Array.isArray(body._graphData.edges)) {
@@ -5470,6 +5514,7 @@ app.post('/api/import/rnef/start', dbLimiter, authMiddleware, (req, res) => {
 
 // GET /api/import/rnef/progress?since=N — runtime messages from index N on.
 app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const job = _userRnefImportJobs.get(req.user.username);
   if (!job) return res.json({ running: false, done: false, noJob: true });
   const since = Math.max(parseInt(req.query.since, 10) || 0, job.base);
@@ -5478,7 +5523,7 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
   // running — it is a separate process). While the job runs, every poll that has less than
   // 6 h left on its token gets a fresh 12 h one in X-Auth-Token; the client swaps it in.
   if (job.running && req.user.exp && req.user.exp - Math.floor(Date.now() / 1000) < 6 * 3600) {
-    res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h' }));
+    res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h', algorithm: 'HS256' }));
   }
   res.json({ running: job.running, done: job.done, exitCode: job.exitCode, error: job.error,
              startedAt: job.startedAt, filesTotal: job.filesTotal, logFile: job.logFile, logPath: job.logPath,
@@ -5927,7 +5972,7 @@ app.get('/api/curate/progress', dbLimiter, authMiddleware, (req, res) => {
   const since = Math.max(parseInt(req.query.since, 10) || 0, job.base);
   // same login-keepalive as the RNEF import: a long run must not lose its live view when the token ages
   if (job.running && req.user.exp && req.user.exp - Math.floor(Date.now() / 1000) < 6 * 3600) {
-    res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h' }));
+    res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h', algorithm: 'HS256' }));
   }
   res.json({ running: job.running, done: job.done, error: job.error, stopped: job.stopped, kind: job.kind || 'curate',
              stopping: job.cancelRequested && job.running, startedAt: job.startedAt,
