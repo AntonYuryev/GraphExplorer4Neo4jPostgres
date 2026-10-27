@@ -510,9 +510,15 @@
   <div id="statistics-modal" class="modal-backdrop" style="display:none">
     <div class="modal-box" style="width:900px;max-width:95vw" onclick="event.stopPropagation()">
       <h3>Database Statistics</h3>
-      <div id="statistics-body" style="max-height:75vh;overflow:auto;font-size:12px"></div>
+      <div style="display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid #2d3147">
+        <button id="stat-tab-stats" class="btn-ghost" style="border-radius:4px 4px 0 0" onclick="switchStatTab('stats')">Statistics</button>
+        <button id="stat-tab-bysource" class="btn-ghost" style="border-radius:4px 4px 0 0" onclick="switchStatTab('bysource')">BySource</button>
+      </div>
+      <div id="statistics-body" style="max-height:70vh;overflow:auto;font-size:12px"></div>
+      <div id="stat-bysource" style="display:none;max-height:70vh;overflow:auto;font-size:12px"></div>
       <div class="modal-actions" style="margin-top:12px">
         <button class="btn-ghost" onclick="document.getElementById('statistics-modal').style.display='none'">Close</button>
+        <button class="btn-ghost" onclick="copyStatistics(this)" title="Copy the statistics to the clipboard as text">Copy</button>
         <button class="btn-primary" onclick="refreshStatistics()">↻ Refresh</button>
       </div>
     </div>
