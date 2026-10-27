@@ -3,8 +3,8 @@
 A web application for exploring, visualizing, and curating biological knowledge graphs stored in **Neo4j**, with **PostgreSQL** literature-reference lookup, RNEF pathway import, a multi-tab graph workspace, Excel/CSV export — and an integrated **AI chat agent** that can translate natural-language questions into Cypher/SQL, visualize the results, and (only with your confirmation) write curated relations back to the graph.
 
 > **Documentation**
-> 📘 [Graph_Explorer_User_Manual.docx](Graph_Explorer_User_Manual.docx) — step-by-step guide for end users
-> 📗 [Graph_Explorer_FRD.docx](Graph_Explorer_FRD.docx) — complete functional requirements for developers
+> 📘 [Graph_Explorer_User_Manual.docx](docs/Graph_Explorer_User_Manual.docx) — step-by-step guide for end users
+> 📗 [Graph_Explorer_FRD.docx](docs/Graph_Explorer_FRD.docx) — complete functional requirements for developers
 
 ---
 
@@ -12,15 +12,26 @@ A web application for exploring, visualizing, and curating biological knowledge 
 
 ```
 graph-explorer/
-  server.js                       Backend server (Node.js/Express) — auth, graph/DB APIs, agent process supervisor
+  server.js                       Backend server (Node.js/Express) — auth, graph/DB APIs, agent process supervisor,
+                                   Database -> Import RNEF / Curate / Refresh Reference count job runners
   agent_service.py                AI agent backend (Python/FastAPI) — LLM chat loop, Cypher/SQL execution
-  requirements_agent.txt          Python dependencies for the agent service
+  summarize_agent.py              Literature summarization agent (default outline, Methods/Procedures prompts)
+  text2cypher_agent.py            Natural-language → Cypher agent
+  agent_skills/                   Small editable skill files (*.md) pulled into the agent prompts only when relevant
+  requirements_agent.txt          Python dependencies (agent service and the ResnetGraph runners)
   cypher_examples.json            Curated few-shot Cypher examples the agent learns this graph's conventions from
-  agentic_ai_block.js             Standalone/legacy agent UI fragment (see note below)
   rnef_to_json.py                 RNEF → JSON converter for a single pathway (invoked by server.js per-file)
   rnef_index.py                   Walks an entire pathway collection directory once, building the lightweight
                                    index that powers Pathway Collection Browse/Search/Statistics/Anatomy Index
                                    and Pathway Alias resolution (invoked by server.js, separate from rnef_to_json.py)
+  rnef_import_runner.py           Database -> Import RNEF: loads .rnef/.xml files into Neo4j + Postgres (started by server.js)
+  curation_runner.py              Database -> Curate / Refresh Reference count: refreshes relation reference/sentence
+                                   counts in Neo4j from Postgres (started by server.js)
+  ResnetGraph/
+    ElsevierAPI/                  The subset of the ElsevierAPI Python library the runners import
+                                   (api/EmbioPSG_API, api/ResnetAPI, utils) — also published separately, see "Releasing to GitHub"
+    scripts/Neo4j/GraphCurator.cypher   The curation steps run by Database -> Curate (edit this file to change them)
+    github-sync.js                Sync of ResnetGraph/ElsevierAPI with the ElsevierAPI_Project repository
   package.json                    Node dependency list
   settings.example.json           Template for settings.json (copy and fill in your own credentials)
   settings.json                   Real DB/LLM credentials — created locally, never committed
@@ -32,13 +43,16 @@ graph-explorer/
     index.html                    App HTML, dialogs, and menus
     app.js                        All frontend logic
     app.css                       Styles
+    lib/relation-id.js            RelationID hash shared by browser and server
     vendor/                       Bundled third-party JS libraries (Cytoscape.js + its dagre/klay layout
                                    extensions, D3 + d3-sankey, ExcelJS, JSZip) — loaded locally, not from a CDN
-  Graph_Explorer_User_Manual.docx End-user guide
-  Graph_Explorer_FRD.docx         Functional requirements document
+  docs/                           Graph_Explorer_User_Manual.docx (end users), Graph_Explorer_FRD.docx (functional requirements)
+  logs/                           Run logs written at runtime (gitignored): logs/import_logs, logs/curation_logs
+  github-upload.js, github-download.js   Publish to / restore from the GitHub repositories (see "Releasing to GitHub")
+  .github/workflows/codeql.yml    CodeQL code scanning (JavaScript/TypeScript and Python)
 ```
 
-> **Note on `agentic_ai_block.js`:** this file is not currently wired into `public/index.html`'s script tags. Confirm whether it's dead code left over from an earlier extraction or a fragment still awaiting integration before relying on it.
+> `public/agentic_ai_block.js` is a standalone/legacy agent UI fragment that is not wired into `public/index.html`.
 
 ---
 
@@ -46,12 +60,14 @@ graph-explorer/
 
 **Node.js v18 or later** — https://nodejs.org (LTS installer).
 
-**Python 3.10+** — required both for RNEF file conversion and for the AI agent service. Install dependencies with:
+**Python 3.10+** — required for RNEF file conversion, the AI agent service, and the Database → Import RNEF / Curate / Refresh Reference count runners. Install dependencies with:
 ```bash
 pip install -r requirements_agent.txt
 ```
 
 **An LLM API key** — the agent supports Anthropic Claude (native), Google Gemini (via an OpenAI-compatible endpoint), or any other OpenAI-compatible provider. An admin sets up the provider **URL** once (Settings → Agentic AI / LLM — admin-managed the same way as the Neo4j/Postgres connection URLs under URL Connections for Database Endpoints); each user then picks that provider and enters their own **API key** under My Connection after first login. No key is required just to browse the graph without the AI agent.
+
+**Neo4j with the APOC plugin** (Neo4j 5.9 or later is recommended) — Database → Curate and Refresh Reference count use `apoc.periodic.iterate`, `apoc.refactor.mergeRelationships` and `valueType()`. Import RNEF, Curate and Refresh Reference count also need a Neo4j login that is allowed to write, and a PostgreSQL account that can write to the `reference` table.
 
 The machine also needs network access to:
 - Neo4j at your configured host
@@ -81,7 +97,7 @@ Credentials are **never hardcoded in source**. There are two tiers:
 
 1. Copy `settings.example.json` to `settings.json` and adjust the placeholder values, or leave `settings.json` absent — the app will create one automatically on first save from the UI.
 2. Start the server (see below).
-3. Log in as `admin` (default password: `admin123`) and change the password immediately.
+3. Log in as `admin` with the one-time password the server prints on its console the first time it starts (when `users.json` does not exist yet), and change the password immediately.
 4. Open **⚙ Settings ▾ → URL Connections for Database Endpoints** and enter the shared Neo4j URL and Postgres host/port. Separately, open **⚙ Settings ▾ → Agentic AI / LLM** and add the LLM provider URL(s) you want available (e.g. Google Gemini's endpoint, Anthropic's endpoint, or a self-hosted OpenAI-compatible one) — admin-managed the same way as the database endpoints, not something individual users type in freely.
 5. Open **⚙ Settings ▾ → My Connection** and enter your own Neo4j database/username/password, Postgres database/schema/username/password, and pick an LLM provider from the admin's list plus your own API key.
 
@@ -100,13 +116,9 @@ node server.js
 
 Open **http://localhost:3000** in your browser. Stop the server with **Ctrl+C**.
 
-### Default admin account
+### First admin account
 
-| Username | Password   |
-|----------|------------|
-| `admin`  | `admin123` |
-
-**Change this password immediately** after first login via **⚙ Settings ▾ → Change Password** — this default account is a known, public value once this repo is public.
+On the very first start (no `users.json` yet) the server creates the user `admin` with a **random one-time password** and prints it once on the console — there is no well-known default password. Log in and change it immediately via **⚙ Settings ▾ → Change Password**. If you lose it, stop the server, delete `users.json` and start again (this also removes all other users).
 
 ---
 
@@ -129,7 +141,21 @@ Open **http://localhost:3000** in your browser. Stop the server with **Ctrl+C**.
 | **Pathway Collection** | Point the app at a curated pathway directory (⚙ Settings → Pathway Collection) and it builds a searchable index: **Browse** (folder tree with recursive pathway counts, including **Pathway Alias** entries — lightweight references to a pathway that lives in a different folder, shown with a 🔗 icon, opening the real pathway on click), **Text/Entity/Combined Search**, **Alphabetical Index**, **Anatomy Index**, and collection-wide **Statistics** |
 | **Import/Export** | JSON subgraph save/load, **Save / Save As** for a pathway back into your collection (as a full copy, or as a Pathway Alias pointing at the currently open pathway), Excel/CSV export (with automatic file-splitting for very large result sets), Sankey SVG export |
 | **Curation** | Create/Edit Relation dialogs (general multi-node, and a streamlined 2-node pair dialog) — reference management with jump-to-reference-number, Find-by-identifier (DOI/PMID/etc.) with Find-Next cycling through repeat matches, live RelationID preview — restricted to the `user` role, not `admin` |
-| **Admin tools** | User management, shared DB endpoint configuration, read-only ad-hoc SQL runner (`SELECT`/`WITH` only) |
+| **Cypher / SQL editors** | Run Cypher and read-only SQL (`SELECT`/`WITH`/`EXPLAIN`); table results offer **Copy query+result**, **Copy result** and **Save as TSV**; "no data"/error messages stay on screen until closed |
+| **Admin tools** | User management, shared DB endpoint configuration, and the **Database** maintenance tools described below |
+
+### Database maintenance (admin only)
+
+These items of the **Database** menu write to the shared Neo4j and Postgres databases and are available to the `admin` role only. Each uses the administrator's own Neo4j/Postgres connection (⚙ Settings → My Connection), runs on the server in the background (closing the dialog does not stop it; reopen the dialog to see the live progress again), and writes a time-stamped log file.
+
+| Menu item | What it does |
+|---|---|
+| **Import RNEF** | Loads one `.rnef`/`.xml` file or a whole folder (a path on the **server**, with a Browse button; files are never uploaded through the browser) into Neo4j and Postgres: new nodes/relations are created, relations already present are not duplicated, and new references are added to Postgres. Choose the reference **Source**; the Import button is locked while a run is active; **Stop** ends the run. Coloured live output in the dialog; log in `logs/import_logs/`. |
+| **Curate** | Runs the numbered steps of `ResnetGraph/scripts/Neo4j/GraphCurator.cypher` (merging duplicate/similar relations and cleaning properties) one at a time. Tick the steps to run; the dialog shows the current step, per-step elapsed time, the number of relations changed/failed, a live progress and rough time-left estimate for the long `apoc.periodic.iterate` steps, and the number of relationships in the database before and after the run. **Stop** interrupts the running statement (it is rolled back). The first row refreshes `RelationNumberOfReferences`/`RelationNumberOfSentences` from Postgres (only where the Postgres count is larger). Log in `logs/curation_logs/`. |
+| **Refresh Reference count** | Two steps, run together or independently: **1.** refresh `RelationNumberOfSentences`/`RelationNumberOfReferences` of every Neo4j relation whose count differs from Postgres; **2.** replace list-valued counts (left on relations that exist only in Neo4j and were merged by Curate) by the **sum** of the list. Step 2 always runs after step 1. The log reports how many relations were converted. |
+| **Statistics** | Neo4j totals, counts per node label and relation type, property keys, Postgres snippet/article/journal counts, and a background-loaded **BySource** tab with a relation-type × Source count table. **Copy** puts the active tab on the clipboard (tables tab-separated). |
+
+> Curate steps merge and delete relations and cannot be undone — back up the database first and try new steps on a copy.
 
 ### AI Agent
 
@@ -197,6 +223,21 @@ Colleagues connect at: `http://<server-ip>:3000`
 
 ---
 
+## Releasing to GitHub
+
+```bash
+# the token is read from the GITHUB_TOKEN environment variable or from GithubToken.txt, never from a source file
+node github-upload.js [--dry-run]     # three repositories in one run; unchanged files are skipped
+node github-download.js [--dry-run]   # restore the project from GitHub (SOURCE=elsevier for the other repo)
+```
+
+- `github-upload.js` publishes the file list at the top of the script to `AntonYuryev/GraphExplorer4Neo4jPostgres` and `elsevier-health/psg-graphexplorer-neo4j-postgres`, and syncs `ResnetGraph/ElsevierAPI` plus `GraphCurator.cypher` to `AntonYuryev/ElsevierAPI_Project`. Add a new source file to that list when you add one.
+- `github-download.js` downloads every file in the repository tree and never overwrites `settings*.json`, `users*.json` or `GithubToken.txt`.
+- The token needs the `repo` scope (plus `workflow` to publish `.github/workflows/codeql.yml`). Keep `GithubToken.txt` out of Git (it is in `.gitignore`).
+- Pushes to GitHub run CodeQL (`.github/workflows/codeql.yml`) for JavaScript/TypeScript and Python.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -210,6 +251,8 @@ Colleagues connect at: `http://<server-ip>:3000`
 | Port 3000 already in use | `PORT=3001 node server.js` (Mac/Linux) · `set PORT=3001 && node server.js` (Windows) |
 | Session expired after 12 hours | Log in again; save your work with File → Save Subgraph before long breaks |
 | Agent query times out | The agent now applies a 25-second server-side Cypher timeout and reports the exact query that timed out in chat so you (or the agent, on retry) can narrow it — e.g. add `shortestPath()`/`allShortestPaths()` instead of an unbounded variable-length match |
+| Curate/Refresh fails with `There is no procedure with the name apoc...` | Install the APOC plugin on the Neo4j server and allow the procedures used by `GraphCurator.cypher` |
+| Curate step reports failed operations | Failed batches are rolled back; the log shows the error messages — fix the cause and run the step again |
 | `Unsafe PostgreSQL schema name rejected` on start | Open `settings.json` and replace the schema placeholder with your actual PostgreSQL schema name, then restart |
 
 ---
@@ -218,10 +261,15 @@ Colleagues connect at: `http://<server-ip>:3000`
 
 - Credentials live only in `settings.json`/`users.json`, both gitignored; `settings.example.json` is the committed template. **Never commit real credentials.**
 - The agent service (`agent_service.py`) binds to `127.0.0.1` only and is reachable exclusively through `server.js`'s own reverse proxy, which stamps a trusted username header the browser cannot forge.
-- `/api/sql-query` and the agent's `postgres` action both enforce `SELECT`/`WITH`-only — no INSERT/UPDATE/DELETE/DDL.
+- `/api/sql-query` (admin only) accepts `SELECT`/`WITH`/`EXPLAIN` and `CREATE INDEX`; the agent's `postgres` action is `SELECT`/`WITH`-only. No INSERT/UPDATE/DELETE or other DDL.
 - The agent's LLM provider URL is resolved against the admin-managed allowlist (the `providers` list set up under Agentic AI / LLM, conceptually the same admin-only tier as the URL Connections for Database Endpoints setting) — a request naming a URL not on that list is rejected, so a user cannot redirect the agent's outbound API calls to an arbitrary host.
 - The agent's free-form `cypher` action currently has **no code-level restriction** against write clauses (`CREATE`/`MERGE`/`SET`/`DELETE`) — it relies on a system-prompt instruction asking the model to confirm with you first. Structured writes (`write_relation`, `batch_update`) always require an explicit UI confirmation regardless. If you want a hard code-level read-only enforcement on the free-form `cypher` action as well, that's a straightforward follow-up change.
 - JWT tokens expire after 12 hours; passwords are bcrypt-hashed; login is rate-limited.
 - HTTP security headers (CSP, HSTS, X-Frame-Options, etc.) are set by `helmet`.
 - Internal error messages are never forwarded to the client in production mode.
-- Change the default `admin`/`admin123` account immediately — this is now a public, known credential.
+- The first admin password is random and shown once on the server console; change it immediately.
+- Database → Import RNEF / Curate / Refresh Reference count, SQL and user management are admin-only; imports read local server paths with the `.rnef`/`.xml` extensions only, and every database action runs under the signed-in user's own credentials.
+- JWTs are signed and verified with HS256 only; the signing secret comes from `JWT_SECRET` or is generated once and stored in `settings.json`.
+- Postgres TLS certificates are verified by default; for a server with a self-signed or private-CA certificate set `PG_SSL_ALLOW_SELF_SIGNED=1` (or `"allowSelfSigned": true` under `postgres` in `settings.json`).
+- GitHub tokens are never stored in source files; `github-upload.js`/`github-download.js` read `GITHUB_TOKEN` or the gitignored `GithubToken.txt`.
+- `npm audit` reports no known vulnerabilities in the production dependencies, and CodeQL runs on every push.
