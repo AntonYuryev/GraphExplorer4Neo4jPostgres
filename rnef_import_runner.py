@@ -76,7 +76,12 @@ def main() -> int:
         pass
 
     api_config = job['APIconfig']
-    rnef_files = job['rnef_files']
+    # Paths are chosen by an admin on the server (by design), but only RNEF/XML files that exist are accepted.
+    rnef_files = [os.path.abspath(os.path.normpath(p)) for p in job['rnef_files']]
+    bad = [p for p in rnef_files if not p.lower().endswith(('.rnef', '.xml')) or not os.path.isfile(p)]
+    if bad:
+        print(f'Refusing to import: {len(bad)} path(s) are not existing .rnef/.xml files, e.g. {os.path.basename(bad[0])}', flush=True)
+        return 2
     batch_size = int(job.get('batch_size') or 50000)
     log_file = job['log_file']
     add_source = (job.get('add_source') or '').strip()
