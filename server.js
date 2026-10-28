@@ -673,17 +673,25 @@ function _relationIdsOf(relOrValue) {
 // relationships sharing one RelationID (see match-rnef's hyperedge comment
 // above) isn't counted once per physical row.
 function _sumNeo4jRefCounts(edges) {
+  return _sumNeo4jEdgeCount(edges, 'RelationNumberOfReferences').total;
+}
+// Sums a per-relation count property over edges (deduped by RelationID). A list-valued count counts as the sum
+// of its values. `missing` = the edges that carry no such property at all (their count is unknown).
+function _sumNeo4jEdgeCount(edges, prop) {
   const seen = new Set();
+  const missing = [];
   let total = 0;
   (edges || []).forEach(e => {
     const ids = _relationIdsOf(e);
     const key = ids.length ? ids.join(',') : (e.elementId || e.id);
     if (seen.has(key)) return;
     seen.add(key);
-    const n = e.properties && e.properties.RelationNumberOfReferences;
-    if (n != null && !isNaN(Number(n))) total += Number(n);
+    const raw = e.properties && e.properties[prop];
+    if (raw == null) { missing.push(e); return; }
+    const n = (Array.isArray(raw) ? raw : [raw]).reduce((sum, v) => sum + (isNaN(Number(v)) ? 0 : Number(v)), 0);
+    total += n;
   });
-  return total;
+  return { total, missing };
 }
 
 // Normalizes caller-provided RelationID input into a deduplicated string array.
@@ -845,50 +853,185 @@ app.post('/api/settings/neo4j', dbLimiter, authMiddleware, adminMiddleware, asyn
   res.json({ success: true, warning });
 });
 
-// Any authenticated user can view/edit their OWN Neo4j database/username/password.
-app.get('/api/settings/my-neo4j', dbLimiter, authMiddleware, (req, res) => {
-  const cfg = _resolveNeo4jCfgForUser(req.user.username);
+// ─── Settings -> Database: saved Neo4j/Postgres database PAIRS ─────────────────
+// A "pair" is one Neo4j database together with its complementary Postgres database/schema, each with its own
+// login. Every user keeps their OWN list of pairs in settings.json (connectionPairs[loginUsername][pairName]),
+// stored under the pair name "<neo4j database>/<postgres database>:<postgres schema>", including usernames and passwords, so
+// one click switches between databases without retyping anything. Pairs are private to the user who saved
+// them: nobody can connect with, or even see, another user's saved logins. The URLs (host/port) are shared
+// and admin-managed (Settings -> Database -> Connection URLs).
+// The pair a user is connected to is still stored on their users.json record (u.neo4j / u.postgres) exactly
+// as before, so every other part of the server keeps resolving connections the same way.
+const _PW_MASK = '••••••••';
+const _PAIR_NAME_PART = /^[\w.$-]{1,128}$/;
+
+function _userPairs(username) {
+  const all = appSettings.connectionPairs;
+  if (!all || typeof all !== 'object' || !Object.prototype.hasOwnProperty.call(all, username)) return {};
+  return (all[username] && typeof all[username] === 'object') ? all[username] : {};
+}
+function _setUserPair(username, name, pair) {
+  if (username === '__proto__' || username === 'constructor' || username === 'prototype') throw new Error('Invalid user name');
+  if (!appSettings.connectionPairs || typeof appSettings.connectionPairs !== 'object') appSettings.connectionPairs = {};
+  if (!Object.prototype.hasOwnProperty.call(appSettings.connectionPairs, username)) appSettings.connectionPairs[username] = {};
+  if (pair === null) delete appSettings.connectionPairs[username][name];
+  else appSettings.connectionPairs[username][name] = pair;
+  saveAppSettings(appSettings);
+}
+const _pairName = (p) => p.neo4j.database + '/' + p.postgres.database + ':' + p.postgres.schema;
+
+// The pair the user is connected to right now (including the legacy shared fallback for users who never set their own).
+function _currentPair(username) {
+  const n = _resolveNeo4jCfgForUser(username), p = _resolvePgCfgForUser(username);
+  return {
+    neo4j:    { database: n.database, username: n.username, password: n.password },
+    postgres: { database: p.database, schema: p.schema, username: p.username, password: p.password },
+  };
+}
+function _publicPair(name, pair, extra) {
+  return Object.assign({
+    name,
+    neo4j:    { database: pair.neo4j.database, username: pair.neo4j.username, password: pair.neo4j.password ? _PW_MASK : '' },
+    postgres: { database: pair.postgres.database, schema: pair.postgres.schema, username: pair.postgres.username, password: pair.postgres.password ? _PW_MASK : '' },
+  }, extra || {});
+}
+// Password of a saved pair (used when a Fetch button is pressed with the password box left blank)
+function _storedPw(username, pairName, kind) {
+  if (typeof pairName !== 'string') return '';
+  const stored = _userPairs(username);
+  if (!Object.prototype.hasOwnProperty.call(stored, pairName)) return '';
+  const part = stored[pairName] && stored[pairName][kind];
+  return (part && part.password) || '';
+}
+
+async function _testNeo4jLogin(cfg) {
+  const driver = makeNeo4jDriver(cfg);
+  try {
+    const session = driver.session({ database: cfg.database });
+    try { await session.run('RETURN 1'); } finally { await session.close(); }
+  } catch (e) {
+    console.error('[settings/databases] Neo4j connection test failed: %s', e.message);
+    throw new Error('Neo4j connection test failed. Check the database name, username and password.');
+  } finally { await driver.close(); }
+}
+async function _testPgLogin(cfg, safeSchema) {
+  const pool = makePgPool(cfg);
+  try {
+    // the one table every feature depends on: also proves the role may use this schema
+    await pool.query('SELECT 1 FROM ' + safeSchema + '.reference LIMIT 1');
+  } catch (e) {
+    console.error('[settings/databases] Postgres connection test failed: %s', e.message);
+    throw new Error('Postgres connection test failed: ' + e.message);
+  } finally { await pool.end(); }
+}
+
+// Makes the pair the user's active connection (what every request resolves to) and drops everything cached for the old one.
+function _activatePair(username, pair) {
+  const prevN = _resolveNeo4jCfgForUser(username), prevP = _resolvePgCfgForUser(username);
+  const users = loadUsers();
+  const u = users.find(x => x.username === username);
+  if (!u) throw new Error('User not found');
+  u.neo4j    = { database: pair.neo4j.database, username: pair.neo4j.username, password: pair.neo4j.password };
+  u.postgres = { database: pair.postgres.database, schema: pair.postgres.schema, username: pair.postgres.username, password: pair.postgres.password };
+  saveUsers(users);
+  if (prevN.database && prevN.database !== pair.neo4j.database) _invalidateSchemaForDb(prevN.database);
+  invalidateNeo4jConnForUser(username);
+  invalidatePgConnForUser(username);
+  // the Sources list is cached by schema name alone — drop the old and the new one
+  _sourcesCacheBySchema.delete(prevP.schema);
+  _sourcesCacheBySchema.delete(pair.postgres.schema);
+}
+
+// Reads and validates the pair sent by the dialog; blank/masked passwords keep the stored one.
+function _pairFromBody(username, body) {
+  const b = body || {};
+  const str = v => (typeof v === 'string' ? v.trim() : '');
+  const n = b.neo4j || {}, p = b.postgres || {};
+  const pair = {
+    neo4j:    { database: str(n.database), username: str(n.username), password: typeof n.password === 'string' ? n.password : '' },
+    postgres: { database: str(p.database), schema: str(p.schema), username: str(p.username), password: typeof p.password === 'string' ? p.password : '' },
+  };
+  if (!pair.neo4j.database || !pair.neo4j.username) throw new Error('Neo4j database and username are required.');
+  if (!pair.postgres.database || !pair.postgres.schema || !pair.postgres.username) throw new Error('Postgres database, schema and username are required.');
+  if (!_PAIR_NAME_PART.test(pair.neo4j.database) || !_PAIR_NAME_PART.test(pair.postgres.database)) throw new Error('Database names may contain only letters, digits, and the characters _ . $ -');
+  pair.postgres.schema = sanitizeSchemaName(pair.postgres.schema);
+  const name = _pairName(pair);
+  const stored = _userPairs(username);
+  // passwords left blank are taken from the pair with the same name, or from the pair being edited (b.from) when
+  // its name changed because the user edited a database/schema name
+  const has = n => typeof n === 'string' && Object.prototype.hasOwnProperty.call(stored, n);
+  const old = has(name) ? stored[name] : (has(b.from) ? stored[b.from] : null);
+  const cur = _currentPair(username);
+  const keep = (given, kind) => {
+    if (given && given !== _PW_MASK) return given;
+    if (old && old[kind] && old[kind].username === pair[kind].username && old[kind].password) return old[kind].password;
+    if (cur[kind].username === pair[kind].username) return cur[kind].password;   // same login as the one in use
+    return '';
+  };
+  pair.neo4j.password    = keep(pair.neo4j.password, 'neo4j');
+  pair.postgres.password = keep(pair.postgres.password, 'postgres');
+  return { name, pair };
+}
+
+// Everything the dialog needs: the shared URLs, whether this user may edit them, the user's pairs and the one in use.
+app.get('/api/settings/databases', dbLimiter, authMiddleware, (req, res) => {
+  const username = req.user.username;
+  const stored = _userPairs(username);
+  const cur = _currentPair(username);
+  const active = _pairName(cur);
+  const pairs = Object.keys(stored).sort().map(n => _publicPair(n, stored[n]));
+  if (!Object.prototype.hasOwnProperty.call(stored, active)) pairs.unshift(_publicPair(active, cur, { unsaved: true }));
   res.json({
-    url:      cfg.url,       // read-only here — set by an admin
-    database: cfg.database,
-    username: cfg.username,
-    password: cfg.password ? '••••••••' : ''  // never send real password to client
+    urls: { neo4j: appSettings.neo4j.url, postgres: appSettings.postgres.url, postgresPort: appSettings.postgres.port },
+    canEditUrls: req.user.role === 'admin',
+    active,
+    pairs,
   });
 });
 
-app.post('/api/settings/my-neo4j', dbLimiter, authMiddleware, async (req, res) => {
-  const { database, username, password } = req.body || {};
-  if (!database || !username) return res.status(400).json({ error: 'database and username are required' });
-
-  const current = _resolveNeo4jCfgForUser(req.user.username);
-  const cfg = {
-    url:      appSettings.neo4j.url,
-    database: String(database).trim(),
-    username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : current.password
-  };
-
-  const testDriver = makeNeo4jDriver(cfg);
+// Saves a pair (after testing both logins); with connect:true it also becomes the active connection.
+app.post('/api/settings/databases/save', dbLimiter, authMiddleware, async (req, res) => {
+  const username = req.user.username;
+  let name, pair;
+  try { ({ name, pair } = _pairFromBody(username, req.body)); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
   try {
-    const session = testDriver.session({ database: cfg.database });
-    try { await session.run('RETURN 1'); } finally { await session.close(); }
-  } catch(e) {
-    await testDriver.close();
-    console.error('[settings/my-neo4j] Connection test failed for %s: %s', req.user.username, e.message);
-    return res.status(400).json({ error: 'Connection test failed. Check database name and credentials.' });
+    await _testNeo4jLogin({ url: appSettings.neo4j.url, ...pair.neo4j });
+    await _testPgLogin({ host: appSettings.postgres.url, port: appSettings.postgres.port, ...pair.postgres }, pair.postgres.schema);
+    _setUserPair(username, name, pair);
+    const connect = !!(req.body || {}).connect;
+    if (connect) _activatePair(username, pair);
+    res.json({ success: true, name, connected: connect });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
   }
-  await testDriver.close();
+});
 
-  const users = loadUsers();
-  const u = users.find(x => x.username === req.user.username);
-  if (!u) return res.status(404).json({ error: 'User not found' });
-  u.neo4j = { database: cfg.database, username: cfg.username, password: cfg.password };
-  saveUsers(users);
-  // Also drop the cached schema for the old database (if any) so the next
-  // /api/graph/schema call re-fetches from the newly-configured database.
-  const oldDb = current.database;
-  if (oldDb && oldDb !== cfg.database) _invalidateSchemaForDb(oldDb);
-  invalidateNeo4jConnForUser(req.user.username);
+// One-click switch to a saved pair.
+app.post('/api/settings/databases/connect', dbLimiter, authMiddleware, async (req, res) => {
+  const username = req.user.username;
+  const name = (req.body || {}).name;
+  const stored = _userPairs(username);
+  if (typeof name !== 'string' || !Object.prototype.hasOwnProperty.call(stored, name)) return res.status(404).json({ error: 'No saved database pair with this name.' });
+  const pair = stored[name];
+  try {
+    await _testNeo4jLogin({ url: appSettings.neo4j.url, ...pair.neo4j });
+    await _testPgLogin({ host: appSettings.postgres.url, port: appSettings.postgres.port, ...pair.postgres }, sanitizeSchemaName(pair.postgres.schema));
+    _activatePair(username, pair);
+    res.json({ success: true, name });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Forgets a saved pair (the pair in use cannot be removed — connect to another one first).
+app.post('/api/settings/databases/remove', dbLimiter, authMiddleware, (req, res) => {
+  const username = req.user.username;
+  const name = (req.body || {}).name;
+  const stored = _userPairs(username);
+  if (typeof name !== 'string' || !Object.prototype.hasOwnProperty.call(stored, name)) return res.status(404).json({ error: 'No saved database pair with this name.' });
+  if (name === _pairName(_currentPair(username))) return res.status(400).json({ error: 'This is the pair you are connected to. Connect to another pair first.' });
+  _setUserPair(username, name, null);
   res.json({ success: true });
 });
 
@@ -910,7 +1053,7 @@ app.post('/api/settings/list-neo4j-databases', dbLimiter, authMiddleware, async 
   const cfg = {
     url:      appSettings.neo4j.url,
     username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : current.password
+    password: (password && password !== '••••••••') ? String(password) : (_storedPw(req.user.username, (req.body || {}).pair, 'neo4j') || current.password)
   };
 
   const testDriver = makeNeo4jDriver(cfg);
@@ -963,71 +1106,6 @@ app.post('/api/settings/postgres', dbLimiter, authMiddleware, adminMiddleware, a
   res.json({ success: true, warning });
 });
 
-// Any authenticated user can view/edit their OWN Postgres database/schema/username/password.
-app.get('/api/settings/my-postgres', dbLimiter, authMiddleware, (req, res) => {
-  const cfg = _resolvePgCfgForUser(req.user.username);
-  res.json({
-    url:      cfg.host,   // read-only here — set by an admin
-    port:     cfg.port,   // read-only here — set by an admin
-    database: cfg.database,
-    schema:   cfg.schema,
-    username: cfg.username,
-    password: cfg.password ? '••••••••' : ''
-  });
-});
-
-app.post('/api/settings/my-postgres', dbLimiter, authMiddleware, async (req, res) => {
-  const { database, schema, username, password } = req.body || {};
-  if (!database || !schema || !username) return res.status(400).json({ error: 'database, schema, and username are required' });
-
-  const current = _resolvePgCfgForUser(req.user.username);
-  const cfg = {
-    host:     appSettings.postgres.url,
-    port:     appSettings.postgres.port,
-    database: String(database).trim(),
-    schema:   String(schema).trim(),
-    username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : current.password
-  };
-
-  let safeSchema;
-  try { safeSchema = sanitizeSchemaName(cfg.schema); }
-  catch(e) { return res.status(400).json({ error: e.message }); }
-
-  const testPool = makePgPool(cfg);
-  try {
-    // A bare `SELECT 1` only proves the login/password are valid — it says
-    // nothing about whether this role can actually use the SCHEMA the user
-    // just typed in (Postgres schema permissions are independent of login
-    // authentication, unlike Neo4j's per-database access checked above via
-    // a database-scoped session). Query the one table every feature of this
-    // app actually depends on, so a schema the role has no USAGE/SELECT grant
-    // on — or that doesn't exist — is caught here instead of succeeding this
-    // test and then failing later, silently, on every real query.
-    await testPool.query(`SELECT 1 FROM ${safeSchema}.reference LIMIT 1`);
-  } catch(e) {
-    await testPool.end();
-    console.error('[settings/my-postgres] Connection test failed for %s: %s', req.user.username, e.message);
-    return res.status(400).json({ error: 'Connection test failed: ' + e.message });
-  }
-  await testPool.end();
-
-  const users = loadUsers();
-  const u = users.find(x => x.username === req.user.username);
-  if (!u) return res.status(404).json({ error: 'User not found' });
-  u.postgres = { database: cfg.database, schema: safeSchema, username: cfg.username, password: cfg.password };
-  saveUsers(users);
-  invalidatePgConnForUser(req.user.username);
-  // Drop any cached Sources list for both the old and new schema name — it may
-  // have been populated (possibly empty, from a failed earlier attempt or a
-  // different account) before this connection/credential fix, and Sources is
-  // cached by schema name alone rather than by connection, so a stale entry
-  // would otherwise linger until server restart.
-  _sourcesCacheBySchema.delete(current.schema);
-  _sourcesCacheBySchema.delete(safeSchema);
-  res.json({ success: true });
-});
-
 // Lists the PostgreSQL schemas the given (possibly not-yet-saved)
 // database/credentials can actually see, via information_schema.schemata —
 // so the user can pick from a real list instead of typing a schema name and
@@ -1054,7 +1132,7 @@ app.post('/api/settings/list-pg-databases', dbLimiter, authMiddleware, async (re
     port:     appSettings.postgres.port,
     database: 'postgres',
     username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : current.password
+    password: (password && password !== '••••••••') ? String(password) : (_storedPw(req.user.username, (req.body || {}).pair, 'postgres') || current.password)
   };
 
   const testPool = makePgPool(cfg);
@@ -1084,7 +1162,7 @@ app.post('/api/settings/list-pg-schemas', dbLimiter, authMiddleware, async (req,
     port:     appSettings.postgres.port,
     database: String(database).trim(),
     username: String(username).trim(),
-    password: (password && password !== '••••••••') ? String(password) : current.password
+    password: (password && password !== '••••••••') ? String(password) : (_storedPw(req.user.username, (req.body || {}).pair, 'postgres') || current.password)
   };
 
   const testPool = makePgPool(cfg);
@@ -4804,11 +4882,52 @@ app.get('/api/graph/schema', dbLimiter, authMiddleware, async (req, res) => {
 // single query is the slow one, instead of one opaque multi-minute wait.
 const _statsToNum = (v) => (v && typeof v.toNumber === 'function') ? v.toNumber() : Number(v);
 
+// The statistics are expensive full-graph / full-table queries, so every section is CACHED per user and per
+// database (Neo4j: url + database, Postgres: host + port + database + schema) and recalculated ONLY when the
+// request carries ?refresh=1 (the dialog's Refresh button). The cache is kept in memory and in
+// statistics_cache.json so it survives a server restart. Each answer gets "cachedAt" (ms) = when it was calculated.
+const STATS_CACHE_FILE = path.join(__dirname, 'statistics_cache.json');
+let _statsStore = Object.create(null);   // key -> { data, at }
+try { _statsStore = Object.assign(Object.create(null), JSON.parse(fs.readFileSync(STATS_CACHE_FILE, 'utf8'))); } catch (e) { /* no cache yet */ }
+let _statsSaveTimer = null;
+function _statsPersist() {
+  if (_statsSaveTimer) return;
+  _statsSaveTimer = setTimeout(() => {
+    _statsSaveTimer = null;
+    try { fs.writeFileSync(STATS_CACHE_FILE, JSON.stringify(_statsStore), { mode: 0o600 }); }
+    catch (e) { console.warn('[statistics] cannot write cache file:', e.message); }
+  }, 2000);
+}
+function statsCache(kind, section) {
+  return (req, res, next) => {
+    let scope;
+    if (kind === 'neo4j') {
+      scope = (req.neo4j && req.neo4j.url) + '|' + (req.neo4j && req.neo4j.database);
+    } else {
+      const c = _resolvePgCfgForUser(req.user.username);
+      scope = c.host + ':' + c.port + '/' + c.database + ':' + c.schema;
+    }
+    const key = req.user.username + '|' + kind + '|' + scope + '|' + section;
+    if (req.query.refresh !== '1') {
+      const hit = _statsStore[key];
+      if (hit) return res.json(Object.assign({}, hit.data, { cachedAt: hit.at }));
+    }
+    const sendJson = res.json.bind(res);
+    res.json = (body) => {
+      const at = Date.now();
+      const isData = res.statusCode === 200 && body && !body.error && Object.keys(body).some(k => body[k] !== null);   // never cache errors / "not connected"
+      if (isData) { _statsStore[key] = { data: body, at }; _statsPersist(); }
+      return sendJson(isData ? Object.assign({}, body, { cachedAt: at }) : body);
+    };
+    next();
+  };
+}
+
 // GET /api/database/statistics/counts — total/per-label/per-type counts.
 // Uses apoc.meta.stats() (metadata the database already maintains) instead of
 // MATCH (n)/MATCH ()-[r]->() full-graph scans, which took minutes on a large
 // graph. Falls back to the scanning queries only if APOC isn't installed.
-app.get('/api/database/statistics/counts', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/counts', dbLimiter, authMiddleware, statsCache('neo4j', 'counts'), async (req, res) => {
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     try {
@@ -4856,7 +4975,7 @@ app.get('/api/database/statistics/counts', dbLimiter, authMiddleware, async (req
 // GET /api/database/statistics/by-source — relation counts per relation type and Source value.
 // Needs a full relationship scan, so the dialog fires it in the background and shows it on its own tab.
 // Source can hold a list of values: a relation is then counted under each of them.
-app.get('/api/database/statistics/by-source', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/by-source', dbLimiter, authMiddleware, statsCache('neo4j', 'by-source'), async (req, res) => {
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session.run(
@@ -4883,7 +5002,7 @@ app.get('/api/database/statistics/by-source', dbLimiter, authMiddleware, async (
 });
 
 // GET /api/database/statistics/node-props — distinct node property keys.
-app.get('/api/database/statistics/node-props', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/node-props', dbLimiter, authMiddleware, statsCache('neo4j', 'node-props'), async (req, res) => {
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   try {
     const result = await session
@@ -4900,7 +5019,7 @@ app.get('/api/database/statistics/node-props', dbLimiter, authMiddleware, async 
 
 // GET /api/database/statistics/rel-props — distinct relationship property keys
 // (reuses the existing cached schema fetch, which already computes this).
-app.get('/api/database/statistics/rel-props', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/rel-props', dbLimiter, authMiddleware, statsCache('neo4j', 'rel-props'), async (req, res) => {
   try {
     const schema = await _fetchSchemaForConn(req.neo4j.driver, req.neo4j.database);
     res.json({ relationPropertyKeys: (schema && schema.propKeys) || [] });
@@ -4917,7 +5036,7 @@ app.get('/api/database/statistics/rel-props', dbLimiter, authMiddleware, async (
 // and COUNT(DISTINCT journal) each require their own full table scan plus a
 // hash-dedup pass, and bundling them into one statement made that one
 // statement take as long as the slowest of the three combined.
-app.get('/api/database/statistics/postgres/snippets', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/postgres/snippets', dbLimiter, authMiddleware, statsCache('pg', 'snippets'), async (req, res) => {
   if (!req.pg || !req.pg.pool) return res.json({ snippets: null });
   try {
     const result = await req.pg.pool.query(`SELECT COUNT(*) AS snippets FROM ${req.pg.schema}.reference`);
@@ -4929,7 +5048,7 @@ app.get('/api/database/statistics/postgres/snippets', dbLimiter, authMiddleware,
 });
 
 // GET /api/database/statistics/postgres/articles — count(distinct unique_ref).
-app.get('/api/database/statistics/postgres/articles', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/postgres/articles', dbLimiter, authMiddleware, statsCache('pg', 'articles'), async (req, res) => {
   if (!req.pg || !req.pg.pool) return res.json({ articles: null });
   try {
     const result = await req.pg.pool.query(`SELECT COUNT(DISTINCT unique_ref) AS articles FROM ${req.pg.schema}.reference`);
@@ -4941,7 +5060,7 @@ app.get('/api/database/statistics/postgres/articles', dbLimiter, authMiddleware,
 });
 
 // GET /api/database/statistics/postgres/journals — count(distinct journal).
-app.get('/api/database/statistics/postgres/journals', dbLimiter, authMiddleware, async (req, res) => {
+app.get('/api/database/statistics/postgres/journals', dbLimiter, authMiddleware, statsCache('pg', 'journals'), async (req, res) => {
   if (!req.pg || !req.pg.pool) return res.json({ journals: null });
   try {
     const result = await req.pg.pool.query(`SELECT COUNT(DISTINCT journal) AS journals FROM ${req.pg.schema}.reference`);
@@ -7024,8 +7143,11 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
 
   const session = req.neo4j.driver.session({ database: req.neo4j.database });
   let groups;
+  const _t0 = Date.now();
+  let _tNeo4j = 0;
   try {
     const result = await session.run(cypher, cypherParams);
+    _tNeo4j = Date.now() - _t0;
     groups = result.records.map(rec => {
       const d = rec.get('d');
       const links = rec.get('links') || [];
@@ -7080,53 +7202,70 @@ app.post('/api/graph/explore-relations-report', dbLimiter, authMiddleware, async
     });
   }
 
-  // Same batched Postgres reference/snippet lookup as common-neighbors-report.
-  const allRelIds = Array.from(new Set(groups.flatMap(g => g._relationIds)))
-    .filter(s => _normalizeRelationIdInputs([s]).length > 0);
-  const rowsByRelId = new Map();
-  const _sf = Array.isArray(sources) && sources.length ? new Set(sources.map(String)) : null;
-  if (allRelIds.length && req.pg && req.pg.pool) {
-    try {
-      // Always fetch the FULL (unfiltered) row set, including `source` — needed
-      // to compute both the unfiltered total (referenceCount) and, when a
-      // Source filter is active, the filtered subset (filteredReferenceCount)
-      // from this SAME batch fetch, rather than round-tripping to Postgres twice.
-      const sql = `SELECT id, doi, pmid, unique_id, source FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
-      const pgResult = await req.pg.pool.query(sql, [allRelIds]);
-      pgResult.rows.forEach(row => {
-        const key = String(row.id);
-        if (!rowsByRelId.has(key)) rowsByRelId.set(key, []);
-        rowsByRelId.get(key).push(row);
-      });
-    } catch (err) {
-      console.error('explore-relations-report Postgres error:', err.message);
-    }
-  }
-
+  // Everything below comes from Neo4j alone, so the report can be shown immediately: reference counts and snippet
+  // counts are summed from each relation's own RelationNumberOfReferences / RelationNumberOfSentences. Postgres is
+  // needed only for
+  //   - relations that carry no RelationNumberOfSentences at all (their snippet count is unknown), and
+  //   - the Source-filtered reference counts when a Source filter is active (Neo4j has no per-source counts).
+  // Those relation IDs are handed back per group as `pgRelIds`; the client fetches the counts in the background with
+  // POST /api/graph/relation-pg-counts while the user already looks at the results.
+  const _sf = Array.isArray(sources) && sources.length;
+  let _pgPending = false;
   groups.forEach(g => {
-    // referenceCount ("RelationNumberOfReferences"): summed from each
-    // relation's own Neo4j property — see _sumNeo4jRefCounts. Never derived
-    // by counting Postgres rows. filteredReferenceCount is the one count that
-    // genuinely does need Postgres (Neo4j has no per-source-filtered count).
-    const filteredRefKeys = _sf ? new Set() : null;
-    let snippetCount = 0;
-    g._relationIds.forEach(rid => {
-      (rowsByRelId.get(rid) || []).forEach(row => {
-        if (_sf && row.source != null && _sf.has(String(row.source))) {
-          const coalesced = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
-          if (coalesced != null && coalesced !== '') filteredRefKeys.add(String(coalesced));
-        }
-        if (row.unique_id != null) snippetCount++;
-      });
-    });
+    const sn = _sumNeo4jEdgeCount(g.edges, 'RelationNumberOfSentences');
+    g.snippetCount = sn.total;
     g.referenceCount = _sumNeo4jRefCounts(g.edges);
-    g.snippetCount = snippetCount;
-    if (_sf) g.filteredReferenceCount = filteredRefKeys.size;
+    const valid = rid => _normalizeRelationIdInputs([rid]).length > 0;
+    const missingIds = new Set();                 // relations whose snippet count must come from Postgres
+    sn.missing.forEach(e => _relationIdsOf(e).forEach(rid => missingIds.add(rid)));
+    const need = new Set(missingIds);             // relations to look up in Postgres at all
+    if (_sf) g._relationIds.forEach(rid => need.add(rid));
+    g.pgRelIds = Array.from(need).filter(valid);
+    g.pgSnipIds = Array.from(missingIds).filter(valid);
+    if (g.pgRelIds.length) _pgPending = true;
+    else { delete g.pgRelIds; delete g.pgSnipIds; }
+    if (g.pgSnipIds && !g.pgSnipIds.length) delete g.pgSnipIds;
     delete g._relationIds;
   });
+  console.log('[explore-report] ' + action + ': ' + groups.length + ' groups from Neo4j in ' + _tNeo4j + ' ms, total ' + (Date.now() - _t0) +
+              ' ms' + (_pgPending ? ' (Postgres counts fetched separately)' : ''));
 
   groups.sort((a, b) => b.targetCount - a.targetCount);
-  res.json({ groups });
+  res.json({ groups, pgPending: _pgPending });
+});
+
+// POST /api/graph/relation-pg-counts { relationIds: [...], sources?: [...] }
+//   -> { counts: { <relationId>: { s: <snippet rows>, f: [<doi-or-pmid of the rows from the given sources>] } } }
+// The Postgres half of the explore report, requested by the client in the background after the report is shown.
+// Only relation IDs that have rows are returned; `f` is only filled when `sources` is given.
+app.post('/api/graph/relation-pg-counts', dbLimiter, authMiddleware, async (req, res) => {
+  const { relationIds, sources } = req.body || {};
+  const ids = _normalizeRelationIdInputs(Array.isArray(relationIds) ? relationIds.slice(0, 20000) : []);
+  if (!ids.length || !req.pg || !req.pg.pool) return res.json({ counts: {} });
+  const sf = Array.isArray(sources) && sources.length ? new Set(sources.map(String)) : null;
+  const t0 = Date.now();
+  try {
+    const sql = `SELECT id, doi, pmid, unique_id, source FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[])`;
+    const counts = Object.create(null);
+    let rows = 0;
+    for (let i = 0; i < ids.length; i += 5000) {          // 5000 IDs per statement keeps each lookup short
+      const r = await req.pg.pool.query(sql, [ids.slice(i, i + 5000)]);
+      rows += r.rows.length;
+      r.rows.forEach(row => {
+        const c = counts[String(row.id)] || (counts[String(row.id)] = { s: 0, f: [] });
+        if (row.unique_id != null) c.s++;
+        if (sf && row.source != null && sf.has(String(row.source))) {
+          const k = (row.doi != null && row.doi !== '') ? row.doi : row.pmid;
+          if (k != null && k !== '') c.f.push(String(k));
+        }
+      });
+    }
+    console.log('[relation-pg-counts] ' + ids.length + ' relation ids -> ' + rows + ' rows in ' + (Date.now() - t0) + ' ms');
+    res.json({ counts });
+  } catch (err) {
+    console.error('relation-pg-counts error:', err.message);
+    res.status(500).json({ error: safeError(err) });
+  }
 });
 
 
