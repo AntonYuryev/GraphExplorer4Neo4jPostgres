@@ -292,12 +292,13 @@ async function agentSend() {
       );
     }
 
-    if (result.generated_cypher) {
-      _agentLastCypher = result.generated_cypher;
+    var _pick = _agentPickCypher(reply, result.generated_cypher);
+    if (_pick) {
+      _agentLastCypher = _pick;
       var bar = document.getElementById('agent-cypher-bar');
       var pre = document.getElementById('agent-cypher-preview');
       if (bar) bar.style.display = 'block';
-      if (pre) pre.textContent = result.generated_cypher;
+      if (pre) pre.textContent = _pick;
     }
   } catch(err) {
     console.error('[agentSend] ERROR:', err);
@@ -402,6 +403,39 @@ async function _mergeDbReferencesIntoGraph(currentGraph) {
   return currentGraph;
 }
 
+// ```cypher ... ``` blocks written by the LLM in its reply. Each one becomes a clickable box that loads
+// the statement into the Cypher editor — the statement the LLM PROPOSES (e.g. an update it does not run itself)
+// is not the same as generated_cypher, which is only the last query the agent executed (often a verification query).
+function _agentCypherBlocks(text) {
+  var blocks = [], re = /```[ \t]*(?:cypher)?[ \t]*\n([\s\S]*?)(?:```|$)/gi, m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    var code = m[1].trim();
+    if (code) blocks.push(code);
+  }
+  return blocks;
+}
+// The statement a click on the reply should load: the first proposed statement that changes data (SET / CREATE /
+// MERGE / DELETE / REMOVE) — that is what the user asked for — else the first block, else the executed query.
+function _agentPickCypher(reply, generated) {
+  var blocks = _agentCypherBlocks(reply);
+  var write = blocks.filter(function (b) { return /\b(SET|CREATE|MERGE|DELETE|REMOVE)\b/i.test(b); })[0];
+  return write || blocks[0] || generated || null;
+}
+function _agentMakeCypherBox(code, hint) {
+  var box = document.createElement('div');
+  box.style.cssText = 'margin-top:8px;background:#0d1220;border:1px solid #2a4a7f;border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px;color:#a8c4ff;white-space:pre-wrap;word-break:break-word;cursor:pointer';
+  box.title = 'Click to load into query bar';
+  box.textContent = code;
+  if (hint) {
+    var h = document.createElement('div');
+    h.style.cssText = 'font-size:10px;color:#4a5580;margin-top:4px;font-family:sans-serif';
+    h.textContent = hint;
+    box.appendChild(h);
+  }
+  box.onclick = function () { _agentLastCypher = code; agentLoadCypherToBar(); };
+  return box;
+}
+
 function _agentAppendMessage(role, content, cypher, results) {
   var container = document.getElementById('agent-chat-messages');
   if (!container) return;
@@ -417,7 +451,21 @@ function _agentAppendMessage(role, content, cypher, results) {
       _renderSummarizeReply(content, bubble);
     } else {
       bubble.style.whiteSpace = 'pre-wrap';
-      bubble.textContent = content;
+      var _fenceRe = /```[ \t]*(?:cypher)?[ \t]*\n([\s\S]*?)(?:```|$)/gi, _fm, _last = 0, _hasFence = false;
+      var _text = String(content || '');
+      while ((_fm = _fenceRe.exec(_text)) !== null) {
+        _hasFence = true;
+        var _before = _text.slice(_last, _fm.index).replace(/\n+$/, '');
+        if (_before) bubble.appendChild(document.createTextNode(_before));
+        if (_fm[1].trim()) bubble.appendChild(_agentMakeCypherBox(_fm[1].trim(), 'Click to load into the Cypher editor'));
+        _last = _fenceRe.lastIndex;
+      }
+      if (_hasFence) {
+        var _rest = _text.slice(_last).replace(/^\n+/, '');
+        if (_rest) bubble.appendChild(document.createTextNode(_rest));
+      } else {
+        bubble.textContent = content;
+      }
     }
   }
   if (role !== 'assistant' || _agentCurrentMode !== 'summarize') {
@@ -425,7 +473,8 @@ function _agentAppendMessage(role, content, cypher, results) {
     if (!bubble.childNodes.length) bubble.textContent = content;
   }
 
-  if (cypher) {
+  var _shownBlocks = _agentCypherBlocks(content).map(function (b) { return b.replace(/\s+/g, ' '); });
+  if (cypher && _shownBlocks.indexOf(String(cypher).trim().replace(/\s+/g, ' ')) < 0) {
     var cypherBox = document.createElement('div');
     cypherBox.style.cssText = 'margin-top:8px;background:#0d1220;border:1px solid #2a4a7f;border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px;color:#a0cfff;white-space:pre-wrap;word-break:break-all;cursor:pointer';
     cypherBox.title = 'Click to load into query bar';
@@ -851,9 +900,18 @@ function _renderSummarizeReply(text, container) {
 
 function agentLoadCypherToBar() {
   if (!_agentLastCypher) return;
+  // The Cypher editor (query bar) is hidden until the user opens it — open it, otherwise the text is
+  // copied into an editor nobody can see and the click appears to do nothing.
+  var bar = document.getElementById('query-bar');
+  if (bar && bar.style.display === 'none') bar.style.display = '';
   // Try plain textarea first, then CodeMirror
   var input = document.getElementById('cypher-input') || document.querySelector('textarea[placeholder*="Cypher"]');
-  if (input) { input.value = _agentLastCypher; input.dispatchEvent(new Event('input')); }
+  if (input) {
+    input.value = _agentLastCypher;
+    if (typeof cypherAutoResize === 'function') cypherAutoResize(input);   // grow to the text (the editor starts one row high)
+    input.dispatchEvent(new Event('input'));
+    setTimeout(function() { input.focus(); }, 50);
+  }
   if (window.cypherEditor && window.cypherEditor.setValue) window.cypherEditor.setValue(_agentLastCypher);
 }
 
