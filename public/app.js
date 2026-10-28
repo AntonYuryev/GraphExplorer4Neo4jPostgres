@@ -743,13 +743,12 @@ function showApp() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
   document.getElementById('current-user-label').textContent = currentUser;
+  refreshCurrentDbLabel();
   // "My Connection" (personal Neo4j/Postgres credentials) is available to all roles
   document.getElementById('settings-db-section').style.display = '';
   if (currentRole === 'admin') {
     document.getElementById('admin-btn') && (document.getElementById('admin-btn').style.display = '');
     document.getElementById('settings-users-item').style.display = '';
-    // Database endpoint (URL/host) configuration is admin-only
-    document.getElementById('settings-db-admin-section').style.display = '';
     document.getElementById('mi-import-rnef').style.display = '';
     document.getElementById('mi-curate').style.display = '';
     document.getElementById('mi-refcount').style.display = '';
@@ -805,6 +804,7 @@ function showApp() {
 }
 
 function logout() {
+  _setCurrentDbLabel('');
   authToken = null; currentUser = null; currentRole = null;
   sessionStorage.clear();
   if (cy) cy.destroy();
@@ -1932,6 +1932,18 @@ function focusCypherInput() {
   }
 }
 
+// Opens the Cypher editor (if it is closed) and puts `text` into it. Unlike focusCypherInput() — the menu item
+// "Open Cypher editor", which TOGGLES the editor — this never closes an editor that is already open.
+function showCypherEditor(text) {
+  var bar = document.getElementById('query-bar');
+  if (bar) bar.style.display = '';
+  var el = document.getElementById('cypher-input');
+  if (!el) return;
+  if (typeof text === 'string') { el.value = text; onCypherInput(el); }
+  cypherAutoResize(el);
+  setTimeout(function() { el.focus(); }, 10);
+}
+
 // ─── SQL query dialog ─────────────────────────────────────────────────────────
 // ─── Load Node Properties ─────────────────────────────────────────────────────
 async function openLoadNodePropertiesDialog() {
@@ -2807,7 +2819,24 @@ function closeStatisticsModal(e) {
 // the last-fetched numbers instantly; the "Refresh" button is the only thing
 // that re-queries.
 var _STAT_UNFINISHED_HTML = '<span style="color:#c9a227">⏳ unfinished…</span>';
-var _statsCache = null;  // null until the first fetch cycle completes; then { elId: innerHTML, ... }
+// Every section is cached — here (instant re-open) and on the server (statistics_cache.json, per user and
+// database, survives restarts). Nothing is recalculated unless the user presses Refresh.
+var _statsCache = {};    // section element id -> { html, at } ; at = when the server calculated it
+var _statsPending = {};  // section element id -> token of the request in flight (a late answer of an older request is ignored)
+var _statsDbKey = null;  // the database pair the cached values belong to
+var _currentDbPairName = '';
+var _STAT_SECTIONS = [
+  { url: '/api/database/statistics/counts',            kind: 'neo4j', id: 'stat-sec-counts',       render: function(d) { return _renderStatCounts(d); } },
+  { url: '/api/database/statistics/node-props',        kind: 'neo4j', id: 'stat-sec-nodeprops',    render: function(d) { return _renderStatNodeProps(d); } },
+  { url: '/api/database/statistics/rel-props',         kind: 'neo4j', id: 'stat-sec-relprops',     render: function(d) { return _renderStatRelProps(d); } },
+  // Each Postgres count is its own query/request — count(distinct unique_ref) and count(distinct journal) each do
+  // their own full-table scan + dedup, so bundling them made the combined statement as slow as the slowest of the three.
+  { url: '/api/database/statistics/postgres/snippets', kind: 'pg', id: 'stat-sec-pg-snippets',  render: function(d) { return _statNumberOrNotConnected(d.snippets); } },
+  { url: '/api/database/statistics/postgres/articles', kind: 'pg', id: 'stat-sec-pg-articles',  render: function(d) { return _statNumberOrNotConnected(d.articles); } },
+  { url: '/api/database/statistics/postgres/journals', kind: 'pg', id: 'stat-sec-pg-journals',  render: function(d) { return _statNumberOrNotConnected(d.journals); } },
+  // full relationship scan: runs in the background, the user can look at the stats meanwhile
+  { url: '/api/database/statistics/by-source',         kind: 'neo4j', id: 'stat-bysource',         render: function(d) { return _renderStatBySource(d); } }
+];
 
 var _statTab = 'stats';
 function switchStatTab(tab) {
@@ -2820,16 +2849,26 @@ function switchStatTab(tab) {
 
 function _renderStatBySource(d) {
   if (!d.relTypes.length) return '<span style="color:#7a8099">None</span>';
+  // First row "Total" (sum over all relation types); the Source columns are sorted by it, most prevalent first
+  var totals = {};
+  d.sources.forEach(function(src) {
+    totals[src] = d.relTypes.reduce(function(sum, t) { return sum + ((d.counts[t] && d.counts[t][src]) || 0); }, 0);
+  });
+  var sources = d.sources.slice().sort(function(x, y) { return (totals[y] - totals[x]) || x.localeCompare(y); });
   var th = 'padding:3px 10px;background:#1a1f33;border:1px solid #2d3147;color:#8899cc;white-space:nowrap;position:sticky;top:0;';
   var td = 'padding:3px 10px;border:1px solid #1e2340;color:#c8cde4;text-align:right;';
+  var tdTot = 'padding:3px 10px;border:1px solid #2d3147;color:#fff;font-weight:600;background:#1a2340;text-align:right;';
   var html = '<table style="border-collapse:collapse;font-size:11px"><thead><tr>'
     + '<th style="' + th + 'text-align:left;left:0;z-index:2">Relation type</th>'
-    + d.sources.map(function(s) { return '<th style="' + th + 'text-align:right">' + escHtml(s) + '</th>'; }).join('')
+    + sources.map(function(s) { return '<th style="' + th + 'text-align:right">' + escHtml(s) + '</th>'; }).join('')
     + '</tr></thead><tbody>';
+  html += '<tr><td style="' + tdTot + 'text-align:left;position:sticky;left:0">Total</td>'
+    + sources.map(function(src) { return '<td style="' + tdTot + '">' + totals[src].toLocaleString() + '</td>'; }).join('')
+    + '</tr>';
   d.relTypes.forEach(function(t) {
     html += '<tr><td style="' + td + 'text-align:left;position:sticky;left:0;background:#13172a">' + escHtml(t) + '</td>'
-      + d.sources.map(function(s) {
-          var n = d.counts[t][s];
+      + sources.map(function(src) {
+          var n = d.counts[t][src];
           return '<td style="' + td + '">' + (n ? n.toLocaleString() : '') + '</td>';
         }).join('')
       + '</tr>';
@@ -2840,33 +2879,45 @@ function _renderStatBySource(d) {
 function openStatisticsDialog() {
   document.getElementById('statistics-modal').style.display = 'flex';
   switchStatTab(_statTab);
-  _renderStatisticsSkeleton();
-  if (_statsCache) {
-    Object.keys(_statsCache).forEach(function(elId) {
-      var el = document.getElementById(elId);
-      if (el) el.innerHTML = _statsCache[elId];
-    });
-  } else {
-    refreshStatistics();
+  if (_statsDbKey !== _currentDbPairName) {      // connected to another database pair: the cached numbers are not its own
+    _statsCache = {}; _statsPending = {}; _statsDbKey = _currentDbPairName;
   }
+  _renderStatisticsSkeleton();
+  _STAT_SECTIONS.forEach(function(sec) {
+    if (_statsCache[sec.id]) document.getElementById(sec.id).innerHTML = _statsCache[sec.id].html;
+    else if (!_statsPending[sec.id]) _statFetchSection(sec, false);   // answered from the server cache when it has one
+  });
+  _statsUpdateNote();
 }
 
-function refreshStatistics() {
-  _statsCache = {};
-  _renderStatisticsSkeleton();
-  _statFetchSection('/api/database/statistics/counts', 'stat-sec-counts', _renderStatCounts);
-  _statFetchSection('/api/database/statistics/node-props', 'stat-sec-nodeprops', _renderStatNodeProps);
-  _statFetchSection('/api/database/statistics/rel-props', 'stat-sec-relprops', _renderStatRelProps);
-  // Each Postgres count is its own query/request — count(distinct unique_ref)
-  // and count(distinct journal) each do their own full-table scan + dedup, so
-  // bundling them with count(*) made the combined statement as slow as the
-  // slowest of the three. Running them as separate requests also means the
-  // frontend can show which one specifically is still running.
-  _statFetchSection('/api/database/statistics/postgres/snippets', 'stat-sec-pg-snippets', function(d) { return _statNumberOrNotConnected(d.snippets); });
-  _statFetchSection('/api/database/statistics/postgres/articles', 'stat-sec-pg-articles', function(d) { return _statNumberOrNotConnected(d.articles); });
-  _statFetchSection('/api/database/statistics/postgres/journals', 'stat-sec-pg-journals', function(d) { return _statNumberOrNotConnected(d.journals); });
-  // full relationship scan: runs in the background, the user can look at the stats above meanwhile
-  _statFetchSection('/api/database/statistics/by-source', 'stat-bysource', _renderStatBySource);
+// The Refresh buttons are the ONLY thing that makes the server recalculate (?refresh=1). Neo4j and Postgres are
+// refreshed separately: the Postgres counts are slow and change rarely, the Neo4j ones are quick to repeat.
+function refreshStatistics(kind) {
+  _statsDbKey = _currentDbPairName;
+  _STAT_SECTIONS.forEach(function(sec) {
+    if (kind && sec.kind !== kind) return;       // the other database keeps its numbers
+    delete _statsCache[sec.id];
+    var el = document.getElementById(sec.id);
+    if (el) el.innerHTML = _STAT_UNFINISHED_HTML;
+    _statFetchSection(sec, true);
+  });
+  _statsUpdateNote();
+}
+
+// "Neo4j calculated 10/28/2026, 9:15 AM · Postgres calculated 10/20/2026, 4:02 PM" (the oldest value of each database)
+function _statsUpdateNote() {
+  var el = document.getElementById('stat-cache-note');
+  if (!el) return;
+  var parts = [];
+  [['neo4j', 'Neo4j'], ['pg', 'Postgres']].forEach(function(k) {
+    var secs = _STAT_SECTIONS.filter(function(sec) { return sec.kind === k[0]; });
+    var done = secs.filter(function(sec) { return _statsCache[sec.id]; });
+    var text = '';
+    if (done.length) text = k[1] + ' calculated ' + new Date(Math.min.apply(null, done.map(function(sec) { return _statsCache[sec.id].at; }))).toLocaleString();
+    if (done.length < secs.length) text += (text ? ' (' : k[1] + ' (') + (secs.length - done.length) + ' loading\u2026)';
+    parts.push(text);
+  });
+  el.textContent = parts.join(' \u00b7 ');
 }
 
 // Plain-text version of the dialog: headings and "label: value" lines as shown, tables as tab-separated rows
@@ -2926,15 +2977,23 @@ function _statNumberOrNotConnected(v) {
   return v == null ? '<span style="color:#7a8099">N/A</span>' : '<b style="color:#e0e0e0">' + v.toLocaleString() + '</b>';
 }
 
-async function _statFetchSection(url, elId, renderFn) {
-  var el = document.getElementById(elId);
+async function _statFetchSection(sec, refresh) {
+  var token = {};
+  _statsPending[sec.id] = token;
+  var html, at = null;
   try {
-    var data = await api(url, null, 'GET');
-    el.innerHTML = renderFn(data);
+    var data = await api(sec.url + (refresh ? '?refresh=1' : ''), null, 'GET');
+    html = sec.render(data);
+    at = data.cachedAt || Date.now();
   } catch (e) {
-    el.innerHTML = '<span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
+    html = '<span style="color:#e05560">' + escHtml(e.message || String(e)) + '</span>';
   }
-  if (_statsCache) _statsCache[elId] = el.innerHTML;
+  if (_statsPending[sec.id] !== token) return; // a newer request for this section / another database took over
+  delete _statsPending[sec.id];
+  if (at !== null) _statsCache[sec.id] = { html: html, at: at };   // errors are shown but not cached (re-opening retries)
+  var el = document.getElementById(sec.id);    // looked up now: the dialog may have been closed and re-opened meanwhile
+  if (el) el.innerHTML = html;
+  _statsUpdateNote();
 }
 
 function _renderStatCounts(n) {
@@ -7369,16 +7428,21 @@ async function runQuery(mergeIntoExisting) {
   // (aggregates, property accesses, literals).  Such queries can never
   // overflow the graph viewer — they produce a simple table result.
   var _tooLarge = false;
+  var _skipCount = false;   // true when the count is skipped because of a small LIMIT (see below)
   if (_analyzeCypherReturn(query).primary_type === 'graph_data') {
-    var _limitMatch = query.match(/LIMIT\s+(\d+)\s*$/i);
+    var _limitMatch = query.match(/LIMIT\s+(\d+)\s*;?\s*$/i);
     var _limitVal   = _limitMatch ? parseInt(_limitMatch[1], 10) : Infinity;
     var _edgeCount  = NaN;
 
-    setProgressMsg('\u23f3 Counting matching relations\u2026');
+    // A query that ends with LIMIT n (n < 1000) is a quick look the user sized on purpose: it can never reach the
+    // "too large" threshold, so it is run directly without the (slow) count of all matching relations.
+    _skipCount = _limitVal < 1000;
+
+    if (!_skipCount) setProgressMsg('\u23f3 Counting matching relations\u2026');
 
     // Run the COUNT(*) version of the query with no client-side timeout so we
     // always get the real number (the server enforces its own Neo4j timeout).
-    try {
+    if (!_skipCount) try {
       var _countOpts = {
         method:  'POST',
         headers: { 'Content-Type': 'application/json',
@@ -7394,7 +7458,7 @@ async function runQuery(mergeIntoExisting) {
     } catch (countErr) {
       console.warn('count-query failed:', countErr.message);
     }
-    setProgressMsg(null);
+    if (!_skipCount) setProgressMsg(null);
 
     // Intercept when we have a real count >= 1000, or when count failed but the
     // query has an explicit LIMIT >= 1000 (safe conservative assumption).
@@ -7418,6 +7482,8 @@ async function runQuery(mergeIntoExisting) {
 
   try {
     var data = await api('/api/graph/query', { query: query });
+    // no count was run, so the history gets the number of relations actually returned
+    if (_skipCount && !(data.table && !(data.nodes || []).length && !(data.edges || []).length)) appendCypherHistory(query, (data.edges || []).length);
     var shortQ = query.length > 40 ? query.substring(0, 40) + '…' : query;
     var startTabIdx = tabs.findIndex(function(t) { return t.id === startTabId; });
     if (startTabIdx < 0) return; // tab was closed while query ran
@@ -7787,7 +7853,7 @@ function _chUpdateSortHeaders() {
   var dateTh  = document.getElementById('ch-th-date');
   var countTh = document.getElementById('ch-th-count');
   dateTh.textContent  = 'Date'         + (_chSortField === 'date'  ? arrow : '');
-  countTh.textContent = 'Result Count' + (_chSortField === 'count' ? arrow : '');
+  countTh.textContent = '# results' + (_chSortField === 'count' ? arrow : '');
 }
 
 function _chEscHtml(s) {
@@ -7880,10 +7946,22 @@ function _chRender() {
     tdQuery.style.cssText = 'padding:5px 10px;border-bottom:1px solid #2a3050;font-family:monospace;font-size:12px;word-break:break-all;cursor:pointer;color:#e2e8f0;vertical-align:top';
     tdQuery.title = 'Click to open in Graph editor';
     tdQuery.addEventListener('click', function() {
-      var ta = document.getElementById('cypher-input');
-      if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
       _chCloseModal();
+      showCypherEditor(r.query);
     });
+
+    // "Reopen" button: loads the query into the Cypher editor (same as clicking the query text)
+    var tdReopen = document.createElement('td');
+    tdReopen.style.cssText = 'white-space:nowrap;padding:5px 6px;border-bottom:1px solid #2a3050;text-align:center;vertical-align:top';
+    var reopenBtn = document.createElement('button');
+    reopenBtn.textContent = 'Reopen';
+    reopenBtn.title = 'Load this query into the Cypher editor';
+    reopenBtn.style.cssText = 'background:#252a40;border:1px solid #3a4060;border-radius:5px;color:#a0b0d0;font-size:12px;padding:3px 9px;cursor:pointer';
+    reopenBtn.addEventListener('click', function() {
+      _chCloseModal();
+      showCypherEditor(r.query);
+    });
+    tdReopen.appendChild(reopenBtn);
 
     // "Open in" dropdown
     var tdOpen = document.createElement('td');
@@ -7910,8 +7988,7 @@ function _chRender() {
         }
       } else {
         // Default: load into Graph Cypher editor
-        var ta = document.getElementById('cypher-input');
-        if (ta) { ta.value = r.query; onCypherInput(ta); focusCypherInput(); }
+        showCypherEditor(r.query);
       }
       // Reset dropdown so it can be triggered again for the same option
       setTimeout(function() { sel.value = 'graph'; }, 300);
@@ -7922,6 +7999,7 @@ function _chRender() {
     tr.appendChild(tdDate);
     tr.appendChild(tdCount);
     tr.appendChild(tdQuery);
+    tr.appendChild(tdReopen);
     tr.appendChild(tdOpen);
     tbody.appendChild(tr);
   });
@@ -8045,7 +8123,7 @@ function _shUpdateSortHeaders() {
   var dateTh  = document.getElementById('sh-th-date');
   var countTh = document.getElementById('sh-th-count');
   dateTh.textContent  = 'Date'         + (_shSortField === 'date'  ? arrow : '');
-  countTh.textContent = 'Result Count' + (_shSortField === 'count' ? arrow : '');
+  countTh.textContent = '# results' + (_shSortField === 'count' ? arrow : '');
 }
 
 // Reuses _chHighlight/_chEscHtml (identical escaping/highlighting logic —
@@ -8421,6 +8499,22 @@ function renderRefsHtml(refs, asc) {
   return out;
 }
 
+// The Source property of a relation for display: from the full Neo4j properties kept in graphData (the Cytoscape edge
+// data only carries a few display fields), else from the edge data itself. Several values are joined with '; '.
+function _edgeSourceText(edge) {
+  var v;
+  try {
+    var id = String(edge.id());
+    var ge = (typeof graphData !== 'undefined' && graphData && graphData.edges) ? graphData.edges.find(function(e) { return String(e.id) === id; }) : null;
+    if (ge && ge.properties) v = ge.properties.Source != null ? ge.properties.Source : ge.properties.source;
+  } catch (e) { /* fall back below */ }
+  if (v == null || v === '') { var d = edge.data('Source'); if (d != null && d !== '') v = d; }
+  if (v == null) return '';
+  if (Array.isArray(v)) v = v.filter(function(x) { return x != null && x !== ''; }).join('; ');
+  v = String(v).trim();
+  return v;
+}
+
 function renderTooltip(edge, refs) {
   var el = document.getElementById('tooltip');
   var src = edge.data('source');
@@ -8477,6 +8571,13 @@ function renderTooltip(edge, refs) {
   if (mechanism && String(mechanism).trim()) {
     html += '<div style="font-size:11px;color:#7a8099;margin-bottom:4px">Mechanism: '
       + escHtml(String(mechanism).trim()) + '</div>';
+  }
+
+  // Source of the relation (its Source property: one value, several separated by ';', or a list)
+  var srcText = _edgeSourceText(edge);
+  if (srcText) {
+    html += '<div style="font-size:11px;color:#7a8099;margin-bottom:4px">Source: '
+      + escHtml(srcText) + '</div>';
   }
 
   // REQ (tooltip breakdown): split the reference count into "database" vs
@@ -13022,6 +13123,7 @@ function _cncSwitchTab(tab) {
 var _cncAction  = null;
 var _cncContext = null;
 
+var _cncOpenToken = 0;   // identifies the latest opening of the dialog, so an older one waiting for the schema stops
 async function _cncOpenDialog(action, context, title) {
   _cncAction  = action;
   _cncContext = context;
@@ -13056,9 +13158,21 @@ async function _cncOpenDialog(action, context, title) {
   if (tabsBar) tabsBar.style.display = nodeTabApplicable ? 'flex' : 'none';
   _cncSwitchTab(nodeTabApplicable ? 'node' : 'rel');
 
-  try {
-    await _loadSchema();
-  } catch (e) { /* fall through — subsections just stay empty (no filter applied either way) */ }
+  // The node/relation types come from the database schema. Right after a server restart it may still be loading
+  // (or the first attempt may have failed): block the dialog with "Database schema is loading…" and keep trying
+  // until it is there, instead of showing a dialog with nothing to choose from.
+  var _loadingEl = document.getElementById('cnc-schema-loading');
+  var _modalEl = document.getElementById('common-neighbors-config-modal');
+  var _myToken = ++_cncOpenToken;
+  if (_loadingEl) _loadingEl.style.display = _schemaCache ? 'none' : 'flex';
+  while (!_schemaCache) {
+    try { await _loadSchema(); } catch (e) { /* retried below */ }
+    if (_schemaCache) break;
+    if (_cncOpenToken !== _myToken || _modalEl.style.display === 'none') return;   // closed (or re-opened) meanwhile
+    await new Promise(function(r) { setTimeout(r, 2000); });
+    if (_cncOpenToken !== _myToken || _modalEl.style.display === 'none') return;
+  }
+  if (_loadingEl) _loadingEl.style.display = 'none';
   var schema = _schemaCache || { labels: [], relTypes: [], propKeys: [] };
 
   if (nodeTabApplicable) {
@@ -13330,38 +13444,37 @@ async function runExploreConfigQuery() {
         groups: groups
       });
     } else if (action === 'findBetween') {
-      // Like connectSelected, dedupe across groups then merge straight into
-      // the graph — no second dialog; the config dialog already served as the
-      // one user confirmation step.
-      var fbNodesById = new Map();
-      var fbEdgesById = new Map();
-      (groups || []).forEach(function(g) {
-        if (g.node) fbNodesById.set(g.node.id, g.node);
-        (g.targets || []).forEach(function(t) { fbNodesById.set(t.id, t); });
-        (g.edges || []).forEach(function(e) { fbEdgesById.set(e.id, e); });
+      // Same result dialog as Connect Selected Nodes: the relation types found are listed with a checkbox each,
+      // so the user can add only some of them.
+      openConnectSelectedResultDialog({
+        title: 'Connect Selected and Unselected \u2014 Results',
+        tabTitle: 'Connect Selected and Unselected',
+        summary: (ctx.summaryText || '') + ' \u2014 filter: ' + filterLabel,
+        description: dialogTitle + ': find relations between ' + (ctx.summaryText || '') + ', filter: ' + filterLabel,
+        groups: groups
       });
-      var fbPending = { nodes: Array.from(fbNodesById.values()), edges: Array.from(fbEdgesById.values()) };
-      var fbResult = mergeGraphData(fbPending);
-      updateStats();
-      if (fbResult.addedEdges + fbResult.addedNodes > 0 && _tabHasDefaultName(activeTabIdx)) {
-        var fbDesc = dialogTitle + ': find relations between ' + (ctx.summaryText || '') + ', filter: ' + filterLabel;
-        _nameTabFromExplore(fbDesc, tabs[activeTabIdx].id, activeTabIdx);
-      }
-      if (document.getElementById('table-view').style.display !== 'none') _reloadCurrentTableMode();
-      console.log('[findBetween] added ' + fbResult.addedNodes + ' node(s), ' + fbResult.addedEdges + ' edge(s)');
-      if (fbResult.addedEdges === 0 && fbResult.addedNodes === 0) {
-        showAlignHint('No new relations found between selected and unselected nodes.', true);
-      } else {
-        showAlignHint('Added ' + fbResult.addedEdges + ' relation(s)' +
-          (fbResult.addedNodes > 0 ? ' and ' + fbResult.addedNodes + ' node(s)' : '') + ' to the graph.');
-      }
     } else {
+      // The report itself needs nothing from Postgres. A big result (tabs) is shown at once and the Postgres counts
+      // are fetched in the background; a small one waits for them (a moment) so its single table is complete.
+      var pgPromise = null;
+      if (result.pgPending) {
+        pgPromise = _crFetchPgCounts(groups, body.sources);
+        if (groups.length <= _CR_TAB_THRESHOLD) {
+          setProgressMsg('⏳ Querying Postgres database to obtain reference count…');
+          try { await pgPromise; } catch (e) { console.warn('Postgres counts failed:', e.message); }
+          setProgressMsg(null);
+          pgPromise = null;
+        } else {
+          pgPromise.catch(function(e) { console.warn('Postgres counts failed:', e.message); });
+        }
+      }
       openConnectivityReport({
         title: dialogTitle,
         columnLabel: _CNC_MODE_COLUMN_LABEL[action === 'commonNeighbors' ? ctx.direction : action] || 'Name',
         summary: (ctx.summaryText || '') + ' — filter: ' + filterLabel + ' — ' +
                  groups.length + ' result' + (groups.length !== 1 ? 's' : '') + ' found',
-        groups: groups
+        groups: groups,
+        pgPromise: pgPromise
       });
     }
   } catch (err) {
@@ -16083,11 +16196,22 @@ function openConnectSelectedResultDialog(options) {
   edges.forEach(function(e) { var t = e.type || 'Unknown'; typeCounts[t] = (typeCounts[t] || 0) + 1; });
   var breakdownEl = document.getElementById('csr-breakdown');
   var emptyMsg = document.getElementById('csr-empty-msg');
+  document.getElementById('csr-title').textContent = options.title || 'Connect Selected Nodes \u2014 Results';
+  _csrTabTitle = options.tabTitle || 'Connect Selected';
   if (edges.length) {
-    var lines = ['Found ' + edges.length + ' relation' + (edges.length === 1 ? '' : 's') + ' by type:'];
-    Object.keys(typeCounts).sort(function(a, b) { return typeCounts[b] - typeCounts[a]; })
-      .forEach(function(t) { lines.push('  • ' + t + ': ' + typeCounts[t]); });
-    breakdownEl.textContent = lines.join('\n');
+    // One checkbox per relation type found (most frequent first): only the checked types are added to the graph.
+    var typesSorted = Object.keys(typeCounts).sort(function(a, b) { return (typeCounts[b] - typeCounts[a]) || a.localeCompare(b); });
+    breakdownEl.style.whiteSpace = 'normal';
+    breakdownEl.innerHTML = '<div style="margin-bottom:4px">Found ' + edges.length + ' relation' + (edges.length === 1 ? '' : 's')
+      + ' by type \u2014 tick the relation types to add:</div>'
+      + typesSorted.map(function(t) {
+          return '<label style="display:block;padding:1px 0;cursor:pointer"><input type="checkbox" class="csr-type-cb" data-type="' + escHtml(t) + '" checked style="width:auto;margin:0 6px 0 0;vertical-align:middle"> '
+            + escHtml(t) + ': ' + typeCounts[t] + '</label>';
+        }).join('')
+      + (typesSorted.length > 1
+          ? '<div style="margin-top:4px"><a href="#" onclick="_csrTypesAll(true);return false" style="margin-right:8px;color:#6ab4ff">all</a>'
+            + '<a href="#" onclick="_csrTypesAll(false);return false" style="color:#6ab4ff">none</a></div>'
+          : '');
     breakdownEl.style.display = 'block';
     emptyMsg.style.display = 'none';
   } else {
@@ -16102,20 +16226,40 @@ function openConnectSelectedResultDialog(options) {
   // dedupes them straight back out via mergeGraphData's URN matching.
   _csrPending = { nodes: Array.from(nodesById.values()), edges: edges };
   // Store description for AI tab naming when the user commits.
-  _csrDescription = 'Connect Selected Nodes: ' + (options.summary || '');
+  _csrDescription = options.description || ('Connect Selected Nodes: ' + (options.summary || ''));
   document.getElementById('connect-selected-result-modal').style.display = 'flex';
 }
 
 var _csrDescription = '';  // description for AI tab naming
+var _csrTabTitle = 'Connect Selected';
+
+function _csrTypesAll(on) {
+  document.querySelectorAll('.csr-type-cb').forEach(function(cb) { cb.checked = on; });
+}
+// _csrPending narrowed to the relation types ticked in the dialog (all of them = unchanged): their edges and the
+// nodes those edges connect. Returns null (after telling the user) when nothing is ticked.
+function _csrChosen() {
+  var boxes = document.querySelectorAll('.csr-type-cb');
+  if (!boxes.length) return _csrPending;          // no relations found: nothing to choose
+  var on = new Set();
+  boxes.forEach(function(cb) { if (cb.checked) on.add(cb.getAttribute('data-type')); });
+  if (!on.size) { alert('Tick at least one relation type to add.'); return null; }
+  if (on.size === boxes.length) return _csrPending;
+  var edges = _csrPending.edges.filter(function(e) { return on.has(e.type || 'Unknown'); });
+  var ends = new Set();
+  edges.forEach(function(e) { ends.add(String(e.startNodeId)); ends.add(String(e.endNodeId)); });
+  return { nodes: _csrPending.nodes.filter(function(n) { return ends.has(String(n.id)); }), edges: edges };
+}
 
 function closeConnectSelectedResultModal() {
   document.getElementById('connect-selected-result-modal').style.display = 'none';
 }
 
 function _csrCommit() {
+  if (!_csrPending) { document.getElementById('connect-selected-result-modal').style.display = 'none'; return; }
+  var pending = _csrChosen();
+  if (!pending) return;
   document.getElementById('connect-selected-result-modal').style.display = 'none';
-  if (!_csrPending) return;
-  var pending = _csrPending;
   var desc    = _csrDescription;
   _csrPending     = null;
   _csrDescription = '';
@@ -16129,14 +16273,15 @@ function _csrCommit() {
 }
 
 function _csrCommitNewTab() {
+  if (!_csrPending) { document.getElementById('connect-selected-result-modal').style.display = 'none'; return; }
+  var pending = _csrChosen();
+  if (!pending) return;
   document.getElementById('connect-selected-result-modal').style.display = 'none';
-  if (!_csrPending) return;
-  var pending = _csrPending;
   var desc    = _csrDescription;
   _csrPending     = null;
   _csrDescription = '';
 
-  createNewTab('Connect Selected ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+  createNewTab(_csrTabTitle + ' ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
   var result = mergeGraphData(pending);
   console.log('[connectSelected→new tab] added ' + result.addedNodes + ' nodes, ' + result.addedEdges + ' edges');
   updateStats();
@@ -16160,6 +16305,17 @@ var _crGroups       = [];      // [{node, targetCount, referenceCount, snippetCo
 var _crSortCol       = 'targetCount';
 var _crSortAsc       = false;  // most-connected first by default
 var _crExpandedIdx   = new Set();  // indices (into the SORTED render order) with their detail row open
+var _crTypeOn        = new Set();  // relation types currently switched on in the type filter (all of them by default)
+var _crAllTypes      = [];         // every relation type found in this report, most frequent first
+// Big results (more than _CR_TAB_THRESHOLD rows) open on three tabs instead of one long table, because building
+// thousands of table rows takes a long time: "Nodes" (statistics per node label), "Relations" (statistics per relation
+// type) and "All" (the row-by-row table, built only when that tab is opened).
+var _CR_TAB_THRESHOLD = 1000;
+var _crTabMode       = false;
+var _crAllRendered   = false;      // the row table of the All tab has been built for the current filters
+var _crLabelOn       = new Set();  // node labels switched on in the Nodes tab
+var _crAllLabels     = [];
+var _crLabelExpanded = new Set();  // labels whose "top nodes" detail row is open in the Nodes tab
 var _crLastClickedIdx = null;  // Shift+click range-select anchor — the last row clicked WITHOUT Shift
 
 function _crNodeName(node) {
@@ -16201,6 +16357,222 @@ function _crFormatBreakdown(groups) {
   };
 }
 
+// Postgres half of the explore report (fetched in the background — the Nodes and Relations tabs need none of it):
+// snippet counts of relations that have no stored RelationNumberOfSentences, and the Source-filtered reference counts.
+var _crPgPending = false;   // the Postgres counts of the open report are still being fetched
+var _crPgPromise = null;
+async function _crFetchPgCounts(groups, sources) {
+  var idSet = new Set();
+  groups.forEach(function(g) { (g.pgRelIds || []).forEach(function(id) { idSet.add(id); }); });
+  var ids = Array.from(idSet);
+  if (!ids.length) return;
+  var CHUNK = 5000, chunks = [];
+  for (var i = 0; i < ids.length; i += CHUNK) chunks.push(ids.slice(i, i + CHUNK));
+  var counts = {};
+  var next = 0;
+  async function worker() {                       // 3 requests in flight at most
+    while (next < chunks.length) {
+      var chunk = chunks[next++];
+      var res = await api('/api/graph/relation-pg-counts', { relationIds: chunk, sources: sources || undefined }, 'POST');
+      Object.keys(res.counts || {}).forEach(function(k) { counts[k] = res.counts[k]; });
+    }
+  }
+  await Promise.all([worker(), worker(), worker()]);
+  groups.forEach(function(g) {
+    (g.pgSnipIds || []).forEach(function(rid) { if (counts[rid]) g.snippetCount = (g.snippetCount || 0) + counts[rid].s; });
+    if (sources) {
+      var keys = new Set();
+      (g.pgRelIds || []).forEach(function(rid) { if (counts[rid]) counts[rid].f.forEach(function(k) { keys.add(k); }); });
+      g.filteredReferenceCount = keys.size;
+    }
+    delete g.pgRelIds; delete g.pgSnipIds;
+  });
+}
+
+function _crLabelOf(g) { return g.nodeType || 'Unknown'; }
+function _crNum(v) {
+  if (Array.isArray(v)) return v.reduce(function(sum, x) { return sum + _crNum(x); }, 0);
+  var n = Number(v); return isFinite(n) ? n : 0;
+}
+function _crFmt(n) { return Number(n || 0).toLocaleString(); }
+
+// Relation types of one result row: its edges restricted to the types switched on in the filter bar.
+function _crActiveEdges(g) {
+  return (g.edges || []).filter(function(e) { return _crTypeOn.has((e && e.type) || 'Unknown'); });
+}
+// "Binding (2), Regulation (1)" — the relation types connecting this row's node, most frequent first
+function _crTypeText(g) {
+  var counts = {};
+  _crActiveEdges(g).forEach(function(e) { var t = (e && e.type) || 'Unknown'; counts[t] = (counts[t] || 0) + 1; });
+  return Object.keys(counts).sort(function(a, b) { return (counts[b] - counts[a]) || a.localeCompare(b); })
+    .map(function(t) { return t + ' (' + counts[t] + ')'; }).join(', ');
+}
+// Number of distinct targets reached through the switched-on relation types
+function _crTargetCountActive(g) {
+  if (_crTypeOn.size === _crAllTypes.length) return g.targetCount;
+  var ids = new Set(), self = g.node && String(g.node.id);
+  _crActiveEdges(g).forEach(function(e) {
+    [e.startNodeId, e.endNodeId].forEach(function(id) { if (id != null && String(id) !== self) ids.add(String(id)); });
+  });
+  return ids.size;
+}
+// Checkbox per relation type found: switch types off to leave them out of the rows and out of what is added.
+function _crRenderTypeBar() {
+  var el = document.getElementById('cr-types');
+  if (!el) return;
+  if (_crAllTypes.length < 2) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  var counts = {};
+  _crGroups.forEach(function(g) { (g.edges || []).forEach(function(e) { var t = (e && e.type) || 'Unknown'; counts[t] = (counts[t] || 0) + 1; }); });
+  el.innerHTML = '<span style="color:#7a8099;margin-right:8px">Relation types to add:</span>'
+    + _crAllTypes.map(function(t) {
+        return '<label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;cursor:pointer;white-space:nowrap">'
+          + '<input type="checkbox" class="cr-type-cb" style="width:auto;margin:0;vertical-align:middle" data-type="' + escHtml(t) + '"' + (_crTypeOn.has(t) ? ' checked' : '') + ' onchange="_crTypeToggle()">'
+          + escHtml(t) + ' (' + counts[t] + ')</label>';
+      }).join('')
+    + '<a href="#" onclick="_crTypesAll(true);return false" style="margin-right:8px;color:#6ab4ff">all</a>'
+    + '<a href="#" onclick="_crTypesAll(false);return false" style="color:#6ab4ff">none</a>';
+  el.style.display = 'block';
+}
+var _crActiveTab = 'nodes';
+function _crShowTab(name) {
+  _crActiveTab = name;
+  ['nodes', 'rels', 'all'].forEach(function(t) {
+    var pane = document.getElementById(t === 'all' ? 'cr-pane-all' : 'cr-pane-' + t);
+    if (pane) pane.style.display = (t === name) ? '' : 'none';
+    var btn = document.getElementById('cr-tab-' + t);
+    if (btn) btn.style.background = (t === name) ? '#252a40' : '';
+  });
+  var block = document.getElementById('cr-pg-block');
+  if (block) block.style.display = 'none';
+  if (name === 'all' && _crPgPending) {
+    // The row table shows reference/snippet counts that come from Postgres: block this tab until they have arrived
+    document.getElementById('cr-pane-all').style.display = 'none';
+    if (block) block.style.display = 'flex';
+    var waiting = _crPgPromise;
+    waiting.then(function() {}, function() {}).then(function() {
+      if (_crPgPromise !== waiting || _crActiveTab !== 'all') return;
+      _crShowTab('all');                           // pending is cleared by now: shows and builds the table
+    });
+    return;
+  }
+  if (name === 'all' && !_crAllRendered) {
+    var tbody = document.getElementById('cr-body');
+    tbody.innerHTML = '<tr><td colspan="9" style="padding:14px;text-align:center;color:#7a8099">Building the table\u2026</td></tr>';
+    setTimeout(function() { _renderConnectivityReport(); _crAllRendered = true; }, 30);   // let the message paint first
+  }
+}
+
+function _crRenderNodesPane() {
+  var stats = {};
+  _crAllLabels.forEach(function(l) { stats[l] = { nodes: 0, rels: 0, targets: 0, refs: 0, snips: 0, top: [] }; });
+  _crGroups.forEach(function(g) {
+    var act = _crActiveEdges(g);
+    if (g.edges && g.edges.length && !act.length) return;       // no relation of a switched-on type
+    var st = stats[_crLabelOf(g)];
+    st.nodes++; st.rels += act.length; st.targets += _crTargetCountActive(g);
+    st.refs += _crNum(g.referenceCount); st.snips += _crNum(g.snippetCount);
+    st.top.push(g);
+  });
+  var td = 'padding:5px 8px;border-top:1px solid #2a2f4a;';
+  var html = '';
+  _crAllLabels.slice().sort(function(a, b) { return (stats[b].nodes - stats[a].nodes) || a.localeCompare(b); }).forEach(function(l) {
+    var st = stats[l], open = _crLabelExpanded.has(l);
+    html += '<tr data-label="' + escHtml(l) + '" style="' + (_crLabelOn.has(l) ? '' : 'opacity:.45') + '">'
+      + '<td style="' + td + '"><input type="checkbox" class="cr-label-cb" data-label="' + escHtml(l) + '" style="width:auto;margin:0" ' + (_crLabelOn.has(l) ? 'checked' : '') + ' onchange="_crLabelToggle()"></td>'
+      + '<td style="' + td + 'cursor:pointer;color:#7a8099" onclick="_crToggleLabelDetail(this.parentNode.getAttribute(\'data-label\'))">' + (open ? '\u25bc' : '\u25b6') + '</td>'
+      + '<td style="' + td + '">' + escHtml(l) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.nodes) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.rels) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.targets) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.refs) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.snips) + '</td></tr>';
+    if (open) {
+      var top = st.top.slice().sort(function(a, b) { return b.targetCount - a.targetCount; }).slice(0, 25)
+        .map(function(g) { return _crNodeName(g.node) + ' (' + g.targetCount + ')'; });
+      html += '<tr><td colspan="8" style="padding:6px 8px 10px 34px;border-top:1px solid #2a2f4a;background:#181c2c;color:#9aa0c0;font-size:11px">'
+        + 'Most connected (' + top.length + ' of ' + st.top.length.toLocaleString() + '): ' + escHtml(top.join(', ')) + '</td></tr>';
+    }
+  });
+  document.getElementById('cr-nodes-body').innerHTML = html;
+}
+
+function _crRenderRelsPane() {
+  var stats = {};
+  _crGroups.forEach(function(g, gi) {
+    if (!_crLabelOn.has(_crLabelOf(g))) return;
+    var seen = {};
+    (g.edges || []).forEach(function(e) {
+      var t = (e && e.type) || 'Unknown';
+      var st = stats[t] || (stats[t] = { ids: new Set(), nodes: new Set(), refs: 0, snips: 0 });
+      if (st.ids.has(e.id)) return;
+      st.ids.add(e.id); st.nodes.add(gi);
+      var pr = e.properties || {};
+      st.refs += _crNum(pr.RelationNumberOfReferences); st.snips += _crNum(pr.RelationNumberOfSentences);
+    });
+  });
+  var td = 'padding:5px 8px;border-top:1px solid #2a2f4a;';
+  var html = '';
+  _crAllTypes.slice().sort(function(a, b) { return ((stats[b] ? stats[b].ids.size : 0) - (stats[a] ? stats[a].ids.size : 0)) || a.localeCompare(b); }).forEach(function(t) {
+    var st = stats[t] || { ids: new Set(), nodes: new Set(), refs: 0, snips: 0 };
+    html += '<tr style="' + (_crTypeOn.has(t) ? '' : 'opacity:.45') + '">'
+      + '<td style="' + td + '"><input type="checkbox" class="cr-type-cb2" data-type="' + escHtml(t) + '" style="width:auto;margin:0" ' + (_crTypeOn.has(t) ? 'checked' : '') + ' onchange="_crTypeToggleTab()"></td>'
+      + '<td style="' + td + '">' + escHtml(t) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.ids.size) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.nodes.size) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.refs) + '</td>'
+      + '<td style="' + td + 'text-align:right">' + _crFmt(st.snips) + '</td></tr>';
+  });
+  document.getElementById('cr-rels-body').innerHTML = html;
+}
+
+// how many rows would be added with the current Nodes / Relations choices
+function _crUpdateTabSummary() {
+  var el = document.getElementById('cr-tab-summary');
+  if (!el) return;
+  var rows = _crVisibleGroups();
+  el.textContent = _crFmt(rows.length) + ' of ' + _crFmt(_crGroups.length) + ' nodes selected \u2014 the All tab lists them one by one'
+    + (_crPgPending ? ' \u00b7 reference counts are still being read from Postgres\u2026' : '');
+}
+
+function _crTabsRefresh() {
+  _crAllRendered = false;                                       // the row table is stale: rebuilt when the All tab is opened
+  document.getElementById('cr-body').innerHTML = '';
+  _crRenderNodesPane(); _crRenderRelsPane(); _crUpdateTabSummary();
+}
+function _crLabelToggle() {
+  _crLabelOn = new Set();
+  document.querySelectorAll('.cr-label-cb').forEach(function(cb) { if (cb.checked) _crLabelOn.add(cb.getAttribute('data-label')); });
+  _crTabsRefresh();
+}
+function _crTypeToggleTab() {
+  _crTypeOn = new Set();
+  document.querySelectorAll('.cr-type-cb2').forEach(function(cb) { if (cb.checked) _crTypeOn.add(cb.getAttribute('data-type')); });
+  _crTabsRefresh();
+}
+function _crToggleLabelDetail(label) {
+  if (_crLabelExpanded.has(label)) _crLabelExpanded.delete(label); else _crLabelExpanded.add(label);
+  _crRenderNodesPane();
+}
+
+// Rows that pass the Nodes-tab label choice and have at least one edge of a switched-on relation type
+function _crVisibleGroups() {
+  return _crGroups.filter(function(g) {
+    if (_crTabMode && !_crLabelOn.has(_crLabelOf(g))) return false;
+    return !(g.edges && g.edges.length) || _crActiveEdges(g).length > 0;
+  });
+}
+
+function _crTypeToggle() {
+  _crTypeOn = new Set();
+  document.querySelectorAll('.cr-type-cb').forEach(function(cb) { if (cb.checked) _crTypeOn.add(cb.getAttribute('data-type')); });
+  _crExpandedIdx = new Set(); _crLastClickedIdx = null;
+  _renderConnectivityReport();
+}
+function _crTypesAll(on) {
+  document.querySelectorAll('.cr-type-cb').forEach(function(cb) { cb.checked = on; });
+  _crTypeToggle();
+}
+
 // options: { title, columnLabel, summary, groups }
 // `groups` is exactly what /api/graph/find-drugs-report (or a future sibling
 // endpoint) returns — see that endpoint's comment for the shared shape.
@@ -16237,6 +16609,30 @@ function openConnectivityReport(options) {
     g.nodeType = (g.node && Array.isArray(g.node.labels) && g.node.labels[0]) || '';
     return g;
   });
+  // relation types found in this result (the filter bar and the "Relation type" column are built from them)
+  var _typeCounts = {};
+  _crGroups.forEach(function(g) { (g.edges || []).forEach(function(e) { var t = (e && e.type) || 'Unknown'; _typeCounts[t] = (_typeCounts[t] || 0) + 1; }); });
+  _crAllTypes = Object.keys(_typeCounts).sort(function(a, b) { return (_typeCounts[b] - _typeCounts[a]) || a.localeCompare(b); });
+  _crTypeOn = new Set(_crAllTypes);
+  _crTabMode = _crGroups.length > _CR_TAB_THRESHOLD;
+  _crAllLabels = Array.from(new Set(_crGroups.map(_crLabelOf)));
+  _crLabelOn = new Set(_crAllLabels);
+  _crLabelExpanded = new Set();
+  _crAllRendered = false;
+  _crPgPromise = options.pgPromise || null;
+  _crPgPending = !!_crPgPromise;
+  if (_crPgPromise) {
+    var _thisPromise = _crPgPromise;
+    var _done = function(ok) {
+      if (_crPgPromise !== _thisPromise) return;          // another report was opened meanwhile
+      _crPgPending = false;
+      if (!ok) { var te = document.getElementById('cr-error'); if (te) { te.textContent = 'Could not get the Postgres reference counts \u2014 snippet / filtered counts may be incomplete.'; te.style.display = 'block'; } }
+      if (_crTabMode) { _crAllRendered = false; _crRenderNodesPane(); _crUpdateTabSummary(); }
+    };
+    _thisPromise.then(function() { _done(true); }, function() { _done(false); });
+  }
+  if (!_crTabMode) _crRenderTypeBar();
+  else { var _tb = document.getElementById('cr-types'); if (_tb) { _tb.style.display = 'none'; _tb.innerHTML = ''; } }
   var breakdownEl = document.getElementById('cr-breakdown');
   if (breakdownEl) {
     var bd = _crFormatBreakdown(_crGroups);
@@ -16248,7 +16644,20 @@ function openConnectivityReport(options) {
   _crSortAsc = false;
   _crExpandedIdx = new Set();
   _crLastClickedIdx = null;
-  _renderConnectivityReport();
+  var _tabsEl = document.getElementById('cr-tabs'), _tabSum = document.getElementById('cr-tab-summary');
+  if (_tabsEl) _tabsEl.style.display = _crTabMode ? 'flex' : 'none';
+  if (_tabSum) _tabSum.style.display = _crTabMode ? '' : 'none';
+  if (_crTabMode) {
+    // thousands of rows: show the per-label / per-relation-type statistics first; the row table is built on demand
+    document.getElementById('cr-body').innerHTML = '';
+    _crRenderNodesPane(); _crRenderRelsPane(); _crUpdateTabSummary();
+    _crShowTab('nodes');
+  } else {
+    ['nodes', 'rels'].forEach(function(t) { var pane = document.getElementById('cr-pane-' + t); if (pane) pane.style.display = 'none'; });
+    document.getElementById('cr-pane-all').style.display = '';
+    _renderConnectivityReport();
+    _crAllRendered = true;
+  }
   // Reset master checkbox to checked (all rows default to selected)
   var crMaster = document.getElementById('cr-select-all');
   if (crMaster) crMaster.checked = true;
@@ -16304,7 +16713,10 @@ function _crToggleExpand(idx) {
 
 function _renderConnectivityReport() {
   var col = _crSortCol, asc = _crSortAsc;
-  var rows = _crGroups.slice().sort(function(a, b) {
+  // rows without any edge of a switched-on relation type drop out (rows without edge data at all stay)
+  var visible = _crVisibleGroups();
+  visible.forEach(function(g) { g.relTypeStr = _crTypeText(g); g._shownTargets = _crTargetCountActive(g); });
+  var rows = visible.sort(function(a, b) {
     var av = col === 'name' ? _crNodeName(a.node).toLowerCase() : a[col];
     var bv = col === 'name' ? _crNodeName(b.node).toLowerCase() : b[col];
     if (typeof av === 'number' && typeof bv === 'number') return asc ? av - bv : bv - av;
@@ -16329,7 +16741,8 @@ function _renderConnectivityReport() {
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;cursor:pointer;color:#7a8099" title="Show all matched targets">' + (isOpen ? '▼' : '▶') + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a">' + escHtml(_crNodeName(g.node)) + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a">' + escHtml(g.nodeType || '') + '</td>' +
-      '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + g.targetCount + '</td>' +
+      '<td style="padding:5px 8px;border-top:1px solid #2a2f4a">' + escHtml(g.relTypeStr || '') + '</td>' +
+      '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + g._shownTargets + '</td>' +
       '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + g.referenceCount + '</td>' +
       (_activeSourceFilter
         ? '<td style="padding:5px 8px;border-top:1px solid #2a2f4a;text-align:right">' + (g.filteredReferenceCount != null ? g.filteredReferenceCount : '') + '</td>'
@@ -16365,7 +16778,7 @@ function _renderConnectivityReport() {
       var detailTr = document.createElement('tr');
       var targetNames = (g.targets || []).map(function(t) { return _crNodeName(t); }).sort(function(a, b) { return a.localeCompare(b); });
       var detailTd = document.createElement('td');
-      detailTd.colSpan = 7;
+      detailTd.colSpan = 9;
       detailTd.style.cssText = 'padding:6px 8px 10px 34px;border-top:1px solid #2a2f4a;background:#181c2c;color:#9aa0c0;font-size:11px';
       detailTd.textContent = 'Matched targets (' + targetNames.length + '): ' + targetNames.join(', ');
       detailTr.appendChild(detailTd);
@@ -16379,6 +16792,9 @@ function _renderConnectivityReport() {
 }
 
 function _crSelectedGroups() {
+  // Big result and the row table was never built for the current Nodes/Relations choices: everything those choices
+  // let through is added (the user chose by label and relation type instead of row by row)
+  if (_crTabMode && !_crAllRendered) return _crVisibleGroups();
   var tbody = document.getElementById('cr-body');
   var rows = tbody._crSortedRows || [];
   var selected = [];
@@ -16396,10 +16812,19 @@ function _crBuildPending() {
   var includeRelations = !includeRelCb || includeRelCb.checked;  // default true if the checkbox is somehow missing
   var nodes = [];
   var edges = [];
+  var allTypesOn = _crTypeOn.size === _crAllTypes.length;
   selected.forEach(function(g) {
     nodes.push(g.node);
-    (g.targets || []).forEach(function(t) { nodes.push(t); });
-    if (includeRelations) (g.edges || []).forEach(function(e) { edges.push(e); });
+    if (allTypesOn) {
+      (g.targets || []).forEach(function(t) { nodes.push(t); });
+      if (includeRelations) (g.edges || []).forEach(function(e) { edges.push(e); });
+    } else {
+      // only the relation types switched on: their edges, and the targets those edges reach
+      var active = _crActiveEdges(g), ends = new Set();
+      active.forEach(function(e) { ends.add(String(e.startNodeId)); ends.add(String(e.endNodeId)); });
+      (g.targets || []).forEach(function(t) { if (ends.has(String(t.id))) nodes.push(t); });
+      if (includeRelations) active.forEach(function(e) { edges.push(e); });
+    }
   });
   return { nodes: nodes, edges: edges };
 }
@@ -16692,86 +17117,252 @@ document.addEventListener('click', function(e) {
   if (wrap && !wrap.contains(e.target)) closeSettingsMenu();
 });
 
-// ─── Neo4j endpoint dialog (admin only) ──────────────────────────────────────
-// Only the shared URL lives here now — database/username/password moved to
-// each user's own "My Connection" dialog below. The menu item itself is
-// hidden for non-admins (see showApp()), so this dialog assumes admin.
-async function openNeo4jSettings() {
-  var errEl = document.getElementById('neo4j-settings-error');
-  var okEl  = document.getElementById('neo4j-settings-success');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  try {
-    var s = await api('/api/settings/neo4j');
-    document.getElementById('ns-url').value = s.url || '';
-  } catch(e) { /* show empty form */ }
-  document.getElementById('neo4j-settings-modal').style.display = 'flex';
-}
-function closeNeo4jSettingsModal(e) {
-  if (!e || e.target === document.getElementById('neo4j-settings-modal'))
-    document.getElementById('neo4j-settings-modal').style.display = 'none';
-}
-async function saveNeo4jSettings() {
-  var errEl = document.getElementById('neo4j-settings-error');
-  var okEl  = document.getElementById('neo4j-settings-success');
-  var btn   = document.getElementById('ns-save-btn');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  var url = document.getElementById('ns-url').value.trim();
-  if (!url) { errEl.textContent = 'URL is required.'; errEl.style.display = 'block'; return; }
+// ─── Settings → Database dialog ──────────────────────────────────────────────
+// Tab 1 "Connection URLs": the shared Neo4j URL and Postgres host[:port] — editable by admins only, shown
+// dimmed to everybody else. Tab 2 "Databases": the user's own Neo4j/Postgres pairs (named
+// "<neo4j database>/<postgres database>"); Connect switches to the selected pair in one click, Add enters a
+// new one, Save remembers it (usernames and passwords included — kept in settings.json, private to the user).
+var _dbData = null;          // last answer of GET /api/settings/databases
+var _dbTab = 'pairs';
+var _DB_NEW = '';            // value of the "new pair" option in the drop-down
+var _dbAddFrom = '';         // pair whose values were copied into the form by Add (its stored passwords are reused)
+var _DB_PW_MASK = '••••••••';
 
-  btn.disabled = true; btn.textContent = 'Saving…';
-  try {
-    var result = await api('/api/settings/neo4j', { url: url }, 'POST');
-    okEl.textContent = result.warning || 'Saved! Every user reconnects with their own credentials.';
-    okEl.style.display = 'block';
-    setTimeout(function() { document.getElementById('neo4j-settings-modal').style.display = 'none'; }, 1800);
-    _invalidateSchemaCache(); // reset schema autocomplete for new connection
-  } catch(err) {
-    errEl.textContent = err.message;
-    errEl.style.display = 'block';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Save';
+// The pair the user is connected to stays visible next to the logo (click it to open Settings → Database).
+function _setCurrentDbLabel(name) {
+  _currentDbPairName = name || '';
+  var el = document.getElementById('current-db-pair');
+  if (!el) return;
+  el.textContent = name ? '⛁ ' + name : '';
+  el.style.display = name ? '' : 'none';
+}
+async function refreshCurrentDbLabel() {
+  try { _setCurrentDbLabel((await api('/api/settings/databases', null, 'GET')).active); }
+  catch (e) { _setCurrentDbLabel(''); }
+}
+
+function _dbMsg(kind, text) {
+  var err = document.getElementById('db-error'), ok = document.getElementById('db-success');
+  err.style.display = 'none'; ok.style.display = 'none';
+  if (!text) return;
+  var el = kind === 'error' ? err : ok;
+  el.textContent = text; el.style.display = 'block';
+}
+
+function switchDbTab(tab) {
+  _dbTab = tab === 'urls' ? 'urls' : 'pairs';
+  document.getElementById('db-pane-urls').style.display  = _dbTab === 'urls'  ? '' : 'none';
+  document.getElementById('db-pane-pairs').style.display = _dbTab === 'pairs' ? '' : 'none';
+  document.getElementById('db-tab-urls').style.background  = _dbTab === 'urls'  ? '#252a40' : '';
+  document.getElementById('db-tab-pairs').style.background = _dbTab === 'pairs' ? '#252a40' : '';
+  _dbMsg('', '');
+}
+
+async function openDatabasesDialog() {
+  _dbMsg('', '');
+  document.getElementById('databases-modal').style.display = 'flex';
+  switchDbTab(_dbTab);
+  try { await _dbLoad(null); }
+  catch (e) { _dbMsg('error', e.message || String(e)); }
+}
+function closeDatabasesDialog() {
+  document.getElementById('databases-modal').style.display = 'none';
+}
+
+// Reloads the data from the server; selectName = the pair to show (default: the one in use).
+async function _dbLoad(selectName) {
+  _dbData = await api('/api/settings/databases', null, 'GET');
+  var canEdit = !!_dbData.canEditUrls;
+  var pgUrl = _dbData.urls.postgres || '';
+  var pgFull = pgUrl ? pgUrl + (_dbData.urls.postgresPort && Number(_dbData.urls.postgresPort) !== 5432 ? ':' + _dbData.urls.postgresPort : '') : '';
+  var nEl = document.getElementById('dbu-neo4j'), pEl = document.getElementById('dbu-pg');
+  nEl.value = _dbData.urls.neo4j || '';
+  pEl.value = pgFull;
+  [nEl, pEl].forEach(function (el) { el.disabled = !canEdit; el.style.opacity = canEdit ? '' : '0.55'; el.style.color = canEdit ? '' : '#7a8099'; });
+  document.getElementById('dbu-save-btn').style.display = canEdit ? '' : 'none';
+  document.getElementById('dbu-note').textContent = canEdit
+    ? 'Shared by every user. After changing a URL every user reconnects with their own saved logins.'
+    : 'Set by an administrator — only users with the Admin role can change these URLs.';
+
+  var sel = document.getElementById('dbp-select');
+  sel.innerHTML = _dbData.pairs.map(function (p) {
+    return '<option value="' + escHtml(p.name) + '">' + escHtml(p.name) + '</option>';
+  }).join('');
+  var want = selectName || _dbData.active;
+  if (_dbData.pairs.some(function (p) { return p.name === want; })) sel.value = want;
+  document.getElementById('dbp-current').textContent = 'Connected to: ' + _dbData.active;
+  _setCurrentDbLabel(_dbData.active);
+  if (_dbData.pairs.length) dbPairSelected(); else dbAddPair();
+}
+
+function _dbFill(pair) {
+  var n = pair ? pair.neo4j : {}, p = pair ? pair.postgres : {};
+  document.getElementById('dbp-n-db').value     = n.database || '';
+  document.getElementById('dbp-n-user').value   = n.username || '';
+  document.getElementById('dbp-n-pw').value     = '';
+  document.getElementById('dbp-n-pw').placeholder = (n.password ? 'stored — leave blank to keep' : '');
+  document.getElementById('dbp-p-db').value     = p.database || '';
+  document.getElementById('dbp-p-schema').value = p.schema || '';
+  document.getElementById('dbp-p-user').value   = p.username || '';
+  document.getElementById('dbp-p-pw').value     = '';
+  document.getElementById('dbp-p-pw').placeholder = (p.password ? 'stored — leave blank to keep' : '');
+  ['dbp-n-db-status', 'dbp-p-db-status', 'dbp-p-schema-status'].forEach(function (id) { document.getElementById(id).textContent = ''; });
+}
+
+function dbPairSelected() {
+  _dbMsg('', '');
+  _dbAddFrom = '';
+  var name = document.getElementById('dbp-select').value;
+  var pair = (_dbData && _dbData.pairs || []).find(function (p) { return p.name === name; });
+  _dbFill(pair || null);
+  document.getElementById('dbp-remove-btn').disabled = !pair || pair.name === _dbData.active || !!pair.unsaved;
+}
+
+// Add: the form keeps the values of the pair that was selected (so nothing has to be looked up or retyped);
+// the user only changes what differs. Passwords are never sent to the browser, so the password boxes stay
+// blank and the server reuses the stored passwords of the pair the values were copied from (same username).
+function dbAddPair() {
+  _dbMsg('', '');
+  var sel = document.getElementById('dbp-select');
+  var copied = _dbForm();
+  var src = sel.value;                       // '' when already on a new pair
+  var hasValues = !!(copied.neo4j.database || copied.neo4j.username || copied.postgres.database || copied.postgres.username);
+  if (!Array.prototype.some.call(sel.options, function (o) { return o.value === _DB_NEW; })) {
+    var opt = document.createElement('option');
+    opt.value = _DB_NEW; opt.textContent = '— new pair —';
+    sel.insertBefore(opt, sel.firstChild);
   }
+  sel.value = _DB_NEW;
+  if (hasValues) {
+    _dbAddFrom = src || _dbAddFrom;
+    _dbFill({ neo4j: { database: copied.neo4j.database, username: copied.neo4j.username, password: '' },
+              postgres: { database: copied.postgres.database, schema: copied.postgres.schema, username: copied.postgres.username, password: '' } });
+    if (_dbAddFrom) {
+      var ph = 'same as ' + _dbAddFrom + ' — leave blank to keep';
+      document.getElementById('dbp-n-pw').placeholder = ph;
+      document.getElementById('dbp-p-pw').placeholder = ph;
+    }
+  } else {
+    _dbFill(null);
+  }
+  document.getElementById('dbp-remove-btn').disabled = true;
+  document.getElementById('dbp-n-db').focus();
+  document.getElementById('dbp-n-db').select();
 }
 
-// ─── Postgres endpoint dialog (admin only) ───────────────────────────────────
-async function openPostgresSettings() {
-  var errEl = document.getElementById('pg-settings-error');
-  var okEl  = document.getElementById('pg-settings-success');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  try {
-    var s = await api('/api/settings/postgres');
-    document.getElementById('pgs-url').value  = s.url  || '';
-    document.getElementById('pgs-port').value = s.port || 5432;
-  } catch(e) { /* show empty form */ }
-  document.getElementById('postgres-settings-modal').style.display = 'flex';
-}
-function closePostgresSettingsModal(e) {
-  if (!e || e.target === document.getElementById('postgres-settings-modal'))
-    document.getElementById('postgres-settings-modal').style.display = 'none';
-}
-async function savePostgresSettings() {
-  var errEl = document.getElementById('pg-settings-error');
-  var okEl  = document.getElementById('pg-settings-success');
-  var btn   = document.getElementById('pgs-save-btn');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  var payload = {
-    url:  document.getElementById('pgs-url').value.trim(),
-    port: parseInt(document.getElementById('pgs-port').value) || 5432
+function _dbForm() {
+  function v(id) { return document.getElementById(id).value.trim(); }
+  return {
+    neo4j:    { database: v('dbp-n-db'), username: v('dbp-n-user'), password: document.getElementById('dbp-n-pw').value },
+    postgres: { database: v('dbp-p-db'), schema: v('dbp-p-schema'), username: v('dbp-p-user'), password: document.getElementById('dbp-p-pw').value }
   };
-  if (!payload.url) { errEl.textContent = 'URL is required.'; errEl.style.display = 'block'; return; }
+}
 
-  btn.disabled = true; btn.textContent = 'Saving…';
-  try {
-    var result = await api('/api/settings/postgres', payload, 'POST');
-    okEl.textContent = result.warning || 'Saved! Every user reconnects with their own credentials.';
-    okEl.style.display = 'block';
-    setTimeout(function() { document.getElementById('postgres-settings-modal').style.display = 'none'; }, 1800);
-  } catch(err) {
-    errEl.textContent = err.message;
-    errEl.style.display = 'block';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Save';
+// connect = false: test and remember the pair; connect = true: also switch to it
+async function dbSavePair(connect) {
+  var form = _dbForm();
+  if (!form.neo4j.database || !form.neo4j.username || !form.postgres.database || !form.postgres.schema || !form.postgres.username) {
+    _dbMsg('error', 'Neo4j database and username, and Postgres database, schema and username are required.');
+    return;
   }
+  var btn = document.getElementById(connect ? 'dbp-connect-btn' : 'dbp-save-btn');
+  var other = document.getElementById(connect ? 'dbp-save-btn' : 'dbp-connect-btn');
+  var oldText = btn.textContent;
+  btn.disabled = true; other.disabled = true; btn.textContent = 'Testing…';
+  _dbMsg('', '');
+  try {
+    var r = await api('/api/settings/databases/save', { neo4j: form.neo4j, postgres: form.postgres, connect: connect, from: document.getElementById('dbp-select').value || _dbAddFrom || undefined }, 'POST');
+    _dbAddFrom = '';
+    await _dbLoad(r.name);
+    _dbMsg('ok', connect ? 'Connected to ' + r.name + '.' : 'Saved ' + r.name + '.');
+    if (connect) _invalidateSchemaCache();   // schema autocomplete etc. must be re-read from the new database
+  } catch (e) {
+    _dbMsg('error', e.message || String(e));
+  } finally {
+    btn.disabled = false; other.disabled = false; btn.textContent = oldText;
+  }
+}
+
+async function dbRemovePair() {
+  var name = document.getElementById('dbp-select').value;
+  if (!name || !confirm('Forget the saved pair "' + name + '" and its stored logins?')) return;
+  try {
+    await api('/api/settings/databases/remove', { name: name }, 'POST');
+    await _dbLoad(null);
+    _dbMsg('ok', 'Removed ' + name + '.');
+  } catch (e) {
+    _dbMsg('error', e.message || String(e));
+  }
+}
+
+async function dbSaveUrls() {
+  var btn = document.getElementById('dbu-save-btn');
+  var neo = document.getElementById('dbu-neo4j').value.trim();
+  var pg  = document.getElementById('dbu-pg').value.trim();
+  if (!neo || !pg) { _dbMsg('error', 'Both URLs are required.'); return; }
+  var host = pg, port = 5432;
+  var m = /^(.*):(\d{1,5})$/.exec(pg);
+  if (m && m[1].indexOf(':') < 0) { host = m[1]; port = parseInt(m[2], 10); }   // host:port (a bare IPv6 address keeps its colons)
+  btn.disabled = true; btn.textContent = 'Saving…';
+  _dbMsg('', '');
+  try {
+    var warnings = [];
+    var r1 = await api('/api/settings/neo4j', { url: neo }, 'POST');
+    if (r1.warning) warnings.push(r1.warning);
+    var r2 = await api('/api/settings/postgres', { url: host, port: port }, 'POST');
+    if (r2.warning) warnings.push(r2.warning);
+    await _dbLoad(null);
+    _dbMsg(warnings.length ? 'error' : 'ok', warnings.length ? warnings.join(' ') : 'Saved. Every user reconnects with their own saved logins.');
+    _invalidateSchemaCache();
+  } catch (e) {
+    _dbMsg('error', e.message || String(e));
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save URLs';
+  }
+}
+
+// Fetch buttons: list what the entered login can see, so a name can be picked instead of typed.
+// A blank password box uses the password stored for the selected pair (the server looks it up).
+function _dbSelectedPairName() { return document.getElementById('dbp-select').value || undefined; }
+
+async function dbFetchNeo4jDatabases() {
+  var st = document.getElementById('dbp-n-db-status');
+  var username = document.getElementById('dbp-n-user').value.trim();
+  if (!username) { st.textContent = 'Enter a username first.'; return; }
+  st.textContent = 'Fetching…';
+  try {
+    var data = await api('/api/settings/list-neo4j-databases', { username: username, password: document.getElementById('dbp-n-pw').value, pair: _dbSelectedPairName() });
+    var names = data.databases || [];
+    document.getElementById('dbp-n-db-list').innerHTML = names.map(function (n) { return '<option value="' + escHtml(n) + '">'; }).join('');
+    st.textContent = names.length + ' database' + (names.length !== 1 ? 's' : '') + ' available';
+  } catch (e) { st.textContent = 'Fetch failed: ' + e.message; }
+}
+
+async function dbFetchPgDatabases() {
+  var st = document.getElementById('dbp-p-db-status');
+  var username = document.getElementById('dbp-p-user').value.trim();
+  if (!username) { st.textContent = 'Enter a username first.'; return; }
+  st.textContent = 'Fetching…';
+  try {
+    var data = await api('/api/settings/list-pg-databases', { username: username, password: document.getElementById('dbp-p-pw').value, pair: _dbSelectedPairName() }, 'POST');
+    var names = data.databases || [];
+    document.getElementById('dbp-p-db-list').innerHTML = names.map(function (n) { return '<option value="' + escHtml(n) + '">'; }).join('');
+    st.textContent = names.length + ' database' + (names.length !== 1 ? 's' : '') + ' available';
+  } catch (e) { st.textContent = 'Fetch failed: ' + e.message; }
+}
+
+async function dbFetchPgSchemas() {
+  var st = document.getElementById('dbp-p-schema-status');
+  var database = document.getElementById('dbp-p-db').value.trim();
+  var username = document.getElementById('dbp-p-user').value.trim();
+  if (!database || !username) { st.textContent = 'Enter a database name and username first.'; return; }
+  st.textContent = 'Fetching…';
+  try {
+    var data = await api('/api/settings/list-pg-schemas', { database: database, username: username, password: document.getElementById('dbp-p-pw').value, pair: _dbSelectedPairName() });
+    var names = data.schemas || [];
+    document.getElementById('dbp-p-schema-list').innerHTML = names.map(function (n) { return '<option value="' + escHtml(n) + '">'; }).join('');
+    st.textContent = names.length + ' schema' + (names.length !== 1 ? 's' : '') + ' available';
+  } catch (e) { st.textContent = 'Fetch failed: ' + e.message; }
 }
 
 // ─── My Pathway Collection settings dialog (every role — personal directory,
@@ -18610,106 +19201,6 @@ async function savePathwayAsAlias() {
   } finally {
     btn.disabled = false;
     btn.textContent = origText;
-  }
-}
-
-// ─── My Neo4j Connection dialog (every role) ─────────────────────────────────
-// Each user's OWN database/username/password — separate from their Graph
-// Explorer login (which stays personal and is what createdBy/updatedBy stamps
-// use). The URL is shown read-only here for visibility/sync with whatever the
-// admin has configured.
-async function openMyNeo4jSettings() {
-  var errEl = document.getElementById('my-neo4j-error');
-  var okEl  = document.getElementById('my-neo4j-success');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  try {
-    var s = await api('/api/settings/my-neo4j');
-    document.getElementById('mns-url').value      = s.url      || '';
-    document.getElementById('mns-database').value = s.database || '';
-    document.getElementById('mns-username').value = s.username || '';
-    document.getElementById('mns-password').value = '';  // never pre-fill password
-  } catch(e) { /* show empty form */ }
-  document.getElementById('my-neo4j-modal').style.display = 'flex';
-}
-function closeMyNeo4jSettingsModal(e) {
-  if (!e || e.target === document.getElementById('my-neo4j-modal'))
-    document.getElementById('my-neo4j-modal').style.display = 'none';
-}
-async function saveMyNeo4jSettings() {
-  var errEl = document.getElementById('my-neo4j-error');
-  var okEl  = document.getElementById('my-neo4j-success');
-  var btn   = document.getElementById('mns-save-btn');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  var payload = {
-    database: document.getElementById('mns-database').value.trim(),
-    username: document.getElementById('mns-username').value.trim(),
-    password: document.getElementById('mns-password').value  // blank = keep current
-  };
-  if (!payload.database || !payload.username) {
-    errEl.textContent = 'Database and username are required.';
-    errEl.style.display = 'block'; return;
-  }
-  btn.disabled = true; btn.textContent = 'Testing…';
-  try {
-    await api('/api/settings/my-neo4j', payload, 'POST');
-    okEl.textContent = 'Saved! Your Neo4j connection is ready.';
-    okEl.style.display = 'block';
-    setTimeout(function() { document.getElementById('my-neo4j-modal').style.display = 'none'; }, 1500);
-    _invalidateSchemaCache();
-  } catch(err) {
-    errEl.textContent = err.message;
-    errEl.style.display = 'block';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Test & Save';
-  }
-}
-
-// ─── My Postgres Connection dialog (every role) ──────────────────────────────
-async function openMyPostgresSettings() {
-  var errEl = document.getElementById('my-pg-error');
-  var okEl  = document.getElementById('my-pg-success');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  try {
-    var s = await api('/api/settings/my-postgres');
-    document.getElementById('mpgs-url').value      = s.url      || '';
-    document.getElementById('mpgs-port').value     = s.port     || 5432;
-    document.getElementById('mpgs-database').value = s.database || '';
-    document.getElementById('mpgs-schema').value   = s.schema   || '';
-    document.getElementById('mpgs-username').value = s.username || '';
-    document.getElementById('mpgs-password').value = '';  // never pre-fill password
-  } catch(e) { /* show empty form */ }
-  document.getElementById('my-postgres-modal').style.display = 'flex';
-}
-function closeMyPostgresSettingsModal(e) {
-  if (!e || e.target === document.getElementById('my-postgres-modal'))
-    document.getElementById('my-postgres-modal').style.display = 'none';
-}
-async function saveMyPostgresSettings() {
-  var errEl = document.getElementById('my-pg-error');
-  var okEl  = document.getElementById('my-pg-success');
-  var btn   = document.getElementById('mpgs-save-btn');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-  var payload = {
-    database: document.getElementById('mpgs-database').value.trim(),
-    schema:   document.getElementById('mpgs-schema').value.trim(),
-    username: document.getElementById('mpgs-username').value.trim(),
-    password: document.getElementById('mpgs-password').value
-  };
-  if (!payload.database || !payload.schema || !payload.username) {
-    errEl.textContent = 'Database, schema, and username are required.';
-    errEl.style.display = 'block'; return;
-  }
-  btn.disabled = true; btn.textContent = 'Testing…';
-  try {
-    await api('/api/settings/my-postgres', payload, 'POST');
-    okEl.textContent = 'Saved! Your Postgres connection is ready.';
-    okEl.style.display = 'block';
-    setTimeout(function() { document.getElementById('my-postgres-modal').style.display = 'none'; }, 1500);
-  } catch(err) {
-    errEl.textContent = err.message;
-    errEl.style.display = 'block';
-  } finally {
-    btn.disabled = false; btn.textContent = 'Test & Save';
   }
 }
 
@@ -23609,73 +24100,6 @@ async function llmsUserFetchModels() {
     dl.innerHTML = models.map(function(m) { return '<option value="' + escHtml(m) + '">'; }).join('');
     statusEl.textContent = models.length + ' model' + (models.length !== 1 ? 's' : '') + ' available';
   } catch(e) {
-    statusEl.textContent = 'Fetch failed: ' + e.message;
-  }
-}
-
-// Lists the Neo4j databases the entered username/password can actually see
-// (using the same connection-testing endpoint pattern as "Test & Save"),
-// populating a datalist so the Database name field can be picked from a real
-// list instead of typed and risking a typo — mirrors llmsUserFetchModels()
-// above. Access to specific databases is controlled by the Neo4j
-// administrator, not by this app: whatever this login is restricted from
-// simply won't appear in the returned list.
-async function fetchNeo4jDatabaseList() {
-  var statusEl = document.getElementById('mns-db-list-status');
-  var username = document.getElementById('mns-username').value.trim();
-  var password = document.getElementById('mns-password').value;
-  if (!username) { statusEl.textContent = 'Enter a username first.'; return; }
-  statusEl.textContent = 'Fetching…';
-  try {
-    var data = await api('/api/settings/list-neo4j-databases', { username: username, password: password });
-    var names = data.databases || [];
-    var dl = document.getElementById('mns-database-list');
-    dl.innerHTML = names.map(function(n) { return '<option value="' + escHtml(n) + '">'; }).join('');
-    statusEl.textContent = names.length + ' database' + (names.length !== 1 ? 's' : '') + ' available';
-  } catch (e) {
-    statusEl.textContent = 'Fetch failed: ' + e.message;
-  }
-}
-
-// Lists the PostgreSQL databases the entered username/password can connect to,
-// populating a datalist on the Database name field — mirrors fetchNeo4jDatabaseList().
-async function fetchPgDatabaseList() {
-  var statusEl = document.getElementById('mpgs-db-list-status');
-  var username = document.getElementById('mpgs-username').value.trim();
-  var password = document.getElementById('mpgs-password').value;
-  if (!username) { statusEl.textContent = 'Enter a username first.'; return; }
-  statusEl.textContent = 'Fetching…';
-  try {
-    var data = await api('/api/settings/list-pg-databases', { username: username, password: password }, 'POST');
-    var names = data.databases || [];
-    var dl = document.getElementById('mpgs-database-list');
-    dl.innerHTML = names.map(function(n) { return '<option value="' + escHtml(n) + '">'; }).join('');
-    statusEl.textContent = names.length + ' database' + (names.length !== 1 ? 's' : '') + ' available';
-  } catch (e) {
-    statusEl.textContent = 'Fetch failed: ' + e.message;
-  }
-}
-
-// Lists the PostgreSQL schemas the entered database/username/password can
-// actually see, populating a datalist so the Schema field can be picked from
-// a real list instead of typed and risking a typo — mirrors
-// llmsUserFetchModels() above. Access to specific schemas is controlled by
-// the PostgreSQL administrator, not by this app: whatever this login is
-// restricted from simply won't appear in the returned list.
-async function fetchPgSchemaList() {
-  var statusEl = document.getElementById('mpgs-schema-list-status');
-  var database = document.getElementById('mpgs-database').value.trim();
-  var username = document.getElementById('mpgs-username').value.trim();
-  var password = document.getElementById('mpgs-password').value;
-  if (!database || !username) { statusEl.textContent = 'Enter a database name and username first.'; return; }
-  statusEl.textContent = 'Fetching…';
-  try {
-    var data = await api('/api/settings/list-pg-schemas', { database: database, username: username, password: password });
-    var names = data.schemas || [];
-    var dl = document.getElementById('mpgs-schema-list');
-    dl.innerHTML = names.map(function(n) { return '<option value="' + escHtml(n) + '">'; }).join('');
-    statusEl.textContent = names.length + ' schema' + (names.length !== 1 ? 's' : '') + ' available';
-  } catch (e) {
     statusEl.textContent = 'Fetch failed: ' + e.message;
   }
 }
