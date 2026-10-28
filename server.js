@@ -182,7 +182,8 @@ const DEFAULT_SETTINGS = {
     database: 'your-pg-database',
     schema:   'your-pg-schema',
     username: 'your-pg-username',
-    password: ''
+    password: '',
+    allowSelfSigned: true   // accept a self-signed / private-CA Postgres TLS certificate (set false to verify certificates strictly)
   },
   llm: {
     url:        '',          // LLM API base URL (leave blank for Anthropic default)
