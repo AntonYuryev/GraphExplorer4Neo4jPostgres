@@ -919,31 +919,31 @@ def register_summarize_routes(app, runtime: Dict[str, Any]) -> None:
         SECTION_STAGGER_SECS = 0.0
         n_workers = max(1, len(system_prompts))
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            for i, prompt in enumerate(system_prompts):
-                if i > 0:
-                    time.sleep(SECTION_STAGGER_SECS)
-                thread_ctx = contextvars.copy_context()
-                futures.append(executor.submit(thread_ctx.run, _call_summarize_llm, messages, llm, prompt))
+          for i, prompt in enumerate(system_prompts):
+              if i > 0:
+                  time.sleep(SECTION_STAGGER_SECS)
+              thread_ctx = contextvars.copy_context()
+              futures.append(executor.submit(thread_ctx.run, _call_summarize_llm, messages, llm, prompt))
 
-            for f_idx, future in enumerate(futures):
-                try:
-                    prompt_reply, prompt_reply_was_truncated = future.result()
-                    if prompt_reply_was_truncated:
-                        was_truncated = True
-                    # Strip leading markdown section headers (## Organ System\n etc.)
-                    # before checking for the "No information available" sentinel,
-                    # because the LLM wraps the sentinel in a header line.
-                    _reply_body = re.sub(r'^#+[^\n]*\n?', '', prompt_reply.strip(),
-                                          flags=re.MULTILINE).strip()
-                    if prompt_reply and not _reply_body.lower().startswith("no information available"):
-                        if section_titles[f_idx]:
-                            # enforce the default outline: drop any heading the model wrote itself
-                            # and start the section with its canonical title
-                            prompt_reply = f"## {section_titles[f_idx]}\n\n{_reply_body}"
-                        reply_text += "\n\n" + prompt_reply
-                except Exception as section_exc:
-                    log.error("Section LLM call failed: %s", section_exc, exc_info=True)
-                    reply_text += "\n\n(Section could not be generated: " + str(section_exc) + ")"
+          for f_idx, future in enumerate(futures):
+            try:
+              prompt_reply, prompt_reply_was_truncated = future.result()
+              if prompt_reply_was_truncated:
+                  was_truncated = True
+              # Strip leading markdown section headers (## Organ System\n etc.)
+              # before checking for the "No information available" sentinel,
+              # because the LLM wraps the sentinel in a header line.
+              _reply_body = re.sub(r'^#+[^\n]*\n?', '', prompt_reply.strip(),
+                                    flags=re.MULTILINE).strip()
+              if prompt_reply and not _reply_body.lower().startswith("no information available"):
+                  if section_titles[f_idx]:
+                      # enforce the default outline: drop any heading the model wrote itself
+                      # and start the section with its canonical title
+                      prompt_reply = f"## {section_titles[f_idx]}\n\n{_reply_body}"
+                  reply_text += "\n\n" + prompt_reply
+            except Exception as section_exc:
+              log.error("Section LLM call failed: %s", section_exc, exc_info=True)
+              reply_text += "\n\n(Section could not be generated: " + str(section_exc) + ")"
 
         return {
             "reply": reply_text,
