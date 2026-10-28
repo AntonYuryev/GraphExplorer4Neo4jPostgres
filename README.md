@@ -52,7 +52,7 @@ graph-explorer/
   .github/workflows/codeql.yml    CodeQL code scanning (JavaScript/TypeScript and Python)
 ```
 
-> `public/agentic_ai_block.js` is a standalone/legacy agent UI fragment that is not wired into `public/index.html`.
+> `public/agentic_ai_block.js` is the agent chat panel module; `public/index.html` loads it after `app.js`, so for functions defined in both files (for example `agentLoadCypherToBar`) the version in `agentic_ai_block.js` is the one that runs.
 
 ---
 
@@ -90,16 +90,16 @@ pip install -r requirements_agent.txt
 
 Credentials are **never hardcoded in source**. There are two tiers:
 
-- **Admin-level (shared) settings** — the Neo4j bolt URL and the PostgreSQL host/port are set once by an admin under **⚙ Settings ▾ → URL Connections for Database Endpoints**. The list of approved **LLM provider URLs** (e.g. Google Gemini, Anthropic Claude, or any self-hosted/OpenAI-compatible endpoint) is managed the same way — admin-configured once, shared by everyone — but lives in its own **⚙ Settings ▾ → Agentic AI / LLM** admin section rather than that same menu. Either way, the backend only ever calls out to an LLM URL already on the admin's list; a request naming an unlisted URL is rejected.
-- **Per-user settings** — every user (including admins) configures their *own* database name/schema/username/password for both Neo4j and Postgres, plus picks a provider from the admin's list and supplies their *own* API key/model/temperature, under **⚙ Settings ▾ → My Connection**. Each save is tested against the live service before it's stored, so a bad credential never silently persists.
+- **Admin-level (shared) settings** — the Neo4j bolt URL and the PostgreSQL host/port are set once by an admin under **⚙ Settings ▾ → Database → Connection URLs** (shown dimmed and read-only to everyone else). The list of approved **LLM provider URLs** (e.g. Google Gemini, Anthropic Claude, or any self-hosted/OpenAI-compatible endpoint) is managed the same way — admin-configured once, shared by everyone — but lives in its own **⚙ Settings ▾ → Agentic AI / LLM** admin section rather than that same menu. Either way, the backend only ever calls out to an LLM URL already on the admin's list; a request naming an unlisted URL is rejected.
+- **Per-user settings** — every user (including admins) configures their *own* database name/schema/username/password for both Neo4j and Postgres, plus picks a provider from the admin's list and supplies their *own* API key/model/temperature, under **⚙ Settings ▾ → Database → Databases**. A Neo4j database and its complementary Postgres database/schema form a **pair**, listed as `neo4j database/postgres database:schema`; **Add** enters a new pair, **Save** remembers it (usernames and passwords included, in `settings.json`, private to the user who saved it) and **Connect** switches to the selected pair in one click. Each save is tested against the live service before it's stored, so a bad credential never silently persists.
 
 ### First-time setup
 
 1. Copy `settings.example.json` to `settings.json` and adjust the placeholder values, or leave `settings.json` absent — the app will create one automatically on first save from the UI.
 2. Start the server (see below).
 3. Log in as `admin` with the one-time password the server prints on its console the first time it starts (when `users.json` does not exist yet), and change the password immediately.
-4. Open **⚙ Settings ▾ → URL Connections for Database Endpoints** and enter the shared Neo4j URL and Postgres host/port. Separately, open **⚙ Settings ▾ → Agentic AI / LLM** and add the LLM provider URL(s) you want available (e.g. Google Gemini's endpoint, Anthropic's endpoint, or a self-hosted OpenAI-compatible one) — admin-managed the same way as the database endpoints, not something individual users type in freely.
-5. Open **⚙ Settings ▾ → My Connection** and enter your own Neo4j database/username/password, Postgres database/schema/username/password, and pick an LLM provider from the admin's list plus your own API key.
+4. Open **⚙ Settings ▾ → Database → Connection URLs** and enter the shared Neo4j URL and Postgres host (`host` or `host:port`). Separately, open **⚙ Settings ▾ → Agentic AI / LLM** and add the LLM provider URL(s) you want available (e.g. Google Gemini's endpoint, Anthropic's endpoint, or a self-hosted OpenAI-compatible one) — admin-managed the same way as the database endpoints, not something individual users type in freely.
+5. Open **⚙ Settings ▾ → Database → Databases**, press **Add**, enter your own Neo4j database/username/password and Postgres database/schema/username/password, and **Connect**. Under **⚙ Settings ▾ → Agentic AI / LLM** pick an LLM provider from the admin's list plus your own API key.
 
 `settings.json` and `users.json` are listed in `.gitignore` — **never commit them**. The `agent_library/` folder is also gitignored: saved agent workflow snapshots can embed your LLM API key in their stored configuration, so it must stay local too.
 
@@ -153,7 +153,7 @@ These items of the **Database** menu write to the shared Neo4j and Postgres data
 | **Import RNEF** | Loads one `.rnef`/`.xml` file or a whole folder (a path on the **server**, with a Browse button; files are never uploaded through the browser) into Neo4j and Postgres: new nodes/relations are created, relations already present are not duplicated, and new references are added to Postgres. Choose the reference **Source**; the Import button is locked while a run is active; **Stop** ends the run. Coloured live output in the dialog; log in `logs/import_logs/`. |
 | **Curate** | Runs the numbered steps of `ResnetGraph/scripts/Neo4j/GraphCurator.cypher` (merging duplicate/similar relations and cleaning properties) one at a time. Tick the steps to run; the dialog shows the current step, per-step elapsed time, the number of relations changed/failed, a live progress and rough time-left estimate for the long `apoc.periodic.iterate` steps, and the number of relationships in the database before and after the run. **Stop** interrupts the running statement (it is rolled back). The first row refreshes `RelationNumberOfReferences`/`RelationNumberOfSentences` from Postgres (only where the Postgres count is larger). Log in `logs/curation_logs/`. |
 | **Refresh Reference count** | Two steps, run together or independently: **1.** refresh `RelationNumberOfSentences`/`RelationNumberOfReferences` of every Neo4j relation whose count differs from Postgres; **2.** replace list-valued counts (left on relations that exist only in Neo4j and were merged by Curate) by the **sum** of the list. Step 2 always runs after step 1. The log reports how many relations were converted. |
-| **Statistics** | Neo4j totals, counts per node label and relation type, property keys, Postgres snippet/article/journal counts, and a background-loaded **BySource** tab with a relation-type × Source count table. **Copy** puts the active tab on the clipboard (tables tab-separated). |
+| **Statistics** | Neo4j totals, counts per node label and relation type, property keys, Postgres snippet/article/journal counts, and a background-loaded **BySource** tab with a relation-type × Source count table. All values are cached (per user and database, also across server restarts, in `statistics_cache.json`) and recalculated only when you press **Refresh Neo4j** or **Refresh Postgres** (separate buttons — the Postgres counts are slow and change rarely); the dialog shows when each database's values were calculated. **Copy** puts the active tab on the clipboard (tables tab-separated). |
 
 > Curate steps merge and delete relations and cannot be undone — back up the database first and try new steps on a copy.
 
@@ -246,7 +246,7 @@ node github-download.js [--dry-run]   # restore the project from GitHub (SOURCE=
 | `Cannot find module 'express'` | Run `npm install` inside the project folder |
 | Agent panel shows "disconnected" | Check that Python 3.10+ and `pip install -r requirements_agent.txt` succeeded; check the server console for `[agent]` startup logs |
 | RNEF conversion fails | Ensure Python 3 is installed and on PATH |
-| Cannot reach Neo4j / PostgreSQL | Check VPN; update credentials via ⚙ Settings ▾ → My Connection |
+| Cannot reach Neo4j / PostgreSQL | Check VPN; update credentials via ⚙ Settings ▾ → Database → Databases |
 | "Connection test failed" in settings | Verify host, port, and credentials; check VPN |
 | Port 3000 already in use | `PORT=3001 node server.js` (Mac/Linux) · `set PORT=3001 && node server.js` (Windows) |
 | Session expired after 12 hours | Log in again; save your work with File → Save Subgraph before long breaks |
