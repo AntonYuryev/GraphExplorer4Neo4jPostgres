@@ -10,6 +10,7 @@
     "port": 5432,
     "database": "YOUR_PG_DATABASE",
     "schema": "YOUR_PG_SCHEMA",
+    "allowSelfSigned": true,
     "username": "YOUR_PG_USER",
     "password": "YOUR_PG_PASSWORD"
   },
