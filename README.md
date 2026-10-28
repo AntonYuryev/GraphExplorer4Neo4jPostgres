@@ -270,6 +270,6 @@ node github-download.js [--dry-run]   # restore the project from GitHub (SOURCE=
 - The first admin password is random and shown once on the server console; change it immediately.
 - Database → Import RNEF / Curate / Refresh Reference count, SQL and user management are admin-only; imports read local server paths with the `.rnef`/`.xml` extensions only, and every database action runs under the signed-in user's own credentials.
 - JWTs are signed and verified with HS256 only; the signing secret comes from `JWT_SECRET` or is generated once and stored in `settings.json`.
-- Postgres TLS certificates are verified by default; for a server with a self-signed or private-CA certificate set `PG_SSL_ALLOW_SELF_SIGNED=1` (or `"allowSelfSigned": true` under `postgres` in `settings.json`).
+- Postgres connections use TLS. The settings.json that the app generates (and `settings.example.json`) set `"allowSelfSigned": true` under `postgres`, which accepts a self-signed or private-CA certificate; set it to `false` (or remove it) and set a trusted certificate to verify the server strictly. `PG_SSL_ALLOW_SELF_SIGNED=1` has the same effect as the setting.
 - GitHub tokens are never stored in source files; `github-upload.js`/`github-download.js` read `GITHUB_TOKEN` or the gitignored `GithubToken.txt`.
 - `npm audit` reports no known vulnerabilities in the production dependencies, and CodeQL runs on every push.
