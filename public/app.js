@@ -551,7 +551,16 @@ function loadColumnConfig() {
     var saved = localStorage.getItem(COL_CONFIG_KEY);
     if (saved) {
       var parsed = JSON.parse(saved);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        // "Sentence" (msrc, with markup) was renamed "Markup sentence" and a plain "Sentence" column added after it
+        var si = parsed.findIndex(function(c) { return c && c.key === 'sentence'; });
+        if (si >= 0 && parsed[si].label === 'Sentence') parsed[si].label = 'Markup sentence';
+        if (!parsed.some(function(c) { return c && c.key === 'plainSentence'; })) {
+          var def = DEFAULT_COLUMNS.find(function(c) { return c.key === 'plainSentence'; });
+          parsed.splice(si >= 0 ? si + 1 : parsed.length, 0, Object.assign({}, def));
+        }
+        return parsed;
+      }
     }
   } catch(e) {}
   return null;
@@ -579,7 +588,10 @@ const DEFAULT_COLUMNS = [
   { key: 'doi',           label: 'DOI',            visible: true,  source: 'reference', dbField: 'doi' },
   { key: 'year',          label: 'Year',           visible: true,  source: 'reference', dbField: 'pubyear', numeric: true },
   { key: 'title',         label: 'Title',          visible: true,  source: 'reference', dbField: 'title' },
-  { key: 'sentence',      label: 'Sentence',       visible: true,  source: 'reference', dbField: 'msrc' }
+  // msrc as stored: the sentence with NLP markup, ID{medscanId=text}; shown coloured (regulator red, target green)
+  { key: 'sentence',      label: 'Markup sentence', visible: true, source: 'reference', dbField: 'msrc' },
+  // the same sentence with the markup removed: ID{12345=TNF} -> TNF
+  { key: 'plainSentence', label: 'Sentence',       visible: true,  source: 'reference', dbField: 'msrc' }
 ];
 
 // Default columns for the Nodes table view — source:'node_graph' is the node-view
@@ -5707,6 +5719,7 @@ async function exportQueryCSVReferences(query, relationIdChunks) {
         if (col.source === 'reference') {
           if      (col.key === 'year')     row.year     = getRefYear(ref);
           else if (col.key === 'sentence') row.sentence = ref.msrc || '';
+          else if (col.key === 'plainSentence') row.plainSentence = stripNlpMarkup(ref.msrc);
           else                             row[col.key] = ref[col.dbField] != null ? String(ref[col.dbField]) : '';
         } else if (col.source === 'scopus_data') {
           row[col.key] = ref['sd_' + col.dbField] != null ? String(ref['sd_' + col.dbField]) : '';
@@ -6188,6 +6201,7 @@ async function exportQueryReferences(query, relationIdChunks) {
           if (col.source === 'reference') {
             if (col.key === 'year') row.year = getRefYear(ref);
             else if (col.key === 'sentence') row.sentence = ref.msrc || '';
+            else if (col.key === 'plainSentence') row.plainSentence = stripNlpMarkup(ref.msrc);
             else row[col.key] = ref[col.dbField] != null ? String(ref[col.dbField]) : '';
           } else if (col.source === 'scopus_data') {
             row[col.key] = ref['sd_' + col.dbField] != null ? String(ref['sd_' + col.dbField]) : '';
@@ -8802,6 +8816,16 @@ function getRefYear(ref) {
     (ref.publicationdate ? String(ref.publicationdate).slice(0, 4) : '');
 }
 
+// Removes the NLP markup from a sentence: ID{12345,678=TNF alpha} -> TNF alpha, and the CONTEXT{7106089,8803117}
+// marker (the IDs of the context entities, normally at the end of the sentence) together with the space before it.
+function stripNlpMarkup(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/ID\{[^=}]*=([^}]*)\}/g, '$1')
+    .replace(/\s*CONTEXT\{[^}]*\}/g, '')
+    .trim();
+}
+
 // Renders a sentence with ID{medscanId=text} markups.
 // Markups whose medscanId matches regulatorMedScan are colored red;
 // those matching targetMedScan are colored green; others are shown as plain text.
@@ -8934,7 +8958,7 @@ async function setTableViewMode(mode) {
   var _hasData = mode === 'node' ? graphData.nodes.length > 0 : graphData.edges.length > 0;
   if (document.getElementById('table-view').style.display !== 'none' && _hasData) {
     if (mode === 'relation') {
-      loadRelationData();
+      await loadRelationData();   // await so RAF fires after data is rendered
     } else if (mode === 'node') {
       if (nodeRows.length > 0) {
         renderTableHeader();
@@ -9260,6 +9284,7 @@ async function loadTableData() {
           if (col.source === 'reference') {
             if (col.key === 'year') row.year = getRefYear(ref);
             else if (col.key === 'sentence') row.sentence = ref.msrc || '';
+            else if (col.key === 'plainSentence') row.plainSentence = stripNlpMarkup(ref.msrc);
             else row[col.key] = ref[col.dbField] != null ? String(ref[col.dbField]) : '';
           } else if (col.source === 'scopus_data') {
             row[col.key] = ref['sd_' + col.dbField] != null ? String(ref['sd_' + col.dbField]) : '';
@@ -9290,6 +9315,7 @@ async function loadTableData() {
 
   renderTableHeader();
   renderTableRows(tableRows);
+  _refitTableColumns();
 }
 
 // ─── Nodes table view ─────────────────────────────────────────────────────────
@@ -9432,6 +9458,7 @@ async function loadNodeData() {
 
   renderTableHeader();
   renderTableRows(nodeRows);
+  _refitTableColumns();
 }
 
 async function loadRelationData() {
@@ -9583,6 +9610,7 @@ async function loadRelationData() {
 
   renderTableHeader();
   renderTableRows(relationRows);
+  _refitTableColumns();
 }
 
 // Columns actually shown for the currently active table mode — the single
@@ -9663,6 +9691,7 @@ function renderTableRows(rows) {
       if (val === undefined && col.source === 'reference') {
         if (col.key === 'year') val = row['_ref_pubyear'] != null ? String(row['_ref_pubyear']) : '';
         else if (col.key === 'sentence') val = row['_ref_msrc'] || '';
+        else if (col.key === 'plainSentence') val = stripNlpMarkup(row['_ref_msrc']);
         else val = row['_ref_' + col.dbField] != null ? String(row['_ref_' + col.dbField]) : '';
       }
       if (col.key === 'sentence') {
@@ -9684,7 +9713,7 @@ function renderTableRows(rows) {
     });
     tr.innerHTML = cells.map(function(v, i) {
       var col = visCols[i];
-      var isSentence = col.key === 'sentence' || (col.source === 'scopus_data');
+      var isSentence = col.key === 'sentence' || col.key === 'plainSentence' || (col.source === 'scopus_data');
       var cls = isSentence ? ' class="sentence-cell"' : '';
       var raw = typeof v === 'string' ? v : '';
       return '<td' + cls + ' title="' + raw.replace(/"/g, '&quot;') + '">' + v + '</td>';
@@ -10261,6 +10290,18 @@ function colResizeStart(event, th) {
   }
   document.addEventListener('mousemove', onMove);
   document.addEventListener('mouseup',   onUp);
+}
+
+// Called by every table loader (Relations / References / Nodes) once the table has been built, so the columns are
+// fitted however the table came to be (re)built: View menu, graph changes, Source filter, new query results...
+// Fits to the content when no widths were customised, else re-applies the customised widths (the rebuilt header
+// has lost them). Skipped while the table is hidden — nothing can be measured then.
+function _refitTableColumns() {
+  requestAnimationFrame(function() {
+    var tv = document.getElementById('table-view');
+    if (!tv || tv.style.display === 'none') return;
+    if (columnWidths === null) autofitColumns(); else applyColumnWidths();
+  });
 }
 
 function autofitColumns() {
