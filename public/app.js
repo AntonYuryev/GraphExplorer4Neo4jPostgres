@@ -5492,7 +5492,7 @@ async function buildExcelBuffer(rows, isRelMode, plainText) {
         ]};
         cell.alignment = { vertical: 'top', wrapText: true };
       } else if (col.key === 'sentence') {
-        cell.value     = plainText ? valStr : buildSentenceRichText(valStr, row.regulatorMedScan, row.targetMedScan);
+        cell.value     = plainText ? valStr : buildSentenceRichText(valStr, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
         cell.alignment = { vertical: 'top', wrapText: true };
       } else {
         // Write as number when: column is flagged numeric, or the raw value is
@@ -6151,7 +6151,9 @@ async function exportQueryReferences(query, relationIdChunks) {
   function nodeMedScanLocal(node) {
     if (!node || !node.properties) return '';
     var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
-    return (nid && medScan[nid]) ? medScan[nid] : '';
+    if (nid && medScan[nid]) return medScan[nid];
+    var own = node.properties.MedScan_ID;                 // Neo4j node property, when the database has one
+    return own != null && own !== '' ? String(Array.isArray(own) ? own[0] : own) : '';
   }
 
   setProgressMsg('⏳ Building rows…');
@@ -6328,7 +6330,9 @@ async function exportQueryRelations(query, relationIdChunks) {
   function nodeMedScanLocal(node) {
     if (!node || !node.properties) return '';
     var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
-    return (nid && medScan[nid]) ? medScan[nid] : '';
+    if (nid && medScan[nid]) return medScan[nid];
+    var own = node.properties.MedScan_ID;                 // Neo4j node property, when the database has one
+    return own != null && own !== '' ? String(Array.isArray(own) ? own[0] : own) : '';
   }
 
   // Ensure NEO4J_PROP_DEFS columns exist (same logic as loadRelationData)
@@ -8816,6 +8820,21 @@ function getRefYear(ref) {
     (ref.publicationdate ? String(ref.publicationdate).slice(0, 4) : '');
 }
 
+// Does one ID{ids=text} markup refer to one of these node identifiers? `ids` = the comma-separated ids inside the
+// markup; `candidates` = a string or an array of identifiers of the node. Which identifier the markup carries depends
+// on the database: a numeric MedScan ID (ID{7106089=dogs}) or the node URN (ID{biodata:protein/HGNC5522=IgE}). Both are
+// tried; the comparison ignores case and punctuation, so 'biodata:protein/HGNC:5522' equals 'biodata:protein/HGNC5522'.
+function _markupIdMatches(ids, candidates) {
+  var norm = function(x) { return String(x).toLowerCase().replace(/[^a-z0-9]/g, ''); };
+  var list = (Array.isArray(candidates) ? candidates : [candidates]).filter(function(c) { return c != null && c !== ''; }).map(norm);
+  if (!list.length) return false;
+  return ids.some(function(id) { return list.indexOf(norm(id)) !== -1; });
+}
+// The identifiers of a table row's regulator / target that a sentence markup may use
+function _rowMarkupIds(row, role) {
+  return [row[role + 'MedScan'], row[role + 'URN']];
+}
+
 // Removes the NLP markup from a sentence: ID{12345,678=TNF alpha} -> TNF alpha, and the CONTEXT{7106089,8803117}
 // marker (the IDs of the context entities, normally at the end of the sentence) together with the space before it.
 function stripNlpMarkup(text) {
@@ -8841,8 +8860,8 @@ function colorSentence(text, regulatorMedScan, targetMedScan) {
     var ids    = match[1].split(',').map(function(s) { return s.trim(); }); // one or more IDs
     var full   = match[0];   // entire ID{...} markup
     var color  = null;
-    if (regulatorMedScan && ids.indexOf(String(regulatorMedScan)) !== -1) color = '#e05560';
-    else if (targetMedScan && ids.indexOf(String(targetMedScan))  !== -1) color = '#4daf4a';
+    if (_markupIdMatches(ids, regulatorMedScan)) color = '#e05560';
+    else if (_markupIdMatches(ids, targetMedScan)) color = '#4daf4a';
     if (color) {
       result += '<span style="color:' + color + ';font-weight:600">' + escHtml(full) + '</span>';
     } else {
@@ -9037,11 +9056,15 @@ async function colorSentencesNow() {
   tableRows = [];
   await loadTableData();
 
-  var colored = Object.keys(medScanMap).length;
+  // a node can be matched by its MedScan ID or by its URN (see _markupIdMatches)
+  var colored = graphData.nodes.filter(function(n) {
+    var pr = n.properties || {};
+    return (pr.NodeID != null && medScanMap[String(pr.NodeID)]) || pr.MedScan_ID || pr.URN;
+  }).length;
   if (statsEl) {
     statsEl.innerHTML = colored
       ? '<span style="color:#2a9d2a">Sentence coloring applied (' + colored + ' nodes matched)</span>'
-      : '<span style="color:#e05560">No MedScan IDs found for current nodes</span>';
+      : '<span style="color:#e05560">No MedScan IDs or URNs found for current nodes</span>';
     setTimeout(updateStats, 3000);
   }
 }
@@ -9218,7 +9241,9 @@ async function loadTableData() {
   function nodeMedScan(node) {
     if (!node || !node.properties) return '';
     var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
-    return (nid && medScanMap[nid]) ? medScanMap[nid] : '';
+    if (nid && medScanMap[nid]) return medScanMap[nid];
+    var own = node.properties.MedScan_ID;                 // Neo4j node property, when the database has one
+    return own != null && own !== '' ? String(Array.isArray(own) ? own[0] : own) : '';
   }
 
   tableRows = [];
@@ -9535,7 +9560,9 @@ async function loadRelationData() {
   function nodeMedScan(node) {
     if (!node || !node.properties) return '';
     var nid = node.properties.NodeID != null ? String(node.properties.NodeID) : null;
-    return (nid && medScanMap[nid]) ? medScanMap[nid] : '';
+    if (nid && medScanMap[nid]) return medScanMap[nid];
+    var own = node.properties.MedScan_ID;                 // Neo4j node property, when the database has one
+    return own != null && own !== '' ? String(Array.isArray(own) ? own[0] : own) : '';
   }
   // Ensure all NEO4J_PROP_DEFS columns exist in columnDefs (hidden by default).
   var existingNeo4j = {};
@@ -9695,7 +9722,7 @@ function renderTableRows(rows) {
         else val = row['_ref_' + col.dbField] != null ? String(row['_ref_' + col.dbField]) : '';
       }
       if (col.key === 'sentence') {
-        return colorSentence(val != null ? String(val) : '', row.regulatorMedScan, row.targetMedScan);
+        return colorSentence(val != null ? String(val) : '', _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
       }
       if (col.key === 'regulator' && row.regulatorMedScan) {
         return escHtml(val != null ? String(val) : '') + '<br><span style="color:#7a8099;font-size:11px">MedScan ID: ' + escHtml(row.regulatorMedScan) + '</span>';
@@ -10462,8 +10489,8 @@ function buildSentenceRichText(text, regulatorMedScan, targetMedScan) {
     var ids   = match[1].split(',').map(function(s) { return s.trim(); });
     var full  = match[0];
     var color = null;
-    if (regulatorMedScan && ids.indexOf(String(regulatorMedScan)) !== -1) color = 'FFE05560';
-    else if (targetMedScan && ids.indexOf(String(targetMedScan))   !== -1) color = 'FF4DAF4A';
+    if (_markupIdMatches(ids, regulatorMedScan)) color = 'FFE05560';
+    else if (_markupIdMatches(ids, targetMedScan)) color = 'FF4DAF4A';
     if (color) {
       richText.push({ text: full, font: { name: 'Arial', size: 10, bold: true, color: { argb: color } } });
     } else {
@@ -10535,7 +10562,7 @@ async function _writeExcelFile(exportRows, visCols, filename, sheetName) {
         ]};
         cell.alignment = { vertical: 'top', wrapText: true };
       } else if (col.key === 'sentence') {
-        cell.value     = buildSentenceRichText(valStr, row.regulatorMedScan, row.targetMedScan);
+        cell.value     = buildSentenceRichText(valStr, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
         cell.alignment = { vertical: 'top', wrapText: true };
       } else {
         cell.value = valStr;
