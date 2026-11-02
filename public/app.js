@@ -10342,6 +10342,19 @@ function autofitColumns() {
   var widths = Array.from(ths).map(function(th) { return th.offsetWidth; });
   // Restore fixed layout and apply the measured widths
   table.style.tableLayout = 'fixed';
+  // The window width is shared out between the columns by the browser according to their content, so two long-text
+  // columns showing the same kind of text (Markup sentence / Sentence) came out very different — the one with long
+  // unbreakable ID{...} tokens kept its width, the other was squeezed. Columns of the same kind get the same width:
+  // the widest of them.
+  var visCols = _visibleColsForMode();
+  var longTextIdx = [];
+  visCols.forEach(function(col, i) {
+    if (col && (col.key === 'sentence' || col.key === 'plainSentence') && i < widths.length) longTextIdx.push(i);
+  });
+  if (longTextIdx.length > 1) {
+    var widest = Math.max.apply(null, longTextIdx.map(function(i) { return widths[i]; }));
+    longTextIdx.forEach(function(i) { widths[i] = widest; });
+  }
   ths.forEach(function(th, i) {
     th.style.width    = widths[i] + 'px';
     th.style.minWidth = widths[i] + 'px';
