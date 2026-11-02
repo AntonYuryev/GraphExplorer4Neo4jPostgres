@@ -5491,6 +5491,9 @@ async function buildExcelBuffer(rows, isRelMode, plainText) {
           { text: '\nMedScan ID: ' + row.targetMedScan,    font: { name: 'Arial', size: 9, color: { argb: 'FF7A8099' } } }
         ]};
         cell.alignment = { vertical: 'top', wrapText: true };
+      } else if (col.key === 'plainSentence') {
+        cell.value     = plainText ? valStr : buildPlainSentenceRichText(row['_ref_msrc'] != null ? row['_ref_msrc'] : valStr, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
+        cell.alignment = { vertical: 'top', wrapText: true };
       } else if (col.key === 'sentence') {
         cell.value     = plainText ? valStr : buildSentenceRichText(valStr, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
         cell.alignment = { vertical: 'top', wrapText: true };
@@ -8835,6 +8838,23 @@ function _rowMarkupIds(row, role) {
   return [row[role + 'MedScan'], row[role + 'URN']];
 }
 
+// The plain "Sentence" column: the markup removed (see stripNlpMarkup) but the words that were marked up as the
+// regulator (red) or the target (green) keep the colours they have in the Markup sentence column.
+function colorPlainSentence(rawMsrc, regulatorIds, targetIds) {
+  if (!rawMsrc) return '';
+  var text = String(rawMsrc).replace(/\s*CONTEXT\{[^}]*\}/g, '').trim();
+  var regex = /ID\{([^=}]+)=([^}]*)\}/g;
+  var html = '', last = 0, m;
+  while ((m = regex.exec(text)) !== null) {
+    html += escHtml(text.slice(last, m.index));
+    var ids = m[1].split(',').map(function(x) { return x.trim(); });
+    var color = _markupIdMatches(ids, regulatorIds) ? '#e05560' : (_markupIdMatches(ids, targetIds) ? '#4daf4a' : null);
+    html += color ? '<span style="color:' + color + ';font-weight:600">' + escHtml(m[2]) + '</span>' : escHtml(m[2]);
+    last = m.index + m[0].length;
+  }
+  return html + escHtml(text.slice(last));
+}
+
 // Removes the NLP markup from a sentence: ID{12345,678=TNF alpha} -> TNF alpha, and the CONTEXT{7106089,8803117}
 // marker (the IDs of the context entities, normally at the end of the sentence) together with the space before it.
 function stripNlpMarkup(text) {
@@ -9721,6 +9741,9 @@ function renderTableRows(rows) {
         else if (col.key === 'plainSentence') val = stripNlpMarkup(row['_ref_msrc']);
         else val = row['_ref_' + col.dbField] != null ? String(row['_ref_' + col.dbField]) : '';
       }
+      if (col.key === 'plainSentence') {
+        return colorPlainSentence(row['_ref_msrc'] != null ? row['_ref_msrc'] : val, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
+      }
       if (col.key === 'sentence') {
         return colorSentence(val != null ? String(val) : '', _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
       }
@@ -9743,6 +9766,7 @@ function renderTableRows(rows) {
       var isSentence = col.key === 'sentence' || col.key === 'plainSentence' || (col.source === 'scopus_data');
       var cls = isSentence ? ' class="sentence-cell"' : '';
       var raw = typeof v === 'string' ? v : '';
+      if (col.key === 'plainSentence') raw = escHtml(stripNlpMarkup(row['_ref_msrc'] != null ? row['_ref_msrc'] : row.plainSentence));
       return '<td' + cls + ' title="' + raw.replace(/"/g, '&quot;') + '">' + v + '</td>';
     }).join('');
     // Clicking any table row dismisses a leftover graph tooltip.
@@ -10490,6 +10514,24 @@ function _writeCSVFile(rows, visCols, filename) {
 // ─── Export Excel ─────────────────────────────────────────────────────────────
 // Builds an ExcelJS richText array from a sentence with ID{ids=text} markup.
 // Regulator markup → red; target markup → green; plain text → default.
+function buildPlainSentenceRichText(rawMsrc, regulatorIds, targetIds) {
+  var plain = function(t) { return { text: t, font: { name: 'Arial', size: 10 } }; };
+  if (!rawMsrc) return { richText: [plain('')] };
+  var text = String(rawMsrc).replace(/\s*CONTEXT\{[^}]*\}/g, '').trim();
+  var regex = /ID\{([^=}]+)=([^}]*)\}/g;
+  var richText = [], last = 0, m;
+  while ((m = regex.exec(text)) !== null) {
+    if (m.index > last) richText.push(plain(text.slice(last, m.index)));
+    var ids = m[1].split(',').map(function(x) { return x.trim(); });
+    var color = _markupIdMatches(ids, regulatorIds) ? 'FFE05560' : (_markupIdMatches(ids, targetIds) ? 'FF4DAF4A' : null);
+    richText.push(color ? { text: m[2], font: { name: 'Arial', size: 10, bold: true, color: { argb: color } } } : plain(m[2]));
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) richText.push(plain(text.slice(last)));
+  if (!richText.length) richText.push(plain(''));
+  return { richText: richText };
+}
+
 function buildSentenceRichText(text, regulatorMedScan, targetMedScan) {
   var plain = function(t) { return { text: t, font: { name: 'Arial', size: 10 } }; };
   if (!text) return { richText: [plain('')] };
@@ -10573,6 +10615,9 @@ async function _writeExcelFile(exportRows, visCols, filename, sheetName) {
           { text: valStr,                                     font: { name: 'Arial', size: 10 } },
           { text: '\nMedScan ID: ' + row.targetMedScan,      font: { name: 'Arial', size: 9, color: { argb: 'FF7A8099' } } }
         ]};
+        cell.alignment = { vertical: 'top', wrapText: true };
+      } else if (col.key === 'plainSentence') {
+        cell.value     = buildPlainSentenceRichText(row['_ref_msrc'] != null ? row['_ref_msrc'] : valStr, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
         cell.alignment = { vertical: 'top', wrapText: true };
       } else if (col.key === 'sentence') {
         cell.value     = buildSentenceRichText(valStr, _rowMarkupIds(row, 'regulator'), _rowMarkupIds(row, 'target'));
