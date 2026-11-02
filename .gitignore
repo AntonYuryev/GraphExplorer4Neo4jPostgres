@@ -56,3 +56,6 @@ logs/
 
 # Cached Database -> Statistics results (per user and database; recalculated by the Refresh button)
 statistics_cache.json
+
+# written by install-autostart.ps1
+start-hidden.vbs
