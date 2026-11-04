@@ -70,6 +70,11 @@ def convert_resnet(resnet, out_dir):
     # the collection -- the alias needs something stable to point back at.
     resnet_urn = resnet.get('urn') or resnet.get('URN')
 
+    # Text-mining (NLP) RNEF files keep the supporting sentence on the <resnet> element itself:
+    #   <resnet mref="38093320:100" msrc="... ID{10000122=dendritic cell} ..."> <controls> <control> ... </control> </controls>
+    # i.e. one sentence per <resnet>, shared by its controls, instead of a Sentence attribute on every control.
+    resnet_msrc = resnet.get('msrc') or ''
+
     # -- Properties (Description, Notes, or anything else present) -----------
     # Captured generically (same approach as rnef_index.py's extract_pathway())
     # so "View Annotation" in the app can show whatever this pathway actually
@@ -211,7 +216,7 @@ def convert_resnet(resnet, out_dir):
                     'pubyear': r.get('PubYear', ''),
                     'authors': r.get('Authors', ''),
                     'journal': r.get('Journal', ''),
-                    'msrc':    r.get('Sentence', ''),
+                    'msrc':    r.get('Sentence', '') or r.get('msrc', '') or resnet_msrc,
                     'celltype': r.get('CellType', ''),
                     'celllinename': r.get('CellLineName', ''),
                     'tissue': r.get('Tissue', ''),
