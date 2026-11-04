@@ -91,6 +91,10 @@ def main() -> int:
     exit_code = 0
     with Tee(log_file):
         sys.stderr = sys.stdout      # library warnings/tracebacks also reach the log and the dialog
+        # Neo4j warns "relationship type does not exist" when the import checks a type that is not in the database yet
+        # (normal for a new type or an empty database: nothing exists yet). Harmless, so keep it out of the log.
+        import logging
+        logging.getLogger('neo4j.notifications').setLevel(logging.ERROR)
         try:
             print(f'Importing {len(rnef_files)} RNEF file(s), batch size {batch_size}', flush=True)
             for path in rnef_files[:5]:
