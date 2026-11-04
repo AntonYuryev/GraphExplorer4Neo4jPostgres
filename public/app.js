@@ -9082,17 +9082,27 @@ async function colorSentencesNow() {
   tableRows = [];
   await loadTableData();
 
-  // a node can be matched by its MedScan ID or by its URN (see _markupIdMatches)
-  var colored = graphData.nodes.filter(function(n) {
-    var pr = n.properties || {};
-    return (pr.NodeID != null && medScanMap[String(pr.NodeID)]) || pr.MedScan_ID || pr.URN;
-  }).length;
+  // Coloring needs the identifiers that tag the entities in the sentences (MedScan ID or URN, see _markupIdMatches)
+  // on the nodes. Count the table rows in which at least one tag belongs to the row's regulator or target.
+  var coloredRows = 0;
+  tableRows.forEach(function(row) {
+    var msrc = row['_ref_msrc'] != null ? row['_ref_msrc'] : row.sentence;
+    if (!msrc) return;
+    var rx = /ID\{([^=}]+)=([^}]*)\}/g, m, hit = false;
+    var reg = _rowMarkupIds(row, 'regulator'), tgt = _rowMarkupIds(row, 'target');
+    while (!hit && (m = rx.exec(msrc)) !== null) {
+      var ids = m[1].split(',').map(function(x) { return x.trim(); });
+      hit = _markupIdMatches(ids, reg) || _markupIdMatches(ids, tgt);
+    }
+    if (hit) coloredRows++;
+  });
   if (statsEl) {
-    statsEl.innerHTML = colored
-      ? '<span style="color:#2a9d2a">Sentence coloring applied (' + colored + ' nodes matched)</span>'
-      : '<span style="color:#e05560">No MedScan IDs or URNs found for current nodes</span>';
-    setTimeout(updateStats, 3000);
+    statsEl.innerHTML = coloredRows
+      ? '<span style="color:#2a9d2a">Sentence coloring applied (' + coloredRows + ' sentence' + (coloredRows !== 1 ? 's' : '') + ' colored)</span>'
+      : '<span style="color:#e05560">Nodes do not have identifiers used for tagging the sentences. Coloring is not possible</span>';
+    setTimeout(updateStats, coloredRows ? 3000 : 8000);
   }
+  if (!coloredRows) showAlignHint('Nodes do not have identifiers used for tagging the sentences. Coloring is not possible', true);
 }
 
 async function loadTableData() {
