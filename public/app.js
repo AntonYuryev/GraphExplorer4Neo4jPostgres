@@ -5807,6 +5807,9 @@ async function exportQueryCSVReferences(query, relationIdChunks) {
         var _r = refsGrouped[String(rid)];
         if (_r && _r.length) refs = refs.concat(_r);
       });
+      // references embedded in a loaded file (File -> Load subgraph: RNEF / .graph.json) are not in Postgres under this
+      // relation's id: add them (a copy that Postgres also has wins, see _mergeInlineAndDbRefs)
+      refs = _mergeInlineAndDbRefs(edge.properties && edge.properties.references, refs);
 
       var base = {
         edgeId: edge.id, elementId: edge.elementId || edge.id,
@@ -6175,6 +6178,9 @@ async function exportQueryReferences(query, relationIdChunks) {
       var _r = refsGrouped[rid];
       if (_r && _r.length) refs = refs.concat(_r);
     });
+    // references embedded in a loaded file (File -> Load subgraph: RNEF / .graph.json) are not in Postgres under this
+    // relation's id: add them (a copy that Postgres also has wins, see _mergeInlineAndDbRefs)
+    refs = _mergeInlineAndDbRefs(edge.properties && edge.properties.references, refs);
     var base = {
       edgeId: edge.id, elementId: edge.elementId || edge.id,
       relId: relIdsArr.join(', ') || relId,
@@ -9283,6 +9289,9 @@ async function loadTableData() {
       var _r = refsGrouped[rid];
       if (_r && _r.length) refs = refs.concat(_r);
     });
+    // references embedded in a loaded file (File -> Load subgraph: RNEF / .graph.json) are not in Postgres under this
+    // relation's id: add them (a copy that Postgres also has wins, see _mergeInlineAndDbRefs)
+    refs = _mergeInlineAndDbRefs(edge.properties && edge.properties.references, refs);
 
     var base = {
       edgeId: edge.id,
