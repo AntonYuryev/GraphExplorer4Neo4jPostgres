@@ -14,7 +14,7 @@ from typing import Optional
 from collections import defaultdict,deque
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from .NetworkxObjects import PSObject,PSRelation,len, DIRECT, INDIRECT, DBID,EFFECT, RELATIONID
-from .NetworkxObjects import REGULATORS,TARGETS,CHILDS,REFCOUNT,STATE,PHYSICAL_INTERACTIONS,OBJECT_TYPE
+from .NetworkxObjects import REGULATORS,TARGETS,CHILDS,REFCOUNT,STATE,PHYSICAL_INTERACTIONS,OBJECT_TYPE, ALL_REL_PROPS
 from .references import Reference, pubmed_hyperlink, make_hyperlink
 from .references import PUBYEAR,TITLE,REFERENCE_PROPS,JOURNAL,INT_PROPS,PS_CITATION_INDEX,SENTENCE_PROPS,SENTENCE,AUTHORS,PS_REFERENCE_PROPS
 # RefStats / IDENTIFIER_COLUMN are imported inside bibliography() (their only user),
@@ -2413,7 +2413,6 @@ class ResnetGraph (nx.MultiDiGraph):
 
   def remove_undirected_duplicates(self)->"ResnetGraph":
     before_number_of_edges = self.number_of_edges()
-    #print(f'Removing undirected duplicate relations from graph "{self.name}" with {self.number_of_edges()} edges')
     relset = set()
     to_return = self.copy()
     for ruid,tuid,rel in self.edges.data('relation'):
@@ -2423,12 +2422,14 @@ class ResnetGraph (nx.MultiDiGraph):
         relset.add(rel)
 
     number_of_edges = to_return.number_of_edges()
-    print(f"Removed {before_number_of_edges - number_of_edges} undirected duplicate relations from graph \"{self.name}\" with {self.number_of_edges()} edges")
+    removed_edges = before_number_of_edges - number_of_edges
+    if removed_edges > 0:
+        print(f"Removed {removed_edges} undirected duplicate relations from graph \"{self.name}\" with {self.number_of_edges()} edges")
     print(f'Total number of relations after removing duplicates: {number_of_edges}')
     return to_return
   
 
-  def dump2rnef(self,fname='',ent_prop2print:list=['Name'],rel_prop2print:list=[],add_rel_props:dict={},
+  def dump2rnef(self,fname='',ent_prop2print:list=['Name'],rel_prop2print:list=ALL_REL_PROPS,add_rel_props:dict={},
                 with_section_size=0,delete_nodes=False,lock=None):
     '''
     input:
@@ -2781,7 +2782,7 @@ class ResnetGraph (nx.MultiDiGraph):
       '''
       Input
       -----
-      set merge=True if graph loaded form multiple RNEF files with multiple <resnet> sections
+      set merge=True if graph loaded form multiple RNEF files with multiple <resnet> sections\n
       prop2values={prop_name:[values]} - filter to load relations only for nodes with desired properties
 
       Raises FileNotFoundError if "rnef_file" is not found
