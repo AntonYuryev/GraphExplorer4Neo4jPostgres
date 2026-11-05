@@ -3070,7 +3070,7 @@ function _irnFillSources() {
 // and reopening the dialog reattaches to it.
 var _curSteps = [];          // [{id, num, name, label}]
 var _curRunning = false;
-var _curMode = 'curate';      // 'curate' (Database -> Curate) or 'refcount' (Database -> Refresh Reference count)
+var _curMode = 'curate';      // 'curate' (Database -> Curate) or 'refcount' (Database -> Update relations)
 var _curRunMode = 'curate';   // mode of the run that is going, if any
 var _curAllSteps = [];        // every step the server offers; _curSteps is what the current mode shows
 var _CUR_DESC_CURATE = null;  // original description markup of the dialog
@@ -3147,18 +3147,18 @@ function _curSetBusy(busy) {
   _curUpdateCount();
 }
 
-// One dialog, two entry points: Database -> Curate (all steps) and Database -> Refresh Reference count (only the first row,
+// One dialog, two entry points: Database -> Curate (all steps) and Database -> Update relations (only the first row,
 // "Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres", run with only_greater = False, so every relation whose sentence count differs from Postgres is updated).
 function _curApplyMode(mode) {
   _curMode = mode === 'refcount' ? 'refcount' : 'curate';
   var refcount = _curMode === 'refcount';
   var desc = document.getElementById('cur-desc');
   if (_CUR_DESC_CURATE === null) _CUR_DESC_CURATE = desc.innerHTML;
-  document.getElementById('cur-title').textContent = refcount ? 'Database \u2192 Refresh Reference count' : 'Database \u2192 Curate';
+  document.getElementById('cur-title').textContent = refcount ? 'Database \u2192 Update relations' : 'Database \u2192 Curate';
   desc.innerHTML = refcount
-    ? 'Two steps, run together or on their own. <b>1.</b> Refreshes <code>RelationNumberOfSentences</code> and <code>RelationNumberOfReferences</code> of the Neo4j relations from Postgres (the first row of Database \u2192 Curate). Unlike in Curate, <b>every relation whose sentence count differs from Postgres is updated</b> (<code>only_greater = False</code>), not only those whose count has grown. <b>2.</b> Relations that exist only in Neo4j and were merged by Curate may still hold <b>lists</b> in these two properties; each list is replaced by the <b>sum</b> of its values. Step 2 runs after step 1.'
+    ? 'Two steps, run together or on their own. <b>1.</b> Refreshes <code>RelationNumberOfSentences</code> and <code>RelationNumberOfReferences</code> of the Neo4j relations from Postgres (the first row of Database \u2192 Curate) <b>and copies the other relation properties</b> from the Postgres references of each relation (<code>Source, Effect, CellLineName, CellType, ChangeType, Mechanism, ModificationType, NCT_ID, Organ, Organism, QuantitativeType, Tissue</code>): a property the relation lacks is set to the value, a single value becomes a list of the old and the new value, a list gets the new value appended; a value the relation already has is never added twice. Unlike in Curate, <b>every relation whose sentence count differs from Postgres is updated</b> (<code>only_greater = False</code>), not only those whose count has grown. <b>2.</b> Relations that exist only in Neo4j and were merged by Curate may still hold <b>lists</b> in these two properties; each list is replaced by the <b>sum</b> of its values. Step 2 runs after step 1.'
     : _CUR_DESC_CURATE;
-  document.getElementById('cur-run-btn').textContent = refcount ? 'Refresh' : 'Run curation';
+  document.getElementById('cur-run-btn').textContent = refcount ? 'Update' : 'Run curation';
   ['cur-all-btn', 'cur-none-btn'].forEach(function (id) { document.getElementById(id).style.display = ''; });
   if (_curAllSteps.length) _curSteps = _curAllSteps.filter(function (s) { return refcount ? (s.id === 'pg-counts' || s.id === 'sum-lists') : s.id !== 'sum-lists'; });
 }
@@ -3221,7 +3221,7 @@ async function runCurate() {
   if (!ids.length) return;
   if (_curMode === 'refcount') {
     var what = [];
-    if (ids.indexOf('pg-counts') >= 0) what.push('refresh RelationNumberOfSentences and RelationNumberOfReferences of every Neo4j relation whose sentence count differs from Postgres');
+    if (ids.indexOf('pg-counts') >= 0) what.push('update the properties of every Neo4j relation from Postgres (reference/sentence counts where they differ; Source, Effect, CellType, ... added as values or lists)');
     if (ids.indexOf('sum-lists') >= 0) what.push('replace list-valued RelationNumberOfSentences / RelationNumberOfReferences by the sum of the list');
     if (!confirm('Run: ' + what.join(', then ') + '?\n\nThis can take a long time on a large database.')) return;
   } else if (!confirm('Run ' + ids.length + ' curation step(s) on the current Neo4j database?\n\nThe steps merge and delete relations and cannot be undone.')) return;
