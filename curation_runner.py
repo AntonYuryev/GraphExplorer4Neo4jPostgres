@@ -25,7 +25,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)   # makes the `ResnetGraph...` package importable
 
 
-def update_refcount(APIconfig: dict, only_greater: bool = True):
+def update_refcount(APIconfig: dict, only_greater: bool = True, update_props: bool = False):
     """APIconfig: connection settings built by the App from the current user's Neo4j/Postgres settings.
     only_greater: True (Database -> Curate) updates only the relations whose sentence count in Postgres exceeds
     RelationNumberOfSentences in Neo4j; False (Database -> Refresh Reference count) updates every relation whose count differs."""
@@ -36,8 +36,8 @@ def update_refcount(APIconfig: dict, only_greater: bool = True):
 
     start = time.time()
     neo4j = neo4j_nx(APIconfig)
-    print(f"update_refcount(only_greater={only_greater})", flush=True)
-    neo4j.update_refcount(only_greater=only_greater)
+    print(f"update_refcount(only_greater={only_greater}, update_props={update_props})", flush=True)
+    neo4j.update_refcount(only_greater=only_greater, update_props=update_props)
     print(f"\033[94mTotal execution time: {execution_time(start)}\033[0m", flush=True)
 
 
@@ -62,7 +62,7 @@ def main() -> int:
 
     sys.stderr = sys.stdout          # library warnings/tracebacks also reach the run's messages
     try:
-        update_refcount(job['APIconfig'], only_greater=bool(job.get('only_greater', True)))
+        update_refcount(job['APIconfig'], only_greater=bool(job.get('only_greater', True)), update_props=bool(job.get('update_props', False)))
         return 0
     except BaseException:
         traceback.print_exc(file=sys.stdout)
