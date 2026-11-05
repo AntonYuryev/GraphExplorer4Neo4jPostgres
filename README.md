@@ -13,7 +13,7 @@ A web application for exploring, visualizing, and curating biological knowledge 
 ```
 graph-explorer/
   server.js                       Backend server (Node.js/Express) — auth, graph/DB APIs, agent process supervisor,
-                                   Database -> Import RNEF / Curate / Refresh Reference count job runners
+                                   Database -> Import RNEF / Curate / Update relations job runners
   agent_service.py                AI agent backend (Python/FastAPI) — LLM chat loop, Cypher/SQL execution
   summarize_agent.py              Literature summarization agent (default outline, Methods/Procedures prompts)
   text2cypher_agent.py            Natural-language → Cypher agent
@@ -25,7 +25,7 @@ graph-explorer/
                                    index that powers Pathway Collection Browse/Search/Statistics/Anatomy Index
                                    and Pathway Alias resolution (invoked by server.js, separate from rnef_to_json.py)
   rnef_import_runner.py           Database -> Import RNEF: loads .rnef/.xml files into Neo4j + Postgres (started by server.js)
-  curation_runner.py              Database -> Curate / Refresh Reference count: refreshes relation reference/sentence
+  curation_runner.py              Database -> Curate / Update relations: refreshes relation reference/sentence
                                    counts in Neo4j from Postgres (started by server.js)
   ResnetGraph/
     ElsevierAPI/                  The subset of the ElsevierAPI Python library the runners import
@@ -60,14 +60,14 @@ graph-explorer/
 
 **Node.js v18 or later** — https://nodejs.org (LTS installer).
 
-**Python 3.10+** — required for RNEF file conversion, the AI agent service, and the Database → Import RNEF / Curate / Refresh Reference count runners. Install dependencies with:
+**Python 3.10+** — required for RNEF file conversion, the AI agent service, and the Database → Import RNEF / Curate / Update relations runners. Install dependencies with:
 ```bash
 pip install -r requirements_agent.txt
 ```
 
 **An LLM API key** — the agent supports Anthropic Claude (native), Google Gemini (via an OpenAI-compatible endpoint), or any other OpenAI-compatible provider. An admin sets up the provider **URL** once (Settings → Agentic AI / LLM — admin-managed the same way as the Neo4j/Postgres connection URLs under URL Connections for Database Endpoints); each user then picks that provider and enters their own **API key** under My Connection after first login. No key is required just to browse the graph without the AI agent.
 
-**Neo4j with the APOC plugin** (Neo4j 5.9 or later is recommended) — Database → Curate and Refresh Reference count use `apoc.periodic.iterate`, `apoc.refactor.mergeRelationships` and `valueType()`. Import RNEF, Curate and Refresh Reference count also need a Neo4j login that is allowed to write, and a PostgreSQL account that can write to the `reference` table.
+**Neo4j with the APOC plugin** (Neo4j 5.9 or later is recommended) — Database → Curate and Update relations use `apoc.periodic.iterate`, `apoc.refactor.mergeRelationships` and `valueType()`. Import RNEF, Curate and Update relations also need a Neo4j login that is allowed to write, and a PostgreSQL account that can write to the `reference` table.
 
 The machine also needs network access to:
 - Neo4j at your configured host
@@ -152,7 +152,7 @@ These items of the **Database** menu write to the shared Neo4j and Postgres data
 |---|---|
 | **Import RNEF** | Loads one `.rnef`/`.xml` file or a whole folder (a path on the **server**, with a Browse button; files are never uploaded through the browser) into Neo4j and Postgres: new nodes/relations are created, relations already present are not duplicated, and new references are added to Postgres. Choose the reference **Source**; the Import button is locked while a run is active; **Stop** ends the run. Coloured live output in the dialog; log in `logs/import_logs/`. |
 | **Curate** | Runs the numbered steps of `ResnetGraph/scripts/Neo4j/GraphCurator.cypher` (merging duplicate/similar relations and cleaning properties) one at a time. Tick the steps to run; the dialog shows the current step, per-step elapsed time, the number of relations changed/failed, a live progress and rough time-left estimate for the long `apoc.periodic.iterate` steps, and the number of relationships in the database before and after the run. **Stop** interrupts the running statement (it is rolled back). The first row refreshes `RelationNumberOfReferences`/`RelationNumberOfSentences` from Postgres (only where the Postgres count is larger). Log in `logs/curation_logs/`. |
-| **Refresh Reference count** | Two steps, run together or independently: **1.** refresh `RelationNumberOfSentences`/`RelationNumberOfReferences` of every Neo4j relation whose count differs from Postgres; **2.** replace list-valued counts (left on relations that exist only in Neo4j and were merged by Curate) by the **sum** of the list. Step 2 always runs after step 1. The log reports how many relations were converted. |
+| **Update relations** | Two steps, run together or independently: **1.** refresh `RelationNumberOfSentences`/`RelationNumberOfReferences` of every Neo4j relation whose count differs from Postgres **and copy the other relation properties** (`Source`, `Effect`, `CellLineName`, `CellType`, `ChangeType`, `Mechanism`, `ModificationType`, `NCT_ID`, `Organ`, `Organism`, `QuantitativeType`, `Tissue`; mapping `POSTGRES2NEO4J_RELPROPS` in `PSnx2Neo4j.py`) from the Postgres references matched by `RelationID`: a missing property is set to the value, a single value becomes a list `[old, new]`, a list gets the new value appended, and values already present are not added again; **2.** replace list-valued counts (left on relations that exist only in Neo4j and were merged by Curate) by the **sum** of the list. Step 2 always runs after step 1. The log reports how many relations were converted. |
 | **Statistics** | Neo4j totals, counts per node label and relation type, property keys, Postgres snippet/article/journal counts, and a background-loaded **BySource** tab with a relation-type × Source count table. All values are cached (per user and database, also across server restarts, in `statistics_cache.json`) and recalculated only when you press **Refresh Neo4j** or **Refresh Postgres** (separate buttons — the Postgres counts are slow and change rarely); the dialog shows when each database's values were calculated. **Copy** puts the active tab on the clipboard (tables tab-separated). |
 
 > Curate steps merge and delete relations and cannot be undone — back up the database first and try new steps on a copy.
@@ -268,7 +268,7 @@ node github-download.js [--dry-run]   # restore the project from GitHub (SOURCE=
 - HTTP security headers (CSP, HSTS, X-Frame-Options, etc.) are set by `helmet`.
 - Internal error messages are never forwarded to the client in production mode.
 - The first admin password is random and shown once on the server console; change it immediately.
-- Database → Import RNEF / Curate / Refresh Reference count, SQL and user management are admin-only; imports read local server paths with the `.rnef`/`.xml` extensions only, and every database action runs under the signed-in user's own credentials.
+- Database → Import RNEF / Curate / Update relations, SQL and user management are admin-only; imports read local server paths with the `.rnef`/`.xml` extensions only, and every database action runs under the signed-in user's own credentials.
 - JWTs are signed and verified with HS256 only; the signing secret comes from `JWT_SECRET` or is generated once and stored in `settings.json`.
 - Postgres connections use TLS. The settings.json that the app generates (and `settings.example.json`) set `"allowSelfSigned": true` under `postgres`, which accepts a self-signed or private-CA certificate; set it to `false` (or remove it) and set a trusted certificate to verify the server strictly. `PG_SSL_ALLOW_SELF_SIGNED=1` has the same effect as the setting.
 - GitHub tokens are never stored in source files; `github-upload.js`/`github-download.js` read `GITHUB_TOKEN` or the gitignored `GithubToken.txt`.
