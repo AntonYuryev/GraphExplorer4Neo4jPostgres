@@ -5682,7 +5682,7 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
 // script is enough — nothing is hardcoded here. Admin only (bulk write to the shared DBs);
 // uses the caller's own Neo4j/Postgres connections.
 const GRAPH_CURATOR_FILE = path.join(__dirname, 'ResnetGraph', 'scripts', 'Neo4j', 'GraphCurator.cypher');
-const PG_COUNTS_STEP = { id: 'pg-counts', num: 0, short: 'Postgres counts', name: 'Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres', label: '' };
+const PG_COUNTS_STEP = { id: 'pg-counts', num: 0, short: 'Postgres counts', name: 'Update RelationNumberOfReferences and RelationNumberOfSentences from Postgres (Database -> Update relations also copies the other relation properties)', label: '' };
 // Second row of Database -> Refresh Reference count (not part of Database -> Curate): relations that are only in Neo4j and were
 // merged by GraphCurator got list-valued counts, which are replaced by the sum of the list. Runs after the Postgres update so
 // that every relation Postgres knows already has its integer count and only the leftovers are touched.
@@ -5754,7 +5754,7 @@ function _curateStepUpdateRefcount(job, username) {
     try { apiConfig = _buildImportApiConfig(username); } catch (e) { return reject(e); }
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'curatejob-'));
     const jobFile = path.join(tmpDir, 'job.json');
-    fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig, only_greater: job.onlyGreater !== false }), { mode: 0o600 });
+    fs.writeFileSync(jobFile, JSON.stringify({ APIconfig: apiConfig, only_greater: job.onlyGreater !== false, update_props: !!job.updateProps }), { mode: 0o600 });
     const cleanup = () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {} };
 
     const child = spawn(PYTHON_CMD, ['-u', CURATION_RUNNER, jobFile],
@@ -5958,6 +5958,32 @@ async function _curateRelCount(neo) {
   finally { await session.close(); }
 }
 
+// Before the sum-lists step: how many relations hold a list in RelationNumberOfReferences / RelationNumberOfSentences, so the user
+// knows what to expect from the step (it scans every relationship, so the count itself can take a while on a big database)
+async function _curateReportListCounts(job, neo) {
+  _pushCurateMsg(job, '    Counting relations with list-valued RelationNumberOfReferences / RelationNumberOfSentences ...');
+  const session = neo.driver.session({ database: neo.database, defaultAccessMode: neo4j.session.READ });
+  try {
+    const res = await session.run(
+      `MATCH ()-[r]->()
+       WITH valueType(r.RelationNumberOfReferences) STARTS WITH 'LIST' AS refList, valueType(r.RelationNumberOfSentences) STARTS WITH 'LIST' AS sentList
+       RETURN count(CASE WHEN refList OR sentList THEN 1 END) AS anyList,
+              count(CASE WHEN refList THEN 1 END) AS refLists,
+              count(CASE WHEN sentList THEN 1 END) AS sentLists`, {}, _curateTx(job));
+    const num = v => (v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v || 0));
+    const r = res.records[0];
+    const any = num(r.get('anyList')), refs = num(r.get('refLists')), sents = num(r.get('sentLists'));
+    const fmt = n => n.toLocaleString('en-US');
+    _pushCurateMsg(job, `    ${fmt(any)} relations have a list in RelationNumberOfReferences (${fmt(refs)}) or RelationNumberOfSentences (${fmt(sents)}) and will be converted` +
+      (any === 0 ? ' - nothing to do' : ' - the step takes longer the more there are (roughly 10,000 relations per batch)'));
+  } catch (e) {
+    if (job.cancelRequested) throw e;
+    _pushCurateMsg(job, '    Could not count the list-valued relations: ' + e.message);
+  } finally {
+    await session.close();
+  }
+}
+
 async function _runCurate(job, selected, neo) {
   const total = selected.length;
   const fmtN = n => Number(n).toLocaleString('en-US');
@@ -5976,6 +6002,7 @@ async function _runCurate(job, selected, neo) {
         if (step.id === PG_COUNTS_STEP.id) {
           await _curateStepUpdateRefcount(job, job.username);
         } else {
+          if (step.id === SUM_LISTS_STEP.id) await _curateReportListCounts(job, neo);
           const session = neo.driver.session({ database: neo.database });
           const monitor = !step.refcountOnly && /apoc\.periodic\.(iterate|commit)/i.test(step.query) ? _curateMonitorPeriodic(job, neo, step) : null;
           try {
@@ -6078,7 +6105,7 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   const job = {
     running: true, done: false, error: null, startedAt: Date.now(), detail: '', current: null,
     token: _crypto.randomBytes(12).toString('hex'), cancelRequested: false, stopped: false, username,
-    kind: mode, onlyGreater: mode !== 'refcount',
+    kind: mode, onlyGreater: mode !== 'refcount', updateProps: mode === 'refcount',
     neo: req.neo4j,
     steps: all.map(s => ({ id: s.id, num: s.num, name: s.name, status: wanted.has(s.id) ? 'pending' : 'skipped' })),
     messages: [], base: 0,
@@ -6091,7 +6118,7 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
   } catch (e) { job.logPath = null; console.warn('[curate] cannot create log file:', e.message); }
   _userCurateJobs.set(username, job);
   if (job.logPath) _pushCurateMsg(job, `Log file: ${job.logPath}`);
-  if (mode === 'refcount') _pushCurateMsg(job, 'Refresh Reference count: Postgres update uses only_greater=False (every relation whose sentence count differs from Postgres is updated); list-valued counts are then summed to integers');
+  if (mode === 'refcount') _pushCurateMsg(job, 'Update relations: counts use only_greater=False (every relation whose sentence count differs from Postgres is updated); Source, Effect, CellType, ... are copied from the Postgres references (single value -> list when a second value appears; existing values are not duplicated); list-valued counts are then summed to integers');
   _pushCurateMsg(job, `Selected ${selected.length} step(s): ${selected.map(s => s.num ? 'Step ' + s.num : s.short).join(', ')}`);
   res.json({ started: true, selected: selected.length });
   _runCurate(job, selected, req.neo4j);   // not awaited: runs on the server, independent of the browser
