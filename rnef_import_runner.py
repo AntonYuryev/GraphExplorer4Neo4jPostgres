@@ -44,7 +44,12 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_sou
     batch_counter = 0
     for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size):
         batch_counter += 1
-        [rel.set_property('Source',add_source) for rel in rels]
+        if add_source:
+            for rel in rels:
+                rel.set_property('Source', add_source)           # the Neo4j relation property
+                for ref in rel.refs():                           # ... and the Source column of its Postgres references
+                    for snippet in ref.snippets.values():          # (written from the references' snippets)
+                        snippet['Source'] = {add_source}
         imported_nodes, imported_rels, imported_refs = neo4j.importGraph(nodes, rels)
         total_created_nodes += imported_nodes
         total_imported_rels += imported_rels
