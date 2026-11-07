@@ -1658,14 +1658,18 @@ def ping_llm(req: PingRequest = None):
                 p in model.lower() for p in ("o1", "o3", "gpt-5", "gpt5")
             ) or any(p in model for p in ("/o1", "/o3", "/gpt-5", "/gpt5")) else "max_tokens"
             response = client.chat.completions.create(
-                model=model, **{_ping_max_key: 16},
+                model=model, **{_ping_max_key: 64},
                 messages=[
                     {"role": "system", "content": "Reply with only the word PONG."},
                     {"role": "user",   "content": "ping"},
                 ],
                 timeout=30,
             )
-            reply = response.choices[0].message.content.strip()
+            # The reply text can be None: a reasoning model (e.g. Gemini 3.x) may spend the whole 16-token budget on
+            # thinking and return no text, and that used to end in "AttributeError: 'NoneType' has no attribute 'strip'".
+            # A provider that answered at all (HTTP 200) means the connection works.
+            _msg = response.choices[0].message if getattr(response, 'choices', None) else None
+            reply = ((_msg.content if _msg is not None else None) or '').strip() or '(empty reply - the model answered but returned no text)'
         elapsed  = time.time() - t0
         if _is_anthropic_url(url):
             provider = "anthropic"
@@ -1693,6 +1697,10 @@ def ping_llm(req: PingRequest = None):
         }
         _code = getattr(_ping_exc, "status_code", None)
         _detail = "Ping failed due to an internal error."
+        # No HTTP status: the request never got an answer (bad URL, unreachable host, TLS, timeout, missing package ...).
+        # Only the exception CLASS name is returned, never its text (the text stays in the log above).
+        _detail = (f"Ping failed ({type(_ping_exc).__name__}): no response from the provider - check the URL, "
+                   "the network and the key; details are in the agent service log")
         if isinstance(_code, int):
             _hint = _PING_HINTS.get(_code) or ("provider error" if _code >= 500 else "request failed")
             _detail = f"HTTP {_code}: {_hint}"
