@@ -961,6 +961,15 @@ function initCytoscape() {
   });
 
   // Node click: highlight neighbourhood
+  // Elements added later (another Cypher result merged into the window, similar relations, ...) carry no inline style, so
+  // re-apply the current View > Style once the batch of additions is done (several adds in a row collapse into one call).
+  var _restyleTimer = null;
+  cy.on('add', function() {
+    if (currentStyle === 'default') return;
+    if (_restyleTimer) clearTimeout(_restyleTimer);
+    _restyleTimer = setTimeout(function() { _restyleTimer = null; if (cy && currentStyle !== 'default') applyStyle(currentStyle); }, 50);
+  });
+
   cy.on('tap', 'node', function(evt) {
     var node = evt.target;
     var isCtrl = evt.originalEvent && (evt.originalEvent.ctrlKey || evt.originalEvent.metaKey);
@@ -8420,6 +8429,9 @@ function updateSelectionInfo() {
 function updateLegend() {
   var container = document.getElementById('legend-items');
   container.innerHTML = '';
+  var _lt = document.getElementById('legend-title');
+  if (_lt) _lt.textContent = (currentStyle === 'source' && cy) ? 'Sources' : 'Relation Types';
+  if (currentStyle === 'source' && cy) { _updateSourceLegend(container); return; }
   var HYPEREDGE_TYPES = new Set(['Substrate','Product','Cofactor']);
   Object.keys(typeColorMap).forEach(function(type) {
     if (HYPEREDGE_TYPES.has(type)) return;
@@ -21583,7 +21595,7 @@ function menuApplyStyle(name) {
 }
 
 function updateStyleMenu(name) {
-  ['default', 'effect', 'metabolic'].forEach(function(s) {
+  ['default', 'effect', 'source', 'metabolic'].forEach(function(s) {
     var el = document.getElementById('mc-style-' + s);
     if (el) el.textContent = (s === name) ? '✓' : '';
   });
@@ -21611,10 +21623,97 @@ function wrapLabelForMetabolic(text) {
   return lines.join('\n');
 }
 
+// ─── "By Source" style: relation colour from its Source attribute ────────────────
+var _sourceColorMap = {};                       // source name (lower case) -> { name, color }
+var _SOURCE_PALETTE = ['#1e88e5', '#e53935', '#43a047', '#fb8c00', '#8e24aa', '#00acc1', '#fdd835', '#6d4c41', '#d81b60', '#3949ab'];
+var _SOURCE_NONE_COLOR = '#9e9e9e';
+
+function _hexToRgb(h) { return [parseInt(h.substr(1, 2), 16), parseInt(h.substr(3, 2), 16), parseInt(h.substr(5, 2), 16)]; }
+function _rgbToHex(c) { return '#' + c.map(function(v) { v = Math.max(0, Math.min(255, Math.round(v))); return (v < 16 ? '0' : '') + v.toString(16); }).join(''); }
+function _hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  var k = function(n) { return (n + h / 30) % 12; }, a = s * Math.min(l, 1 - l);
+  var f = function(n) { return l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1))); };
+  return _rgbToHex([f(0) * 255, f(8) * 255, f(4) * 255]);
+}
+
+// Individual colour of one source; assigned on first use and kept for the session so it never changes under the user.
+function _sourceColor(name) {
+  var key = String(name).trim().toLowerCase();
+  var e = _sourceColorMap[key];
+  if (!e) {
+    var n = Object.keys(_sourceColorMap).length;
+    e = _sourceColorMap[key] = { name: String(name).trim(), color: n < _SOURCE_PALETTE.length ? _SOURCE_PALETTE[n] : _hslToHex((n * 137.508) % 360, 65, 48) };
+  }
+  return e.color;
+}
+
+// All Source values of a relation: Source is either a string (one source) or a list of strings.
+function _edgeSourceList(edge) {
+  var v;
+  try {
+    var id = String(edge.id());
+    var ge = (graphData && graphData.edges) ? graphData.edges.find(function(x) { return String(x.id) === id; }) : null;
+    if (ge && ge.properties) v = ge.properties.Source != null ? ge.properties.Source : ge.properties.source;
+  } catch (err) { /* fall back below */ }
+  if (v == null || v === '') v = edge.data('Source');
+  if (v == null || v === '') return [];
+  var arr = Array.isArray(v) ? v : [v];   // Source is a string or a list of strings
+  var seen = {}, out = [];
+  arr.forEach(function(x) {
+    x = String(x == null ? '' : x).trim();
+    if (x && !seen[x.toLowerCase()]) { seen[x.toLowerCase()] = 1; out.push(x); }
+  });
+  return out.sort(function(a, b) { return a.toLowerCase() < b.toLowerCase() ? -1 : 1; });
+}
+
+// Mixture (average RGB) of the individual colours of all the sources.
+function _mixSourceColors(sources) {
+  if (!sources.length) return _SOURCE_NONE_COLOR;
+  var sum = [0, 0, 0];
+  sources.forEach(function(sn) { var c = _hexToRgb(_sourceColor(sn)); sum[0] += c[0]; sum[1] += c[1]; sum[2] += c[2]; });
+  return _rgbToHex([sum[0] / sources.length, sum[1] / sources.length, sum[2] / sources.length]);
+}
+
+function _applySourceStyle() {
+  cy.edges().forEach(function(e) {
+    var c = _mixSourceColors(_edgeSourceList(e));
+    e.style({ 'line-color': c, 'target-arrow-color': c, 'source-arrow-color': c });
+  });
+}
+
+function _updateSourceLegend(container) {
+  var used = {}, noSource = false;
+  cy.edges().forEach(function(e) {
+    var l = _edgeSourceList(e);
+    if (!l.length) noSource = true;
+    l.forEach(function(sn) { used[sn.toLowerCase()] = sn; _sourceColor(sn); });
+  });
+  Object.keys(used).sort().forEach(function(k) {
+    var div = document.createElement('div');
+    div.className = 'legend-item';
+    div.innerHTML = '<span class="legend-color-dot" style="background:' + escHtml(_sourceColor(used[k])) + '"></span><span>' + escHtml(used[k]) + '</span>';
+    container.appendChild(div);
+  });
+  if (noSource) {
+    var d = document.createElement('div');
+    d.className = 'legend-item';
+    d.innerHTML = '<span class="legend-color-dot" style="background:' + _SOURCE_NONE_COLOR + '"></span><span>(no Source)</span>';
+    container.appendChild(d);
+  }
+  if (Object.keys(used).length > 1) {
+    var n = document.createElement('div');
+    n.style.cssText = 'font-size:10px;color:#7a8099;margin-top:4px;max-width:180px';
+    n.textContent = 'Relations with several Sources use the mixture of their colors.';
+    container.appendChild(n);
+  }
+}
+
 function applyStyle(name) {
   currentStyle = name || 'default';
   updateStyleMenu(currentStyle);
   if (!cy) return;
+  setTimeout(updateLegend, 0);   // legend lists Sources in the By Source style, relation types otherwise
 
   if (currentStyle === 'default') {
     // Remove inline overrides — stylesheet takes over again
@@ -21649,6 +21748,9 @@ function applyStyle(name) {
         'source-arrow-color':  color
       });
     });
+
+  } else if (currentStyle === 'source') {
+    _applySourceStyle();
 
   } else if (currentStyle === 'metabolic') {
     // Edge colors by effect (same as 'effect' style)
