@@ -2966,8 +2966,10 @@ app.post('/api/references', exportLimiter, authMiddleware, async (req, res) => {
     : null;
   try {
     const sql = safeSources
-      ? `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) AND source = ANY($2::text[]) ORDER BY pubyear DESC NULLS LAST, id`
-      : `SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) ORDER BY pubyear DESC NULLS LAST, id`;
+      // The inner SELECT (with OFFSET 0 as an optimisation fence) finds the rows by id first and only then are they sorted: without
+      // it Postgres may walk an index in pubyear order and filter by id, which scans the whole table for a handful of rows.
+      ? `SELECT * FROM (SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) AND source = ANY($2::text[]) OFFSET 0) r ORDER BY pubyear DESC NULLS LAST, id`
+      : `SELECT * FROM (SELECT * FROM ${req.pg.schema}.reference WHERE id = ANY($1::bigint[]) OFFSET 0) r ORDER BY pubyear DESC NULLS LAST, id`;
     const result = await req.pg.pool.query(sql, safeSources ? [validIds, safeSources] : [validIds]);
     res.json(result.rows);
   } catch (err) {
@@ -5966,12 +5968,14 @@ async function _curateReportListCounts(job, neo) {
   try {
     const res = await session.run(
       `MATCH ()-[r]->()
-       WITH valueType(r.RelationNumberOfReferences) STARTS WITH 'LIST' AS refList, valueType(r.RelationNumberOfSentences) STARTS WITH 'LIST' AS sentList
-       RETURN count(CASE WHEN refList OR sentList THEN 1 END) AS anyList,
+       WITH r, valueType(r.RelationNumberOfReferences) STARTS WITH 'LIST' AS refList, valueType(r.RelationNumberOfSentences) STARTS WITH 'LIST' AS sentList
+       RETURN collect(CASE WHEN refList OR sentList THEN elementId(r) END) AS ids,
+              count(CASE WHEN refList OR sentList THEN 1 END) AS anyList,
               count(CASE WHEN refList THEN 1 END) AS refLists,
               count(CASE WHEN sentList THEN 1 END) AS sentLists`, {}, _curateTx(job));
     const num = v => (v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v || 0));
     const r = res.records[0];
+    job.listRelIds = r.get('ids');   // the conversion works on exactly these relations, found by this one scan
     const any = num(r.get('anyList')), refs = num(r.get('refLists')), sents = num(r.get('sentLists'));
     const fmt = n => n.toLocaleString('en-US');
     _pushCurateMsg(job, `    ${fmt(any)} relations have a list in RelationNumberOfReferences (${fmt(refs)}) or RelationNumberOfSentences (${fmt(sents)}) and will be converted` +
@@ -6006,7 +6010,16 @@ async function _runCurate(job, selected, neo) {
           const session = neo.driver.session({ database: neo.database });
           const monitor = !step.refcountOnly && /apoc\.periodic\.(iterate|commit)/i.test(step.query) ? _curateMonitorPeriodic(job, neo, step) : null;
           try {
-            const res = await session.run(step.query, {}, _curateTx(job));
+            let stepQuery = step.query, stepParams = {};
+            if (step.id === SUM_LISTS_STEP.id && Array.isArray(job.listRelIds)) {
+              // The step's own query scans every relationship of the database to find the list-valued ones (minutes on tens of
+              // millions of relations, however few there are); the count above already found them, so convert exactly those by id.
+              stepQuery = step.query
+                .replace(/"MATCH \(\)-\[r\]->\(\) WHERE [^"]*RETURN r"/, '"UNWIND $ids AS id MATCH ()-[r]->() WHERE elementId(r) = id RETURN r"')
+                .replace('retries: 3}', 'retries: 3, params: {ids: $ids}}');
+              stepParams = { ids: job.listRelIds };
+            }
+            const res = await session.run(stepQuery, stepParams, _curateTx(job));
             const num = v => (v && typeof v.toNumber === 'function' ? v.toNumber() : Number(v || 0));
             const out = res.records.map(r => {
               const n = num(r.get('mergedCount'));
