@@ -294,6 +294,7 @@ async function agentSend() {
 
     var _pick = _agentPickCypher(reply, result.generated_cypher);
     if (_pick) {
+      _pick = formatCypher(_pick);
       _agentLastCypher = _pick;
       var bar = document.getElementById('agent-cypher-bar');
       var pre = document.getElementById('agent-cypher-preview');
@@ -403,13 +404,63 @@ async function _mergeDbReferencesIntoGraph(currentGraph) {
   return currentGraph;
 }
 
+// Puts every clause of a one-line Cypher statement on its own line (the usual convention), e.g.
+//   MATCH (a)-[r]-(b) WHERE a.x = 1 RETURN a LIMIT 10   ->   MATCH (a)-[r]-(b)\nWHERE a.x = 1\nRETURN a\nLIMIT 10
+// The LLM often writes the whole query on one line. Text inside quotes and inside (), [] or {} (a subquery such as
+// NOT EXISTS { MATCH ... }) is left alone, and a statement that already has line breaks is returned as it is.
+function formatCypher(cypher) {
+  var src = String(cypher == null ? '' : cypher).trim();
+  if (!src || src.indexOf('\n') >= 0) return src;
+  var KEYWORDS = ['OPTIONAL MATCH', 'DETACH DELETE', 'ORDER BY', 'UNION ALL', 'UNION', 'MATCH', 'WHERE', 'WITH', 'RETURN',
+                  'SKIP', 'LIMIT', 'UNWIND', 'CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE', 'CALL', 'YIELD'];
+  var isWord = function (c) { return /[A-Za-z0-9_$]/.test(c || ''); };
+  var out = '', depth = 0, quote = null, prevWord = '', i = 0;
+  while (i < src.length) {
+    var ch = src.charAt(i);
+    if (quote) {                                  // inside '...', "..." or `...`
+      out += ch;
+      if (ch === '\\' && quote !== '`') { out += src.charAt(i + 1); i += 2; continue; }
+      if (ch === quote) quote = null;
+      i++; continue;
+    }
+    if (ch === "'" || ch === '"' || ch === '`') { quote = ch; out += ch; i++; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+    if (depth === 0 && /[A-Za-z]/.test(ch) && !isWord(src.charAt(i - 1)) && src.charAt(i - 1) !== '.') {
+      var hit = null;
+      for (var k = 0; k < KEYWORDS.length && !hit; k++) {
+        var kw = KEYWORDS[k];
+        if (src.substr(i, kw.length).toUpperCase() === kw && !isWord(src.charAt(i + kw.length))) hit = kw;
+      }
+      if (hit) {
+        // "STARTS WITH" / "ENDS WITH" and "ON CREATE SET" / "ON MATCH SET" are not clause starts
+        var inline = (hit === 'WITH' && /^(STARTS|ENDS)$/i.test(prevWord)) ||
+                     (hit === 'SET' && /^(CREATE|MATCH)$/i.test(prevWord)) ||
+                     ((hit === 'CREATE' || hit === 'MATCH') && /^ON$/i.test(prevWord));
+        if (!inline && out.trim()) out = out.replace(/[ \t]+$/, '') + '\n';
+        out += src.substr(i, hit.length);
+        prevWord = hit.split(' ').pop();
+        i += hit.length;
+        continue;
+      }
+    }
+    if (isWord(ch)) {
+      var j = i; while (j < src.length && isWord(src.charAt(j))) j++;
+      prevWord = src.slice(i, j);
+      out += prevWord; i = j; continue;
+    }
+    out += ch; i++;
+  }
+  return out;
+}
+
 // ```cypher ... ``` blocks written by the LLM in its reply. Each one becomes a clickable box that loads
 // the statement into the Cypher editor — the statement the LLM PROPOSES (e.g. an update it does not run itself)
 // is not the same as generated_cypher, which is only the last query the agent executed (often a verification query).
 function _agentCypherBlocks(text) {
   var blocks = [], re = /```[ \t]*(?:cypher)?[ \t]*\n([\s\S]*?)(?:```|$)/gi, m;
   while ((m = re.exec(String(text || ''))) !== null) {
-    var code = m[1].trim();
+    var code = formatCypher(m[1].trim());
     if (code) blocks.push(code);
   }
   return blocks;
@@ -457,7 +508,7 @@ function _agentAppendMessage(role, content, cypher, results) {
         _hasFence = true;
         var _before = _text.slice(_last, _fm.index).replace(/\n+$/, '');
         if (_before) bubble.appendChild(document.createTextNode(_before));
-        if (_fm[1].trim()) bubble.appendChild(_agentMakeCypherBox(_fm[1].trim(), 'Click to load into the Cypher editor'));
+        if (_fm[1].trim()) bubble.appendChild(_agentMakeCypherBox(formatCypher(_fm[1].trim()), 'Click to load into the Cypher editor'));
         _last = _fenceRe.lastIndex;
       }
       if (_hasFence) {
@@ -478,6 +529,7 @@ function _agentAppendMessage(role, content, cypher, results) {
     var cypherBox = document.createElement('div');
     cypherBox.style.cssText = 'margin-top:8px;background:#0d1220;border:1px solid #2a4a7f;border-radius:6px;padding:8px 10px;font-family:monospace;font-size:11px;color:#a0cfff;white-space:pre-wrap;word-break:break-all;cursor:pointer';
     cypherBox.title = 'Click to load into query bar';
+    cypher = formatCypher(cypher);
     cypherBox.textContent = cypher;
     cypherBox.onclick = function() { _agentLastCypher = cypher; agentLoadCypherToBar(); };
     bubble.appendChild(cypherBox);
@@ -900,6 +952,7 @@ function _renderSummarizeReply(text, container) {
 
 function agentLoadCypherToBar() {
   if (!_agentLastCypher) return;
+  _agentLastCypher = formatCypher(_agentLastCypher);
   // The Cypher editor (query bar) is hidden until the user opens it — open it, otherwise the text is
   // copied into an editor nobody can see and the click appears to do nothing.
   var bar = document.getElementById('query-bar');
@@ -1654,9 +1707,27 @@ async function llmsUserTestConnection() {
     // server falls back to the user's saved key.
     var provObj = (typeof _llmProviders !== 'undefined' && _llmProviders.find)
       ? (_llmProviders.find(function(p) { return p.name === provider; }) || {}) : {};
+    // In this dialog the dropdown value can be the provider's URL itself rather than its name (then there is no
+    // list entry to look up, and the value is the URL to use).
+    var provUrl = provObj.url || (/^https?:\/\//i.test(provider) ? provider : '');
+    if (!provUrl) {   // an admin may have typed the URL in the custom-providers list without saving yet
+      document.querySelectorAll('.llms-provider-name').forEach(function(nameEl) {
+        if (nameEl.value.trim() === provider) {
+          var urlEl = nameEl.parentNode.querySelector('.llms-provider-url');
+          if (urlEl && urlEl.value.trim()) provUrl = urlEl.value.trim();
+        }
+      });
+    }
+    // Never send the provider NAME as the URL (it was the fallback before): the agent then tried to call "Cerebus" as an
+    // address and reported only "Ping failed due to an internal error".
+    if (!/^https?:\/\//i.test(provUrl)) {
+      resultEl.textContent = '✗ Provider "' + provider + '" has no API URL — set it under Admin — Custom providers and Save';
+      resultEl.style.color = '#e07070';
+      return;
+    }
     var result = await api('/api/agent/ping-llm', {
       llm: {
-        url:        provObj.url || provider,
+        url:        provUrl,
         apikey:     (apiKey === '••••••••') ? '' : apiKey,
         model_name: modelName
       }
