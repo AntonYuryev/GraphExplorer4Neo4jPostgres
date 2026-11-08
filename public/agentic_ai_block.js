@@ -125,17 +125,32 @@ function toggleAgenticPanel() {
   }
 }
 
+// true once the agent service has this user's database schema (pushed when the page loads the schema after login/restart);
+// null = not known yet. Text2Cypher cannot answer before that: it has neither the schema nor the Neo4j connection.
+var _agentSchemaReady = null;
+function _agentApplyHealth(r) {
+  _agentSchemaReady = !!(r && r.schema_loaded);
+  if (_agentSchemaReady) _agentSetStatus(true, (r && r.llm_model) || 'connected');
+  else _agentSetStatus(null, 'Database schema is loading…');
+  return _agentSchemaReady;
+}
+
 function _agentPollStatus() {
+  clearTimeout(_agentStatusTimer);
   api('/api/agent/health', null, 'GET')
-    .then(function(r) { _agentSetStatus(true,  r.llm_model || 'connected'); })
-    .catch(function()  { _agentSetStatus(false, 'service unavailable'); });
-  _agentStatusTimer = setTimeout(_agentPollStatus, 10000);
+    .then(function(r) { _agentApplyHealth(r); })
+    .catch(function()  { _agentSchemaReady = null; _agentSetStatus(false, 'service unavailable'); })
+    .then(function() {
+      if (!_agentPanelOpen) return;
+      // poll quickly while the schema is still loading so the panel unlocks as soon as it is there
+      _agentStatusTimer = setTimeout(_agentPollStatus, _agentSchemaReady === false ? 2000 : 10000);
+    });
 }
 
 function _agentSetStatus(ok, label) {
   var dot = document.getElementById('agent-status-dot');
   var lbl = document.getElementById('agent-status-label');
-  if (dot) dot.style.background = ok ? '#3a9c66' : '#c0392b';
+  if (dot) dot.style.background = ok === null ? '#e0a800' : (ok ? '#3a9c66' : '#c0392b');   // null = amber: loading
   if (lbl) lbl.textContent = label;
 }
 
@@ -151,6 +166,18 @@ async function agentSend() {
   if (!msg) {
     console.log('[agentSend] Empty message, aborting');
     return;
+  }
+  // Text2Cypher needs the database schema (and the Neo4j connection pushed with it). Right after an app restart the
+  // agent can be opened before that has happened; then the LLM must not be called (it ended in the misleading
+  // "Neo4j not configured" error). Ask the service now, and keep the typed text so the user can simply send again.
+  if (_agentCurrentMode === 'text2cypher' && _agentSchemaReady !== true) {
+    var _ready = false;
+    try { _ready = _agentApplyHealth(await api('/api/agent/health', null, 'GET')); } catch (_e) { _ready = false; }
+    if (!_ready) {
+      _agentAppendMessage('assistant', 'Database schema is loading… please wait a moment, then send your question again.');
+      _agentPollStatus();
+      return;
+    }
   }
   input.value = '';
 
@@ -1536,7 +1563,18 @@ function _populateModelSelect(providerUrl, savedModel) {
 }
 
 // ── LLM Settings modal ────────────────────────────────────────────────────────
+// Every value a save stores; the Save button stays disabled after a save until one of them changes.
+function _llmsSig() {
+  var ids = ['llms-user-provider', 'llms-user-apikey', 'llms-user-model', 'llms-user-temperature', 'llms-user-top-p'];
+  var parts = ids.map(function (id) { var e = document.getElementById(id); return e ? e.value : ''; });
+  var jm = document.getElementById('llms-user-json-mode'); parts.push(jm && jm.checked ? '1' : '0');
+  Array.prototype.forEach.call(document.querySelectorAll('#llms-providers-list input'), function (e) { parts.push(e.value); });
+  return parts.join('');
+}
+
 async function openLLMSettings() {
+  _saveGuardReset('llm', 'llms-save-btn');
+  _saveGuardWatch('llm-settings-modal', 'llm', 'llms-save-btn', _llmsSig);
   document.getElementById('llm-settings-error').style.display   = 'none';
   document.getElementById('llm-settings-success').style.display = 'none';
   try {
@@ -1781,6 +1819,7 @@ async function saveLLMSettings() {
   errEl.style.display = 'none';
   okEl.style.display  = 'none';
   saveBtn.disabled    = true;
+  var _llmSaved = false;
 
   try {
     // First, verify auth is working
@@ -1844,6 +1883,7 @@ async function saveLLMSettings() {
     });
     okEl.textContent   = 'Settings saved.';
     okEl.style.display = 'block';
+    _llmSaved = true;
   } catch(e) {
     console.error('[LLM] Save error:', e, 'Message:', e.message);
     errEl.textContent   = 'Save failed: ' + (e.message || String(e));
@@ -1851,6 +1891,7 @@ async function saveLLMSettings() {
   } finally {
     saveBtn.disabled = false;
   }
+  if (_llmSaved) _saveGuardArm('llm', 'llms-save-btn', _llmsSig);   // nothing left to save until a setting changes
 }
 
 // ── Init on login ─────────────────────────────────────────────────────────────
