@@ -1686,6 +1686,10 @@ def register_text2cypher_routes(app, runtime: Dict[str, Any]) -> None:
 
     @app.post("/chat")
     def chat(req: ChatRequest):
+        # No schema yet = the page has not pushed this user's schema/Neo4j connection (e.g. just after a restart).
+        # Without this guard the first Cypher failed with a confusing "Neo4j not configured" error.
+        if not (_runtime_('resolve_schema_cfg')(_runtime_('current_username').get()).get("schema_text") or "").strip():
+            raise HTTPException(status_code=503, detail="Database schema is loading — please wait a moment and try again.")
         llm = _runtime_('effective_llm')(req.llm)
 
         # Build message list from history + new user message. When a past turn's
@@ -1736,6 +1740,9 @@ def register_text2cypher_routes(app, runtime: Dict[str, Any]) -> None:
         # Agentic loop — allow up to 8 LLM↔tool round-trips
         truncation_retries = 0
         hallucination_retries = 0
+        empty_query_retries = 0
+        _last_action_type: Optional[str] = None   # last action the model emitted (for the fallback message below)
+        _vocab_saved: List[str] = []              # vocabulary mappings saved this turn
         for _turn in range(8):
             _runtime_('log').info("Agentic loop turn %d", _turn)
             # A single failed LLM call (network blip, provider momentarily overloaded,
@@ -1820,6 +1827,7 @@ def register_text2cypher_routes(app, runtime: Dict[str, Any]) -> None:
                 break  # LLM gave a final answer — done
 
             action_type = action.get("action", "cypher")
+            _last_action_type = action_type
 
             # render, write_relation, and save_vocabulary are terminal — no "query" field needed.
             # ontology_lookup uses "term"/"concept" fields (not "query"), so skip the query check.
@@ -1827,8 +1835,21 @@ def register_text2cypher_routes(app, runtime: Dict[str, Any]) -> None:
             if action_type in ("render", "write_relation", "batch_update", "save_vocabulary", "ontology_lookup", "pubmed_search"):
                 query = action.get("query", "")  # may be empty; each handler uses its own fields
             else:
-                query = action.get("query", "").strip()
+                # Models sometimes put the statement under another key ("cypher", "sql", "statement").
+                query = str(action.get("query") or action.get("cypher") or action.get("sql")
+                            or action.get("statement") or "").strip()
                 if not query:
+                    # Used to `break` silently, which ended the turn with an empty reply and the generic
+                    # "Query complete" text although nothing had run. Ask the model to redo it instead.
+                    if empty_query_retries < 2:
+                        empty_query_retries += 1
+                        _runtime_('log').warning("Turn %d: '%s' action has no query text (retry %d/2)",
+                                    _turn, str(action_type)[:40], empty_query_retries)
+                        messages.append({"role": "user", "content": (
+                            "Your last action block had no \"query\" field, so nothing was executed. "
+                            "Emit the action again as {\"action\": \"cypher\", \"query\": \"<the full Cypher>\"}."
+                        )})
+                        continue
                     break
 
             if action_type == "cypher":
@@ -2135,6 +2156,7 @@ def register_text2cypher_routes(app, runtime: Dict[str, Any]) -> None:
                         _runtime_('log').info("save_vocabulary: %s → %s (%s)", user_term, neo4j_name, neo4j_label)
                 if saved:
                     _runtime_('log').info("Agent saved %d vocabulary mapping(s)", len(saved))
+                _vocab_saved = saved
                 break
 
             else:
@@ -2237,10 +2259,22 @@ def register_text2cypher_routes(app, runtime: Dict[str, Any]) -> None:
                 desc = render_action.get("description", "")
                 tool = render_action.get("tool", "graph")
                 cleaned_reply = f"Displaying {desc or 'results'} in {tool} view."
-            else:
-                # The LLM emitted only an action block with no surrounding text.
-                # Never show raw JSON — use a neutral placeholder.
+            elif _vocab_saved:
+                cleaned_reply = "Saved to vocabulary: " + "; ".join(_vocab_saved) + "."
+            elif generated_cypher is not None or postgres_results is not None:
+                # A query really ran; its Cypher/rows are shown with the reply.
                 cleaned_reply = "Query complete — see results below."
+            else:
+                # The LLM emitted only an action block with no text and nothing was executed or rendered
+                # (e.g. a save_vocabulary block with no mapping, an unusable action, or the loop ran out of
+                # turns). Saying "see results below" here was misleading because there are none.
+                _runtime_('log').warning("Empty reply with nothing executed: last action=%s, raw reply starts: %s",
+                            str(_last_action_type)[:40],
+                            re.sub(r"\s+", " ", (raw_reply or "")[:300]))
+                cleaned_reply = ("I could not turn that into a query, so nothing was run"
+                                 + (f" (the model only returned a '{_last_action_type}' action)" if _last_action_type else "")
+                                 + ". Please rephrase the request, for example: \"list all drug names with their URN and "
+                                 "Medscan-ID\".")
 
         final_reply = cleaned_reply
 
