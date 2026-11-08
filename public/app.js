@@ -1224,15 +1224,18 @@ var _QR_BTNS = function (which) {
        + '<button class="qr-btn" onclick="saveResultTableTsv(\'' + which + '\')">Save as TSV</button>';
 };
 
+var QR_MAX_DISPLAY_ROWS = 1000;   // rows drawn in the result table; Save as TSV / Copy always use all rows
 function showQueryResultTable(table) {
   var overlay = document.getElementById('query-result-overlay');
   if (!overlay) return;
   var rowCount = table.rows.length;
+  var shownRows = rowCount > QR_MAX_DISPLAY_ROWS ? table.rows.slice(0, QR_MAX_DISPLAY_ROWS) : table.rows;
   _lastTsv.cypher = _tsvFromTable(table.columns, table.rows);
   _lastQueryText.cypher = currentQuery || '';
   var html = '<div class="qr-header">'
     + '<span class="qr-title">Query Result</span>'
-    + '<span class="qr-count">' + rowCount + ' row' + (rowCount !== 1 ? 's' : '') + '</span>'
+    + '<span class="qr-count">' + rowCount.toLocaleString() + ' row' + (rowCount !== 1 ? 's' : '')
+    + (shownRows.length < rowCount ? ' &mdash; showing the first ' + shownRows.length.toLocaleString() + '; Save as TSV / Copy include all rows' : '') + '</span>'
     + _QR_BTNS('cypher')
     + '<button class="qr-close" onclick="hideQueryResultTable()">&#x2715;</button>'
     + '</div><div class="qr-table-wrap"><table class="qr-table"><thead><tr>';
@@ -1240,7 +1243,7 @@ function showQueryResultTable(table) {
     html += '<th>' + escHtml(String(col)) + '</th>';
   });
   html += '</tr></thead><tbody>';
-  table.rows.forEach(function(row) {
+  shownRows.forEach(function(row) {
     html += '<tr>';
     row.forEach(function(cell) {
       var display = (cell === null || cell === undefined)
@@ -7538,6 +7541,10 @@ async function runQuery(mergeIntoExisting) {
       if (data.table && data.nodes.length === 0 && data.edges.length === 0) {
         appendCypherHistory(query, 0);   // record aggregate/table queries in history
         showQueryResultTable(data.table);
+        // Name the tab like a graph result: query text first, then a short LLM-generated name (was left as "Pathway N").
+        updateCurrentTabName(shortQ);
+        tabs[startTabIdx]._tableCypher = query;
+        _nameGraphFromCypher(query, tabs[startTabIdx].id, startTabIdx, 'table');
       } else if (mergeIntoExisting && cy && cy.elements().length) {
         // "Add to graph" — merge into whatever's already on the canvas instead of
         // replacing it. mergeGraphData() dedupes nodes by URN and edges by id, so
@@ -7597,10 +7604,12 @@ async function runQuery(mergeIntoExisting) {
  * @param {number} tabId       id of the tab that triggered this query
  * @param {number} tabIdx      index of that tab at query time
  */
-async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
+// kind = 'table' for a query whose result is a table (no graph); the name is then kept on the tab only.
+async function _nameGraphFromCypher(cypher, tabId, tabIdx, kind) {
+  var isTable = kind === 'table';
   // LLM config lives server-side (users.json) — no client-side model_name check needed.
   var prompt =
-    'Give a succinct name (5 words max) for the graph produced by this Cypher query. ' +
+    'Give a succinct name (5 words max) for the ' + (isTable ? 'table of results' : 'graph') + ' produced by this Cypher query. ' +
     'Reply with ONLY the name — no quotes, no punctuation, no extra text.\n\nQuery:\n' + cypher;
 
   // Helper: set the tab label (works whether tab is active or backgrounded)
@@ -7614,6 +7623,10 @@ async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
 
   // Helper: guard — returns false if the user has already loaded a different graph
   function _graphStillCurrent() {
+    if (isTable) {   // the tab must still show this table (not a newer query)
+      var ti = tabs.findIndex(function(t) { return t.id === tabId; });
+      return ti >= 0 && tabs[ti]._tableCypher === cypher;
+    }
     var g = SummarizeRequest.NodeJSGraph;
     return g && g.cypher === cypher;
   }
@@ -7640,7 +7653,7 @@ async function _nameGraphFromCypher(cypher, tabId, tabIdx) {
       }
       _setTabName(aiName);
       var g = SummarizeRequest.NodeJSGraph;
-      if (g && g.cypher === cypher) g.Name = aiName;
+      if (!isTable && g && g.cypher === cypher) g.Name = aiName;
       return;  // done
 
     } catch (err) {
@@ -17315,7 +17328,44 @@ function switchDbTab(tab) {
   _dbMsg('', '');
 }
 
+// ── "Save" button that stays disabled after a successful save until something in the dialog changes ──────────────
+// Without it there is no sign that a save actually went through. key = one guarded button, sigFn() = a string of
+// every value in the dialog that a save would store.
+var _saveSigs = {};
+function _saveGuardReset(key, btnId) {
+  delete _saveSigs[key];
+  var b = document.getElementById(btnId); if (b) b.disabled = false;
+}
+function _saveGuardArm(key, btnId, sigFn) {
+  _saveSigs[key] = sigFn();
+  var b = document.getElementById(btnId); if (b) b.disabled = true;
+}
+function _saveGuardWatch(rootId, key, btnId, sigFn) {   // call once; re-checks on every edit/selection/click in the dialog
+  var root = document.getElementById(rootId);
+  if (!root || root._saveGuard) return;
+  root._saveGuard = true;
+  ['input', 'change', 'click'].forEach(function (ev) {
+    root.addEventListener(ev, function (e) {
+      if (_saveSigs[key] === undefined) return;
+      var b = document.getElementById(btnId);
+      if (!b || (e.target && (e.target === b || b.contains(e.target)))) return;
+      b.disabled = (sigFn() === _saveSigs[key]);
+    });
+  });
+}
+function _dbPairSig() {
+  return ['dbp-select', 'dbp-n-db', 'dbp-n-user', 'dbp-n-pw', 'dbp-p-db', 'dbp-p-schema', 'dbp-p-user', 'dbp-p-pw']
+    .map(function (id) { var e = document.getElementById(id); return e ? e.value : ''; }).join('');
+}
+function _dbUrlSig() {
+  return ['dbu-neo4j', 'dbu-pg'].map(function (id) { var e = document.getElementById(id); return e ? e.value : ''; }).join('');
+}
+
 async function openDatabasesDialog() {
+  _saveGuardReset('dbpair', 'dbp-save-btn');
+  _saveGuardReset('dburls', 'dbu-save-btn');
+  _saveGuardWatch('databases-modal', 'dbpair', 'dbp-save-btn', _dbPairSig);
+  _saveGuardWatch('databases-modal', 'dburls', 'dbu-save-btn', _dbUrlSig);
   _dbMsg('', '');
   document.getElementById('databases-modal').style.display = 'flex';
   switchDbTab(_dbTab);
@@ -17425,6 +17475,7 @@ async function dbSavePair(connect) {
   var btn = document.getElementById(connect ? 'dbp-connect-btn' : 'dbp-save-btn');
   var other = document.getElementById(connect ? 'dbp-save-btn' : 'dbp-connect-btn');
   var oldText = btn.textContent;
+  var _saved = false;
   btn.disabled = true; other.disabled = true; btn.textContent = 'Testing…';
   _dbMsg('', '');
   try {
@@ -17433,11 +17484,13 @@ async function dbSavePair(connect) {
     await _dbLoad(r.name);
     _dbMsg('ok', connect ? 'Connected to ' + r.name + '.' : 'Saved ' + r.name + '.');
     if (connect) _invalidateSchemaCache();   // schema autocomplete etc. must be re-read from the new database
+    _saved = true;
   } catch (e) {
     _dbMsg('error', e.message || String(e));
   } finally {
     btn.disabled = false; other.disabled = false; btn.textContent = oldText;
   }
+  if (_saved) _saveGuardArm('dbpair', 'dbp-save-btn', _dbPairSig);   // nothing left to save until the form changes
 }
 
 async function dbRemovePair() {
@@ -17460,6 +17513,7 @@ async function dbSaveUrls() {
   var host = pg, port = 5432;
   var m = /^(.*):(\d{1,5})$/.exec(pg);
   if (m && m[1].indexOf(':') < 0) { host = m[1]; port = parseInt(m[2], 10); }   // host:port (a bare IPv6 address keeps its colons)
+  var _urlsSaved = false;
   btn.disabled = true; btn.textContent = 'Saving…';
   _dbMsg('', '');
   try {
@@ -17471,11 +17525,13 @@ async function dbSaveUrls() {
     await _dbLoad(null);
     _dbMsg(warnings.length ? 'error' : 'ok', warnings.length ? warnings.join(' ') : 'Saved. Every user reconnects with their own saved logins.');
     _invalidateSchemaCache();
+    _urlsSaved = true;
   } catch (e) {
     _dbMsg('error', e.message || String(e));
   } finally {
     btn.disabled = false; btn.textContent = 'Save URLs';
   }
+  if (_urlsSaved) _saveGuardArm('dburls', 'dbu-save-btn', _dbUrlSig);
 }
 
 // Fetch buttons: list what the entered login can see, so a name can be picked instead of typed.
