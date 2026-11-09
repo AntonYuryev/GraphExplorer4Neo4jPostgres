@@ -5527,6 +5527,8 @@ function _buildImportApiConfig(username) {
 }
 
 function _pushImportMsg(job, line) {
+  const fm = /^@@FILES_IMPORTED (\d+)\/(\d+)\s*$/.exec(line);
+  if (fm) { job.filesDone = parseInt(fm[1], 10); return; }   // progress marker from rnef_import_runner.py: not a message
   job.messages.push(line);
   if (job.messages.length > RNEF_IMPORT_MAX_MSGS) {
     const drop = Math.floor(RNEF_IMPORT_MAX_MSGS / 4);
@@ -5670,7 +5672,7 @@ app.get('/api/import/rnef/progress', dbLimiter, authMiddleware, (req, res) => {
     res.set('X-Auth-Token', jwt.sign({ username: req.user.username, role: req.user.role }, JWT_SECRET, { expiresIn: '12h', algorithm: 'HS256' }));
   }
   res.json({ running: job.running, done: job.done, exitCode: job.exitCode, error: job.error,
-             startedAt: job.startedAt, filesTotal: job.filesTotal, logFile: job.logFile, logPath: job.logPath,
+             startedAt: job.startedAt, filesTotal: job.filesTotal, filesDone: job.filesDone || 0, logFile: job.logFile, logPath: job.logPath,
              messages: job.messages.slice(since - job.base), next: job.base + job.messages.length });
 });
 
