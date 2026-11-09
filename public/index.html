@@ -709,6 +709,14 @@
   .ch-chip.active { background: #4f8ef7; border-color: #4f8ef7; color: #fff; font-weight: 600; }
   .ch-chip:hover:not(.active) { border-color: #4f8ef7; color: #c8d8ff; }
   mark.ch-hit { background: #4f8ef7; color: #fff; border-radius: 2px; padding: 0 1px; }
+/* Configure Columns: three tabs; the checkboxes of a tab fill a table of at most 3 rows, each option aligned with its neighbours */
+#columns-modal .prop-section-title { min-height:18px; overflow:hidden; margin-top:0 !important; }
+.col-tabs { display:flex; gap:4px; margin-bottom:12px; border-bottom:1px solid #2d3147; }
+.col-tabs button { border-radius:4px 4px 0 0; }
+.col-tabs button.active { background:#252a40; color:#fff; }
+.col-grid { display:grid; grid-template-rows:repeat(3, auto); grid-auto-flow:column; grid-auto-columns:max-content; gap:8px 32px; align-items:center; overflow-x:auto; padding-bottom:8px; margin-bottom:12px; }
+.col-grid > label { white-space:nowrap !important; margin:0; }
+.col-grid input[type=checkbox] { width:auto !important; flex:none; margin:0; }
 </style>
 <div id="cypher-history-modal" class="modal-backdrop" style="display:none">
   <div class="modal-box" style="min-width:760px;max-width:92vw;max-height:85vh;display:flex;flex-direction:column">
@@ -881,33 +889,50 @@
 
 <!-- Columns dialog -->
 <div id="columns-modal" class="modal-backdrop" style="display:none">
-  <div class="modal-box" style="min-width:500px;max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
+  <div class="modal-box" style="width:min(1500px,95vw);max-height:80vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
     <h3>Configure Columns</h3>
-    <p style="color:#7a8099;font-size:12px;margin-bottom:14px">Check columns to show. Drag table headers to reorder.</p>
-    <div style="overflow-y:auto;flex:1">
-      <div class="prop-section-title" id="col-graph-title">graph columns (both views)</div>
-      <div id="col-graph-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
-      <div id="col-neo4j-section">
-        <div class="prop-section-title">Neo4j edge properties (Relation view)</div>
-        <div id="col-neo4j-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+    <p style="color:#7a8099;font-size:12px;margin-bottom:10px">Check columns to show. Drag table headers to reorder.</p>
+    <div class="col-tabs">
+      <button class="btn-ghost" id="col-tab-graph" onclick="switchColTab('graph')">Graph columns</button>
+      <button class="btn-ghost" id="col-tab-neo4j" onclick="switchColTab('neo4j')">Relation properties</button>
+      <button class="btn-ghost" id="col-tab-ref" onclick="switchColTab('ref')">Reference table columns</button>
+      <button class="btn-ghost" id="col-tab-sd" onclick="switchColTab('sd')">Scopus data</button>
+      <button class="btn-ghost" id="col-tab-node" onclick="switchColTab('node')">Node properties</button>
+    </div>
+    <div style="overflow-y:auto;flex:1;min-height:200px">
+      <div id="col-pane-graph">
+        <div class="prop-section-title" id="col-graph-title"></div>
+        <div id="col-graph-list" class="col-grid"></div>
       </div>
-      <div id="col-ref-section">
-        <div class="prop-section-title">reference table columns (Reference view)</div>
-        <div id="col-ref-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:12px"></div>
+      <div id="col-pane-neo4j" style="display:none">
+        <div id="col-neo4j-section">
+          <div class="prop-section-title"></div>
+          <div id="col-neo4j-list" class="col-grid"></div>
+        </div>
       </div>
-      <div id="col-sd-section">
-        <div class="prop-section-title">scopus_data table (Reference view)</div>
-        <div id="col-sd-list" style="display:flex;flex-wrap:wrap;gap:4px 16px"></div>
+      <div id="col-pane-node" style="display:none">
+        <div id="col-nodeprops-section" style="display:none">
+          <div class="prop-section-title" style="margin-top:0"></div>
+          <div id="col-nodeprops-list" class="col-grid"></div>
+          <div id="col-nodeprops-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
+        </div>
+        <div id="col-nodecols-section" style="display:none">
+          <div class="prop-section-title" style="margin-top:0"></div>
+          <div id="col-nodecols-list" class="col-grid"></div>
+          <div id="col-nodecols-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
+        </div>
       </div>
-      <div id="col-nodeprops-section" style="display:none">
-        <div class="prop-section-title" style="margin-top:12px">node properties (both views)</div>
-        <div id="col-nodeprops-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:4px"></div>
-        <div id="col-nodeprops-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
+      <div id="col-pane-ref" style="display:none">
+        <div id="col-ref-section">
+          <div class="prop-section-title"></div>
+          <div id="col-ref-list" class="col-grid"></div>
+        </div>
       </div>
-      <div id="col-nodecols-section" style="display:none">
-        <div class="prop-section-title" style="margin-top:12px">node properties (Node view)</div>
-        <div id="col-nodecols-list" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin-bottom:4px"></div>
-        <div id="col-nodecols-note" style="font-size:11px;color:#7a8099;margin-top:2px"></div>
+      <div id="col-pane-sd" style="display:none">
+        <div id="col-sd-section">
+          <div class="prop-section-title"></div>
+          <div id="col-sd-list" class="col-grid"></div>
+        </div>
       </div>
     </div>
     <div class="modal-actions" style="margin-top:14px">
