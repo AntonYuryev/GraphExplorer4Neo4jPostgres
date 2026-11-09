@@ -10081,7 +10081,7 @@ async function openColumnsDialog() {
   // ── Graph columns — 'graph' for Relations/References, 'node_graph' for Nodes ──
   var graphList  = document.getElementById('col-graph-list');
   var graphTitle = document.getElementById('col-graph-title');
-  if (graphTitle) graphTitle.textContent = isNodeView ? 'graph columns (Node view)' : 'graph columns (both views)';
+  if (graphTitle) graphTitle.textContent = '';   // the tab name says it; the bar only carries the Select all box
   graphList.innerHTML = '';
   var graphSource = isNodeView ? 'node_graph' : 'graph';
   columnDefs.filter(function(c) { return c.source === graphSource; }).forEach(function(col) {
@@ -10126,9 +10126,12 @@ async function openColumnsDialog() {
   var refList    = document.getElementById('col-ref-list');
   if (refSection) refSection.style.display = (isRelationView || isNodeView) ? 'none' : '';
   if (!isRelationView && !isNodeView) {
-    // Match by dbField to avoid duplicating columns with custom keys (e.g. sentence/msrc).
+    // Match by dbField to avoid duplicating columns with custom keys. One DB field can back several columns
+    // (msrc -> "Markup sentence" and the plain "Sentence"): every one of them gets its own checkbox.
     var refByDbField = {};
-    columnDefs.forEach(function(c) { if (c.source === 'reference') refByDbField[c.dbField] = c; });
+    columnDefs.forEach(function(c) {
+      if (c.source === 'reference') (refByDbField[c.dbField] = refByDbField[c.dbField] || []).push(c);
+    });
 
     refList.innerHTML = '';
     refCols.forEach(function(dbField) {
@@ -10136,18 +10139,19 @@ async function openColumnsDialog() {
         var label = COL_DISPLAY_NAMES[dbField] || dbField;
         var newCol = { key: dbField, label: label, visible: false, source: 'reference', dbField: dbField };
         columnDefs.push(newCol);
-        refByDbField[dbField] = newCol;
+        refByDbField[dbField] = [newCol];
       }
-      var col = refByDbField[dbField];
-      var cbLabel = escHtml(col.label);
-      if (col.dbField && col.label !== col.dbField) {
-        cbLabel += ' <span style="color:#7a8099;font-size:11px">(' + escHtml(col.dbField) + ')</span>';
-      }
-      var lb = document.createElement('label');
-      lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
-      lb.innerHTML = '<input type="checkbox" data-col-key="' + escHtml(col.key) + '"'
-        + (col.visible ? ' checked' : '') + '> ' + cbLabel;
-      refList.appendChild(lb);
+      refByDbField[dbField].forEach(function(col) {
+        var cbLabel = escHtml(col.label);
+        if (col.dbField && col.label !== col.dbField) {
+          cbLabel += ' <span style="color:#7a8099;font-size:11px">(' + escHtml(col.dbField) + ')</span>';
+        }
+        var lb = document.createElement('label');
+        lb.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;white-space:nowrap';
+        lb.innerHTML = '<input type="checkbox" data-col-key="' + escHtml(col.key) + '"'
+          + (col.visible ? ' checked' : '') + '> ' + cbLabel;
+        refList.appendChild(lb);
+      });
     });
     _attachSelectAll(refList, refSection.querySelector('.prop-section-title'));
   }
@@ -10242,6 +10246,7 @@ async function openColumnsDialog() {
             + (isChecked ? ' checked' : '') + '> ' + escHtml(propName);
           nodePropList.appendChild(lb);
         });
+        _colFitVisible();   // the list is filled asynchronously: re-fit its rows to the dialog width
       })
       .catch(function() {
         nodePropNote.textContent = 'Could not load property list from database.';
@@ -10286,6 +10291,7 @@ async function openColumnsDialog() {
             + (col.visible ? ' checked' : '') + '> ' + escHtml(propName);
           nodeColList.appendChild(lb);
         });
+        _colFitVisible();   // the list is filled asynchronously: re-fit its rows to the dialog width
       })
       .catch(function() {
         if (nodeColNote) nodeColNote.textContent = 'Could not load property list from database.';
@@ -10293,7 +10299,46 @@ async function openColumnsDialog() {
   }
 
   document.getElementById('columns-modal').style.display = 'flex';
+  _colTabsRefresh();
+  _colFitVisible();
 }
+
+// Configure Columns tabs: Graph columns (always) / Reference table columns / Scopus data (Reference view only).
+var _colTab = 'graph';
+function _colTabsRefresh() {
+  var shown = { graph: true };
+  var rs = document.getElementById('col-ref-section'), ss = document.getElementById('col-sd-section');
+  shown.ref = !!(rs && rs.style.display !== 'none');
+  shown.sd  = !!(ss && ss.style.display !== 'none');
+  var n4 = document.getElementById('col-neo4j-section');
+  shown.neo4j = !!(n4 && n4.style.display !== 'none');
+  var ns = document.getElementById('col-nodeprops-section'), nc = document.getElementById('col-nodecols-section');
+  shown.node = !!((ns && ns.style.display !== 'none') || (nc && nc.style.display !== 'none'));
+  if (!shown[_colTab]) _colTab = 'graph';
+  ['graph', 'neo4j', 'node', 'ref', 'sd'].forEach(function (t) {
+    var btn = document.getElementById('col-tab-' + t), pane = document.getElementById('col-pane-' + t);
+    if (btn) { btn.style.display = shown[t] ? '' : 'none'; btn.classList.toggle('active', t === _colTab); }
+    if (pane) pane.style.display = (t === _colTab) ? '' : 'none';
+  });
+  // a single tab needs no tab bar
+  var bar = document.querySelector('#columns-modal .col-tabs');
+  if (bar) bar.style.display = (shown.ref || shown.sd || shown.node || shown.neo4j) ? '' : 'none';
+}
+// The reference list is long: start at 4 rows and add rows (up to 10) until it fits the dialog width without a
+// horizontal scroll bar. Needs the pane to be visible, so it runs after the tab is shown.
+function _colFitRows(listEl, minRows) {
+  if (!listEl || !listEl.offsetParent) return;
+  for (var rows = minRows || 4; rows <= 10; rows++) {
+    listEl.style.gridTemplateRows = 'repeat(' + rows + ', auto)';
+    if (listEl.scrollWidth <= listEl.clientWidth + 1) break;
+  }
+}
+function _colFitVisible() {
+  if (_colTab === 'ref') _colFitRows(document.getElementById('col-ref-list'));
+  if (_colTab === 'neo4j') _colFitRows(document.getElementById('col-neo4j-list'), 3);
+  if (_colTab === 'node') { _colFitRows(document.getElementById('col-nodeprops-list'), 3); _colFitRows(document.getElementById('col-nodecols-list'), 3); }
+}
+function switchColTab(t) { _colTab = t; _colTabsRefresh(); _colFitVisible(); }
 
 function closeColumnsModal(e) {
   if (e.target === document.getElementById('columns-modal'))
