@@ -3563,7 +3563,8 @@ async function _pollRnefImportProgress() {
     _irnSince = job.next;
     statusEl.innerHTML = job.done
       ? ''
-      : '<span style="color:#8fb8ff">⏳ Imported ' + (job.filesDone || 0) + ' out of ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + '…</span>';
+      : '<span style="color:#8fb8ff">⏳ Imported ' + (job.filesDone || 0) + ' out of ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + '.'
+          + (job.currentFile ? ' Importing ' + escHtml(job.currentFile) + ' file…' : '..') + '</span>';
 
     if (job.done) { _irnShowDone(job); return; }
 
