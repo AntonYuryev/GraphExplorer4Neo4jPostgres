@@ -1223,6 +1223,9 @@ def calc_relation_id(inref=None, inoutref=None, outref=None,
     """
     Calculate RelationID — identical to server.js calcRelationId.
     Returns string to preserve full 64-bit precision.
+    NOTE: the string is only a transport format. RelationID is an INTEGER (int64) in Neo4j: before it is used in a
+    Cypher query it must be converted with int() (parameter value or bare digits in the query text), never passed
+    as a string, or `r.RelationID = ...` / `IN [...]` will not match the stored integer property.
     inref    : NodeID values of source nodes  (direction →), sorted desc
     inoutref : NodeID values of bidirectional nodes
     outref   : NodeID values of target nodes  (direction ←), sorted desc
