@@ -50,7 +50,7 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_sou
                 for ref in rel.refs():                           # ... and the Source column of its Postgres references
                     for snippet in ref.snippets.values():          # (written from the references' snippets)
                         snippet['Source'] = {add_source}
-        imported_nodes, imported_rels, imported_refs = neo4j.importGraph(nodes, rels)
+        imported_nodes, imported_rels, imported_refs = neo4j.importGraph(nodes, rels, add_source=add_source)
         total_created_nodes += imported_nodes
         total_imported_rels += imported_rels
         total_imported_refs += imported_refs
