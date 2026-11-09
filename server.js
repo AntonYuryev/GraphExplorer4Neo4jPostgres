@@ -6120,7 +6120,7 @@ app.post('/api/curate/start', dbLimiter, authMiddleware, (req, res) => {
     token: _crypto.randomBytes(12).toString('hex'), cancelRequested: false, stopped: false, username,
     kind: mode, onlyGreater: mode !== 'refcount', updateProps: mode === 'refcount',
     neo: req.neo4j,
-    steps: all.map(s => ({ id: s.id, num: s.num, name: s.name, status: wanted.has(s.id) ? 'pending' : 'skipped' })),
+    steps: all.map(s => ({ id: s.id, num: s.num, short: s.short, name: s.name, status: wanted.has(s.id) ? 'pending' : 'skipped' })),
     messages: [], base: 0,
   };
   try {
