@@ -42,7 +42,8 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_sou
     total_imported_refs = 0
     total_created_nodes = 0
     batch_counter = 0
-    files_done = [0]
+    files_done = [0, '']
+    prev_done = 0
     for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size, files_done=files_done):
         batch_counter += 1
         if add_source:
@@ -51,15 +52,19 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_sou
                 for ref in rel.refs():                           # ... and the Source column of its Postgres references
                     for snippet in ref.snippets.values():          # (written from the references' snippets)
                         snippet['Source'] = {add_source}
+        # progress markers for the App's dialog (server.js reads them and does not show the lines):
+        # files finished so far | the file this batch ends in = the one being imported now
+        cur_file = os.path.basename(files_done[1]) if len(files_done) > 1 else ''
+        print(f"@@FILES_IMPORTED {prev_done}/{len(rnef_files)}|{cur_file}", flush=True)
         imported_nodes, imported_rels, imported_refs = neo4j.importGraph(nodes, rels, add_source=add_source)
+        prev_done = files_done[0]
         total_created_nodes += imported_nodes
         total_imported_rels += imported_rels
         total_imported_refs += imported_refs
         print(f"Batch {batch_counter} with {len(rels)} relations: Imported {imported_nodes} nodes, {imported_rels} relations, and {imported_refs} references", flush=True)
         print(f"Imported so far {total_created_nodes} nodes, {total_imported_rels} relations, and {total_imported_refs} references\n\n", flush=True)
-        # progress marker for the App's dialog (server.js reads it and does not show the line)
-        print(f"@@FILES_IMPORTED {files_done[0]}/{len(rnef_files)}", flush=True)
-    print(f"@@FILES_IMPORTED {len(rnef_files)}/{len(rnef_files)}", flush=True)
+        print(f"@@FILES_IMPORTED {prev_done}/{len(rnef_files)}|", flush=True)   # batch imported, the next file is not known yet
+    print(f"@@FILES_IMPORTED {len(rnef_files)}/{len(rnef_files)}|", flush=True)
     # color final statistics in red
     print(f"\033[91mTotal imported count: {total_created_nodes} nodes, {total_imported_rels} relations and {total_imported_refs} references\033[0m")
     print(f"\033[94mTotal execution time: {execution_time(start)}\033[0m")
