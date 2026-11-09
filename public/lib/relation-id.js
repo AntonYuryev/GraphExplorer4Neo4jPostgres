@@ -165,6 +165,10 @@
    * All node-ID lists are sorted descending (64-bit safe via BigInt).
    * Returns the RelationID as a string to preserve full 64-bit precision
    * (Number/float64 would corrupt values above 2^53-1).
+   *
+   * NOTE: the string is only a transport format. RelationID is an INTEGER (int64) in Neo4j: when it goes into a
+   * Cypher query, pass it as an integer (a BigInt / neo4j.int parameter, or bare digits in the query text),
+   * never as a quoted string, or `r.RelationID = ...` / `IN [...]` will not match the stored integer property.
    */
   function calcRelationId(opts) {
     opts = opts || {};
