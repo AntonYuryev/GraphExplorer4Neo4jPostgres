@@ -3537,7 +3537,7 @@ async function _irnReattach() {
     document.getElementById('irn-status').style.display = '';
     if (job.running) {
       _irnSetBusy(true);
-      document.getElementById('irn-status').innerHTML = '<span style="color:#8fb8ff">⏳ An import is running — reattached (' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + ')…</span>';
+      document.getElementById('irn-status').innerHTML = '<span style="color:#8fb8ff">⏳ An import is running — reattached (imported ' + (job.filesDone || 0) + ' out of ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + ')…</span>';
       if (_irnPollHandle) clearTimeout(_irnPollHandle);
       _irnPollHandle = setTimeout(_pollRnefImportProgress, 1000);
     } else {
@@ -3563,7 +3563,7 @@ async function _pollRnefImportProgress() {
     _irnSince = job.next;
     statusEl.innerHTML = job.done
       ? ''
-      : '<span style="color:#8fb8ff">⏳ Importing ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + '…</span>';
+      : '<span style="color:#8fb8ff">⏳ Imported ' + (job.filesDone || 0) + ' out of ' + job.filesTotal + ' file' + (job.filesTotal !== 1 ? 's' : '') + '…</span>';
 
     if (job.done) { _irnShowDone(job); return; }
 
