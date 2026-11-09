@@ -42,7 +42,8 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_sou
     total_imported_refs = 0
     total_created_nodes = 0
     batch_counter = 0
-    for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size):
+    files_done = [0]
+    for nodes, rels in ResnetGraph.batch_read(rnef_files, batch_size=batch_size, files_done=files_done):
         batch_counter += 1
         if add_source:
             for rel in rels:
@@ -56,6 +57,9 @@ def import_rnef(APIconfig: dict, rnef_files: list[str], batch_size=50000,add_sou
         total_imported_refs += imported_refs
         print(f"Batch {batch_counter} with {len(rels)} relations: Imported {imported_nodes} nodes, {imported_rels} relations, and {imported_refs} references", flush=True)
         print(f"Imported so far {total_created_nodes} nodes, {total_imported_rels} relations, and {total_imported_refs} references\n\n", flush=True)
+        # progress marker for the App's dialog (server.js reads it and does not show the line)
+        print(f"@@FILES_IMPORTED {files_done[0]}/{len(rnef_files)}", flush=True)
+    print(f"@@FILES_IMPORTED {len(rnef_files)}/{len(rnef_files)}", flush=True)
     # color final statistics in red
     print(f"\033[91mTotal imported count: {total_created_nodes} nodes, {total_imported_rels} relations and {total_imported_refs} references\033[0m")
     print(f"\033[94mTotal execution time: {execution_time(start)}\033[0m")
